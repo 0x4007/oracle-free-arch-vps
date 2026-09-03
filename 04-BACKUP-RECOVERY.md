@@ -12,18 +12,18 @@ block-volume backup objects when this kit was written. Verify the current rule.
 
 Recommended steady-state use:
 
-| Slot | Object |
-|---:|---|
-| 1 | Accepted staging boot backup |
-| 2 | Accepted Arch root backup with the same suffix |
-| 3 | Free for the next staging backup |
-| 4 | Free for the next root backup |
-| 5 | Unused; not a complete recovery point by itself |
+| Slot | Object                                          |
+| ---: | ----------------------------------------------- |
+|    1 | Accepted staging boot backup                    |
+|    2 | Accepted Arch root backup with the same suffix  |
+|    3 | Free for the next staging backup                |
+|    4 | Free for the next root backup                   |
+|    5 | Unused; not a complete recovery point by itself |
 
-During rotation, the accepted and replacement pairs briefly use four slots.
-Keep the fifth slot unused unless the owner explicitly accepts a volume-only
-backup for a change that affects only that volume. Such an object is not a
-complete machine recovery point.
+During rotation, the accepted and replacement pairs briefly use four slots. Keep
+the fifth slot unused unless the owner explicitly accepts a volume-only backup
+for a change that affects only that volume. Such an object is not a complete
+machine recovery point.
 
 ## Create the golden pair
 
@@ -68,8 +68,8 @@ complete machine recovery point.
 ## Rotation
 
 1. Reconcile all existing objects and verify that at least two slots are free.
-2. If two accepted pairs already consume four slots, choose one complete pair
-   as the retained recovery point. Obtain exact approval to delete the other
+2. If two accepted pairs already consume four slots, choose one complete pair as
+   the retained recovery point. Obtain exact approval to delete the other
    complete pair, delete both of its members, and confirm their terminal states.
    Never delete the last accepted pair.
 3. Create a new matched incremental pair with one new suffix:
@@ -87,10 +87,14 @@ complete machine recovery point.
    now the sole accepted steady-state pair, and two slots are free for the next
    rotation.
 
-Never rotate one side independently. Never delete the last accepted pair to
-make space for an unverified replacement.
+Never rotate one side independently. Never delete the last accepted pair to make
+space for an unverified replacement.
 
 ## Restore from OCI backups
+
+Use `scripts/oci-restore.ts` as described in `07-OPERATIONS-AND-DRILLS.md`. Keep
+`action` set to `plan` until the private ledger contains the exact approved pair
+and operation.
 
 1. Confirm both backup names share the intended suffix.
 2. Restore the staging backup as a boot volume in the tenancy home region.
@@ -101,19 +105,26 @@ make space for an unverified replacement.
 6. Attach the restored root volume paravirtualized.
 7. Assign the reserved public IP to the new primary private IP.
 8. Verify UEFI -> GRUB -> staged kernel/initramfs -> UUID root boot.
-9. Verify SSH host-key expectations. A restored image may intentionally have
-   the old host key; a rebuilt machine should have a newly recorded key.
+9. Verify SSH host-key expectations. A restored image may intentionally have the
+   old host key; a rebuilt machine should have a newly recorded key.
 10. Confirm staged kernel and initramfs parity before normal operation.
 
 A backup does not reserve A1 capacity. If no A1 capacity is available, try
 another availability domain in the home region or retry later. Do not create a
 duplicate restore that would exceed the live-volume allowance.
 
+The tool checks all configured domains before it restores volumes. If launch
+still fails after restoration, it stops and retains the candidate identifiers
+for an approved cleanup. It never creates a second candidate pair automatically.
+
+Backup metadata validation is not a restore drill. Record `RESTORE_DRILL_PROVED`
+only after a replacement instance boots and passes the full live checklist.
+
 ## Optional Object Storage safety image
 
 A tested QCOW2 can be retained in Object Storage as an additional recovery
-artifact if the object and all other objects fit the current free allowance.
-It is not a substitute for the paired volume backups.
+artifact if the object and all other objects fit the current free allowance. It
+is not a substitute for the paired volume backups.
 
 Before sharing or uploading a QCOW2:
 
@@ -157,3 +168,5 @@ from application-native dumps or replication evidence.
 - SSH host-key policy.
 - Object or archive digests.
 - A redacted recovery report and a private identifier ledger.
+- Tenancy-wide Object Storage totals and multipart-upload state.
+- External encrypted-copy ciphertext hash and isolated decrypt-test evidence.

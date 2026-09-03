@@ -2,12 +2,14 @@
 
 ## Decision
 
-| Stage | Status | Evidence references |
-|---|---|---|
-| Implemented | `<COMPLETE_OR_INCOMPLETE>` | `<EVIDENCE_IDS>` |
-| Focused checks passed | `<YES_OR_NO>` | `<EVIDENCE_IDS>` |
-| Live accepted | `<YES_OR_NO>` | `<EVIDENCE_IDS>` |
-| Recovery pair accepted | `<YES_OR_NO>` | `<EVIDENCE_IDS>` |
+| Stage                     | Status                     | Evidence references |
+| ------------------------- | -------------------------- | ------------------- |
+| Implemented               | `<COMPLETE_OR_INCOMPLETE>` | `<EVIDENCE_IDS>`    |
+| Focused checks passed     | `<YES_OR_NO>`              | `<EVIDENCE_IDS>`    |
+| Live accepted             | `<YES_OR_NO>`              | `<EVIDENCE_IDS>`    |
+| Recovery pair accepted    | `<YES_OR_NO>`              | `<EVIDENCE_IDS>`    |
+| Restore metadata proved   | `<YES_OR_NO>`              | `<EVIDENCE_IDS>`    |
+| Full restore drill proved | `<YES_OR_NO>`              | `<EVIDENCE_IDS>`    |
 
 Overall decision: `<ACCEPTED_OR_BLOCKED>`
 
@@ -33,18 +35,21 @@ Do not mark the setup accepted when any required check is `missing` or
 - Live boot plus block storage: `<TOTAL_GB>` GB
 - Backup-object count: `<COUNT>` of current verified limit `<LIMIT>`
 - Object Storage use: `<TOTAL_GB>` GB of current verified limit `<LIMIT>`
+- Object Storage inventory: `<BUCKETS>` buckets, `<CURRENT_OBJECTS>` current
+  objects, `<STORED_OBJECTS>` stored objects and versions, `<BYTES>` bytes,
+  `<MULTIPART_UPLOADS>` active uploads
 - Paid features, account upgrades, or cross-region copies: `<NONE_OR_DETAILS>`
 
 ## Resource state
 
 Use aliases in this shareable report. Keep OCIDs in the private evidence ledger.
 
-| Resource alias | Type | Size or allocation | State | Evidence |
-|---|---|---:|---|---|
-| `arch` | A1 instance | `<OCPU_AND_RAM>` | `<STATE>` | `<EVIDENCE_ID>` |
-| `arch-stage` | Boot volume | `50 GB` | `<STATE>` | `<EVIDENCE_ID>` |
-| `arch-root` | Block volume | `150 GB` | `<STATE>` | `<EVIDENCE_ID>` |
-| `arch-reserved-ip` | Reserved IPv4 | `<REDACTED>` | `<STATE>` | `<EVIDENCE_ID>` |
+| Resource alias     | Type          | Size or allocation | State     | Evidence        |
+| ------------------ | ------------- | -----------------: | --------- | --------------- |
+| `arch`             | A1 instance   |   `<OCPU_AND_RAM>` | `<STATE>` | `<EVIDENCE_ID>` |
+| `arch-stage`       | Boot volume   |            `50 GB` | `<STATE>` | `<EVIDENCE_ID>` |
+| `arch-root`        | Block volume  |           `150 GB` | `<STATE>` | `<EVIDENCE_ID>` |
+| `arch-reserved-ip` | Reserved IPv4 |       `<REDACTED>` | `<STATE>` | `<EVIDENCE_ID>` |
 
 ## Boot, guest, and storage
 
@@ -76,14 +81,24 @@ Use aliases in this shareable report. Keep OCIDs in the private evidence ledger.
 - Required services and timers: `<RESULT>`
 - Metrics run, if enabled: `<RESULT_OR_NOT_APPLICABLE>`
 - Repository synchronization: `<RESULT_AND_KNOWN_FAILURES>`
+- Sync classification and alert: `<COMPLETE_PARTIAL_OR_TOTAL>`
 - Unexpected listeners: `<NONE_OR_DETAILS>`
+
+## Seven-day OCI metrics
+
+- Coverage: `<FIRST_UTC>` through `<LAST_UTC>`; `<HOURS>` hours
+- CPU 95th percentile: `<PERCENT>`
+- Memory utilization: `<SUMMARY>`
+- Network bytes in/out: `<SUMMARIES>`
+- Idle-risk assessment: `<PENDING_NOT_IDLE_OR_INDETERMINATE>`
+- Artificial anti-idle workload: `none`
 
 ## Paired backups
 
-| Pair role | Shared UTC suffix | Stage name | Root name | Types | Source sizes | States | Evidence |
-|---|---|---|---|---|---|---|---|
-| Golden | `<SUFFIX>` | `arch-stage-golden-<SUFFIX>` | `arch-root-golden-<SUFFIX>` | `FULL / FULL` | `50 / 150 GB` | `<STATES>` | `<EVIDENCE_IDS>` |
-| Latest | `<SUFFIX_OR_NA>` | `<NAME_OR_NA>` | `<NAME_OR_NA>` | `<TYPES>` | `50 / 150 GB` | `<STATES>` | `<EVIDENCE_IDS>` |
+| Pair role | Shared UTC suffix | Stage name                   | Root name                   | Types         | Source sizes  | States     | Evidence         |
+| --------- | ----------------- | ---------------------------- | --------------------------- | ------------- | ------------- | ---------- | ---------------- |
+| Golden    | `<SUFFIX>`        | `arch-stage-golden-<SUFFIX>` | `arch-root-golden-<SUFFIX>` | `FULL / FULL` | `50 / 150 GB` | `<STATES>` | `<EVIDENCE_IDS>` |
+| Latest    | `<SUFFIX_OR_NA>`  | `<NAME_OR_NA>`               | `<NAME_OR_NA>`              | `<TYPES>`     | `50 / 150 GB` | `<STATES>` | `<EVIDENCE_IDS>` |
 
 If the fifth slot holds a volume-only pre-change backup, state its narrow scope
 and state that it is not a complete machine recovery point. Confirm that each
@@ -91,9 +106,9 @@ complete pair has matching source aliases, region, suffix, and timestamps.
 
 ## Approvals and mutations
 
-| Approval ID | Approved operation | Resource alias | Result | Evidence |
-|---|---|---|---|---|
-| `<APR_ID>` | `<OPERATION>` | `<ALIAS>` | `<RESULT>` | `<EVIDENCE_ID>` |
+| Approval ID | Approved operation | Resource alias | Result     | Evidence        |
+| ----------- | ------------------ | -------------- | ---------- | --------------- |
+| `<APR_ID>`  | `<OPERATION>`      | `<ALIAS>`      | `<RESULT>` | `<EVIDENCE_ID>` |
 
 ## Retained and deleted artifacts
 
@@ -101,6 +116,8 @@ complete pair has matching source aliases, region, suffix, and timestamps.
 - Retained recovery artifacts: `<ALIASES>`
 - Deleted or terminated resources: `<ALIASES_AND_TERMINAL_STATES>`
 - Private artifacts excluded from distribution: `<CATEGORIES>`
+- External encrypted copy:
+  `<CIPHERTEXT_HASH_RECIPIENT_FINGERPRINT_AND_DECRYPT_TEST_OR_MISSING>`
 
 ## Recovery procedure
 

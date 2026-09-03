@@ -3,9 +3,9 @@
 Keep raw command output and identifiers in a private working directory. The
 shareable copy must use resource aliases and redact sensitive values.
 
-| Evidence ID | Requirement | UTC time | Read-only command, API, or UI | Result | Artifact | SHA-256 | Approval ID | Status |
-|---|---|---|---|---|---|---|---|---|
-| `EVD-001` | `<REQUIREMENT>` | `<UTC>` | `<METHOD>` | `<OBSERVED_RESULT>` | `<PRIVATE_ARTIFACT_REF>` | `<DIGEST_OR_NA>` | `<APR_ID_OR_NA>` | `proved / contradicted / missing / not-applicable` |
+| Evidence ID | Requirement     | UTC time | Read-only command, API, or UI | Result              | Artifact                 | SHA-256          | Approval ID      | Status                                             |
+| ----------- | --------------- | -------- | ----------------------------- | ------------------- | ------------------------ | ---------------- | ---------------- | -------------------------------------------------- |
+| `EVD-001`   | `<REQUIREMENT>` | `<UTC>`  | `<METHOD>`                    | `<OBSERVED_RESULT>` | `<PRIVATE_ARTIFACT_REF>` | `<DIGEST_OR_NA>` | `<APR_ID_OR_NA>` | `proved / contradicted / missing / not-applicable` |
 
 ## Evidence rules
 
@@ -30,3 +30,10 @@ shareable copy must use resource aliases and redact sensitive values.
 - Authoritative and public DNS results.
 - Paired-backup names, sources, sizes, types, states, and timestamps.
 - Final post-backup start and live acceptance.
+- Guest-poweroff time, SSH loss, each OCI lifecycle observation, and final
+  `STOPPED` or `HARD_STOP_REQUIRED` result.
+- Sync attempted/succeeded/failed counts, classifications, and alert state.
+- Seven-day OCI metric coverage and idle-risk classification.
+- Tenancy-wide Object Storage totals and active multipart uploads.
+- External ciphertext hash, recipient fingerprint, and isolated decrypt test.
+- Separate `METADATA_PROVED` and `RESTORE_DRILL_PROVED` records.

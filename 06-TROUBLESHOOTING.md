@@ -60,8 +60,8 @@ Separate transport, identity, and authentication checks:
 6. Use the normal non-root account and the intended private key.
 
 Do not bypass host-key verification. Do not enable root or password login as a
-quick repair. SSH configuration or daemon restart needs explicit approval and
-a working console recovery path.
+quick repair. SSH configuration or daemon restart needs explicit approval and a
+working console recovery path.
 
 ## DNS still points to the old address
 
@@ -98,8 +98,8 @@ Do not assume that a detached volume or a backup being deleted no longer counts.
 - Check whether a kernel or initramfs update completed on the Arch root.
 - Inspect the boot-sync log and available staging space.
 - Confirm that the hook mounted the intended staging filesystem.
-- Re-run the sync procedure only after the source and destination identities
-  are verified.
+- Re-run the sync procedure only after the source and destination identities are
+  verified.
 - Compare both SHA-256 and byte content before rebooting.
 
 Keep the current running kernel available until the replacement boot has passed.
@@ -117,3 +117,30 @@ Classify the requirement as `missing`; do not infer success from an earlier
 report, local file, source configuration, or a different machine. Repeat only
 safe read-only checks. If a check needs an outage or mutation, obtain the exact
 approval and record it in the approval ledger.
+
+## Repository synchronization returns partial failure
+
+- Keep the nonzero result and complete failure list.
+- Classify each failure as access, renamed or deleted repository, network,
+  checkout, or local-state failure.
+- Mark an ignored failure only with a documented owner, reason, and expiry.
+- Do not convert partial success to exit zero.
+
+## Seven-day metric coverage is incomplete
+
+Report `pending-seven-day-window`. Keep collecting normal OCI metrics until at
+least 167 hours separate the earliest and latest hourly points. Do not replace
+OCI metrics with guest-local load data and do not generate artificial activity.
+
+## Object Storage total is incomplete
+
+List all accessible compartments, buckets, objects, versions when enabled, and
+active multipart uploads. Stop if permissions prevent a tenancy-wide result.
+Report the result as incomplete instead of assuming that the known recovery
+object is the only object.
+
+## External encrypted copy cannot be verified
+
+Do not upload plaintext as a fallback. Stop when the remote destination,
+recipient key, or isolated decrypt-test location is missing. Record the control
+as `missing` until the owner provides those inputs.

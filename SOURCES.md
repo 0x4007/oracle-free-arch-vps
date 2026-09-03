@@ -17,6 +17,26 @@ CLI syntax, and supported-image requirements can change.
   - Use for current image formats, Linux preparation requirements, networking,
     and Arm launch-mode requirements.
   - Last checked for this kit: 2026-09-03.
+- [Managing Custom Images](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/managingcustomimages.htm)
+  - Use for the rule that a custom image contains the boot disk and excludes
+    attached block-volume data.
+- [Balanced Performance](https://docs.oracle.com/en-us/iaas/Content/Block/Concepts/blockvolumebalancedperformance.htm)
+  - Use for current IOPS and throughput scaling. The 2026-09-03 page stated 60
+    IOPS/GB and 480 KB/s/GB, subject to per-volume caps.
+- [Compute Instance Metrics](https://docs.oracle.com/en-us/iaas/Content/Compute/References/computemetrics.htm)
+  - Use for current `oci_computeagent` metric names and meanings.
+- [Boot Volume Backups](https://docs.oracle.com/en-us/iaas/Content/Block/Concepts/bootvolumebackups.htm)
+  - Use for current boot-volume backup and restore behavior.
+- [Restoring a Block Volume](https://docs.oracle.com/en-us/iaas/Content/Block/Tasks/restoringavolumefromabackup.htm)
+  - Use for the current block-volume-backup restore workflow.
+- [Object Storage Overview](https://docs.oracle.com/en-us/iaas/Content/Object/Concepts/objectstorageoverview.htm)
+  - Use with live bucket, object, version, and multipart-upload inventory.
+
+## Encryption reference
+
+- [age file encryption](https://age-encryption.org/)
+  - One suitable client-side encryption option. Verify the installed version,
+    recipient fingerprint, ciphertext hash, and isolated decrypt test.
 
 ## Distribution source
 

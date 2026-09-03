@@ -1,7 +1,7 @@
 # Build Runbook
 
-This runbook is a phase-gated procedure. Do not continue to the next phase
-until the current phase has evidence and every required approval.
+This runbook is a phase-gated procedure. Do not continue to the next phase until
+the current phase has evidence and every required approval.
 
 ## Phase 0: Verify current policy and account state
 
@@ -20,15 +20,15 @@ until the current phase has evidence and every required approval.
    These values fit the 1,500/9,000 baseline verified on 2026-09-03. Recompute
    against the current official limits.
 
-6. Stop if the account is upgraded, the terms differ, A1 is not eligible, or
-   the home region is not confirmed.
+6. Stop if the account is upgraded, the terms differ, A1 is not eligible, or the
+   home region is not confirmed.
 
 ## Phase 1: Inventory and ownership
 
 1. Assign one orchestrator as the sole OCI and guest writer.
-2. List all instances, boot volumes, block volumes, attachments, backups,
-   custom images, Object Storage objects, public IPs, VCN resources, security
-   rules, and DNS records.
+2. List all instances, boot volumes, block volumes, attachments, backups, custom
+   images, Object Storage objects, public IPs, VCN resources, security rules,
+   and DNS records.
 3. Inspect active OCI CLI, SSH, browser, and agent processes without signaling
    them.
 4. Fill in `02-VARIABLES-AND-PREFLIGHT.md`.
@@ -81,16 +81,16 @@ approval for the exact volume OCID and confirm the disk is empty.
      filesystem type.
 5. Create a FAT filesystem on partition 1 if the recovery design uses it.
 6. Create ext4 on partition 2 and record its new UUID as `<ARCH_ROOT_UUID>`.
-7. Mount the root under a temporary directory and mount its EFI partition at
-   the intended Arch EFI path.
+7. Mount the root under a temporary directory and mount its EFI partition at the
+   intended Arch EFI path.
 8. Download the current Arch Linux ARM generic AArch64 root filesystem from an
    official source. Verify its published digest before extraction.
 9. Extract it while preserving numeric ownership, modes, links, ACLs, and
    extended attributes supported by the source archive and target filesystem.
 10. Generate UUID-based `fstab` entries. Do not depend on `/dev/sd*` names.
 
-Stop if the device identity, size, geometry, or filesystem UUID differs from
-the recorded plan.
+Stop if the device identity, size, geometry, or filesystem UUID differs from the
+recorded plan.
 
 ## Phase 4: Configure Arch for OCI A1
 
@@ -110,8 +110,8 @@ cross-architecture emulation.
    - `PasswordAuthentication no`
    - `KbdInteractiveAuthentication no`
    - `PubkeyAuthentication yes`
-6. Validate the effective SSH configuration before any daemon restart. A
-   restart requires exact approval and a serial-console recovery path.
+6. Validate the effective SSH configuration before any daemon restart. A restart
+   requires exact approval and a serial-console recovery path.
 7. Enable only required services. Do not install broad application stacks or
    perform an unrelated full-system upgrade during the boot cutover.
 
@@ -149,9 +149,10 @@ cross-architecture emulation.
 2. Record the SSH host key before the boot change.
 3. Obtain approval for the outage.
 4. Run `sync`, request a clean guest poweroff, and wait for OCI `STOPPED`.
-5. If the guest is off but OCI remains `RUNNING`, stop. Obtain separate
-   approval before using the provider hard `STOP` action. Do not substitute
-   `RESET` or `SOFTSTOP`.
+5. If the guest is off but OCI remains `RUNNING`, stop. Obtain separate approval
+   before using the provider hard `STOP` action. Do not substitute `RESET` or
+   `SOFTSTOP`. Use the bounded `wait-for-stopped` action in
+   `07-OPERATIONS-AND-DRILLS.md`.
 6. Start the same instance.
 7. Verify the expected host key before accepting SSH.
 8. Prove Arch, AArch64, root UUID, mounts, networking, SSH, services, and staged
@@ -181,5 +182,8 @@ passed.
 2. Write the final report from `templates/FINAL-REPORT.md`.
 3. Record retained and deleted resource aliases and private OCIDs separately.
 4. Create a redacted copy for sharing.
-5. Stop. Refinement, package upgrades, and unrelated hardening need a separate
+5. Run the weekly OCI and Object Storage audit. Mark a short metric history as
+   `pending-seven-day-window`.
+6. Record `METADATA_PROVED` or `RESTORE_DRILL_PROVED` accurately.
+7. Stop. Refinement, package upgrades, and unrelated hardening need a separate
    task and approval.

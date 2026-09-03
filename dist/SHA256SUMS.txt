@@ -1,0 +1,1 @@
+f1908a5e779e4bb2c395329fb1513e51c6f21da3895363bf723a850d372da03e  arch-oracle-free-tier-agent-kit.tar.gz

@@ -38,8 +38,8 @@ written on 2026-09-03:
 - Idle Always Free compute instances may be reclaimed.
 
 These are policy facts, not constants. The first agent action must be to reopen
-Oracle's current Free Tier documentation and the signed-in account page. Stop
-if the current limits or account type differ.
+Oracle's current Free Tier documentation and the signed-in account page. Stop if
+the current limits or account type differ.
 
 ## Why this layout
 
@@ -50,14 +50,14 @@ system on a separate volume. It also preserves an Oracle Linux recovery entry.
 
 The cost-maximized steady state is:
 
-| Resource | Allocation |
-|---|---:|
-| A1 instance | 1 |
-| OCPUs | 2 |
-| RAM | 12 GB |
-| Staging boot volume | 50 GB |
-| Arch root volume | 150 GB |
-| Total live volume storage | 200 GB |
+| Resource                  | Allocation |
+| ------------------------- | ---------: |
+| A1 instance               |          1 |
+| OCPUs                     |          2 |
+| RAM                       |      12 GB |
+| Staging boot volume       |      50 GB |
+| Arch root volume          |     150 GB |
+| Total live volume storage |     200 GB |
 
 The recommended steady state uses two of the five backup slots:
 
@@ -81,15 +81,28 @@ pair only after the new pair is `AVAILABLE` and live acceptance passes.
 5. Create the paired backups in `04-BACKUP-RECOVERY.md`.
 6. Pass every item in `05-ACCEPTANCE.md`.
 7. Use `06-TROUBLESHOOTING.md` for evidence-first recovery from failures.
-8. Use `templates/FINAL-REPORT.md` for the evidence handoff.
+8. Configure the restore and weekly audit tools in
+   `07-OPERATIONS-AND-DRILLS.md`.
+9. Use `templates/FINAL-REPORT.md` for the evidence handoff.
 
-The accepted end state is one running instance and guest named `arch`. A
-stopped instance, a completed build, or available backups alone do not satisfy
-live acceptance.
+The accepted end state is one running instance and guest named `arch`. A stopped
+instance, a completed build, or available backups alone do not satisfy live
+acceptance.
 
 `SOURCES.md` lists the official pages that must be checked again at execution
 time. `templates/HANDOFF-GOAL.md` provides a one-sentence prompt for the primary
 agent.
+
+## Included automation
+
+- `scripts/oci-restore.ts` inventories, plans, waits for `STOPPED`, restores,
+  and verifies the two-volume recovery unit. It never performs a hard stop or
+  automatic cleanup.
+- `scripts/oci-weekly-audit.ts` reports the trailing OCI compute metrics and the
+  tenancy-wide Object Storage total, including noncurrent object versions when
+  bucket versioning is enabled.
+- Both tools read ignored mode-`0600` files under `.private/`. The repository
+  contains placeholder examples only.
 
 ## Package boundaries
 

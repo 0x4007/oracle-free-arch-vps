@@ -53,8 +53,10 @@ Use `templates/EVIDENCE-LEDGER.md` for raw references and
 - [ ] Administrative-user failed-unit count is zero.
 - [ ] Required timers are active and enabled.
 - [ ] Any metrics oneshot succeeds and writes a current record.
-- [ ] Any repository synchronization service has a successful unit result;
-      known per-repository failures are reported separately.
+- [ ] Repository synchronization records attempted, successful, skipped, and
+      failed counts plus one reason for each failure.
+- [ ] Any partial or total synchronization failure returns nonzero and creates a
+      durable local alert; unit success means zero repository failures.
 - [ ] Only expected listeners exist.
 - [ ] Nothing listens publicly on TCP 9090.
 - [ ] SSH works for the normal administrative user.
@@ -78,6 +80,20 @@ Use `templates/EVIDENCE-LEDGER.md` for raw references and
 - [ ] A wildcard test returns the reserved address when wildcard DNS is used.
 - [ ] SSH through DNS reaches the expected host key.
 
+## Idle-risk and Object Storage evidence
+
+- [ ] The OCI report covers at least 167 hours across the requested seven-day
+      window, or the result is `pending-seven-day-window`.
+- [ ] CPU 95th percentile and memory utilization come from `oci_computeagent`.
+- [ ] Network byte metrics are recorded without inventing an unsupported
+      network-utilization percentage.
+- [ ] No artificial anti-idle workload exists.
+- [ ] Every accessible bucket and active multipart upload was inspected.
+- [ ] Tenancy-wide home-region current-object and stored-version counts, bytes,
+      current verified limit, and headroom are recorded.
+- [ ] There are no active multipart uploads, or Object Storage accounting is
+      marked incomplete and the audit fails closed.
+
 ## Backups and recovery
 
 - [ ] Golden boot and root backup names share one UTC suffix.
@@ -91,6 +107,12 @@ Use `templates/EVIDENCE-LEDGER.md` for raw references and
 - [ ] The Object Storage image, if kept, has a recorded digest and size.
 - [ ] Local archive and overlay rules are documented.
 - [ ] The recovery procedure has no dependence on the original chat session.
+- [ ] Metadata-only validation and an actual restore drill have separate
+      statuses.
+- [ ] `RESTORE_DRILL_PROVED` is used only after a replacement machine passes the
+      complete live checklist.
+- [ ] An external encrypted recovery copy has a ciphertext hash, recipient-key
+      fingerprint, upload proof, and isolated decrypt test, or is `missing`.
 
 ## Completion decision
 

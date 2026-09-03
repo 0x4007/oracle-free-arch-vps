@@ -22,11 +22,11 @@ OCI firmware
 ```
 
 The exact partition names and device paths are deployment facts. Agents must
-discover and record them. The root UUID is the stable contract between GRUB,
-the kernel command line, `fstab`, and the restored volume.
+discover and record them. The root UUID is the stable contract between GRUB, the
+kernel command line, `fstab`, and the restored volume.
 
-The accepted steady state is one `RUNNING` OCI instance with display name
-`arch` and one running Arch guest with hostname `arch`.
+The accepted steady state is one `RUNNING` OCI instance with display name `arch`
+and one running Arch guest with hostname `arch`.
 
 ## Why not assume a native Arch boot image
 
@@ -37,9 +37,13 @@ boot loader, network initialization, cloud-init, and shape compatibility must
 all work before an imported image is useful.
 
 Treat native Arch custom-image import as an optional experiment. Do not use it
-as the production plan unless it passes an isolated launch, serial-console,
-SSH, stop/start, and recovery test without consuming the live-volume allowance
-needed by the accepted machine.
+as the production plan unless it passes an isolated launch, serial-console, SSH,
+stop/start, and recovery test without consuming the live-volume allowance needed
+by the accepted machine.
+
+A custom image contains only the boot disk and excludes attached block-volume
+data. Verify current image-storage pricing and quota before retaining one. In
+this architecture it cannot replace the matched boot/root backup pair.
 
 The staging design is preferred because it:
 
@@ -75,6 +79,17 @@ The staging volume must retain:
 The synchronization script must fail loudly, use a temporary file plus atomic
 rename where possible, verify source and destination hashes, and write a local
 log. The package hook must run only after the kernel or initramfs changes.
+
+## Storage performance tradeoff
+
+Oracle's Balanced-volume page stated 60 IOPS/GB and 480 KB/s/GB when checked on
+2026-09-03. This gives the 150 GB Arch root a theoretical ceiling of about 9,000
+IOPS and 72 MB/s. A hypothetical single 200 GB root could reach about 12,000
+IOPS and 96 MB/s. Verify the current rates before using these estimates.
+
+Do not rebuild the accepted two-volume machine only for that theoretical gain.
+The staging boot path and paired recovery contract are deliberate safety
+tradeoffs.
 
 ## Network design
 
