@@ -1,0 +1,70 @@
+name: Pre-publication full-history audit
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Audit publication and retained legacy history
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out complete reachable history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Verify audit payload integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload="${RUNNER_TEMP}/full-history-secret-audit.sh"
+          cat \
+            .github/audit/full-history-secret-audit.sh.b64.part1 \
+            .github/audit/full-history-secret-audit.sh.b64.part2 \
+            .github/audit/full-history-secret-audit.sh.b64.part3 \
+            .github/audit/full-history-secret-audit.sh.b64.part4 \
+            .github/audit/full-history-secret-audit.sh.b64.part5 \
+            .github/audit/full-history-secret-audit.sh.b64.part6 \
+            .github/audit/full-history-secret-audit.sh.b64.part7 \
+            .github/audit/full-history-secret-audit.sh.b64.part8 \
+            .github/audit/full-history-secret-audit.sh.b64.part9 \
+            .github/audit/full-history-secret-audit.sh.b64.part10 \
+            .github/audit/full-history-secret-audit.sh.b64.part11 \
+            .github/audit/full-history-secret-audit.sh.b64.part12 \
+            .github/audit/full-history-secret-audit.sh.b64.part13 \
+            .github/audit/full-history-secret-audit.sh.b64.part14 \
+            .github/audit/full-history-secret-audit.sh.b64.part15 \
+            .github/audit/full-history-secret-audit.sh.b64.part16 \
+            .github/audit/full-history-secret-audit.sh.b64.part17 \
+            .github/audit/full-history-secret-audit.sh.b64.part18 \
+            | tr -d '\r\n' \
+            | base64 --decode \
+            > "${payload}"
+          echo "24c9ea6a55032cc6b2fbf68ac0a0cbba858cb92ed6ac30fc5abfa134df0e712f  ${payload}" \
+            | sha256sum --check --strict
+          bash -n "${payload}"
+          chmod 0700 "${payload}"
+
+      - name: Audit exact publication snapshot
+        shell: bash
+        env:
+          AUDIT_TARGET_SHA: 263128dfde5902659c087289cde1ddb72461b3aa
+          AUDIT_EXPECTED_COMMIT_COUNT: "1"
+        run: bash "${RUNNER_TEMP}/full-history-secret-audit.sh"
+
+      - name: Audit prior three-commit lineage retained by pull-request objects
+        shell: bash
+        env:
+          AUDIT_TARGET_SHA: e35807cc2dc2c8c37317abee588160235dc644d8
+          AUDIT_EXPECTED_COMMIT_COUNT: "3"
+        run: bash "${RUNNER_TEMP}/full-history-secret-audit.sh"
