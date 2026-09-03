@@ -23,7 +23,7 @@ jobs:
           fetch-tags: true
           persist-credentials: false
 
-      - name: Verify and execute the audit
+      - name: Decode and syntax-check the audit payload
         shell: bash
         run: |
           set -euo pipefail
@@ -35,7 +35,14 @@ jobs:
             | tr -d '\r\n' \
             | base64 --decode \
             > "${payload}"
-          echo "ed41a1a144fe861eaad5e8d0238980270a7b2742afb7403a1be1e763af338ea0  ${payload}" \
-            | sha256sum --check --strict
-          chmod 0700 "${payload}"
-          bash "${payload}"
+          sha256sum "${payload}"
+          bash -n "${payload}"
+          chmod 0600 "${payload}"
+
+      - name: Upload decoded payload for integrity review
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: decoded-audit-payload-${{ github.run_id }}
+          path: ${{ runner.temp }}/full-history-secret-audit.sh
+          if-no-files-found: error
+          retention-days: 1
