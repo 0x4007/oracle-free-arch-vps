@@ -42,6 +42,11 @@ approval after the guest is proved quiescent.
 
 ## Repository synchronization result contract
 
+Repository synchronization is optional and deployment-specific. This sanitized
+kit does not contain organization names, credentials, repository lists, or a
+sync implementation. If an operator enables a synchronization service, its
+implementation must satisfy this contract before acceptance.
+
 A synchronization run must report:
 
 - UTC run ID and completion time.

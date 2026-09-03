@@ -248,6 +248,24 @@ async function saveState(state: RestoreState): Promise<void> {
   await writePrivateJson(STATE_PATH, state);
 }
 
+export function validateRestoreStateBinding(
+  state: { pairSuffix: string; availabilityDomain?: string },
+  expectedPairSuffix: string,
+  approvedAvailabilityDomains: string[],
+): void {
+  if (state.pairSuffix && state.pairSuffix !== expectedPairSuffix) {
+    throw new Error("Private restore state belongs to another backup pair");
+  }
+  if (
+    state.availabilityDomain &&
+    !approvedAvailabilityDomains.includes(state.availabilityDomain)
+  ) {
+    throw new Error(
+      "Private restore state uses an unapproved availability domain",
+    );
+  }
+}
+
 function validateRestoredVolume(
   volume: JsonRecord,
   expectedName: string,
@@ -429,6 +447,11 @@ async function reconcileRestoreState(
   state: RestoreState,
   runner: CommandRunner,
 ): Promise<void> {
+  validateRestoreStateBinding(
+    state,
+    config.expectedPairSuffix,
+    config.availabilityDomains,
+  );
   if (state.bootVolumeId) {
     const boot = dataObject(
       await runJson(
@@ -600,9 +623,11 @@ async function restore(
 ): Promise<void> {
   const inventory = await readInventory(config, runner);
   const state = await loadState();
-  if (state.pairSuffix && state.pairSuffix !== config.expectedPairSuffix) {
-    throw new Error("Private restore state belongs to another backup pair");
-  }
+  validateRestoreStateBinding(
+    state,
+    config.expectedPairSuffix,
+    config.availabilityDomains,
+  );
   await reconcileRestoreState(config, state, runner);
   const recordedVolumeIds = new Set(
     [state.bootVolumeId, state.rootVolumeId].filter((value): value is string =>

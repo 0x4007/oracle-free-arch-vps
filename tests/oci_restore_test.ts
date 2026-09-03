@@ -2,6 +2,7 @@ import {
   activeVolumeTotal,
   pairSuffix,
   validateBackupPair,
+  validateRestoreStateBinding,
 } from "../scripts/oci-restore.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
@@ -72,4 +73,18 @@ Deno.test("activeVolumeTotal excludes terminal volumes", () => {
     ]),
     250,
   );
+});
+
+Deno.test("restore state rejects an unapproved availability domain", () => {
+  let rejected = false;
+  try {
+    validateRestoreStateBinding(
+      { pairSuffix: "20260903T191507Z", availabilityDomain: "AD-4" },
+      "20260903T191507Z",
+      ["AD-1", "AD-2", "AD-3"],
+    );
+  } catch {
+    rejected = true;
+  }
+  assertEquals(rejected, true);
 });

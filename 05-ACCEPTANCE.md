@@ -53,10 +53,11 @@ Use `templates/EVIDENCE-LEDGER.md` for raw references and
 - [ ] Administrative-user failed-unit count is zero.
 - [ ] Required timers are active and enabled.
 - [ ] Any metrics oneshot succeeds and writes a current record.
-- [ ] Repository synchronization records attempted, successful, skipped, and
-      failed counts plus one reason for each failure.
-- [ ] Any partial or total synchronization failure returns nonzero and creates a
-      durable local alert; unit success means zero repository failures.
+- [ ] If repository synchronization is enabled, it records attempted,
+      successful, skipped, and failed counts plus one reason for each failure.
+- [ ] If repository synchronization is enabled, any partial or total failure
+      returns nonzero and creates a durable local alert; unit success means zero
+      repository failures.
 - [ ] Only expected listeners exist.
 - [ ] Nothing listens publicly on TCP 9090.
 - [ ] SSH works for the normal administrative user.
