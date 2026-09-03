@@ -50,7 +50,7 @@ jobs:
             | tr -d '\r\n' \
             | base64 --decode \
             > "${payload}"
-          echo "aae4249a87aa8495c41bf42f4be4f522f1702153dc91abb2b0c0a9ba7ad55e11  ${payload}" \
+          echo "5cdc6b11d7b1f3a8dc79708bc459645b8a0c3b14de736fbf56e0febc2013f701  ${payload}" \
             | sha256sum --check --strict
           bash -n "${payload}"
           chmod 0700 "${payload}"
