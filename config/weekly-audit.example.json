@@ -1,0 +1,8 @@
+{
+  "ociCliPath": "oci",
+  "ociProfile": "DEFAULT",
+  "region": "<HOME_REGION>",
+  "compartmentId": "<TENANCY_OCID>",
+  "instanceId": "<INSTANCE_OCID>",
+  "objectStorageLimitGb": 20
+}

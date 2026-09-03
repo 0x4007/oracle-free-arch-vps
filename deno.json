@@ -1,0 +1,10 @@
+{
+  "tasks": {
+    "check": "deno check scripts/*.ts tests/*.ts",
+    "fmt": "deno fmt --check scripts tests config deno.json",
+    "lint": "deno lint",
+    "restore": "deno run --allow-read=.private --allow-write=.private --allow-run scripts/oci-restore.ts",
+    "test": "deno test",
+    "weekly:audit": "deno run --allow-read=.private --allow-write=.private --allow-run scripts/oci-weekly-audit.ts"
+  }
+}

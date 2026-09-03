@@ -1,0 +1,40 @@
+{
+  "action": "plan",
+  "ociCliPath": "oci",
+  "ociProfile": "DEFAULT",
+  "region": "<HOME_REGION>",
+  "compartmentId": "<COMPARTMENT_OCID>",
+  "availabilityDomains": ["<AD_1>", "<AD_2>", "<AD_3>"],
+  "subnetId": "<SUBNET_OCID>",
+  "bootVolumeBackupId": "<BOOT_VOLUME_BACKUP_OCID>",
+  "rootVolumeBackupId": "<ROOT_VOLUME_BACKUP_OCID>",
+  "expectedBootSourceVolumeId": "<BOOT_VOLUME_OCID>",
+  "expectedRootSourceVolumeId": "<ROOT_VOLUME_OCID>",
+  "reservedPublicIpId": "<RESERVED_PUBLIC_IP_OCID>",
+  "instanceId": "<CURRENT_INSTANCE_OCID_OR_EMPTY>",
+  "expectedPairSuffix": "<UTC_SUFFIX>",
+  "expectedRootUuid": "<ARCH_ROOT_UUID>",
+  "stopWaitSeconds": 300,
+  "approval": {
+    "approved": false,
+    "approvedAtUtc": "<UTC>",
+    "exactOperation": "restore matched arch backup pair and reassign the reserved IP",
+    "approvedPairSuffix": "<UTC_SUFFIX>",
+    "approvedTargets": {
+      "bootVolumeBackupId": "<BOOT_VOLUME_BACKUP_OCID>",
+      "rootVolumeBackupId": "<ROOT_VOLUME_BACKUP_OCID>",
+      "expectedBootSourceVolumeId": "<BOOT_VOLUME_OCID>",
+      "expectedRootSourceVolumeId": "<ROOT_VOLUME_OCID>",
+      "compartmentId": "<COMPARTMENT_OCID>",
+      "availabilityDomains": ["<AD_1>", "<AD_2>", "<AD_3>"],
+      "subnetId": "<SUBNET_OCID>",
+      "reservedPublicIpId": "<RESERVED_PUBLIC_IP_OCID>"
+    }
+  },
+  "softStopApproval": {
+    "approved": false,
+    "approvedAtUtc": "<UTC>",
+    "exactOperation": "gracefully stop the OCI instance with SOFTSTOP",
+    "instanceId": "<INSTANCE_OCID>"
+  }
+}
