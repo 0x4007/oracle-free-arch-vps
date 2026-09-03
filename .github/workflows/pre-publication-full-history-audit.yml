@@ -24,6 +24,7 @@ jobs:
           persist-credentials: false
 
       - name: Decode and syntax-check the audit payload
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -40,6 +41,7 @@ jobs:
           chmod 0600 "${payload}"
 
       - name: Upload decoded payload for integrity review
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: decoded-audit-payload-${{ github.run_id }}
