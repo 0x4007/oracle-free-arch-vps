@@ -1,0 +1,41 @@
+name: Pre-publication full-history audit
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Audit every reachable commit and archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out complete reachable history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Verify and execute the audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload="${RUNNER_TEMP}/full-history-secret-audit.sh"
+          cat \
+            .github/audit/full-history-secret-audit.sh.b64.part1 \
+            .github/audit/full-history-secret-audit.sh.b64.part2 \
+            .github/audit/full-history-secret-audit.sh.b64.part3 \
+            | tr -d '\r\n' \
+            | base64 --decode \
+            > "${payload}"
+          echo "ed41a1a144fe861eaad5e8d0238980270a7b2742afb7403a1be1e763af338ea0  ${payload}" \
+            | sha256sum --check --strict
+          chmod 0700 "${payload}"
+          bash "${payload}"
