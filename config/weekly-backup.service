@@ -1,0 +1,9 @@
+[Unit]
+Description=Pi-controlled paired Arch VPS backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/pi/ops/weekly-backup-controller
+ExecStart=/usr/local/bin/safepi deno task backup:scheduled
+TimeoutStartSec=infinity
+UMask=0077

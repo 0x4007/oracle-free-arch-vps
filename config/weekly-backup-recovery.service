@@ -1,0 +1,9 @@
+[Unit]
+Description=Recover only an interrupted paired VPS backup outage
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/pi/ops/weekly-backup-controller
+ExecStart=/usr/local/bin/safepi deno task backup:recover
+TimeoutStartSec=infinity
+UMask=0077

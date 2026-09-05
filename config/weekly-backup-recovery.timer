@@ -1,0 +1,11 @@
+[Unit]
+Description=Check interrupted VPS outage recovery after boot and every two minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=2min
+AccuracySec=10s
+Unit=weekly-backup-recovery.service
+
+[Install]
+WantedBy=timers.target
