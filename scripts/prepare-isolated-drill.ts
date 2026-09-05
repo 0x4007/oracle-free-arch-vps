@@ -1,4 +1,8 @@
 import {
+  drillGuestBundle,
+  drillGuestFilesDigest,
+} from "./drill-offline-preparation.ts";
+import {
   type BackupInventoryConfig,
   readBackupInventory,
 } from "./oci-backup-inventory.ts";
@@ -168,6 +172,31 @@ export async function prepareDrill(
     throw new Error("Unexpected controller SSH source evidence");
   }
   controllerCidr(connection[0]);
+  const images = dataArray(
+    await call([
+      "compute",
+      "image",
+      "list",
+      "--compartment-id",
+      config.source.compartmentId,
+      "--operating-system",
+      "Oracle Linux",
+      "--operating-system-version",
+      "9",
+      "--shape",
+      "VM.Standard.A1.Flex",
+      "--all",
+    ]),
+  ).filter((image) =>
+    image["lifecycle-state"] === "AVAILABLE" &&
+    /^Oracle-Linux-9\..*-aarch64-/.test(String(image["display-name"]))
+  );
+  images.sort((left, right) =>
+    String(right["time-created"]).localeCompare(String(left["time-created"]))
+  );
+  if (!images.length) {
+    throw new Error("No available Oracle Linux 9 A1 helper image is proved");
+  }
   const now = new Date();
   const plan: DrillPlan = {
     source: config.source,
@@ -181,7 +210,16 @@ export async function prepareDrill(
     suffix: now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z"),
     maxDurationHours: 4,
     spendingCapUsd: 0.5,
+    helperImageId: stringField(images[0], "id"),
+    offlineFilesSha256: "0".repeat(64),
   };
+  plan.offlineFilesSha256 = await drillGuestFilesDigest(
+    await drillGuestBundle(plan),
+  );
+  await writePrivateJson(
+    ".private/isolated-drill-guest-bundle.json",
+    await drillGuestBundle(plan),
+  );
   const report = {
     status: "DRAFT_REQUIRES_APPROVAL",
     preparedAtUtc: now.toISOString(),
@@ -191,7 +229,7 @@ export async function prepareDrill(
       instances: 2,
       ocpus: 4,
       memoryGb: 24,
-      liveVolumeGb: 400,
+      liveVolumeGb: 450,
       backups: inventory.totals.backups,
       publicIps: 2,
     },
@@ -210,10 +248,13 @@ export async function prepareDrill(
       "internet gateway",
       "isolated route table",
       "isolated subnet",
+      "temporary 2 OCPU / 12 GB Oracle Linux helper with 50 GB disk, removed before clone launch",
       "50 GB boot volume from fresh backup",
       "150 GB root volume from fresh backup",
       "2 OCPU / 12 GB A1 clone with ephemeral public IP",
     ],
+    helperImageName: images[0]["display-name"],
+    helperAndCloneSequential: true,
     productionIpOrDnsMutation: false,
   };
   await writePrivateJson(".private/isolated-drill-plan.json", report);

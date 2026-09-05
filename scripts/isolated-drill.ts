@@ -14,6 +14,8 @@ export interface DrillPlan {
   suffix: string;
   maxDurationHours: number;
   spendingCapUsd: number;
+  helperImageId: string;
+  offlineFilesSha256: string;
 }
 export interface DrillApproval {
   approvedAtUtc: string;
@@ -71,8 +73,9 @@ export function drillDhcpOptions() {
   }];
 }
 export function drillHourlyCostUsd(): number {
-  // Current Oracle A1 and Balanced volume prices; September has 720 hours.
-  return 2 * 0.01 + 12 * 0.0015 + 200 * (0.0255 + 10 * 0.0017) / 720;
+  // Helper and clone run sequentially. Peak extra storage is 250 GB.
+  // Current Oracle A1 and Balanced prices; September has 720 hours.
+  return 2 * 0.01 + 12 * 0.0015 + 250 * (0.0255 + 10 * 0.0017) / 720;
 }
 export async function drillPlanDigest(plan: DrillPlan): Promise<string> {
   // Preserve the exact reviewed JSON bytes; reordered plans require review.
@@ -121,6 +124,7 @@ export async function validateDrillApproval(
     !Number.isFinite(accepted) || accepted > timestamp ||
     !/^\d{8}T\d{6}Z$/.test(plan.suffix) ||
     plan.source.region !== "us-ashburn-1" ||
+    !plan.helperImageId || !/^[a-f0-9]{64}$/.test(plan.offlineFilesSha256) ||
     !Number.isFinite(plan.maxDurationHours) || plan.maxDurationHours <= 0 ||
     plan.maxDurationHours > 4 ||
     !Number.isFinite(plan.spendingCapUsd) || plan.spendingCapUsd <= 0 ||

@@ -28,6 +28,8 @@ const plan: DrillPlan = {
   suffix: "20260905T090000Z",
   maxDurationHours: 4,
   spendingCapUsd: 0.5,
+  helperImageId: "helper-image",
+  offlineFilesSha256: "0".repeat(64),
 };
 function assert(value: unknown): asserts value {
   if (!value) throw new Error("Assertion failed");

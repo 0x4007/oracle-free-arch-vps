@@ -944,3 +944,73 @@ No OCI resources, source outages or notifications occurred in this continuation.
 All local tool sessions are terminal. The alert destination is still unanswered.
 Next substantive work is executable isolated-copy preparation and the exact
 reviewable helper/clone approval package, followed by the drill and cleanup.
+
+
+## Offline preparation and approval package — 2026-09-05 06:40 UTC
+
+The prior continuation made progress: controller recovery fixes were deployed,
+committed, pushed, and publication CI passed. This continuation also made concrete
+implementation and read-only evidence progress. No blocking-turn count applies yet.
+
+New canonical scripts/drill-offline-preparation.ts generates the copied-root
+firewall/startup bundle and a guarded helper command. It checks the helper's live
+metadata identity, exact copied OCI attachment IDs and consistent device paths,
+50/150 GB disk sizes, no existing mounts, copied UUIDs, root start sector, and exact
+kernel/initramfs/GRUB hashes before remounting only the copy writable. Path checks
+precede directory creation. It retains boot bytes and the Oracle recovery entry,
+requires Arch as the default, masks copied timers/Remote/Tailscale/sync work, and
+adds the two startup overrides that postdate this backup. No helper command ran.
+
+The drill plan now includes the exact helper image and a digest of the isolation
+files. The guarded command refuses changed files. Helper and clone are sequential:
+peak footprint 2 instances / 4 OCPU / 24 GB / 450 GB / 5 backups / 2 IPs. Current
+positive Oracle prices give a conservative four-hour estimate of $0.2110277778,
+with a proposed $0.50 operating budget. This is not an OCI-enforced spending cap.
+The old 400 GB draft is superseded; no user approval is implied by this update.
+
+All 63 tests, type check, format check, lint and whitespace checks pass. The final
+generated helper Python and shell parse successfully. Actual Arch nft --check
+passed in a separate network namespace with host firewall rules unchanged. The
+source GRUB was inspected read-only and defaults to Arch. Containers use host
+networking and loopback, so local app acceptance needs no external egress.
+Evidence: .private/reports/drill-{nft-syntax-check,preparation-syntax-fixture}.json,
+drill-source-grub.cfg and drill-first-boot-inspection.txt. These checks do not prove
+a restored first boot. The three Codex review rounds remain exhausted; this new
+preparation code has focused checks, not an additional Codex review verdict.
+
+All 19 current runtime files are hash-verified on Pi under its controller lock;
+manifest .private/reports/pi-runtime-deployment.json. Deployment exec 80881 and
+read-only preparer exec 10028 are TERMINAL, exit 0. Pi remains action=preflight
+with no timer installed or enabled. Its refreshed draft and guest bundle are
+copied to Mac. Plan SHA256:
+2ebae94bd793037c67c870bcea30a84823a1c8258e9b601f23275f0e8decaaa7.
+
+Fresh Organizations API evidence confirms ACTIVE FREE_TRIAL / FREE_AND_TRIAL,
+$300 promotion and September 29 trial expiry. Cost API reports $0.001857775537
+across four USD rows with no next page; billing can lag. Official Oracle pricing
+API responses for B93297, B93298, B91961 and B91962 confirm the positive rates used.
+Do not use that API's older free-hour bands instead of the stricter current
+Always Free documentation. Reports are retained as drill-current-subscription,
+drill-current-billed-usage, drill-billed-usage-summary and drill-price-*.json.
+All related read-only command handles (11643, 45192, 59056) are terminal.
+
+Concrete private approval surface: .private/drill-approval-package.md and .json.
+Package SHA256:
+4dd722e6d8d4acfc15065a8920807eb2c46b9a94d8c578816427873c2687335b.
+It binds 10 reviewed creation request templates, source backups, helper image,
+controller public key, file hashes, budget, isolation steps and cleanup gates.
+The installed CLI schemas were checked; launchVolumeAttachments is supported in
+CLI help/SDK despite being absent from its generated example. Templates remain
+DRAFT and placeholders may be filled only with this package's recorded new IDs.
+The Pi public key matches the already-approved setup fingerprint; no private key
+left Pi. Before copied-disk attachment, mask helper lvm2-pvscan@.service to prevent
+its Oracle Linux LVM tools activating the staging disk's old volume group. Bind
+helper SSH trust to OCI console host-key evidence before remote preparation.
+
+No helper/clone/network was created. Separate user approval of this package is
+required before provisioning. Exact cleanup approvals must include the new OCIDs
+once they exist; do not delete a resource merely to meet the budget. Refresh live
+source/account/limits/controller-IP evidence and validate all package hashes before
+any approved mutation. The alert destination remains unanswered. The existing
+P2 deletion-404 finding, retained-pair release, live drill/cleanup, unattended
+acceptance, alerts/timers and final PR merge remain unfinished.
