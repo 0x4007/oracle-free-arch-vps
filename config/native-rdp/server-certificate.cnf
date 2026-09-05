@@ -1,0 +1,6 @@
+# Use this extension section when creating the RDP server certificate.
+# Supply the existing endpoint SANs when generating it; do not issue a CA cert.
+[server_certificate]
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
