@@ -75,6 +75,10 @@ jobs:
           AUDIT_EXPECTED_COMMIT_COUNT: "1"
         run: bash "${RUNNER_TEMP}/full-history-secret-audit.sh"
 
+      - name: Fetch exact retained legacy audit target
+        shell: bash
+        run: git fetch --no-tags origin e35807cc2dc2c8c37317abee588160235dc644d8
+
       - name: Audit prior three-commit lineage retained by pull-request objects
         shell: bash
         env:
