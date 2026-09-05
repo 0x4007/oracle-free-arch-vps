@@ -1,6 +1,9 @@
 # Native RDP migration and on-demand Docker handoff
 
-Date: 2026-09-05. Status: planned; no live changes made by the planner.
+Date: 2026-09-05. Current status: native RDP pilot is live; client and resource
+results are recorded below. Draft PR #6 is open. Final architecture is pending
+the user's decision after preferring the existing browser desktop. The original
+planning record below is retained; later execution records supersede its state.
 
 ## Objective and authority
 
@@ -595,3 +598,32 @@ different user sessions also affect the memory comparison; the RDP Xfce desktop
 process retains substantially more PSS after earlier HiDPI use. Host available
 memory near the sample was 4,673 MiB; other workloads account for much of the
 host's total use. Do not attribute whole-host consumption to remote desktop.
+
+### Delivery checkpoint and decision gate — 2026-09-05 22:08 UTC
+
+Draft PR: https://github.com/0x4007/oracle-free-arch-vps/pull/6.
+Reviewed implementation head: `748802fc3979cbad87ae36a87632cd762986f8b8`.
+Local `codex review --base 770dbc440a976811721aa257b3c81a5d54a21f39`
+completed with exit 0 and no actionable defects. Review evidence is retained at
+`.private/native-rdp/review-748802f.log`. GitHub run 33994888872 passed the
+repository's publication and retained-legacy-history audit. That workflow
+targets fixed historical snapshots, not native RDP runtime or current-head
+security acceptance; do not overstate its coverage. The implementation head is
+pushed on the exact canonical branch. No merge or final cutover has occurred.
+
+The previous goal turn made progress by completing review, opening the draft PR
+and verifying CI. The current unresolved blocker is a final architecture
+decision, not the cleared iPhone installation or earlier Mac UI blocker.
+The user has been asked whether to keep Guacamole primary and RDP optional,
+replacing the RDP-only cutover. No answer has arrived. Do not treat automated
+goal continuation as an answer, restore a superseded assumption, or continue
+mouse refinements the user explicitly deferred. Keeping the current container
+deployment available automatically after reboot also conflicts with the
+original Docker-off boot policy; resolve that consequence with the user.
+
+Safe preparation and the reviewed pilot checkpoint are complete. Existing-user
+transition, narrower ACL deployment, recovery-policy edits, service cutover and
+reboots must follow the resolved architecture and the existing exact approval
+gates. Keep the draft unmerged and preserve active services while this decision
+is pending. The full original goal remains incomplete; it has not been reduced
+to the pilot or marked achieved.
