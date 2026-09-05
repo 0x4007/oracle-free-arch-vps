@@ -1,0 +1,10 @@
+[Unit]
+Description=Independent hourly VPS backup watchdog
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=weekly-backup-watchdog.service
+
+[Install]
+WantedBy=timers.target

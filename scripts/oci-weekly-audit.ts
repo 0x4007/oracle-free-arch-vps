@@ -145,7 +145,10 @@ async function metric(
   return summarizeSeries(dataArray(response));
 }
 
-async function objectStorage(config: AuditConfig, runner: CommandRunner) {
+export async function objectStorage(
+  config: AuditConfig,
+  runner: CommandRunner,
+) {
   const namespaceValue = dataString(
     await runJson(
       config.ociCliPath,
@@ -235,8 +238,9 @@ async function objectStorage(config: AuditConfig, runner: CommandRunner) {
       ),
     );
     objects += items.length;
-    const versioningEnabled = String(bucketDetails.versioning).toLowerCase() ===
-      "enabled";
+    const versioningEnabled = ["enabled", "suspended"].includes(
+      String(bucketDetails.versioning).toLowerCase(),
+    );
     const versions = versioningEnabled
       ? dataArray(
         await runJson(

@@ -93,13 +93,27 @@ export async function writePrivateJson(
     path.slice(slash + 1)
   }.${crypto.randomUUID()}.tmp`;
   try {
-    await Deno.writeTextFile(
-      temporaryPath,
-      `${JSON.stringify(value, null, 2)}\n`,
-      { createNew: true, mode: 0o600 },
-    );
+    const file = await Deno.open(temporaryPath, {
+      write: true,
+      createNew: true,
+      mode: 0o600,
+    });
+    try {
+      const bytes = new TextEncoder().encode(
+        `${JSON.stringify(value, null, 2)}\n`,
+      );
+      let offset = 0;
+      while (offset < bytes.length) {
+        offset += await file.write(bytes.subarray(offset));
+      }
+      await file.sync();
+    } finally {
+      file.close();
+    }
     await Deno.chmod(temporaryPath, 0o600);
     await Deno.rename(temporaryPath, path);
+    using parent = await Deno.open(directory, { read: true });
+    await parent.sync();
   } catch (error) {
     try {
       await Deno.remove(temporaryPath);

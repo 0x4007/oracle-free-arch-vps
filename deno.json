@@ -5,6 +5,11 @@
     "lint": "deno lint",
     "restore": "deno run --allow-read=.private --allow-write=.private --allow-run scripts/oci-restore.ts",
     "test": "deno test",
-    "weekly:audit": "deno run --allow-read=.private --allow-write=.private --allow-run scripts/oci-weekly-audit.ts"
+    "weekly:audit": "deno run --allow-read=.private --allow-write=.private --allow-run scripts/oci-weekly-audit.ts",
+    "backup:inventory": "deno run --allow-read=.private --allow-write=.private --allow-run scripts/oci-backup-inventory.ts",
+    "backup:run": "deno run --allow-read=.private --allow-write=.private --allow-run --allow-net=docs.oracle.com scripts/backup-runtime.ts",
+    "backup:scheduled": "deno run --allow-read=.private --allow-write=.private --allow-run --allow-net=docs.oracle.com scripts/backup-scheduled.ts",
+    "backup:watchdog": "deno run --allow-read=.private --allow-write=.private --allow-run=ssh scripts/backup-watchdog.ts",
+    "backup:recover": "deno run --allow-read=.private --allow-write=.private --allow-run --allow-net=docs.oracle.com scripts/backup-recovery.ts"
   }
 }

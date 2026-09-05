@@ -1,0 +1,13 @@
+{
+  "action": "inventory",
+  "ociCliPath": "/home/pi/.venvs/oci/bin/oci",
+  "ociProfile": "DEFAULT",
+  "tenancyId": "<TENANCY_OCID>",
+  "source": {
+    "instanceId": "<INSTANCE_OCID>",
+    "bootVolumeId": "<BOOT_VOLUME_OCID>",
+    "rootVolumeId": "<ROOT_VOLUME_OCID>",
+    "compartmentId": "<COMPARTMENT_OCID>",
+    "region": "<HOME_REGION>"
+  }
+}
