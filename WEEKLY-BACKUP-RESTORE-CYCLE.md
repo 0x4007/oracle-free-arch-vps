@@ -1050,3 +1050,53 @@ fixtures, broad checks or stale billing polls are not substitutes for them.
 The previous goal turn and this turn both made progress; this is the second
 consecutive goal turn with the concrete drill approval pending. Apply the blocked
 audit only when its full three-turn threshold and actual impasse are satisfied.
+
+
+## Approved drill and Mac alerts — 2026-09-05 11:27 UTC
+
+The user approved the exact private drill package at 11:07:23 UTC. The immutable
+package and all 14 bound artifacts still match their recorded hashes. Separate
+approval record: .private/drill-user-approval-20260905T110723Z.json, copied to Pi.
+Do not request creation approval again. Exact cleanup approval remains separate.
+
+Pi source preflight passed at 11:14:17 UTC with live boot/application acceptance:
+1 instance / 2 OCPU / 12 GB / 200 GB / 5 backups / 1 IP. A further drill refresh
+passed at 11:19:04 UTC: exact fresh pair, helper image, controller IPv4, ACTIVE
+FREE_TRIAL / FREE_AND_TRIAL and current official limits. Object Storage contains
+1,453,785,088 bytes with no multipart uploads. Billed usage still reports
+$0.001857775537; this is lagging usage, not a verified remaining-credit balance.
+Evidence: .private/reports/drill-approved-refresh.json.
+
+The approved VCN, SSH-only security list, custom DHCP, gateway, route and subnet
+are created. IDs and durable creation intents are in Pi's
+.private/drill-creation-journal.json (also copied to Mac). The four-hour deadline
+is 15:19:43 UTC. The helper launch was rejected at 11:23:19 UTC with HTTP 400:
+“If LaunchOptions is provided, NetworkType must be specified.” The original
+request/package remain immutable. The corrected request adds only the selected
+image's PARAVIRTUALIZED networkType plus the actual created subnet ID.
+.private/drill-launch-helper-corrected.ts rechecks full inventory, account, image,
+network and absent helper name before retry, and preserves the rejected intent.
+Its Pi run is live in exec session 6612 as of this checkpoint; poll before any
+new mutation. No copied disks or clone exist yet. No production outage occurred.
+
+At 11:17:34 UTC the user selected Mac push notifications with records stored on Pi.
+The existing Pi-to-Mac SSH connection and installed terminal-notifier work; no
+package or credential change was needed. New backup-mac-alert.ts is called by
+backup-watchdog.ts, writes status transitions before sending, retains undelivered
+events for retry and does not resend delivered events. Config is private at
+.private/backup-notification.json; records are .private/backup-alerts.json.
+The queue failure/retry/no-duplicate smoke passed. The first fixture attempt had
+a scoped-write permission error caused by the private symlink; the corrected
+fixture explicitly grants the same private directory by both paths and passed.
+
+All 20 Pi runtime files match canonical hashes after deployment. The first
+deployment attempt refused a 0644 task payload; setting that one private payload
+to 0600 allowed the unchanged deployment guard to pass. Actual Pi test notification
+was received by Mac at 11:25:22 UTC, verified by terminal-notifier's exact group
+listing and Pi's saved delivery record. Evidence: mac-alert-queue-smoke.json and
+mac-alert-live-test.json. No permanent timer is enabled yet.
+
+All 63 source tests and check/fmt/lint/whitespace checks pass. Three Codex review
+rounds remain exhausted; no fourth was started. Mac alert changes are pending
+commit at this checkpoint. The P2 retirement-404 issue and full restore, cleanup,
+retention and scheduler acceptance remain unfinished; PR #4 stays draft.
