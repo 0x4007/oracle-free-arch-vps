@@ -31,7 +31,7 @@ export async function drillGuestBundle(
     ip saddr 169.254.169.254 udp sport 67 udp dport 68 accept
   }
   chain output {
-    type filter hook output priority -300; policy drop;
+    type filter hook output priority -150; policy drop;
     oifname "lo" accept
     ip daddr ${plan.controllerIpv4} tcp sport 22 ct state established accept
     ip daddr { 169.254.169.254, 255.255.255.255 } udp sport 68 udp dport 67 accept
@@ -54,8 +54,8 @@ RemainAfterExit=yes
 `,
       "etc/systemd/system/arch-drill.target": `[Unit]
 Description=Isolated Arch restore acceptance
-Requires=basic.target arch-drill-firewall.service systemd-networkd.service systemd-user-sessions.service sshd.service
-After=basic.target arch-drill-firewall.service systemd-networkd.service systemd-user-sessions.service sshd.service
+Requires=basic.target arch-drill-firewall.service systemd-networkd.service systemd-user-sessions.service systemd-logind.service sshd.service
+After=basic.target arch-drill-firewall.service systemd-networkd.service systemd-user-sessions.service systemd-logind.service sshd.service
 AllowIsolate=yes
 `,
       "etc/systemd/system/systemd-networkd.service.d/arch-drill.conf":
@@ -97,6 +97,10 @@ ExecStop=
         "vps-update.timer",
         "cloud-init.service",
         "cloud-final.service",
+        "systemd-imds-early-network.service",
+        "systemd-imds-import.service",
+        "systemd-imdsd.socket",
+        "systemd-imdsd@.service",
       ].map((unit) => `etc/systemd/system/${unit}`),
       ...[
         "tailscaled.service",

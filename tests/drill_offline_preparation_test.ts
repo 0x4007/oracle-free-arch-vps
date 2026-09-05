@@ -146,6 +146,15 @@ Deno.test("clone firewall requires exact controller and does not enable forwardi
   const firewall = bundle.files["etc/arch-drill.nft"];
   assert(firewall.includes("policy drop"));
   assert(!firewall.includes("dport 80") && !firewall.includes("dport 53"));
+  const outputPriority = Number(
+    firewall.match(/hook output priority (-?\d+)/)?.[1],
+  );
+  assert(outputPriority > -200 && outputPriority < 0);
+  assert(
+    bundle.masks.includes(
+      "etc/systemd/system/systemd-imds-early-network.service",
+    ),
+  );
   assert(
     bundle.masks.includes(
       "home/codex/.config/systemd/user/codex-remote-daemon.service",
@@ -176,6 +185,7 @@ Deno.test("isolated boot permits normal user sessions without starting multi-use
       line.startsWith(relationship)
     );
     assert(line?.includes("systemd-user-sessions.service"));
+    assert(line?.includes("systemd-logind.service"));
   }
   assert(!target.includes("multi-user.target"));
   assert(

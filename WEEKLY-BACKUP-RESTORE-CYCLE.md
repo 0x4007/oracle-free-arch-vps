@@ -1295,3 +1295,42 @@ PROVISIONING and the trust/runtime acceptance scripts next in the same sequence.
 No source outage occurred. Both helpers are already removed. Final cleanup,
 retained-pair release, the immediate real timer acceptance cycle, permanent timers
 and PR merge remain. The drill-resource deadline remains 15:19:43 UTC.
+
+
+## Clone firewall repair checkpoint — 2026-09-05 14:41 UTC
+
+The clone booted Arch, but its OUTPUT firewall ran before conntrack and dropped
+SSH replies. A real isolated Linux network-namespace test proved that priority
+-300 fails and -150 passes without changing host networking. The source generator
+now uses -150 only for OUTPUT. It also masks the four systemd IMDS units observed
+before ordinary network startup, and requires logind for clean ACPI shutdown in
+the isolated target. The initial clone boot did not pass full isolation proof.
+The original approved package and guest bundle remain immutable; changes are
+recorded in .private/drill-execution-amendments.json and a corrected guest bundle.
+
+All 68 tests and check/fmt/lint passed; the additional logind assertion also passes.
+Pi runtime deployment is verified for 25 files, including the still-uninstalled
+timer definitions. An initial deployment failed because config/ was absent after
+writing the corrected source; the precise partial write was checked, the directory
+created, and the remaining deployment completed. No timer was activated.
+
+Both preparation helpers are removed. Only the isolated clone, its 200 GB copies,
+and drill network remain. Source production remains online with all five backups.
+The four-hour cleanup deadline remains 15:19:43 UTC. A serial connection was created
+for this clone using the existing Mac RSA key and API-verified console transport.
+Console connection and capture deletion are included in final cleanup.
+
+The first console reconnection missed GRUB. An automatic intercept succeeded on
+the next boot, but the inherited repair command used ttyS0; debug-shell failed.
+Read-only source inspection confirmed the actual console is ttyAMA0. The corrected
+automatic boot command now uses ttyAMA0. Another clone SOFTSTOP is in progress in
+exec 21264; no hard fallback is allowed. The previous clean-stop waiter timed out;
+a fresh API read proved STOPPED before its subsequent START. The live console
+wrapper is exec 5604 and is armed to intercept the next boot. No clone repair has
+yet been applied, and RESTORE_DRILL_PROVED must not be claimed.
+
+Remaining work: repaired normal clone boot and applications/desktop verification,
+exact cleanup before the deadline, retirement of the authorized older pair,
+immediate native Pi timer backup without assistance, permanent Sunday 00:00
+America/New_York/recovery/watchdog activation, final evidence and PR #4 merge.
+Three review rounds remain exhausted; do not run a fourth review.
