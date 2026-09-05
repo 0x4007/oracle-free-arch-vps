@@ -547,3 +547,51 @@ claim clipboard works solely from enabled channel settings.
 Next: isolate physical touch versus Mirroring; complete phone keyboard,
 clipboard, rotation/background/reconnect, then return to the same session from
 Mac. The cutover, workload release, ACL, recovery and reboot gates remain open.
+
+### User acceptance and resource comparison — 2026-09-05 22:02 UTC
+
+The user confirmed physical-phone input works as a trackpad and disliked that
+interaction. At 22:00 UTC the user explicitly approved iPhone acceptance for
+now and deferred the mouse issue. This is user acceptance with deferred checks,
+not evidence that clipboard, rotation, background recovery or direct touch were
+tested. Immediately before that instruction, the session switcher exposed
+hand/mouse buttons and the hand button was selected; return to the desktop was
+observed but direct-touch accuracy was not verified. No further mouse work is
+requested now.
+
+The user next requested resource comparison and said the existing browser path
+is preferred because it feels faster and easier, with no custom client; HiDPI
+is the main RDP benefit. Do not disable the preferred browser path based on the
+earlier migration plan without resolving this changed preference. No cutover
+or boot-policy change was made.
+
+Three five-second live samples, 22:01:57–22:02:08 UTC, measure proportional set
+size (PSS) and process CPU deltas. Raw evidence is ignored private artifact
+`.private/native-rdp/resources-20260905T2201Z.json`. This is a concurrent live
+snapshot comparison, not matched resolution/content/activity benchmarking.
+Both stacks remained running. Browser applications, terminals, development,
+backup jobs and incidental user daemons are excluded from the core totals.
+
+| Measured component | Browser/VNC MiB PSS | Native RDP MiB PSS |
+| --- | ---: | ---: |
+| Web gateway or RDP transport | 337.8–338.1 | 24.7 |
+| X server | 298.2 | 211.0 |
+| Core Xfce, Thunar and panel plugins | 166.2 | 277.2 |
+| Measured desktop stack total | 802.2–802.5 | 512.9 |
+
+The browser gateway group includes Caddy, Java/Tomcat, guacd parent and active
+child, plus its two container shims. Docker/containerd daemon PSS is a separate
+104.3 MiB shared cost while development uses Docker. The two Tailscale daemons
+are another 60.7 MiB shared existing cost; neither group is double-counted above.
+PSS proportions can change when shared processes stop, so these differences
+are not measured shutdown savings. The observed desktop-stack gap is about
+289 MiB (36%); removing Docker later could avoid an additional approximately
+104 MiB of daemon footprint only after other consumers are released.
+
+During these static samples the browser stack used 0–0.59% of one CPU core and
+the RDP stack had no measurable tick increase. This does not establish active
+scrolling/encoding CPU efficiency or interactive speed. Resolution history and
+different user sessions also affect the memory comparison; the RDP Xfce desktop
+process retains substantially more PSS after earlier HiDPI use. Host available
+memory near the sample was 4,673 MiB; other workloads account for much of the
+host's total use. Do not attribute whole-host consumption to remote desktop.
