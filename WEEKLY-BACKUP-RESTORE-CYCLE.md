@@ -1014,3 +1014,39 @@ source/account/limits/controller-IP evidence and validate all package hashes bef
 any approved mutation. The alert destination remains unanswered. The existing
 P2 deletion-404 finding, retained-pair release, live drill/cleanup, unattended
 acceptance, alerts/timers and final PR merge remain unfinished.
+
+
+## Native timer fixture acceptance — 2026-09-05 06:49 UTC
+
+Offline preparation is committed and pushed as bb7424bc2ed91575a14874cd9ab5210f11299e27.
+PR #4 remains draft. Its exact-head publication CI run 33950532613 passed.
+All 63 source tests remain passing; no source code changed in this continuation.
+The concrete drill package was explicitly presented for approval at 06:43 UTC.
+No approval reply or alert destination has arrived. Do not treat automatic goal
+continuation as authorization for the new resources or outbound messages.
+
+This continuation made independent live controller-test progress. An agent-owned
+one-shot systemd timer on Pi invoked a fixture harness through safepi. Deno had
+only private-file read/write permissions, no network or command execution. It
+proved scheduled outside-window refusal, recovery no-op for an accepted complete
+journal, watchdog exit 1 for a failed cycle, and watchdog exit 1 for a missed
+maintenance window. These were temporary state copies; the actual Pi config
+remains preflight and its completed journal is byte-identical to the canonical
+copy. Their file mtimes predate the test. No OCI mutation or notification ran.
+
+Initial evidence collection (exec 67940) exited 1 because it searched only the
+parent service journal for the success marker. The harness itself succeeded;
+safepi attributes its command output to a separate systemd scope. Read-only
+recovery (exec 34917) found the exact scope's TIMER_FIXTURE_SMOKE_PASSED marker
+and the parent service's successful completion. Both handles are terminal.
+Evidence is .private/reports/pi-timer-fixture-smoke.json, including both journals
+and the collector correction. The two agent-owned transient units were stopped
+and removed; no permanent weekly/recovery/watchdog timer was enabled.
+
+This does not replace scheduler-triggered real backup, actual source recovery,
+external failure alerts or restored-guest acceptance. Those remain unfinished.
+The outstanding approval and destination are required user inputs; repeat timer
+fixtures, broad checks or stale billing polls are not substitutes for them.
+The previous goal turn and this turn both made progress; this is the second
+consecutive goal turn with the concrete drill approval pending. Apply the blocked
+audit only when its full three-turn threshold and actual impasse are satisfied.
