@@ -1185,3 +1185,20 @@ copies remain AVAILABLE, all five backup IDs remain and source footprint is
 It has NOT executed. The original creation package's four-hour execution scope
 remains in progress; its initial creation began within the one-hour initiation
 window. No clone has booted and no RESTORE_DRILL_PROVED claim is permitted.
+
+
+## Clone launch gate prepared — 2026-09-05 12:27 UTC
+
+The previous goal turn made live infrastructure and notification progress. This
+continuation prepared .private/drill-launch-clone.ts on Mac and Pi. It binds the
+original approval and recorded compatibility amendment, requires accepted helper
+cleanup, rechecks source/copy identities, detached state, network isolation,
+trial evidence, resource totals and Pi public IPv4, and journals the exact
+request before creation. It cannot launch while the helper remains.
+Both cleanup and clone entry points passed refusal smokes with no network/run
+permissions; report .private/reports/remaining-drill-gates-smoke.json. These are
+gate checks, not clone or cleanup acceptance. Neither entry point executed an
+OCI mutation. Exact cleanup approval remains unanswered since 12:16 UTC. This
+is the second consecutive goal turn with that same approval pending. The helper
+remains running, both prepared copies remain detached, and the 15:19:43 UTC
+deadline is unchanged. Do not treat automatic continuation as approval.
