@@ -1100,3 +1100,59 @@ All 63 source tests and check/fmt/lint/whitespace checks pass. Three Codex revie
 rounds remain exhausted; no fourth was started. Mac alert changes are pending
 commit at this checkpoint. The P2 retirement-404 issue and full restore, cleanup,
 retention and scheduler acceptance remain unfinished; PR #4 stays draft.
+
+
+## Live copied-volume preparation — 2026-09-05 12:13 UTC
+
+Mac alerts were committed and pushed as f8ad6c9447fc911d3c1849b37f7a7232e8c215d5.
+Its publication CI run 33963424638 passed. The canonical lane remains unchanged.
+The approved helper is now RUNNING; both exact restored 50/150-GB copies reached
+AVAILABLE, attached to it, passed real offline preparation, and cleanly detached.
+The original VPS stayed online and all five backups remain preserved.
+Current drill peak is 2 instances / 4 OCPU / 24 GB / 450 GB / 5 backups / 2 IPs.
+The deadline remains 15:19:43 UTC. No clone has been launched.
+
+The helper SSH key was proved against OCI console output. The first capture
+read only the default 10 KiB; requesting the full capture exposed the matching
+fingerprint. LVM pvscan was masked before copied-disk attachment. The helper
+and staging copy share platform-image filesystem UUIDs, so preparation excludes
+mounted disk trees when selecting the copied staging partition.
+
+Real OCI/Oracle Linux execution exposed compatibility defects that static
+fixtures missed. Fixed only those needed for the approved operation:
+- OCI forbids an explicit device path for a boot volume attached as data. The
+  corrected request omits that field; the root keeps its OCI consistent path.
+- Live OCI metadata contains Unicode; the command payload now uses UTF-8 before
+  base64 encoding. This failure happened before any helper command or intent.
+- Oracle Linux lsblk lacks START, so the same partition-start check reads kernel
+  sysfs. Its default JSON is flat without NAME; explicitly request --tree.
+- Boot device selection requires one unmounted tree with the expected UUID;
+  all descendants must be unmounted. The helper's own mounted disk is excluded.
+
+The original approved package and source snapshot are retained unchanged. The
+compatibility amendments and exact old/new hashes are recorded separately in
+.private/drill-execution-amendments.json. The approved isolation-file digest,
+resource identities, firewall rules and budget did not change. The two failed
+helper reads stopped before any mount/write; their intents/results were archived
+before retries after proving /mnt/arch-drill absent.
+
+The successful helper command proved copied UUIDs, sizes, root start sector,
+GRUB and kernel/initramfs hashes, wrote the approved isolation/startup files,
+remounted the root read-only, and unmounted both filesystems. It returned
+OFFLINE_FILES_PREPARED with the approved plan hash and firstBootProved=false.
+The actual resolved boot/root disk paths were recorded for independent detach
+checks. Both data attachments are now DETACHED, after UUID/size/unmounted/holder
+checks. The CLI --force option used on detach only skips its confirmation prompt;
+it is not an unclean detach mode. No hard STOP or RESET was used.
+
+All 65 source tests, check/fmt/lint/whitespace checks pass. No fourth Codex review
+was started. Live records remain authoritative on Pi in
+.private/drill-creation-journal.json and .private/reports/drill-offline-live-*.json.
+The exact helper cleanup request is being generated in exec session 67135; poll
+that session before reading .private/drill-helper-cleanup-request.{json,md}.
+The request requires a new exact approval for helper SOFTSTOP/termination, its
+own 50-GB boot disk deletion and ephemeral-IP release. Preserve both detached
+copies and the network for the already-approved Arch clone launch. No cleanup
+approval has arrived. Full restored-guest proof, cleanup/source acceptance,
+retention release, the P2 deletion-404 issue, timer activation/real scheduled
+acceptance and final PR merge remain unfinished.

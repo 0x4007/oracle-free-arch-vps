@@ -161,8 +161,9 @@ export async function offlinePreparationCommand(
         (index === 0 ? evidence.bootVolumeId : evidence.rootVolumeId) ||
       attachment["lifecycle-state"] !== "ATTACHED" ||
       attachment["attachment-type"] !== "paravirtualized" ||
-      typeof attachment.device !== "string" ||
-      !/^\/dev\/oracleoci\/oraclevd[b-z]$/.test(attachment.device)
+      !(index === 0 && attachment.device === null) &&
+        (typeof attachment.device !== "string" ||
+          !/^\/dev\/oracleoci\/oraclevd[b-z]$/.test(attachment.device))
     ) || bootAttachment.device === rootAttachment.device ||
     ![evidence.rootUuid, evidence.stagingUuid].every((value) =>
       /^[a-f0-9-]{36}$/.test(value)
@@ -178,7 +179,12 @@ export async function offlinePreparationCommand(
   if (await drillGuestFilesDigest(bundle) !== plan.offlineFilesSha256) {
     throw new Error("Offline isolation files differ from the approved plan");
   }
-  const payload = btoa(JSON.stringify({ plan, evidence, bundle }));
+  const payload = btoa(
+    Array.from(
+      new TextEncoder().encode(JSON.stringify({ plan, evidence, bundle })),
+      (byte) => String.fromCharCode(byte),
+    ).join(""),
+  );
   const script =
     `import base64,hashlib,json,os,pathlib,stat,subprocess,urllib.request
 p=json.loads(base64.b64decode('${payload}'))
@@ -188,19 +194,30 @@ with urllib.request.urlopen(request,timeout=10) as response: identity=json.load(
 assert identity['id']==e['helper']['id'] and identity['id']!=p['plan']['source']['instanceId'], 'Wrong helper instance'
 def run(*args): return subprocess.check_output(args,text=True).strip()
 def disk(attachment,uuid,fstype,size):
- device=os.path.realpath(attachment['device'])
- assert stat.S_ISBLK(os.stat(device).st_mode), 'Attachment is not a block device'
- tree=json.loads(run('lsblk','--json','--paths','--bytes','--output','PATH,TYPE,UUID,START,FSTYPE,SIZE,MOUNTPOINTS',device))['blockdevices']
+ # OCI forbids an explicit consistent device path for boot volumes attached
+ # as data. Resolve only that case from the unique copied filesystem UUID.
+ args=['lsblk','--json','--tree','--paths','--bytes','--output','PATH,TYPE,UUID,FSTYPE,SIZE,MOUNTPOINTS']
+ if attachment['device'] is not None: args.append(os.path.realpath(attachment['device']))
+ else: assert attachment==e['bootAttachment'], 'Only the boot copy may use automatic device discovery'
+ tree=json.loads(run(*args))['blockdevices']
+ def has_mounts(item):
+  return any(item.get('mountpoints') or []) or any(has_mounts(child) for child in item.get('children',[]))
+ if attachment['device'] is None:
+  tree=[item for item in tree if item['type']=='disk' and not has_mounts(item) and any(child.get('uuid')==uuid and child.get('fstype')==fstype for child in item.get('children',[]))]
  assert len(tree)==1 and tree[0]['type']=='disk' and int(tree[0]['size'])==size, 'Unexpected disk size or type'
- assert not any(tree[0].get('mountpoints') or []), 'Disk is already mounted'
+ assert stat.S_ISBLK(os.stat(tree[0]['path']).st_mode), 'Attachment is not a block device'
+ def unmounted(item):
+  assert not any(item.get('mountpoints') or []), 'A copied device is already mounted'
+  for child in item.get('children',[]): unmounted(child)
+ unmounted(tree[0])
  children=tree[0].get('children',[])
- assert all(not any(child.get('mountpoints') or []) for child in children), 'A disk partition is already mounted'
  candidates=[child for child in children if child.get('uuid')==uuid and child.get('fstype')==fstype]
  assert len(candidates)==1, 'Copied partition identity is not unique'
+ candidates[0]['diskPath']=tree[0]['path']
  return candidates[0]
 root=disk(e['rootAttachment'],e['rootUuid'],'ext4',150*1024**3)
 stage=disk(e['bootAttachment'],e['stagingUuid'],'xfs',50*1024**3)
-assert int(root['start'])==1050624, 'Root partition start changed'
+assert int((pathlib.Path('/sys/class/block')/pathlib.Path(root['path']).name/'start').read_text())==1050624, 'Root partition start changed'
 base=pathlib.Path('/mnt/arch-drill')
 base.mkdir(mode=0o700,exist_ok=True)
 assert not base.is_symlink() and not any(base.iterdir()), 'Preparation mount directory is not empty'
@@ -260,7 +277,7 @@ try:
  os.chmod(marker,0o600)
  os.sync()
  subprocess.run(['mount','-o','remount,ro',str(r)],check=True)
- print(json.dumps({'status':'OFFLINE_FILES_PREPARED','planSha256':b['planSha256'],'firstBootProved':False}))
+ print(json.dumps({'status':'OFFLINE_FILES_PREPARED','planSha256':b['planSha256'],'firstBootProved':False,'bootDevicePath':stage['diskPath'],'rootDevicePath':root['diskPath']}))
 finally:
  for path in reversed(mounted): subprocess.run(['umount',str(path)],check=True)
  for path in [s,r]: path.rmdir()

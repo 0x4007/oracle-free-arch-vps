@@ -90,6 +90,7 @@ Deno.test("offline preparation rejects production disks and attachment drift", a
       (e: OfflinePreparationEvidence) =>
         e.rootAttachment["lifecycle-state"] = "ATTACHING",
       (e: OfflinePreparationEvidence) => e.rootAttachment.device = "/dev/sda",
+      (e: OfflinePreparationEvidence) => e.rootAttachment.device = null,
       (e: OfflinePreparationEvidence) =>
         e.rootAttachment.device = e.bootAttachment.device,
       (e: OfflinePreparationEvidence) =>
@@ -105,6 +106,40 @@ Deno.test("offline preparation rejects production disks and attachment drift", a
       "sudo -n python3 -c '",
     ),
   );
+});
+Deno.test("boot volume attached as data permits OCI automatic device selection", async () => {
+  const reviewed = {
+    ...plan,
+    offlineFilesSha256: await drillGuestFilesDigest(
+      await drillGuestBundle(plan),
+    ),
+  };
+  const automatic = structuredClone(evidence);
+  automatic.bootAttachment.device = null;
+  assert(
+    (await offlinePreparationCommand(reviewed, automatic)).startsWith(
+      "sudo -n python3 -c '",
+    ),
+  );
+});
+Deno.test("helper metadata retains Unicode in the encoded preparation payload", async () => {
+  const reviewed = {
+    ...plan,
+    offlineFilesSha256: await drillGuestFilesDigest(
+      await drillGuestBundle(plan),
+    ),
+  };
+  const unicode = structuredClone(evidence);
+  unicode.helper["defined-tags"] = { note: "恢復 helper" };
+  const command = await offlinePreparationCommand(reviewed, unicode);
+  const encoded = command.match(/[A-Za-z0-9+/=]{100,}/)?.[0];
+  assert(encoded);
+  const decoded = JSON.parse(
+    new TextDecoder().decode(
+      Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0)),
+    ),
+  );
+  assert(decoded.evidence.helper["defined-tags"].note === "恢復 helper");
 });
 Deno.test("clone firewall requires exact controller and does not enable forwarding or metadata HTTP", async () => {
   const bundle = await drillGuestBundle(plan);
