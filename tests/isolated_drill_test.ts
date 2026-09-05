@@ -51,8 +51,8 @@ Deno.test("drill launch attaches both cloned volumes and cannot reference produc
     "cloned-root",
   );
   assert(request.launchVolumeAttachments[0].volumeId === "cloned-root");
-  // OCI must inherit this setting from the restored boot volume.
-  assert(!("isConsistentVolumeNamingEnabled" in request.launchOptions));
+  // OCI must inherit the restored boot volume's image launch capabilities.
+  assert(!("launchOptions" in request));
   assert(!JSON.stringify(request).includes("production-ip"));
   await refuses(() =>
     drillLaunchRequest(plan, "production-subnet", "cloned-boot", "cloned-root")

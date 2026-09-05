@@ -239,11 +239,5 @@ export function drillLaunchRequest(
       volumeId: rootVolumeId,
     }],
     createVnicDetails: { subnetId, assignPublicIp: true, nsgIds: [] },
-    launchOptions: {
-      networkType: "PARAVIRTUALIZED",
-      remoteDataVolumeType: "PARAVIRTUALIZED",
-      firmware: "UEFI_64",
-      isPvEncryptionInTransitEnabled: false,
-    },
   };
 }

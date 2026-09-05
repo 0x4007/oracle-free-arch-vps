@@ -1277,3 +1277,21 @@ approval. This is the required supervised acceptance run after the startup repai
 no recurring maintenance window is changed or fabricated. The weekly entry point
 still enforces Sunday 00:00 America/New_York. Distinguish this real temporary-timer
 run from the first future Sunday-window invocation, and from the earlier fixtures.
+
+## Clone created — 2026-09-05 13:38 UTC
+
+OCI rejected the deprecated PvEncryptionInTransitEnabled launch override on the
+second attempt at 13:26:24 UTC. Independent inventory again proved no clone and
+available copies; the request and failed intent were archived without retrying an
+ambiguous creation. Oracle's maintainer clarification confirms that stored image
+capabilities supersede launch options (oracle/oci-cli issue 416). The source reports
+UEFI_64 and paravirtualized boot, network and remote data volumes. The restored-boot
+launch now omits launchOptions entirely and inherits those capabilities. The
+original approval/template bytes remain unchanged; executed-request amendments
+and source hashes are recorded separately. All 68 tests and required checks pass.
+
+The corrected launch succeeded. Exec 66021 is LIVE, with the isolated Arch clone
+PROVISIONING and the trust/runtime acceptance scripts next in the same sequence.
+No source outage occurred. Both helpers are already removed. Final cleanup,
+retained-pair release, the immediate real timer acceptance cycle, permanent timers
+and PR merge remain. The drill-resource deadline remains 15:19:43 UTC.
