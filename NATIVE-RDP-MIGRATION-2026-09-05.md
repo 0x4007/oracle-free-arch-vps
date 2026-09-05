@@ -505,3 +505,45 @@ Next client step: iPhone readiness, then real Mac–phone–Mac session testing.
 Clipboard, actual shortcuts, narrow tailnet authorization, existing-user
 rehearsal, recovery integration, coordinated reboots, cutover, Docker lifecycle,
 rollback and controlled resource comparison remain incomplete.
+
+### iPhone connection and open input defect — 2026-09-05 21:54 UTC
+
+Canonical accepted-package/Mac checkpoint is commit
+`2a0a477cab21ba3caa3a986ec0f40acb91883abc`. Its source patch has one intentional
+space-only unified-diff context line reported by git whitespace checking;
+retain the upstream patch bytes and their pinned checksum. Shell checks pass.
+
+The user installed the free Microsoft Windows App Mobile from the official
+App Store and authorized direct phone configuration through iPhone Mirroring.
+The in-app connection information reports version 11.3.5 (5932), iOS 26.1.
+Saved PC Arch RDP targets arch.tail18c5da.ts.net with saved existing rdp-trial
+credentials named Arch RDP. Clipboard is enabled, sound is Don't Play Sound,
+microphone/camera are off and no gateway is configured. The password was read
+directly into the secure field without output. No Apple credential was read;
+the user completed the App Store authentication themselves.
+
+At 21:49:19–20 UTC the real iPhone connected with TLS 1.3,
+TLS_AES_256_GCM_SHA384, authenticated successfully and resumed display :10.0,
+session PID 143927, Xorg PID 143943 and Xfce PID 143952. The retained Chromium
+window was visible. No duplicate desktop was created. The server explicitly
+matched RFX and started a GFX RFX Pro codec session; do not infer H.264 from the
+generic encoder-library message. Client resolution is 736×1374, with a padded
+server allocation of 768×1408. Phone certificate-dialog inspection was not
+captured during this connection, so per-phone trust verification remains open.
+
+The user could not close the remote browser tab by clicking its visible close
+control. Mirrored pointer actions have not proved accurate. Phone connection
+and saved-login checks PASS, but touch accuracy and usable phone interaction
+remain FAIL/unresolved, not accepted. Zoom was toggled on and restored; no
+server DPI change was made. At 21:53 UTC the user began physical-phone testing,
+which paused iPhone Mirroring. Determine whether this defect also occurs with
+physical touch before attributing it to RDP coordinate handling or Mirroring.
+
+Mac clipboard checks also remain unproved: CUA paste timed out and a native
+TextEdit copy followed by remote Control-V produced no visible marker in the
+remote browser address field. No search or form submission was made. Do not
+claim clipboard works solely from enabled channel settings.
+
+Next: isolate physical touch versus Mirroring; complete phone keyboard,
+clipboard, rotation/background/reconnect, then return to the same session from
+Mac. The cutover, workload release, ACL, recovery and reboot gates remain open.
