@@ -167,3 +167,20 @@ Deno.test("preparation refuses changed isolation after plan approval", async () 
     )
   );
 });
+
+Deno.test("isolated boot permits normal user sessions without starting multi-user workloads", async () => {
+  const bundle = await drillGuestBundle(plan);
+  const target = bundle.files["etc/systemd/system/arch-drill.target"];
+  for (const relationship of ["Requires=", "After="]) {
+    const line = target.split("\n").find((line) =>
+      line.startsWith(relationship)
+    );
+    assert(line?.includes("systemd-user-sessions.service"));
+  }
+  assert(!target.includes("multi-user.target"));
+  assert(
+    bundle.files["etc/systemd/system/sshd.service.d/arch-drill.conf"].includes(
+      "Requires=arch-drill-firewall.service",
+    ),
+  );
+});

@@ -1202,3 +1202,45 @@ OCI mutation. Exact cleanup approval remains unanswered since 12:16 UTC. This
 is the second consecutive goal turn with that same approval pending. The helper
 remains running, both prepared copies remain detached, and the 15:19:43 UTC
 deadline is unchanged. Do not treat automatic continuation as approval.
+
+## Cleanup resumed and isolated-login correction — 2026-09-05 12:58 UTC
+
+The user instructed "wtf finish the fucking job" at 12:33:02 UTC. This resumes
+execution and authorizes the concrete helper cleanup already presented. Do not
+repeat that approval request. Exact request binding and the verbatim instruction
+are preserved in .private/drill-helper-cleanup-approval.json. The first helper was
+cleanly stopped, terminated, and its own boot disk and ephemeral IP removed.
+The Pi accepted cleanup with both prepared copies and all five backups preserved;
+source remained RUNNING. Exec 35860 is terminal, exit 0.
+
+Before clone creation, a source read proved that systemd creates /run/nologin
+at boot and the isolated target omitted systemd-user-sessions.service. Stopped
+only this task's launcher (exec 93440, terminal 143) before any clone intent or
+resource existed. The corrected target adds that service to Requires and After;
+firewall and all startup masks stay unchanged. The original approval package and
+guest bundle remain immutable; this two-line correction has a separate amendment.
+
+A replacement preparation helper uses the same approved image, isolation,
+resource ceilings, operating budget and four-hour deadline (15:19:43 UTC).
+Its creation and cleanup are necessary continuation of the approved drill under
+the user's completion instruction, not a claimed new approval reply. Exact IDs,
+intents and authorization basis are recorded privately. The original helper's
+records remain intact under their original keys; repair-helper keys are separate.
+
+The replacement helper's SSH key is verified against OCI console output. Its
+first capture ended before host-key output; that read-only trust check failed
+before disk attachment, and a fresh capture passed. The copied root alone was
+attached, its identity/UUID/size/start verified, and the target corrected. The
+kernel/initramfs stayed unchanged; the root was remounted read-only and unmounted.
+Exec 90169 remains live, now performing clean detach and helper cleanup. Poll it
+before another Pi writer. No Arch clone has booted; no restore-proof claim yet.
+
+Fixed the remaining review P2: after a successful backup deletion, poll a complete
+successful compartment inventory for removal instead of treating GET 404 as
+success or failing forever on disappearance. Authorization/list errors still fail.
+All 68 tests, type check, repository-scoped format, lint and whitespace checks pass.
+A broad format command also reported pre-existing Markdown formatting outside the
+repository fmt task; those files were not reformatted. Three review rounds remain
+exhausted; no fourth review was started. Final runtime deployment, clone acceptance,
+final cleanup, retained-pair release, timer activation and unattended acceptance
+remain pending. PR #4 remains draft until the required live gates pass.

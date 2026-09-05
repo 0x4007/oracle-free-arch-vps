@@ -1,7 +1,7 @@
 import { ociBackupOperations } from "../scripts/oci-backup-operations.ts";
 import type { BackupPolicy } from "../scripts/weekly-backup.ts";
 
-function fixture(recovery = false) {
+function fixture(recovery = false, deletion?: "absent" | "denied") {
   const source = {
     instanceId: "instance",
     bootVolumeId: "boot",
@@ -21,7 +21,7 @@ function fixture(recovery = false) {
       bootId: "old-boot",
       rootId: "old-root",
     },
-    retainPreviousPair: true,
+    retainPreviousPair: !deletion,
     allowFifthSlot: false,
   };
   const calls: string[][] = [];
@@ -44,6 +44,30 @@ function fixture(recovery = false) {
     noop,
     (_command, args) => {
       calls.push(args);
+      if (deletion && args.includes("bv")) {
+        if (args.includes("list") && deletion === "denied") {
+          return Promise.resolve({
+            code: 1,
+            stderr: "NotAuthorizedOrNotFound",
+            stdout: "",
+          });
+        }
+        return Promise.resolve({
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            data: args.includes("get")
+              ? {
+                id: "old-boot",
+                "boot-volume-id": "boot",
+                "compartment-id": "tenancy",
+                "display-name": "arch-stage-golden-20260903T191507Z",
+                "lifecycle-state": "AVAILABLE",
+              }
+              : [],
+          }),
+        });
+      }
       if (recovery && args.includes("list")) {
         const boot = args.includes("boot-volume-attachment");
         return Promise.resolve({
@@ -69,7 +93,7 @@ function fixture(recovery = false) {
             "compartment-id": "tenancy",
             shape: "VM.Standard.A1.Flex",
             "shape-config": { ocpus: 2, "memory-in-gbs": 12 },
-            "lifecycle-state": recovery ? "RUNNING" : "STOPPED",
+            "lifecycle-state": recovery || deletion ? "RUNNING" : "STOPPED",
             "availability-domain": "ad",
           },
         }),
@@ -79,6 +103,35 @@ function fixture(recovery = false) {
   );
   return { ops, calls };
 }
+
+Deno.test("retention proves disappearance using complete inventory after successful deletion", async () => {
+  const { ops, calls } = fixture(false, "absent");
+  await ops.deleteBackup("boot", "old-boot");
+  const deletion = calls.findIndex((args) => args.includes("delete"));
+  const inventory = calls.findIndex((args) => args.includes("list"));
+  if (
+    deletion < 0 || inventory <= deletion ||
+    !calls[inventory].includes("--all") ||
+    calls.slice(deletion + 1).some((args) => args.includes("get"))
+  ) {
+    throw new Error(
+      "Deletion was not followed by independent complete inventory",
+    );
+  }
+});
+
+Deno.test("retention does not interpret denied inventory as successful deletion", async () => {
+  const { ops } = fixture(false, "denied");
+  let refused = false;
+  try {
+    await ops.deleteBackup("boot", "old-boot");
+  } catch {
+    refused = true;
+  }
+  if (!refused) {
+    throw new Error("Denied inventory was accepted as disappearance");
+  }
+});
 
 for (const operation of ["start", "create"] as const) {
   Deno.test(`OCI ${operation} rejects a changed stopped epoch before mutation`, async () => {

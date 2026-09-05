@@ -355,7 +355,22 @@ export function ociBackupOperations(
         ]);
       }
       await wait(
-        () => backupGet(kind, id),
+        async () => {
+          // Deleted objects can return an ambiguous NotAuthorizedOrNotFound
+          // from GET. Require a successful complete inventory after deletion
+          // instead of interpreting that error as proof of removal.
+          const remaining = dataArray(
+            await call([
+              "bv",
+              kind === "boot" ? "boot-volume-backup" : "backup",
+              "list",
+              "--compartment-id",
+              policy.source.compartmentId,
+              "--all",
+            ]),
+          ).find((item) => item.id === id);
+          return remaining ?? { "lifecycle-state": "TERMINATED" };
+        },
         "TERMINATED",
         ["TERMINATING"],
         1200,
