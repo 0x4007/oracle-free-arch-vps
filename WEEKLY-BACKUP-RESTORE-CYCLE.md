@@ -1156,3 +1156,32 @@ copies and the network for the already-approved Arch clone launch. No cleanup
 approval has arrived. Full restored-guest proof, cleanup/source acceptance,
 retention release, the P2 deletion-404 issue, timer activation/real scheduled
 acceptance and final PR merge remain unfinished.
+
+
+## Exact helper cleanup pending — 2026-09-05 12:20 UTC
+
+Compatibility fixes are committed and pushed as
+61e3688ff7cde785c4a92e66f9acb51b288f562a; CI run 33965484673 passed. All 20 Pi
+runtime hashes were recopied and match canonical source. Cleanup-request exec
+67135 and push exec 38198 are terminal, exit 0. No tool session remains live.
+
+The concrete cleanup request is ready at
+.private/drill-helper-cleanup-request.{json,md}, on both Mac and Pi. It proves
+only the helper's own 50-GB boot volume remains attached, both prepared copies
+are detached/AVAILABLE, the source is RUNNING, and the helper's ephemeral IP
+belongs to its VNIC. Exact approval was requested asynchronously at 12:16 UTC;
+no reply has arrived. Do not interpret the earlier creation approval as this
+separate deletion approval. The deadline remains 15:19:43 UTC.
+
+.private/drill-cleanup-helper.ts is prepared on Mac and Pi and type checked. It
+refuses to execute without a separate .private/drill-helper-cleanup-approval.json
+binding the exact request SHA256 and user approval. Once approval arrives,
+record it without modifying the request, then run through safepi. The script
+rechecks source/helper/copy identities and attachments, syncs the helper, uses
+SOFTSTOP without a hard fallback, waits STOPPED, and terminates only the helper
+with its own boot disk. It verifies the exact helper disk/IP disappeared, both
+copies remain AVAILABLE, all five backup IDs remain and source footprint is
+1 instance / 2 OCPU / 12 GB / 400 GB / 5 backups / 1 IP before clone launch.
+It has NOT executed. The original creation package's four-hour execution scope
+remains in progress; its initial creation began within the one-hour initiation
+window. No clone has booted and no RESTORE_DRILL_PROVED claim is permitted.
