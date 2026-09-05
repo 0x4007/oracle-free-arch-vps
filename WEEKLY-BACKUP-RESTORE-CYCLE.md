@@ -914,3 +914,33 @@ Exact costing, trial credit evidence, first-boot isolation implementation, resou
 approvals, drill and cleanup remain unfinished. Alert destination remains pending.
 All tool sessions from this checkpoint are terminal. No new outage or OCI mutation
 occurred during these review corrections.
+
+
+## Git delivery and CI checkpoint — 2026-09-05 06:12 UTC
+
+The controller implementation is committed and pushed as
+17cbfc6b81016ccb30a0e25d0c41d9bfcf9d2f81. Draft PR #4 is open:
+https://github.com/0x4007/oracle-free-arch-vps/pull/4.
+It remains draft because the full restore, cleanup, retention, alerts and
+scheduler-triggered live acceptance are unfinished. Do not merge or claim the
+full goal complete yet. The canonical worktree and branch are unchanged.
+
+Current main had an additional publication-audit workflow commit
+5c24670a3ab09821f4a305bcf2156f3956d15e48, which was merged without replacing
+source work. The first PR check (run 33948981574) failed because the existing
+workflow referenced 18 absent encoded audit payload parts. Recovered those exact
+public blobs from closed PR #3 and proved the decoded SHA256 equals the existing
+workflow pin 5cdc6b11d7b1f3a8dc79708bc459645b8a0c3b14de736fbf56e0febc2013f701.
+The legacy variant also matches its existing pin and both scripts pass bash -n.
+Added only the exact legacy-commit fetch required because its history is not
+reachable from current branch heads. No audit rule or hash pin was weakened.
+CI repair commit ddd25be is pushed; run 33949125730 completed SUCCESS.
+This audit checks its named publication/legacy targets, not live backup behavior.
+
+Source code remains validated by 60 tests/check/fmt/lint and the recorded Pi
+smokes. The single review P2 deletion-404 finding remains recorded, not fixed.
+No fourth review is permitted. No P0/P1 issue remains from the three reviews.
+No OCI resources, source outages or notifications occurred in this continuation.
+All local tool sessions are terminal. The alert destination is still unanswered.
+Next substantive work is executable isolated-copy preparation and the exact
+reviewable helper/clone approval package, followed by the drill and cleanup.
