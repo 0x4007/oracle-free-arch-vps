@@ -1458,3 +1458,36 @@ a clean single-attempt result or repeat the outage just to change that label. Th
 working prototype is accepted by the real stages plus the focused live correction.
 The first ordinary Sunday-window invocation remains future. Permanent timers are
 still disabled until the corrected retention timer completes successfully.
+
+## Final live acceptance — 2026-09-05 16:38 UTC
+
+The existing-pair continuation completed successfully under its native Pi timer.
+The same 20260905T152843Z FULL boot/root pair remains AVAILABLE, the previous pair
+is removed, and the unrelated historical backup is preserved: three objects total.
+The continuation prohibited backup creation and source stop/start. No additional
+backup pair, outage, or manual guest repair occurred after the xfconfd correction.
+The original failed attempt and successful continuation journals are saved in
+.private/reports/timer-real-backup-acceptance.json. Acceptance remains staged:
+unattendedCycleAccepted=false and uninterruptedCycleAccepted=false.
+
+Permanent weekly, recovery and watchdog timers are enabled and active on Pi with
+user linger enabled. The next weekly start is September 6 at 00:00 EDT, using the
+approved Sunday 00:00 America/New_York schedule and 15-minute initiation window.
+The actual installed weekly service returned OUTSIDE_APPROVED_WINDOW without
+changing the accepted runtime journal. The installed watchdog passed. Evidence:
+.private/reports/permanent-backup-timers.json and installed-schedule-acceptance.json.
+The collector was corrected for journalctl timestamp syntax and safepi scope
+attribution; these evidence-only corrections did not rerun infrastructure work.
+
+Reports, the runtime journal, delivery queue, and deployment manifest are durable
+on Pi and mirrored to Mac. Mac notification delivery was previously verified;
+Pi uses SSH to the reachable Mac and queues undelivered alerts for retry. This is
+not an Internet APNs delivery service. Both task transient timers have unloaded;
+the original failed test-service state was cleared after its evidence was saved.
+All temporary restore resources remain removed. The first ordinary Sunday-window
+invocation is future; do not represent it as already observed.
+
+Runtime code is deployed from 3bdc01e with 25 hashes verified and 68 tests plus
+check/fmt/lint passing. Three review rounds are exhausted; no fourth is required.
+PR #4 is ready for final documentation CI and merge. The canonical lane is retained;
+the root handoff remains an intentional untracked mirror in the main checkout.
