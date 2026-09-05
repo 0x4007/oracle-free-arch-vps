@@ -1,8 +1,8 @@
 # Native RDP migration and on-demand Docker handoff
 
-Date: 2026-09-05. Current status: native RDP pilot is live; client and resource
-results are recorded below. Draft PR #6 is open. Final architecture is pending
-the user's decision after preferring the existing browser desktop. The original
+Date: 2026-09-05. Current status: user chose persistent Guacamole/VNC and disabled
+the RDP pilot without uninstalling it. Client and resource results are recorded
+below. Draft PR #6 preserves the experiment. The original
 planning record below is retained; later execution records supersede its state.
 
 ## Objective and authority
@@ -627,3 +627,29 @@ reboots must follow the resolved architecture and the existing exact approval
 gates. Keep the draft unmerged and preserve active services while this decision
 is pending. The full original goal remains incomplete; it has not been reduced
 to the pilot or marked achieved.
+
+### Final user decision and RDP disable — 2026-09-05 22:29 UTC
+
+The user explicitly chose to leave Guacamole/VNC as-is, disable RDP without
+uninstalling it, and retain browser desktop startup across restarts. This
+supersedes the original RDP migration, old-stack retirement and Docker-off
+requirements. Do not resume those superseded cutover gates automatically.
+
+Executed the authorized disable: removed only Tailscale Serve TCP 3389;
+systemctl disable --now xrdp.service xrdp-sesman.service; terminated only the
+rdp-trial user's test session. After shutdown settled, no rdp-trial processes
+remain, both RDP units are inactive/disabled, no port 3389 listener exists, and
+the test user has Linger=no. Reverse dependency inspection found only the two
+RDP units referring to each other, not an enabled boot consumer. Packages
+xrdp 0.10.6.1-1 and xorgxrdp 0.10.5-1, account, credentials and configurations
+remain installed. Saved Mac/iPhone profiles remain available but cannot connect
+until an explicit server start and tailnet forward restoration.
+
+Verified the selected persistent browser path: docker.service and caddy.service
+are enabled; codex vncserver.service is enabled, active and codex has Linger=yes.
+Both Guacamole containers are running with restart=unless-stopped, matching
+their retained compose file. Existing Tailscale Serve 5901 remains. Guacamole
+responds HTTP 200 at its loopback endpoint. No existing desktop or development
+workload was stopped. No new reboot was performed; these are current runtime
+and boot-configuration checks, not a new reboot acceptance test. The existing
+backup recovery contract continues to match the selected Guacamole stack.
