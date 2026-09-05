@@ -243,7 +243,6 @@ export function drillLaunchRequest(
       networkType: "PARAVIRTUALIZED",
       remoteDataVolumeType: "PARAVIRTUALIZED",
       firmware: "UEFI_64",
-      isConsistentVolumeNamingEnabled: false,
       isPvEncryptionInTransitEnabled: false,
     },
   };

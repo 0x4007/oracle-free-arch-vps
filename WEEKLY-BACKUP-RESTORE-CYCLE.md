@@ -1205,7 +1205,7 @@ deadline is unchanged. Do not treat automatic continuation as approval.
 
 ## Cleanup resumed and isolated-login correction — 2026-09-05 12:58 UTC
 
-The user instructed "wtf finish the fucking job" at 12:33:02 UTC. This resumes
+The user explicitly instructed completion at 12:33:02 UTC. This resumes
 execution and authorizes the concrete helper cleanup already presented. Do not
 repeat that approval request. Exact request binding and the verbatim instruction
 are preserved in .private/drill-helper-cleanup-approval.json. The first helper was
@@ -1244,3 +1244,36 @@ repository fmt task; those files were not reformatted. Three review rounds remai
 exhausted; no fourth review was started. Final runtime deployment, clone acceptance,
 final cleanup, retained-pair release, timer activation and unattended acceptance
 remain pending. PR #4 remains draft until the required live gates pass.
+
+## Prepared clone retry — 2026-09-05 13:22 UTC
+
+Replacement-helper cleanup passed: its instance, boot disk and ephemeral IP are
+gone; both prepared copies are available; production and all five backups remain.
+Exec 90169 is terminal, exit 0. The login-target correction is recorded separately
+from the unchanged original package and bundle. All 20 Pi runtime hashes match
+canonical source after the guarded deployment.
+
+The first actual clone request returned HTTP 400 at 13:16:56 UTC because OCI does
+not support overriding ConsistentVolumeNamingEnabled for this restored boot.
+The source setting is true; the template requested false. An independent full
+instance inventory proved no clone exists, and both disks remain AVAILABLE.
+The rejected request and intent are archived; the retry omits only that unsupported
+field and inherits the restored boot setting. Updated the request generator and
+its regression assertion. All 68 tests and type/fmt/lint/whitespace checks pass.
+The original creation template and approval package are unchanged; the additional
+source/request correction is recorded in the private amendment and journal.
+
+Exec 20492 is LIVE, now running the corrected clone launch, trusted first SSH,
+and actual restored-guest checks in sequence. Poll it before another Pi writer.
+The private acceptance script checks boot and data hashes, masks, firewall runtime
+and startup order, blocked metadata HTTP, local Guacamole/Caddy, Xfce/VNC and an
+actual desktop capture. Passing that script still requires visual inspection before
+recording RESTORE_DRILL_PROVED. Final cleanup and retention are prepared but have
+not run. The four-hour resource cleanup deadline remains 15:19:43 UTC.
+
+After cleanup and retention, one immediate native Pi timer will exercise the real
+backup runtime under the user's explicit completion instruction and existing backup
+approval. This is the required supervised acceptance run after the startup repairs;
+no recurring maintenance window is changed or fabricated. The weekly entry point
+still enforces Sunday 00:00 America/New_York. Distinguish this real temporary-timer
+run from the first future Sunday-window invocation, and from the earlier fixtures.
