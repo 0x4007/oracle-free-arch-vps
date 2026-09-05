@@ -1334,3 +1334,127 @@ exact cleanup before the deadline, retirement of the authorized older pair,
 immediate native Pi timer backup without assistance, permanent Sunday 00:00
 America/New_York/recovery/watchdog activation, final evidence and PR #4 merge.
 Three review rounds remain exhausted; do not run a fourth review.
+
+
+## Corrected restore accepted — 2026-09-05 14:59 UTC
+
+The clone reached STOPPED after the SOFTSTOP waiter deadline; a separate fresh
+API read proved STOPPED and source RUNNING before START. The automatic GRUB
+intercept booted the one-time debug shell on the verified ttyAMA0 device.
+The shell checked the copied root UUID and exact preparation marker, changed only
+the amended firewall/target files and IMDS masks, applied the nft transaction
+atomically, and started logind. Pi SSH then passed with the copied source host key.
+
+A normal guest reboot removed the one-time debug shell and boot options. The
+actual console showed orderly service shutdown and a normal boot. The Pi verified
+a new boot ID, normal kernel command line, persistent firewall and active logind.
+Full runtime acceptance passed at 14:58 UTC: exact UUID/start sector, kernel and
+initramfs parity, unchanged GRUB and recovery entry, corrected file hashes, masks,
+firewall before network/SSH, metadata HTTP blocked, representative repository
+commit/data, Guacamole markup, Caddy response, and VNC/Xfce. The primary inspected
+the actual 1920x1080 framebuffer and accepted the visible desktop. The private
+report now records RESTORE_DRILL_PROVED and explicitly states the initial unrepaired
+boot did not pass complete isolation proof.
+
+Final cleanup is running on Pi in exec 34737. It must remove the exact clone,
+200 GB copied disks, isolated network, console connection and captures, preserve
+all five backups, and accept the original source/footprint. Deadline is unchanged
+at 15:19:43 UTC. No permanent timer is enabled yet. The canonical commit is
+65dbdc4, pushed with CI run 33972595472 passing. The remaining gates are cleanup,
+authorized retained-pair release, a real native timer backup with no intervention,
+permanent weekly/recovery/watchdog acceptance, and PR #4 merge.
+
+
+## Temporary cleanup accepted — 2026-09-05 15:13 UTC
+
+Final cleanup exec 34737 exited zero. The repaired clone cleanly stopped; its
+console recorded all filesystems unmounted before power-off. The clone, both
+copied disks, isolated subnet/route/gateway/security-list/DHCP/VCN, console
+connection and owned captures were removed. The live source and original footprint
+were accepted at 15:12:54.798 UTC, before the 15:19:43.635 UTC deadline:
+1 instance / 2 OCPU / 12 GB / 200 GB / 5 backups / 1 public IP. All five backup
+IDs and the production reserved IP were preserved. Console exec 5604 is terminal.
+Private evidence is on Pi and mirrored on Mac; no temporary infrastructure remains.
+
+Authorized retained-pair release is running on Pi in exec 3640. It preserves the
+restore-tested 20260905T050131Z pair and the unrelated pre-consolidation backup.
+Poll it before another Pi writer. The immediate native timer acceptance and
+permanent timer activation remain pending; no unattended success is claimed yet.
+
+
+## Real native timer acceptance started — 2026-09-05 15:25 UTC
+
+Retained-pair release exec 3640 exited zero. The older matched pair was deleted;
+the restored/accepted pair and unrelated historical backup remain AVAILABLE.
+The controller finished its actual retention engine with phase=complete and
+retainPreviousPair=false. Oracle independently showed three backups and source
+RUNNING. Evidence: .private/reports/retained-pair-release.json.
+
+Exec 45730 armed the one-shot native Pi timer weekly-backup-live-acceptance and
+exited zero at approximately 15:25:20 UTC. It invokes the real backup:run runtime
+through safepi after ten seconds. This one immediate acceptance run is covered by
+the user's completion instruction and recorded standing backup authorization;
+the recurring Sunday window remains unchanged. No operator assistance has occurred.
+
+Do not open Pi or VPS SSH sessions while this native timer is running. Its
+controller-process guard treats unrelated SSH processes as competing writers.
+Use the Mac .private/observe-real-cycle.ts against OCI for source/backup changes.
+After the new pair is AVAILABLE, source is RUNNING, and the preceding pair is
+removed, allow the final inventory to finish before collecting Pi service/scope
+journals with .private/collect-timer-acceptance.ts. The immediate timer is active;
+permanent weekly/recovery/watchdog timers remain disabled pending real acceptance.
+
+
+## Timer-created pair available — 2026-09-05 15:52 UTC
+
+Mac-only OCI observations prove the native timer stopped the source and created
+both new FULL backups with suffix 20260905T152843Z. The 50 GB staging backup was
+created at 15:41:29 UTC and the 150 GB root backup at 15:44:57 UTC; both are
+AVAILABLE. Source still reported STOPPED at the 15:52:28 observation, while the
+Pi performs pair/stopped-epoch verification before START. All five objects remain
+protected until source acceptance. There has been no operator assistance and no
+Pi or source SSH connection since the timer starter exited. Preserve this live
+cycle; do not start a second run. The prior temporary infrastructure cleanup
+remains accepted and complete. Observations are durable on Mac in
+.private/reports/real-cycle-observations.json; the runtime journal is on Pi.
+
+The user asked why there were three backups. Explained that a complete VPS backup
+uses two objects (boot and root), plus the preserved historical object; this final
+native timer test replaces the previous pair after successful restart rather than
+accumulating copies. This was a status question, not a cancellation of the test.
+
+
+## Timer recovery and focused correction — 2026-09-05 16:17 UTC
+
+The native timer created the 20260905T152843Z pair and restarted the VPS without
+operator intervention. It then failed at 15:56:43.688 UTC because the conservative
+idle check classified the packaged Xfce settings daemon xfconfd as active work.
+Automatic recovery passed: recoveryStatus=running-accepted and guest.restored=true.
+The service exited 1. Oracle-only observations did not expose this failure; the
+first Pi diagnostic read at 16:07 found the terminal failed service. Do not call
+this original attempt an uninterrupted successful cycle.
+
+The user questioned repeated backups. The correction will use the existing pair
+and cause no second outage. Added only xfconfd to the normal desktop process list.
+The installed xfconf package owns /usr/lib/xfce4/xfconf/xfconfd and its D-Bus unit.
+A real generated-shell regression proves old code returns 21 for xfconfd, corrected
+code accepts it, and Chromium still returns 20. All 68 tests/check/fmt/lint pass.
+The correction is deployed with all 25 Pi runtime hashes verified. A read-only
+xfconf-query activated the real daemon, and the corrected Pi guest-idle check
+passed against that live state. No guest startup/service repair was performed.
+
+The native Pi timer weekly-backup-live-acceptance-finish is now completing the
+existing cycle. It archives the exact recovered failure, proves live source health,
+and runs the existing retention engine against the same backup IDs. Its operations
+adapter explicitly prohibits SOFTSTOP, START and backup creation. It cannot cause
+another backup or outage. No operator SSH session should overlap its controller
+checks. Monitor OCI from Mac, then collect terminal service/scope evidence.
+
+Acceptance reporting must distinguish stages: automatic timer backup/restart and
+successful automatic recovery, followed by timer-controlled verification/retention
+after a narrowly tested code correction. Record uninterruptedCycleAccepted=false
+and unattendedCycleAccepted=false for the original single attempt; do not fabricate
+a clean single-attempt result or repeat the outage just to change that label. The
+working prototype is accepted by the real stages plus the focused live correction.
+The first ordinary Sunday-window invocation remains future. Permanent timers are
+still disabled until the corrected retention timer completes successfully.

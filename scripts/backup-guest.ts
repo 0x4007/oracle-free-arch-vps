@@ -177,7 +177,7 @@ while read -r pid parent uid comm; do
   esac
   if [ "$uid" = "$(id -u)" ]; then
     case "$comm" in
-      systemd|"(sd-pam)"|Thunar|Xvnc|at-spi-bus-laun|at-spi2-registr|codex|dbus-broker|dbus-broker-lau|dconf-service|gpg-agent|polkit-gnome-au|ssh-agent|tailscaled|wrapper-2.0|xfce4-panel|xfce4-session|xfdesktop|xfsettingsd|xfwm4|xinit|ps) ;;
+      systemd|"(sd-pam)"|Thunar|Xvnc|at-spi-bus-laun|at-spi2-registr|codex|dbus-broker|dbus-broker-lau|dconf-service|gpg-agent|polkit-gnome-au|ssh-agent|tailscaled|wrapper-2.0|xfce4-panel|xfce4-session|xfconfd|xfdesktop|xfsettingsd|xfwm4|xinit|ps) ;;
       *) printf 'MAINTENANCE_BUSY process=%s pid=%s parent=%s\\n' "$comm" "$pid" "$parent" >&2; exit 21 ;;
     esac
   fi
