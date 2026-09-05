@@ -1,0 +1,36 @@
+# Backblaze file-backup exclusions for the Arch VPS.
+# Restic --exclude-file syntax: absolute paths, one pattern per line.
+# Apply while backing up the live filesystem at /. See 04-BACKUP-RECOVERY.md.
+# This file does not change OCI volume snapshots or delete source files.
+
+# GitHub sync recreates these repositories. The owner keeps .env copies on Mac.
+# Local-only/unpushed files here are intentionally outside this backup's scope.
+/home/codex/repos
+
+# Downloaded Codex executables; retain installer/version details for recovery.
+# Keep the rest of .codex, including authentication, configuration and sessions.
+/home/codex/.codex/packages
+
+# Known disposable user caches and temporary plugin downloads.
+/home/codex/.cache
+/home/codex/.npm/_cacache
+/home/codex/.npm/_logs
+/home/codex/.codex/cache
+/home/codex/.codex/.tmp
+/home/codex/.codex/tmp
+
+# Downloaded Arch packages; keep /var/lib/pacman and installed system files.
+/var/cache/pacman/pkg
+
+# Historical system logs are not required for system recovery.
+/var/log
+
+# Temporary files and runtime state are recreated at boot.
+/tmp
+/var/tmp
+/run
+
+# Kernel/device interfaces, not persistent disk content.
+/proc
+/sys
+/dev

@@ -171,3 +171,48 @@ from application-native dumps or replication evidence.
 - A redacted recovery report and a private identifier ledger.
 - Tenancy-wide Object Storage totals and multipart-upload state.
 - External encrypted-copy ciphertext hash and isolated decrypt-test evidence.
+
+## Backblaze file-backup exclusion policy
+
+`config/restic-excludes.txt` is the version-controlled exclusion list for the
+planned restic file backup to Backblaze B2. It does not affect OCI volume
+snapshots. The file is prepared policy only: the B2 backup job and restore path
+are not configured or accepted yet.
+
+Pass this file to restic's existing `--exclude-file` option when backing up the
+VPS filesystem at `/`. Its paths are anchored to that root. Do not use the list
+unchanged against a recovery filesystem mounted under another directory.
+Do not pass an excluded directory as a separate backup source: restic does not
+apply exclusions to explicitly named source paths.
+
+The initial list excludes GitHub-recoverable repositories, downloaded Codex
+executables, known caches, logs, temporary directories and virtual filesystems.
+The owner has elected to exclude the whole repository directory, including
+local-only files and `.env` files, whose primary copies are on the Mac. There
+is no `.env` exception in this policy.
+
+Keep the installed operating system, `/etc`, `/boot`, `/efi`, user configuration,
+Codex sessions and authentication, and the package database. Do not exclude
+`.codex`, `.config`, `/var/lib`, `/mnt`, or all files above a size threshold.
+Container storage remains included until image sources/build instructions and
+persistent data coverage have been verified. Container bind mounts outside the
+repository directory need normal backup coverage.
+
+Before the first B2 run:
+
+1. Inventory root, EFI and staging filesystems and include their required files.
+   Do not let a filesystem-boundary option silently omit EFI or staging content.
+2. Preserve package versions, the Codex installation procedure, repository sync
+   setup, and the two-disk partition/UUID/boot manifest in the recovery kit.
+3. Preview the selected paths with this list. Confirm that excluded data is
+   omitted and configuration, user data and boot files remain selected.
+4. Measure actual encrypted repository bytes; directory usage is not a storage
+   bill. Retain four complete accepted weekly recovery points.
+5. Prove a restore that recreates excluded software and boots the two-disk system.
+   A file-selection preview alone does not prove a usable backup.
+
+Add exclusions only for a specific replaceable path, with a comment explaining
+how it is recreated. Review large contributors when usage grows. Do not expand
+exclusions automatically based on process names, file extensions or directory
+size. Restic syntax is documented in
+[Excluding files](https://restic.readthedocs.io/en/stable/040_backup.html#excluding-files).
