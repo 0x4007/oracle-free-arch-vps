@@ -530,3 +530,21 @@ Deno.test("online operations expose no outage or recovery methods", () => {
     assert(!(method in ops), `Legacy method remains exposed: ${method}`);
   }
 });
+
+Deno.test("final creation inventory refuses exhausted replacement headroom", async () => {
+  const state = createState({
+    bootBackups: [0, 1, 2, 3].map((n) =>
+      member("boot", `unrelated-${n}`, null)
+    ),
+    rootBackups: [],
+  });
+  await rejects(
+    () => operations(state).createBackupGroup(suffix),
+    "Four retained members leave only one free slot",
+  );
+  assert(
+    !state.calls.some((args) =>
+      args.includes("volume-group-backup") && args.includes("create")
+    ),
+  );
+});

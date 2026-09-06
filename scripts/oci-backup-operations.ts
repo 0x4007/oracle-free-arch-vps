@@ -413,6 +413,12 @@ export function ociBackupOperations(
       // also gives an ambiguous provider response a complete inventory to
       // reconcile, rather than blindly issuing a second create.
       const inventory = await sourceInventory("backing-up");
+      if (inventory.totals.backups + 2 > (policy.allowFifthSlot ? 5 : 4)) {
+        throw new OnlineBackupBlockedError(
+          "Two free backup slots are unavailable at final creation check",
+          "backing-up",
+        );
+      }
       const displayName = `arch-online-golden-${suffix}`;
       if (
         active(inventory.volumeGroupBackups).some((item) =>
