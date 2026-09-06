@@ -278,7 +278,7 @@ Deno.test("typed transient inventory failure persists backoff and resumes", asyn
         "external-read",
       );
     }
-    return snapshot();
+    return await snapshot();
   };
 
   await rejects(
@@ -362,7 +362,7 @@ Deno.test("failed journal without resume metadata stays blocked", async () => {
 Deno.test("lost create response reconciles the same group without a duplicate", async () => {
   const f = fixture();
   let createCalls = 0;
-  f.ops.createBackupGroup = async (suffix) => {
+  f.ops.createBackupGroup = (suffix) => {
     createCalls++;
     assert(suffix === f.journal.suffix);
     assert(f.journal.volumeGroupBackupIntent === true);
@@ -388,9 +388,10 @@ Deno.test("lost create response reconciles the same group without a duplicate", 
     }
     throw new Error("duplicate create was attempted");
   };
-  f.ops.waitBackupGroup = async (id) => {
+  f.ops.waitBackupGroup = (id) => {
     f.calls.push("wait-group");
     assert(id === "new-group");
+    return Promise.resolve();
   };
 
   await rejects(
