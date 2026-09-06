@@ -95,6 +95,9 @@ agent.
 
 ## Included automation
 
+- [Direct encrypted Backblaze backups](BACKBLAZE-DIRECT-BACKUP.md) send filesystem
+  archives between the VPS and Backblaze. The Pi schedules and verifies jobs,
+  records recovery points, and sends status notifications.
 - `scripts/oci-restore.ts` inventories, performs an exactly approved OCI
   `SOFTSTOP`, waits for `STOPPED`, plans, restores, and verifies the two-volume
   recovery unit. It never performs an immediate stop, reset, or automatic
