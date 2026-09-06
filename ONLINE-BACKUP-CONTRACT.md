@@ -1,127 +1,120 @@
-# Online backup integration contract
+# Online backups and tested independent recovery
 
-Canonical lane: weekly-backup-restore-cycle-g2f1e8856a4, branch
-codex/weekly-backup-restore-cycle-g2f1e8856a4. The controlling handoff is
-/Users/nv/repos/0x4007/oracle-free-arch-vps/ONLINE-BACKUP-RECOVERY-HANDOFF-2026-09-06.md.
+Canonical lane: `weekly-backup-restore-cycle-g2f1e8856a4`, branch
+`codex/weekly-backup-restore-cycle-g2f1e8856a4`. The controlling handoff is
+`ONLINE-BACKUP-RECOVERY-HANDOFF-2026-09-06.md` in the repository root.
 
-## Shared interfaces
+## Running Oracle path
 
-`scripts/online-backup-contract.ts` owns the online phase and capture identity,
-source continuity observation, and machine reconstruction proof types. m01 owns
-the concrete policy, journal, inventory and provider adapter in its recorded
-files. m02 owns only the machine restore module and its focused test. The primary
-owns runtime, scheduling, guest reads, shared gates, target selection and live
-acceptance. Existing B2 archive and index version 1 remain unchanged.
+The Pi runs `backup-scheduled.ts` through the existing weekly service. Its normal
+schedule remains Sunday 00:00 America/New_York. The shared controller lock also
+serializes Backblaze work. The obsolete recovery timer is removed, with its
+previous definition and runtime preserved privately. `backup-recovery.ts` only
+reports legacy state; it cannot restart production.
 
-The ordinary Oracle path has no guest quiesce, stop, start, reboot, freeze or
-process-idle operation. A provider group must bind exactly the existing staging
-boot and Arch root volumes. A group backup must bind both member backup IDs and
-one provider capture identity. Matching display names alone are insufficient.
-New online journals use the online phases. Legacy journals remain preserved;
-they cannot be replayed by the online scheduler or treated as online proof.
-Equivalent approval timestamps compare by epoch while retaining original text.
+The normal capture path has no guest stop, start, reboot, freeze or process-idle
+operation. One FULL volume-group backup captures the existing 50 GB staging boot
+and 150 GB Arch root volumes. Exact source, group and member identities establish
+the recovery unit; matching display names do not. Provider-native capture is
+crash-consistent, not proof of application transaction consistency.
 
-The read-only guest adapter supplies `acceptSource()` and continuity observations;
-it does not repair or restart services. The primary removes all mutation methods
-from the scheduled/recovery entrypoint call graph. Failure leaves production
-running and retains exact creation intent for reconciliation. An ambiguous create
-must not trigger another create. Retention preserves every previous accepted
-point until the replacement meets its required acceptance gates.
+Creation intent and the returned group ID are saved before waiting. The waiter
+allows `COMMITTED` while continuing to require `AVAILABLE` for acceptance. An
+ambiguous create never authorizes a second request. Failed runs require explicit
+reconciliation of the recorded object and journal. Complete legacy journals are
+archived before conversion to online state, preserving the standing approval.
 
-No new CLI option, environment variable or secret is part of the interface.
-Resource binding and any target-write approval use the existing private JSON
-configuration convention. The primary records exact target inputs before m02
-starts. A reconstruction result proves extraction only; a separate actual boot,
-SSH, mount, preserved-data and desktop check is required for RESTORE_DRILL_PROVED.
+A separately approved one-time scheduler window permits live acceptance without
+changing the weekly schedule or fabricating the clock. Its claim prevents a
+second capture. Retention checks the accepted replacement before each deletion;
+`retainPreviousPair` prohibits all previous-pair deletion.
 
-## Reconciled baseline, 2026-09-06
+## Live Oracle evidence, 2026-09-06
 
-The canonical lane advanced by fast-forward from ac3a588 to the already merged
-4733f8d; their file trees are identical. PRs 4, 5 and 8 are merged. The untracked
-B2 handoff and unrelated RDP lane are preserved.
+The approved scheduler capture completed at 17:07:41 UTC. The deployed runtime
+files match source revision `63fe190e0b9d0d11742b3e3fca151cff9021c989`.
+The service exited successfully and its scheduler claim is complete.
 
-Live provider inventory at 14:36 UTC proves one running 2 OCPU / 12 GB instance,
-200 GB live volumes, three available backups and one public IP. Exact source
-attachments match. Current subscription and official free-limit checks pass,
-including five backup slots and complete Object Storage accounting within its
-allowance. Group eligibility and accounting require the dedicated audit.
+- One FULL group and its two members are AVAILABLE, totaling 200 GB.
+- The live free-backup counter reports five used and zero available. The wrapper
+  does not consume a sixth slot. All three previous backups remain intact.
+- Production remains one instance, 2 OCPUs, 12 GB RAM, 200 GB live volumes and
+  one public IP. Account and current official free-limit checks passed.
+- Complete Object Storage accounting is 1,453,785,088 bytes, with
+  18,546,214,912 bytes of headroom under the conservative 20 GB bound.
+- All 186 SSH, served-page and VNC probes passed between 16:37:03 and 17:09:42
+  UTC. The boot ID and seven monitored service invocation IDs stayed unchanged.
+  An owned workload advanced throughout; the live desktop was inspected.
 
-Pi runtime journal is complete with guest.restored=true. The weekly service has
-no process and retains its failed Sunday result. The two-minute recovery timer
-remains installed and periodically invokes the old read path; never overwrite
-its runtime while active. Five selected deployed source hashes match canonical,
-and B2 deployment records source revision 2cc5298. B2 controller is COMPLETE with
-two accepted generations. No active source backup worker was found. Production
-boot and service identities were read without interruption.
+The first waiter stopped on the previously unhandled `COMMITTED` state. After a
+focused correction and regression test, the same backup ID was resumed through
+the scheduler. No second backup was created and no source recovery was needed.
 
-Private read-only inventory evidence is in
-.private/reports/online-initial-inventory.json and online-initial-eligibility.json.
-The pending GPT Pro job 25830afe-e9a1-4503-b680-b213ebee5f80 still returned HTTP 429
-at 14:36:51 UTC. Its owned retriever exited after termination; preserve the job
-and do not resubmit. No GPT Pro verdict is available.
+Exact identifiers and receipts remain under `.private/reports/`, including
+`online-complete-runtime.json`, `online-scheduler-acceptance.txt`,
+`online-continuity-summary.json`, `online-post-capture-inventory.json`, and
+`online-final-runtime-deployment.json`.
 
-## Module assignments and concrete restore target
+## Independent Backblaze boot proof
 
-Both module lanes start at shared foundation
-3432a45ab96856ce675715cec41f99d1884412a8. m01 uses policy.volumeGroupId,
-journal.mode="online", journal.captureIdentity, and optional
-BackupPair.volumeGroupBackupId. Guest operations are only acceptSource() and
-observeSource(); scheduler control is beforeCapture(). The primary archives a
-proved-complete legacy journal before allocating an online journal, preserving
-its accepted pair and original approval text. No legacy phase is replayed.
+Generation `generation-681c4067-aec2-45d5-9afb-77ee530e3a97` was reconstructed
+from exact B2 versions and the off-source recovery kit. The approved Mac download
+was about 8.42 GB of encrypted data, plus disposable rescue tools. No production
+filesystem path supplied recovery data and no private decryption key went to
+the VPS.
 
-m02 uses the first accepted generation
-`generation-681c4067-aec2-45d5-9afb-77ee530e3a97`. The independent kit audit proved
-its GPT, partition starts/sizes/UUIDs, six filesystem identities, LVM PV/LV
-metadata, fstab, EFI records, boot files, parity hashes and swap metadata present.
-Its encrypted index and archives total 8,419,333,307 bytes. The newer accepted
-point has no locally decrypted metadata in the kit; do not substitute it without
-retrieving and validating that metadata.
+Two initially empty sparse disks were rebuilt in an AArch64 QEMU guest: 50 GiB
+staging and 150 GiB root, with 4 GiB guest RAM and two vCPUs. All six filesystem
+archives, GPT layout, UUIDs, LVM metadata and fallback swap were restored.
+Filesystem reconstruction ran from 16:53:24 to approximately 17:02:30 UTC.
 
-The selected proposed target is the existing Mac ARM QEMU HVF, 4 GiB RAM and two
-vCPUs, with an AArch64 Linux rescue guest and two initially empty sparse 50/150
-GiB disks. Proposed directory is
-/Users/nv/.local/share/arch-vps-recovery/drill-20260906-online. Disk serials are
-uos-restore-20260906-stage and uos-restore-20260906-root. m02 executes inside the
-rescue guest against exact serial-bound devices; primary owns host launch,
-download, private-key handling, clone isolation, EDK2 variables and actual boot.
-Home download and destructive target setup/cleanup approval was requested with
-the concrete private target request and remains pending. No target was created.
+The corrected disks booted the retained EFI/shim/GRUB staging chain into Arch
+Linux ARM at 17:15:23 UTC. SSH, root and EFI mounts, staged kernel/initramfs
+parity, fallback metadata/swap, preserved Codex configuration, Docker containers,
+Guacamole markup and a visually inspected Xfce desktop passed. Restricted QEMU
+networking and a guest firewall blocked Internet and cloud metadata access.
+Copied agents and sync jobs were masked; the rescue share was absent.
 
-Official API/documentation and the live block-storage limits support a two-member
-FULL group backup. At 14:48 UTC free-backup-count reports used=3, available=2.
-No separate group-backup limit or SKU was found; wrapper accounting is an
-API-backed inference and must be checked after creation before acceptance.
-There are zero current groups and zero group backups. The exact group request
-is prepared privately; no creation approval or provider mutation is recorded.
+Live testing found three reconstruction corrections now in the module:
 
-The scheduler accepts an optional, separately approved one-time window in the
-existing private schedule record. Its start and expiry use real UTC time and
-are bounded to four hours from approval. The existing claim prevents a second
-attempt for that window. Weekly timing is unchanged; this is a path for actual
-scheduler acceptance without a fabricated clock or a week-long wait.
+- Read full SCSI hardware serials through udev when Alpine's lsblk omits them.
+- Recreate excluded runtime directories and temporary-directory permissions.
+- Explicitly select XFS features compatible with the retained GRUB 2.06 and
+  Oracle fallback kernel. Current mkfs.xfs defaults were not boot-compatible.
 
-Restore validation accepts provider-generated member names only with a live
-FULL, AVAILABLE group record that binds the two exact member IDs, source group,
-compartment, source volumes and sizes. Disaster restore approval continues to
-bind the selected backups and reserved IP; group IDs are also approval-bound.
+The clone also needed a new X11 cookie after its hostname changed. This is an
+isolation preparation step. The drill required these operator corrections; it
+is not evidence of a zero-intervention restore. The dated proof is separate
+from each generation's archive verification.
 
-The proposed QEMU disks use SCSI behind a virtio SCSI controller so their full
-serial strings remain distinct. Virtio block's shorter ID field cannot retain
-the requested strings. The target sizes, files and serials are unchanged.
-The B2 worker incorrectly merged its own fb73cc5 commit into canonical as
-3046c06. The primary preserved that ancestry, corrected ownership, and then
-validated the integrated result. The worker's later 59c5194 option replacement
-was rejected and remains unintegrated. Only the primary writes canonical now.
-Pure mapping against the actual first-generation kit passed; no disk rebuild
-or boot is proved by these source changes.
+The guest shut down cleanly. Temporary disks, downloaded/decrypted payloads and
+the drill SSH key were removed. Small reports, the desktop image, executed
+procedure and hashed source files remain in the private recovery kit. B2 objects
+and both accepted generations were preserved.
 
-Local review round 1 examined c7ed4e9 against 4733f8d and returned a usable
-verdict with three restore blockers and four migration/retention findings.
-Corrections pass the captured LVM metadata to pvcreate, create nested mount
-directories after their parent is mounted, remove the unsupported tar option,
-accept normally completed legacy journals after live checks, and poll complete
-inventory for deletion. Resume permits only the filesystem work completed at
-the saved stage and can observe an already-running deletion cascade.
-GNU tar 1.35 accepted the corrected arguments in a read-only version check.
-The deployment and both real restore drills remain unperformed.
+## Reproduction and remaining boundaries
+
+Use `backblaze-machine-restore.ts` with the existing private JSON input convention:
+selected index and digest, matching metadata, verified plaintext descriptors,
+and an approved serial-bound target. It returns `FILESYSTEMS_REBUILT`, never a
+boot claim. Before boot, set clone identities, mask outbound jobs, isolate the
+network, refresh hostname-bound X11 authentication, and remove the rescue share.
+Then run the SSH, filesystem, data, application and desktop acceptance checks.
+The private kit retains the exact tested host/rescue commands and library hashes.
+
+The Oracle group members pass live identity and restore-validator checks, but the
+new Oracle point has not been restored and booted. Historical stopped-pair boot
+proof and the independent B2 boot proof do not establish that result. The two
+approved requests excluded a new OCI clone. Production already uses the full
+200 GB live-storage allowance, so a separate Oracle boot target needs a new
+scope/resource decision.
+
+`retainPreviousPair` remains true. All five backup slots are occupied; another
+capture cannot proceed until an approved retention action frees two slots.
+Neither existing-backup deletion nor a new Oracle clone was included in this
+acceptance run. Do not describe recurring rotation or the entire handoff as
+complete while these boundaries remain unresolved.
+
+The three permitted local review rounds were used before live acceptance. The
+live corrections received focused tests and actual runtime checks; no fourth
+review was run. PR #9 remains draft pending the remaining acceptance decision.

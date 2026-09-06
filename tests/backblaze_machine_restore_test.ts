@@ -430,77 +430,83 @@ Deno.test("restore mount bindings reject a nested-path substitute or a different
   }
 });
 
-Deno.test("SCSI target uses full hardware serial and refuses a substituted disk", async () => {
-  const index = makeIndex();
-  const workDirectory = await Deno.realPath(await Deno.makeTempDir());
-  await Deno.chmod(workDirectory, 0o700);
-  try {
-    const input: MachineRestoreInput = {
-      index,
-      indexSha256: machineRestoreIndexSha256(index),
-      metadata: metadata(index),
-      target: { ...TARGET, workDirectory },
-      archives: index.archives.filter((a) => a.role !== "recovery").map((
-        a,
-      ) => ({
-        role: a.role as Exclude<typeof a.role, "recovery">,
-        path: `/recovery/${a.role}.tar.zst`,
-        bytes: 4,
-        sha256: "ab".repeat(32),
-        ciphertextBytes: a.bytes,
-        ciphertextSha256: a.sha256,
-      })),
-    };
-    for (const substituted of [false, true]) {
-      let resolves = 0;
-      await rejects(
-        restoreMachine(input, (command, args) => {
-          if (command === "lsblk") {
-            return Promise.resolve({
-              code: 0,
-              stderr: "",
-              stdout: JSON.stringify({
-                blockdevices: [
-                  {
-                    path: "/dev/sda",
-                    type: "disk",
-                    size: TARGET.bootDiskBytes,
-                    serial: null,
-                  },
-                  {
-                    path: "/dev/sdb",
-                    type: "disk",
-                    size: TARGET.rootDiskBytes,
-                    serial: null,
-                  },
-                ],
-              }),
-            });
-          }
-          if (command === "udevadm") {
-            return Promise.resolve({
-              code: 0,
-              stderr: "",
-              stdout: "ID_SERIAL_SHORT=short-id\nID_SCSI_SERIAL=" +
-                (args.at(-1) === "--name=/dev/sda"
-                  ? "uos-restore-20260906-stage"
-                  : substituted
-                  ? "another-disk"
-                  : "uos-restore-20260906-root") +
-                "\n",
-            });
-          }
-          if (command === "readlink") {
-            resolves++;
-            return Promise.resolve({ code: 1, stdout: "", stderr: "" });
-          }
-          throw new Error("Unexpected command before serial acceptance");
-        }),
-        substituted ? "target:serial" : "target:resolve:exit",
-      );
-      assert(resolves === (substituted ? 0 : 1));
+Deno.test({
+  name: "SCSI target uses full hardware serial and refuses a substituted disk",
+  ignore:
+    (await Deno.permissions.query({ name: "read" })).state !== "granted" ||
+    (await Deno.permissions.query({ name: "write" })).state !== "granted",
+  fn: async () => {
+    const index = makeIndex();
+    const workDirectory = await Deno.realPath(await Deno.makeTempDir());
+    await Deno.chmod(workDirectory, 0o700);
+    try {
+      const input: MachineRestoreInput = {
+        index,
+        indexSha256: machineRestoreIndexSha256(index),
+        metadata: metadata(index),
+        target: { ...TARGET, workDirectory },
+        archives: index.archives.filter((a) => a.role !== "recovery").map((
+          a,
+        ) => ({
+          role: a.role as Exclude<typeof a.role, "recovery">,
+          path: `/recovery/${a.role}.tar.zst`,
+          bytes: 4,
+          sha256: "ab".repeat(32),
+          ciphertextBytes: a.bytes,
+          ciphertextSha256: a.sha256,
+        })),
+      };
+      for (const substituted of [false, true]) {
+        let resolves = 0;
+        await rejects(
+          restoreMachine(input, (command, args) => {
+            if (command === "lsblk") {
+              return Promise.resolve({
+                code: 0,
+                stderr: "",
+                stdout: JSON.stringify({
+                  blockdevices: [
+                    {
+                      path: "/dev/sda",
+                      type: "disk",
+                      size: TARGET.bootDiskBytes,
+                      serial: null,
+                    },
+                    {
+                      path: "/dev/sdb",
+                      type: "disk",
+                      size: TARGET.rootDiskBytes,
+                      serial: null,
+                    },
+                  ],
+                }),
+              });
+            }
+            if (command === "udevadm") {
+              return Promise.resolve({
+                code: 0,
+                stderr: "",
+                stdout: "ID_SERIAL_SHORT=short-id\nID_SCSI_SERIAL=" +
+                  (args.at(-1) === "--name=/dev/sda"
+                    ? "uos-restore-20260906-stage"
+                    : substituted
+                    ? "another-disk"
+                    : "uos-restore-20260906-root") +
+                  "\n",
+              });
+            }
+            if (command === "readlink") {
+              resolves++;
+              return Promise.resolve({ code: 1, stdout: "", stderr: "" });
+            }
+            throw new Error("Unexpected command before serial acceptance");
+          }),
+          substituted ? "target:serial" : "target:resolve:exit",
+        );
+        assert(resolves === (substituted ? 0 : 1));
+      }
+    } finally {
+      await Deno.remove(workDirectory, { recursive: true });
     }
-  } finally {
-    await Deno.remove(workDirectory, { recursive: true });
-  }
+  },
 });
