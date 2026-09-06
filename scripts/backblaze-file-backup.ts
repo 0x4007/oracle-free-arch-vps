@@ -142,6 +142,15 @@ const MAX_RECEIPT_BYTES = 64 * 1024;
 const MAX_SETTINGS_BYTES = 64 * 1024;
 const MAX_GPG_DIAGNOSTIC_BYTES = 256 * 1024;
 
+const VERIFIER_GIB = 1024 ** 3;
+const VERIFIER_MIB = 1024 ** 2;
+/** Same free-space constants as the capture stage: after every verifier
+ * write the recovery/verification filesystem must still keep the 5 GiB
+ * reserve plus the 512 MiB margin free. */
+const VERIFIER_SPACE_RESERVE = 5 * VERIFIER_GIB;
+const VERIFIER_SPACE_MARGIN = 512 * VERIFIER_MIB;
+const VERIFIER_SPACE_MIN_FREE = VERIFIER_SPACE_RESERVE + VERIFIER_SPACE_MARGIN;
+
 const JOB_ID_PATTERN =
   /^job-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const GENERATION_PATTERN =
@@ -3129,6 +3138,126 @@ function verifierErrorCode(message: string): VerifierErrorCode {
   return "STATUS_FAILED";
 }
 
+/** Sum of the validated index's ciphertext archive byte totals with safe
+ * integer arithmetic; a malformed or overflowing total fails closed. */
+export function verifierCiphertextTotal(index: RecoveryIndex): number {
+  let total = 0;
+  for (const archive of index.archives) {
+    const bytes = archive.bytes;
+    if (!Number.isSafeInteger(bytes) || bytes <= 0) {
+      throw new Error("Recovery index archive byte total is invalid");
+    }
+    total += bytes;
+    if (!Number.isSafeInteger(total)) {
+      throw new Error("Recovery index archive byte totals overflow");
+    }
+  }
+  return total;
+}
+
+/** Additional bytes the recovery/verification filesystem must still hold,
+ * over and above what is already on disk: one complete new ciphertext copy
+ * plus the full decrypted plaintext plus a conservative ciphertext-sized
+ * allowance for verifier scratch/sample overhead. The capture stage encrypts
+ * with `--compress-algo none`, so the ciphertext byte total bounds the
+ * compressed plaintext size; after reconstruction the ciphertext copy is on
+ * disk and only the plaintext/scratch requirement remains (never counting
+ * the reconstruction twice). The 5 GiB reserve + 512 MiB margin are applied
+ * by the on-disk check, not here. */
+export function verifierHeadroomRequirement(
+  index: RecoveryIndex,
+  afterReconstruction: boolean,
+): number {
+  const ciphertext = verifierCiphertextTotal(index);
+  const reconstructionCopy = afterReconstruction ? 0 : ciphertext;
+  const requirement = reconstructionCopy + ciphertext + ciphertext;
+  if (!Number.isSafeInteger(requirement) || requirement < 0) {
+    throw new Error("Verifier headroom requirement overflows");
+  }
+  return requirement;
+}
+
+/** Fixed GNU df availability read: `df -B1 --output=avail <path>` resolved
+ * from PATH, with strict numeric parsing and a fail-closed unreadable or
+ * malformed capacity (non-zero exit, extra data lines, non-numeric output,
+ * non-safe-integer or non-positive values all reject). */
+export async function readVerifierAvailBytes(path: string): Promise<number> {
+  const result = await new Deno.Command("df", {
+    args: ["-B1", "--output=avail", path],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  if (!result.success) {
+    throw new Error(
+      `Verifier filesystem availability check failed (${result.code})`,
+    );
+  }
+  const lines = new TextDecoder().decode(result.stdout).split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  let data = lines;
+  if (data.length > 0 && /^Avail$/i.test(data[0])) data = data.slice(1);
+  if (data.length !== 1 || !/^[0-9]+$/.test(data[0])) {
+    throw new Error("Verifier filesystem availability output is malformed");
+  }
+  const avail = Number(data[0]);
+  if (!Number.isSafeInteger(avail) || avail <= 0) {
+    throw new Error("Verifier filesystem availability is invalid");
+  }
+  return avail;
+}
+
+async function nearestExistingAncestor(path: string): Promise<string> {
+  let current = path;
+  while (true) {
+    try {
+      await Deno.stat(current);
+      return current;
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    }
+    const parent = current.slice(0, current.lastIndexOf("/"));
+    if (parent === "" || parent === current) {
+      throw new Error(`No existing ancestor for ${path}`);
+    }
+    current = parent;
+  }
+}
+
+/** Real capacity gate before any verifier payload write: the recovery and
+ * verification production paths must live on the checked filesystem, and the
+ * available bytes there must cover the requirement plus the 5 GiB reserve
+ * and 512 MiB margin. Any unreadable capacity fails closed. */
+export async function assertVerifierHeadroom(
+  recoveryDir: string,
+  verificationDir: string,
+  requirement: number,
+): Promise<void> {
+  if (!Number.isSafeInteger(requirement) || requirement < 0) {
+    throw new Error("Verifier headroom requirement is invalid");
+  }
+  const [recoveryInfo, verificationInfo] = await Promise.all([
+    Deno.stat(recoveryDir),
+    Deno.stat(await nearestExistingAncestor(verificationDir)),
+  ]);
+  if (
+    recoveryInfo.dev === null || verificationInfo.dev === null ||
+    recoveryInfo.dev !== verificationInfo.dev
+  ) {
+    throw new Error(
+      "Verifier recovery and verification paths are on different filesystems",
+    );
+  }
+  const avail = await readVerifierAvailBytes(recoveryDir);
+  const required = requirement + VERIFIER_SPACE_MIN_FREE;
+  if (!Number.isSafeInteger(required) || avail - required < 0) {
+    throw new Error(
+      `Verifier recovery space insufficient: available ${avail} bytes, ` +
+        `required ${required} bytes`,
+    );
+  }
+}
+
 async function runSourceVerifier(
   jobId: string,
   settings: TransportSettings,
@@ -3287,12 +3416,21 @@ async function runSourceVerifier(
 
     const recoveryDir = `${RECOVERY_BASE}/${request.generation}`;
     await ensureRecoveryDir(recoveryDir);
+    const verificationDir = `${VERIFICATION_BASE}/${request.generation}`;
+    // Real capacity gate before any reconstruction payload is written: the
+    // recovery and verification paths must be on the same checked
+    // filesystem, and it must hold the fresh ciphertext copy plus the
+    // plaintext plus a scratch allowance on top of the free reserve.
+    await assertVerifierHeadroom(
+      recoveryDir,
+      verificationDir,
+      verifierHeadroomRequirement(workerResult.index, false),
+    );
     const reconstructed = await deps.reconstruct(
       workerResult.index,
       store,
       recoveryDir,
     );
-    const verificationDir = `${VERIFICATION_BASE}/${request.generation}`;
     try {
       await Deno.mkdir(verificationDir, { mode: 0o700 });
     } catch (error) {
@@ -3301,6 +3439,14 @@ async function runSourceVerifier(
       }
       throw error;
     }
+    // Recheck once the reconstruction is on disk so its bytes are already
+    // subtracted by availability: only the remaining plaintext/scratch
+    // requirement plus the reserve must still fit.
+    await assertVerifierHeadroom(
+      recoveryDir,
+      verificationDir,
+      verifierHeadroomRequirement(workerResult.index, true),
+    );
     const receipt = await deps.verify(
       workerResult.index,
       reconstructed,
@@ -4130,6 +4276,18 @@ export async function stepBackupController(
         );
         if (!cleared) return state;
       }
+      // The immutable deadline gates WORKER_TERMINAL before any verifier
+      // gate is created, any tunnel is opened or any verifier is launched:
+      // an expired request reuses the REQUESTED expiry/orphan semantics. An
+      // exact matching gate is orphaned (never cleared without proof); a
+      // foreign gate is never touched.
+      if (now.getTime() > boundedDeadline) {
+        const deadlineGate = await deps.gate.read();
+        if (deadlineGate !== null && deadlineGate.jobId !== request.jobId) {
+          throw new Error("Gate belongs to a different job");
+        }
+        return await orphanJob(deps, state, "SOURCE_UNREACHABLE_AT_DEADLINE");
+      }
       const derived = deriveVerifierGate(
         request,
         job.envelope.requestSha256,
@@ -4545,7 +4703,34 @@ async function pruneStep(
   if (job === undefined) throw new Error("No controller job to prune");
   const config = await loadSourceConfig(deps);
   const store = deps.metadataStore(config.b2);
-  const fresh = await store.versions();
+  let fresh: B2Object[];
+  try {
+    fresh = await store.versions();
+  } catch (error) {
+    // A transient provider/transport inventory failure is never allowed to
+    // escape to the step dispatcher (which would permanently mark the job
+    // FAILED): keep the current job/catalog/phase and resumable evidence.
+    const reason = error instanceof Error ? error.message : String(error);
+    deps.logger(`Prune inventory failed: ${reason.slice(0, 200)}`);
+    if (job.prune === undefined) {
+      // No prune plan exists yet: never invent an empty completed plan that
+      // would drop catalog membership without deleting eligible objects.
+      // ACCEPTED and the pending plan allocation are preserved for the
+      // next normal poll.
+      return state;
+    }
+    return await persist(deps, {
+      ...state,
+      job: {
+        ...job,
+        prune: {
+          ...job.prune,
+          failedAtUtc: now.toISOString(),
+          evidence: `inventory failed: ${reason.slice(0, 200)}`,
+        },
+      },
+    });
+  }
   const selection = selectPruneCandidates(fresh, state.catalog);
   const currentAccepted = state.catalog.some((entry) =>
     entry.index.generation === job.envelope.request.generation
@@ -4709,7 +4894,27 @@ async function deletePruned(
       },
     });
   }
-  fresh = await store.versions();
+  try {
+    fresh = await store.versions();
+  } catch (error) {
+    // The post-delete refresh is a transient provider/transport inventory
+    // failure too: it must never escape and permanently mark the job FAILED.
+    // Keep PRUNING with the exact plan and all planned IDs, write bounded
+    // failure evidence and let the next normal poll re-inventory fresh
+    // (already-absent IDs are treated as already removed).
+    const reason = error instanceof Error ? error.message : String(error);
+    return await persist(deps, {
+      ...state,
+      job: {
+        ...job,
+        prune: {
+          ...plan,
+          failedAtUtc: now.toISOString(),
+          evidence: `refresh inventory failed: ${reason.slice(0, 200)}`,
+        },
+      },
+    });
+  }
   const afterGuard = selectPruneCandidates(fresh, state.catalog);
   const after = revalidatePruneDeletions(
     fresh,
@@ -5096,9 +5301,16 @@ async function cleanupStep(
 // Pi run loop and entry
 // ---------------------------------------------------------------------------
 
+/** One polling run: scheduled under the immutable request deadline. The
+ * default lifetime follows the job's real `deadlineAtUtc` (checked between
+ * steps) and never stops merely at a fixed step count; `maxSteps` remains an
+ * explicitly supplied test/diagnostic bound. At the deadline one final state
+ * assessment runs (preserving any terminal/orphan evidence the step
+ * persisted) and the run reports incomplete/failure truthfully instead of
+ * rewriting durable state from stale data. */
 export async function runBackblazeCycle(
   deps: PiDeps,
-  maxSteps: number = 400,
+  maxSteps: number = Number.POSITIVE_INFINITY,
 ): Promise<BackblazeRunReport> {
   const initial = await deps.private.read<ControllerState>(
     CONTROLLER_STATE_PATH,
@@ -5121,8 +5333,15 @@ export async function runBackblazeCycle(
     healthy: false,
     detail: message,
   });
+  let deadlineExpired = false;
   try {
     for (let step = 0; step < maxSteps; step += 1) {
+      // The immutable request deadline bounds the default lifetime; it is
+      // re-checked between steps, never derived from the step counter.
+      const deadline = state.job?.envelope.request.deadlineAtUtc;
+      const atDeadline = deadline !== undefined &&
+        Date.parse(deadline) <= deps.now().getTime();
+      if (atDeadline) deadlineExpired = true;
       const before = state.job?.phase ?? "none";
       let next: ControllerState;
       try {
@@ -5157,6 +5376,14 @@ export async function runBackblazeCycle(
           // The error followed a durable transition: resume from the
           // latest persisted state instead of forcing a terminal FAILED.
           state = durable!;
+          if (
+            atDeadline && durable!.job!.phase !== "COMPLETE" &&
+            durable!.job!.phase !== "FAILED"
+          ) {
+            // The final expiry assessment already ran this iteration; a
+            // terminal durable transition is reported on the next one.
+            break;
+          }
           continue;
         }
         const base = durable ?? state;
@@ -5207,6 +5434,7 @@ export async function runBackblazeCycle(
         return reportValue;
       }
       state = next;
+      if (atDeadline) break;
       await deps.sleep(POLL_INTERVAL_MS);
     }
   } finally {
@@ -5234,7 +5462,9 @@ export async function runBackblazeCycle(
       generation: state.job.envelope.request.generation,
     }),
     healthy: false,
-    detail: "Step budget exhausted",
+    detail: deadlineExpired
+      ? "Request deadline reached"
+      : "Step budget exhausted",
   };
   await deps.private.write(B2_REPORT_PATH, {
     ...assessBackblazeWatchdog(state, await deps.gate.read(), deps.now()),

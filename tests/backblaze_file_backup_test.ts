@@ -43,6 +43,7 @@ import type { FileSource } from "../scripts/backblaze-capture.ts";
 import type { CommandResult } from "../scripts/oci.ts";
 import type { DecryptedVerification } from "../scripts/backblaze-verifier.ts";
 import {
+  assertVerifierHeadroom,
   assessBackblazeWatchdog,
   buildCleanupScript,
   buildClearProof,
@@ -69,6 +70,7 @@ import {
   type PrivateSeam,
   PUBLIC_HOME_BASE,
   pumpGpgStdout,
+  readVerifierAvailBytes,
   realPrivateSeam,
   realRemoteSeam,
   realTunnelSeam,
@@ -91,6 +93,8 @@ import {
   validateSavedWorkerResult,
   validateTransportSettings,
   validateVerifierStatus,
+  verifierCiphertextTotal,
+  verifierHeadroomRequirement,
   verifyUnitName,
   type WatchdogAssessment,
   weekWindow,
@@ -4457,4 +4461,538 @@ Deno.test("service: permission flags grant the controller reads and host validat
   } finally {
     await Deno.remove(dir, { recursive: true }).catch(() => {});
   }
+});
+
+// ---------------------------------------------------------------------------
+// Final review regressions: verifier headroom, run-loop lifetime, expired
+// WORKER_TERMINAL launch prevention and prune inventory retries
+// ---------------------------------------------------------------------------
+
+Deno.test("verifier: headroom requirement derives from the validated index and fails closed on overflow", () => {
+  const fixture = generationFixture(61, WINDOW_START);
+  const total = fixture.upload.totalBytes;
+  assert(total > 0, "fixture ciphertext total must be positive");
+  assert(
+    verifierCiphertextTotal(fixture.index) === total,
+    "the index archive byte totals equal the upload ciphertext total",
+  );
+  // Another complete ciphertext copy + plaintext bound + scratch allowance
+  // before reconstruction; after reconstruction only the remaining
+  // plaintext/scratch requirement (the copy is already subtracted by df).
+  assert(
+    verifierHeadroomRequirement(fixture.index, false) === 3 * total,
+    "before reconstruction three ciphertext-sized allowances are required",
+  );
+  assert(
+    verifierHeadroomRequirement(fixture.index, true) === 2 * total,
+    "after reconstruction the copy is not counted twice",
+  );
+  const overflow = {
+    ...fixture.index,
+    archives: [
+      { ...fixture.index.archives[0], bytes: Number.MAX_SAFE_INTEGER },
+      { ...fixture.index.archives[1], bytes: 2 },
+    ],
+  };
+  let threw = false;
+  try {
+    verifierCiphertextTotal(overflow);
+  } catch {
+    threw = true;
+  }
+  assert(threw, "overflowing ciphertext totals must fail closed");
+  const nonPositive = {
+    ...fixture.index,
+    archives: [{ ...fixture.index.archives[0], bytes: 0 }],
+  };
+  threw = false;
+  try {
+    verifierCiphertextTotal(nonPositive);
+  } catch {
+    threw = true;
+  }
+  assert(threw, "non-positive archive byte totals must fail closed");
+});
+
+Deno.test("verifier: the real df availability read is strict and the capacity gate keeps the 5 GiB + 512 MiB reserve", async () => {
+  if (!(await fsPermissionsGranted())) {
+    console.log("verifier headroom: skipped without write/run permissions");
+    return;
+  }
+  const dir = await Deno.makeTempDir({ prefix: "m09-verifier-headroom-" });
+  try {
+    const recoveryDir = `${dir}/recovery`;
+    const verificationDir = `${dir}/verification`;
+    await Deno.mkdir(recoveryDir);
+    await Deno.mkdir(verificationDir);
+    const dfPath = `${dir}/df`;
+    const writeDf = async (body: string, exitCode?: number): Promise<void> => {
+      const lines = body.split("\n").map((line) => `printf '%s\\n' ${line}`)
+        .join("\n");
+      await Deno.writeTextFile(
+        dfPath,
+        `#!/bin/sh\n${lines}\n${
+          exitCode === undefined ? "" : `exit ${exitCode}\n`
+        }`,
+      );
+      await Deno.chmod(dfPath, 0o755);
+    };
+    const previousPath = Deno.env.get("PATH") ?? "";
+    try {
+      Deno.env.set("PATH", `${dir}:${previousPath}`);
+      await writeDf("Avail\n123456789", 0);
+      assert(
+        await readVerifierAvailBytes(recoveryDir) === 123456789,
+        "the GNU df avail column parses to bytes",
+      );
+      await writeDf("Avail\n0", 0);
+      let threw = false;
+      try {
+        await readVerifierAvailBytes(recoveryDir);
+      } catch {
+        threw = true;
+      }
+      assert(threw, "a zero avail value must fail closed");
+      await writeDf("Avail\nnot-a-number", 0);
+      threw = false;
+      try {
+        await readVerifierAvailBytes(recoveryDir);
+      } catch {
+        threw = true;
+      }
+      assert(threw, "a non-numeric avail value must fail closed");
+      await writeDf("Avail\n10\n20", 0);
+      threw = false;
+      try {
+        await readVerifierAvailBytes(recoveryDir);
+      } catch {
+        threw = true;
+      }
+      assert(threw, "multiple filesystem rows must fail closed");
+      await writeDf("Avail\n5", 3);
+      threw = false;
+      try {
+        await readVerifierAvailBytes(recoveryDir);
+      } catch {
+        threw = true;
+      }
+      assert(threw, "a failing df must fail closed");
+      const fixture = generationFixture(62, WINDOW_START);
+      const requirement = verifierHeadroomRequirement(fixture.index, false);
+      const reserve = 5 * 1024 ** 3 + 512 * 1024 ** 2;
+      await writeDf(`Avail\n${requirement + reserve - 1}`, 0);
+      threw = false;
+      try {
+        await assertVerifierHeadroom(
+          recoveryDir,
+          verificationDir,
+          requirement,
+        );
+      } catch {
+        threw = true;
+      }
+      assert(threw, "one byte below the requirement plus reserve must reject");
+      await writeDf(`Avail\n${requirement + reserve + 1}`, 0);
+      await assertVerifierHeadroom(recoveryDir, verificationDir, requirement);
+    } finally {
+      Deno.env.set("PATH", previousPath);
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true }).catch(() => {});
+  }
+});
+
+Deno.test("orchestration: an expired WORKER_TERMINAL launches no verifier and reuses the deadline orphan", async () => {
+  const fixture = generationFixture(63, WINDOW_START);
+  const state = stateWithJob(fixture, "WORKER_TERMINAL", {
+    workerStatus: workerPendingStatus(fixture, INVOCATION_A),
+    resultSha256: "77".repeat(32),
+  });
+  const expired = () =>
+    new Date(Date.parse(fixture.request.deadlineAtUtc) + 1000);
+
+  // No existing gate: the expiry orphans the job without any verifier gate,
+  // tunnel or launch (no RuntimeMaxSec workaround either).
+  const h = harness({ now: expired() });
+  const next = await stepBackupController(state, h.deps, h.deps.now());
+  assert(next.job!.phase === "FAILED", `phase=${next.job!.phase}`);
+  assert(
+    next.job!.failure!.code === "ORPHANED_SOURCE_UNREACHABLE_AT_DEADLINE",
+    `code=${next.job!.failure!.code}`,
+  );
+  assert(h.launches.length === 0, "expired work is never launched");
+  assert(h.tunnels.length === 0, "expired work never opens a tunnel");
+  assert(!h.events.includes("gate:create"), "expired work creates no gate");
+  assert(h.gate.value === null, "no gate is invented for expired work");
+
+  // A matching existing verifier gate is orphaned, never cleared without
+  // proof, and never launched through.
+  const matching = harness({
+    now: expired(),
+    gateValue: deriveVerifierGate(
+      fixture.request,
+      fixture.requestSha256,
+    ),
+  });
+  const orphaned = await stepBackupController(
+    state,
+    matching.deps,
+    matching.deps.now(),
+  );
+  assert(orphaned.job!.phase === "FAILED");
+  assert(
+    matching.gate.value !== null &&
+      (matching.gate.value.state as string) === "orphaned",
+    "the exact matching gate is orphaned",
+  );
+  assert(
+    matching.gate.orphaned.includes("SOURCE_UNREACHABLE_AT_DEADLINE"),
+    matching.gate.orphaned.join(","),
+  );
+  assert(!matching.events.includes("gate:clear"));
+  assert(matching.launches.length === 0);
+  assert(matching.tunnels.length === 0);
+
+  // A foreign gate is never touched: the step fails closed and the gate
+  // stays active.
+  const foreign = harness({
+    now: expired(),
+    gateValue: {
+      ...deriveVerifierGate(fixture.request, fixture.requestSha256),
+      jobId: "job-ffffffff-ffff-ffff-ffff-ffffffffffff",
+    },
+  });
+  let threw = false;
+  try {
+    await stepBackupController(state, foreign.deps, foreign.deps.now());
+  } catch {
+    threw = true;
+  }
+  assert(threw, "a foreign gate at expiry must fail closed");
+  assert(
+    foreign.gate.value !== null &&
+      (foreign.gate.value.state as string) === "active",
+    "a foreign gate is never cleared or orphaned",
+  );
+  assert(!foreign.events.includes("gate:clear"));
+});
+
+Deno.test("cycle: the default step budget follows the request deadline past 400 polls and keeps the tunnel", async () => {
+  const fixture = generationFixture(64, WINDOW_START);
+  const receiptText = JSON.stringify(fixture.receipt);
+  const receiptSha256 = sha256HexSync(new TextEncoder().encode(receiptText));
+  const accepted = verifierAcceptedStatus(
+    fixture,
+    INVOCATION_B,
+    receiptSha256,
+  );
+  const { receiptSha256: _receipt, ...acceptedBase } = accepted;
+  const verifying = {
+    ...acceptedBase,
+    state: "VERIFYING",
+    finishedAtUtc: null,
+  };
+  const runningProps = new Map<string, string>([
+    ["LoadState", "loaded"],
+    ["ActiveState", "active"],
+    ["SubState", "running"],
+    ["Result", "success"],
+    ["MainPID", "123"],
+    ["ControlPID", "0"],
+    ["InvocationID", INVOCATION_B],
+  ]);
+  const state = stateWithJob(fixture, "VERIFIER_RUNNING", {
+    workerInvocationId: INVOCATION_A,
+    workerStatus: workerPendingStatus(fixture, INVOCATION_A),
+    verifierInvocationId: INVOCATION_B,
+    verifierStatus: verifying,
+  });
+  let verifierPolls = 0;
+  const h = harness({
+    // Beyond the old 400 * 30s default (200 min) but before the 6 h
+    // immutable deadline: the default lifetime must keep polling.
+    now: new Date(WINDOW_START + 3.5 * 3_600_000),
+    gateValue: {
+      ...deriveVerifierGate(fixture.request, fixture.requestSha256),
+      unitInvocationId: INVOCATION_B,
+    },
+    versions: inventoryFor([fixture]),
+    observed: (unitName) => {
+      if (!unitName.startsWith("arch-vps-b2-verify-")) {
+        throw new Error(`unexpected observed unit ${unitName}`);
+      }
+      verifierPolls += 1;
+      if (verifierPolls > 406) return terminalObserved(accepted);
+      return {
+        props: runningProps,
+        status: verifying,
+        lockFree: false,
+        reachable: true,
+      };
+    },
+    rootResponder: (script) =>
+      script.includes("receipt.json")
+        ? { code: 0, stdout: receiptText, stderr: "" }
+        : undefined,
+    seedPrivate: (map) => {
+      map.set(
+        `${PIP_JOB_EVIDENCE_PATH}/${fixture.jobId}/result.json`,
+        new TextEncoder().encode(JSON.stringify(fixture.workerResult)),
+      );
+    },
+  });
+  await h.deps.private.write(CONTROLLER_STATE_PATH, state);
+  const report = await runBackblazeCycle(h.deps);
+  assert(
+    report.status.startsWith("B2_BACKUP_COMPLETE"),
+    `status=${report.status}`,
+  );
+  assert(
+    verifierPolls > 406,
+    `the loop polled beyond the old 400-step cap (polls=${verifierPolls})`,
+  );
+  assert(
+    h.tunnelCloses() === 1,
+    `the tunnel closes exactly once at the end (closes=${h.tunnelCloses()})`,
+  );
+  assert(h.tunnels.length === 1, "one decrypt tunnel for the whole run");
+});
+
+Deno.test("cycle: an explicit small step budget still bounds the run before the deadline", async () => {
+  const fixture = generationFixture(65, WINDOW_START);
+  const {
+    receiptSha256: _receipt,
+    ...acceptedBase
+  } = verifierAcceptedStatus(fixture, INVOCATION_B, "aa".repeat(32));
+  const verifying = {
+    ...acceptedBase,
+    state: "VERIFYING",
+    finishedAtUtc: null,
+  };
+  const state = stateWithJob(fixture, "VERIFIER_RUNNING", {
+    verifierInvocationId: INVOCATION_B,
+    verifierStatus: verifying,
+  });
+  const h = harness({
+    now: new Date(WINDOW_START + 60_000),
+    gateValue: {
+      ...deriveVerifierGate(fixture.request, fixture.requestSha256),
+      unitInvocationId: INVOCATION_B,
+    },
+  });
+  await h.deps.private.write(CONTROLLER_STATE_PATH, state);
+  const report = await runBackblazeCycle(h.deps, 3);
+  assert(report.status.startsWith("B2_BACKUP_INCOMPLETE"), report.status);
+  assert(
+    report.detail === "Step budget exhausted",
+    `detail=${report.detail}`,
+  );
+  assert(!report.status.includes("FAILED"));
+});
+
+Deno.test("cycle: the default run stays bounded at the request deadline with a persistently retrying job", async () => {
+  const fixture = generationFixture(66, WINDOW_START);
+  const state = validateControllerState({
+    schemaVersion: 1,
+    catalog: [catalogEntry(fixture, WINDOW_START + 1000)],
+    job: {
+      ...stateWithJob(fixture, "ACCEPTED", {
+        workerStatus: workerPendingStatus(fixture, INVOCATION_A),
+        verifierStatus: verifierAcceptedStatus(
+          fixture,
+          INVOCATION_B,
+          "aa".repeat(32),
+        ),
+        resultSha256: "77".repeat(32),
+      }).job!,
+    },
+  });
+  let versionsCalls = 0;
+  const h = harness({
+    now: new Date(Date.parse(fixture.request.deadlineAtUtc) + 1000),
+  });
+  h.store.versions = () => {
+    versionsCalls += 1;
+    return Promise.reject(new Error("inventory transport down"));
+  };
+  await h.deps.private.write(CONTROLLER_STATE_PATH, state);
+  const report = await runBackblazeCycle(h.deps);
+  assert(report.status.startsWith("B2_BACKUP_INCOMPLETE"), report.status);
+  assert(
+    report.detail === "Request deadline reached",
+    `detail=${report.detail}`,
+  );
+  assert(
+    versionsCalls === 1,
+    `one final expiry assessment only (calls=${versionsCalls})`,
+  );
+  const persisted = h.privateMap.get(CONTROLLER_STATE_PATH);
+  const after = JSON.parse(
+    persisted instanceof Uint8Array
+      ? new TextDecoder().decode(persisted)
+      : JSON.stringify(persisted),
+  );
+  assert(after.job.phase === "ACCEPTED", "no durable state is rewritten stale");
+  assert(after.job.prune === undefined, "no invented prune plan");
+  assert(after.catalog.length === 1, "the catalog is preserved");
+});
+
+Deno.test("orchestration: transient inventory failures before planning and after deletion stay resumable", async () => {
+  const fixtures = [1, 2, 3, 4, 5, 6].map((seed) =>
+    generationFixture(seed, WINDOW_START + seed * 3_600_000)
+  );
+  const catalog = fixtures.map((fixture, i) =>
+    catalogEntry(fixture, WINDOW_START + i * 1000)
+  );
+  const current = fixtures[5];
+  const state = validateControllerState({
+    schemaVersion: 1,
+    catalog,
+    job: {
+      ...stateWithJob(current, "ACCEPTED").job!,
+      workerStatus: workerPendingStatus(current, INVOCATION_A),
+      resultSha256: "77".repeat(32),
+    },
+  });
+  const inventory = inventoryFor(fixtures);
+  const pending = generationFixture(7, WINDOW_START + 7 * 3_600_000);
+  inventory.push(...inventoryFor([pending]));
+  inventory.push({
+    fileId: "foreign000000000000",
+    fileName: "restic/direct-v1/other/generation-11111/role/00000000",
+    contentLength: 10,
+    contentSha1: "11".repeat(20),
+    action: "upload",
+    uploadTimestamp: 1,
+  });
+  inventory.push({
+    fileId: "start0000000000000",
+    fileName: `${generationPrefixes(fixtures[1].generation)[0]}root/00000000`,
+    contentLength: 1,
+    contentSha1: "11".repeat(20),
+    action: "start",
+    uploadTimestamp: 1,
+  });
+  inventory.push({
+    fileId: "hide00000000000000",
+    fileName: `${generationPrefixes(fixtures[0].generation)[0]}root/00000000`,
+    contentLength: 0,
+    contentSha1: "11".repeat(20),
+    action: "hide",
+    uploadTimestamp: 1,
+  });
+  const expectedIds = new Set(
+    inventoryFor([fixtures[0], fixtures[1]]).map((object) => object.fileId),
+  );
+  expectedIds.add("hide00000000000000");
+  const h = harness({
+    now: new Date(WINDOW_START + 60_000),
+    versions: inventory,
+  });
+  const originalVersions = h.store.versions.bind(h.store) as () => Promise<
+    B2Object[]
+  >;
+  let versionsCalls = 0;
+  h.store.versions = async () => {
+    versionsCalls += 1;
+    // First call: before any prune plan exists. Fifth call: the post-delete
+    // refresh after the partial deletions ran. Both must stay resumable.
+    if (versionsCalls === 1 || versionsCalls === 5) {
+      throw new Error("inventory transport down");
+    }
+    return await originalVersions();
+  };
+  const originalRemove = h.store.remove.bind(h.store) as (
+    object: B2Object,
+  ) => Promise<void>;
+  let removeFailedOnce = false;
+  h.store.remove = async (object) => {
+    if (!removeFailedOnce) {
+      removeFailedOnce = true;
+      throw new Error("remove failed: 500 transient");
+    }
+    return await originalRemove(object);
+  };
+  let final = state;
+  const phaseOf = (value: ControllerState): ControllerPhase => value.job!.phase;
+  // Inventory failure before any plan: ACCEPTED and the pending plan
+  // allocation are preserved; no empty completed plan drops membership.
+  final = await stepBackupController(final, h.deps, h.deps.now());
+  assert(phaseOf(final) === "ACCEPTED", `phase=${phaseOf(final)}`);
+  assert(final.job!.prune === undefined, "no invented empty plan");
+  assert(final.job!.failure === undefined, "no terminal FAILED");
+  assert(final.catalog.length === 6, "the catalog is preserved");
+  // Fresh inventory allocates the exact plan.
+  final = await stepBackupController(final, h.deps, h.deps.now());
+  assert(phaseOf(final) === "PRUNING", `phase=${phaseOf(final)}`);
+  const planIds = final.job!.prune!.plan.flatMap((entry) => entry.fileIds);
+  assert(planIds.length === expectedIds.size);
+  assert(
+    planIds.every((id) => expectedIds.has(id)),
+    "the plan holds every eligible id",
+  );
+  // A removal failure leaves partial deletion: PRUNING and every planned id
+  // survive with bounded remove evidence (the existing resumability).
+  final = await stepBackupController(final, h.deps, h.deps.now());
+  assert(phaseOf(final) === "PRUNING", `phase=${phaseOf(final)}`);
+  assert(final.job!.prune!.failedAtUtc !== undefined);
+  assert(final.job!.failure === undefined, "no terminal FAILED");
+  assert(h.store.removed.length === 0, "the throwing removal deleted nothing");
+  // The post-delete refresh then fails too: PRUNING, every planned id and
+  // the catalog survive with bounded refresh evidence.
+  final = await stepBackupController(final, h.deps, h.deps.now());
+  assert(phaseOf(final) === "PRUNING", `phase=${phaseOf(final)}`);
+  assert(final.job!.prune!.failedAtUtc !== undefined);
+  assert(final.job!.failure === undefined, "no terminal FAILED");
+  assert(final.catalog.length === 6, "catalog membership survives");
+  assert(
+    JSON.stringify(final.job!.prune!.plan.map((entry) => entry.generation)) ===
+      JSON.stringify([fixtures[0].generation, fixtures[1].generation]),
+    "the existing plan and its IDs are preserved",
+  );
+  assert(
+    final.job!.prune!.plan.flatMap((entry) => entry.fileIds).every((id) =>
+      expectedIds.has(id)
+    ),
+    "no planned id is dropped or replaced",
+  );
+  assert(
+    (final.job!.prune!.evidence ?? "").length <= 300,
+    "failure evidence is bounded",
+  );
+  assert(
+    final.job!.prune!.evidence!.includes("refresh inventory failed"),
+    final.job!.prune!.evidence,
+  );
+  assert(h.store.removed.length === expectedIds.size, "deletions ran");
+  // Subsequent normal polls re-inventory fresh, prove the absent IDs and
+  // complete; newest four, pending, foreign and start data stay intact.
+  for (let step = 0; step < 12; step += 1) {
+    final = await stepBackupController(final, h.deps, h.deps.now());
+    const phase = phaseOf(final);
+    if (phase === "COMPLETE" || phase === "FAILED") break;
+  }
+  assert(phaseOf(final) === "COMPLETE", `phase=${phaseOf(final)}`);
+  assert(final.catalog.length === 4, "catalog shrinks to the newest four");
+  const removedIds = new Set(h.store.removed.map((object) => object.fileId));
+  assert(
+    removedIds.size === expectedIds.size,
+    "every still-present planned id was removed exactly once",
+  );
+  for (const id of expectedIds) {
+    assert(removedIds.has(id), `planned id ${id} must be removed`);
+  }
+  const surviving = new Set(
+    h.store.versionsList.map((object) => object.fileId),
+  );
+  for (const fixture of fixtures.slice(2)) {
+    for (const object of inventoryFor([fixture])) {
+      assert(surviving.has(object.fileId), "newest data must survive");
+    }
+  }
+  for (const object of inventoryFor([pending])) {
+    assert(surviving.has(object.fileId), "pending data must survive");
+  }
+  assert(surviving.has("foreign000000000000"), "foreign data must survive");
+  assert(surviving.has("start0000000000000"), "start markers must survive");
 });
