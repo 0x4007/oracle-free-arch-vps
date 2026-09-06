@@ -1593,6 +1593,26 @@ async function extractArchives(
       `extract:${role}`,
     );
   }
+  // These volatile trees are excluded from capture, including their parent
+  // directories. Recreate mount points before the restored system boots.
+  const current = await guardBeforeWrite(
+    runner,
+    metadata,
+    target,
+    "extract:runtime-directories",
+  );
+  await assertMountedFilesystems(current, metadata, target.workDirectory);
+  await checked(runner, "mkdir", [
+    "-p",
+    ...["dev", "proc", "sys", "run", "tmp", "mnt", "var/tmp"].map((path) =>
+      `${mounts.root}/${path}`
+    ),
+  ], "extract:runtime-directories");
+  await checked(runner, "chmod", [
+    "1777",
+    `${mounts.root}/tmp`,
+    `${mounts.root}/var/tmp`,
+  ], "extract:temporary-permissions");
 }
 
 function assertResumeBinding(
