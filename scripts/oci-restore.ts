@@ -1,3 +1,8 @@
+import { withBackupLock } from "./backup-lock.ts";
+import {
+  assertOracleMutationAllowed,
+  readGate,
+} from "./backblaze-controller-gate.ts";
 import {
   type CommandRunner,
   dataArray,
@@ -1127,11 +1132,30 @@ export async function main(
 ): Promise<void> {
   const config = await loadConfig();
   validateConfig(config);
+  if (config.action === "soft-stop" || config.action === "restore") {
+    // Mutation actions share the controller lock with the Oracle backup
+    // cycle and the Backblaze controller. The gate is asserted before any
+    // remote runner invocation; config is reread and revalidated after the
+    // lock wait, and a changed action is refused.
+    return await withBackupLock(".private/backup-controller.lock", async () => {
+      const gate = await readGate();
+      assertOracleMutationAllowed(gate);
+      const current = await loadConfig();
+      validateConfig(current);
+      if (current.action !== config.action) {
+        throw new Error(
+          "Restore mutation action changed while waiting for the controller lock",
+        );
+      }
+      if (current.action === "soft-stop") {
+        return await softStop(current, runner);
+      }
+      return await restore(current, runner);
+    });
+  }
   if (config.action === "wait-for-stopped") {
     return await waitForStopped(config, runner);
   }
-  if (config.action === "soft-stop") return await softStop(config, runner);
-  if (config.action === "restore") return await restore(config, runner);
   if (config.action === "verify") return await verify(config, runner);
   const inventory = await readInventory(config, runner);
   console.log(JSON.stringify(

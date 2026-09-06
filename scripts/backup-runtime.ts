@@ -1,4 +1,8 @@
 import { withBackupLock } from "./backup-lock.ts";
+import {
+  assertOracleMutationAllowed,
+  readGate,
+} from "./backblaze-controller-gate.ts";
 import { backupControllerEvidence } from "./backup-controller-evidence.ts";
 import {
   backupGuestControl,
@@ -53,6 +57,12 @@ export async function main(
   ) => Promise<BackupRunControl | void>,
 ): Promise<void> {
   await withBackupLock(".private/backup-controller.lock", async () => {
+    // Immediately inside the shared lock, before any config/state read,
+    // callback, evidence, guest or OCI path: a Backblaze gate blocks all
+    // Oracle mutation, including recoveryOnly callbacks. Absence alone
+    // permits; malformed gate state fails closed.
+    const gate = await readGate();
+    assertOracleMutationAllowed(gate);
     const config = await readPrivateJson<RuntimeConfig>(CONFIG);
     if (!["preflight", "cycle"].includes(config.action)) {
       throw new Error("Runtime action must be preflight or cycle");

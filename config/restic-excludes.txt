@@ -34,3 +34,6 @@
 /proc
 /sys
 /dev
+
+# Oracle fallback swap file; recreate its size from the recovery manifest.
+/.swapfile
