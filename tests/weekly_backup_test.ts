@@ -311,6 +311,26 @@ Deno.test("legacy outage journal is rejected before any provider operation", asy
   assert(f.calls.length === 0);
 });
 
+Deno.test("retention preserves the old root if replacement disappears during boot deletion", async () => {
+  const f = fixture(false, false);
+  const remove = f.ops.deleteBackup;
+  f.ops.deleteBackup = async (kind, id) => {
+    await remove(kind, id);
+    if (kind === "boot") {
+      f.state.rootBackups = f.state.rootBackups.filter((item) =>
+        item.id !== "new-root"
+      );
+    }
+  };
+  await rejects(
+    () => runBackupCycle(f.policy, f.journal, f.ops),
+    "replacement loss must stop retention",
+  );
+  assert(f.calls.includes("delete-boot"));
+  assert(!f.calls.includes("delete-root"));
+  assert(f.state.rootBackups.some((item) => item.id === "old-root"));
+});
+
 Deno.test("intent with empty inventory never creates a duplicate group backup", async () => {
   const f = fixture();
   f.journal.phase = "backing-up";

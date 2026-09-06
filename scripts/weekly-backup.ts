@@ -671,6 +671,13 @@ export async function runBackupCycle(
         });
       } else {
         for (const kind of ["boot", "root"] as const) {
+          const beforeDelete = await snapshot(true);
+          validateBackupPairForPolicy(
+            beforeDelete,
+            replacementPair,
+            policy.source,
+            policy,
+          );
           await ops.deleteBackup(
             kind,
             kind === "boot"
