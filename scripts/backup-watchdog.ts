@@ -20,6 +20,35 @@ export const B2_REPORT_PATH = ".private/reports/backblaze-file-backup.json";
 export const ORACLE_REPORT_PATH = ".private/reports/backup-watchdog.json";
 export const B2_STATE_PATH = ".private/file-backup/controller.json";
 
+/** Dated boot evidence is independent of per-generation archive verification. */
+export async function readBootDrillEvidence(path: string, now: Date) {
+  try {
+    const proof = await readPrivateJson<Record<string, unknown>>(path);
+    const checks = proof.checks as Record<string, unknown> | undefined;
+    const bootedAt = Date.parse(String(proof.bootedAtUtc));
+    if (
+      proof.status !== "RESTORE_DRILL_PROVED" || !Number.isFinite(bootedAt) ||
+      bootedAt > now.getTime() || !checks ||
+      !["ssh", "mounts", "bootParity", "preservedData", "desktop", "isolation"]
+        .every((name) => checks[name] === true)
+    ) {
+      return { status: "BOOT_DRILL_EVIDENCE_INVALID", bootedAtUtc: null };
+    }
+    return {
+      status: "RESTORE_DRILL_PROVED",
+      bootedAtUtc: proof.bootedAtUtc,
+      generation: typeof proof.generation === "string"
+        ? proof.generation
+        : null,
+    };
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) {
+      return { status: "BOOT_DRILL_UNPROVED", bootedAtUtc: null };
+    }
+    return { status: "BOOT_DRILL_EVIDENCE_UNREADABLE", bootedAtUtc: null };
+  }
+}
+
 /** Preserve the existing Oracle assessment report and add the Backblaze
  * job/gate assessment; both notifications reuse the same bounded status
  * string and job UUID form. A delivery failure always remains visible.
@@ -54,7 +83,12 @@ export async function main(): Promise<void> {
       ".private/backup-schedule.json",
     );
     validateSchedule(schedule, now);
-    let state: { cycle: BackupWatchdogState } | undefined;
+    let state: {
+      lastSuccessfulCaptureAtUtc?: string;
+      cycle: BackupWatchdogState & {
+        captureIdentity?: { captureTimeUtc: string };
+      };
+    } | undefined;
     try {
       state = await readPrivateJson(".private/backup-runtime.json");
     } catch (error) {
@@ -62,6 +96,15 @@ export async function main(): Promise<void> {
     }
     oracleReport = {
       ...assessBackupWatchdog(state?.cycle, now, schedule),
+      lastSuccessfulCaptureAtUtc: state?.cycle.phase === "complete"
+        ? state.cycle.captureIdentity?.captureTimeUtc ??
+          state.lastSuccessfulCaptureAtUtc ?? null
+        : state?.lastSuccessfulCaptureAtUtc ?? null,
+      lastArchiveVerificationAtUtc: null,
+      lastBootDrill: await readBootDrillEvidence(
+        ".private/reports/online-oracle-boot.json",
+        now,
+      ),
       observedAtUtc: now.toISOString(),
       notificationSent: false,
     };
@@ -103,7 +146,18 @@ export async function main(): Promise<void> {
         };
       }
     }
+    const latestAccepted = controllerState?.catalog.slice().sort((a, b) =>
+      Date.parse(b.acceptedAtUtc) - Date.parse(a.acceptedAtUtc)
+    )[0];
     b2Report = {
+      lastSuccessfulCaptureAtUtc: latestAccepted?.index.captureFinishedAtUtc ??
+        null,
+      lastArchiveVerificationAtUtc: latestAccepted?.receipt.verifiedAtUtc ??
+        null,
+      lastBootDrill: await readBootDrillEvidence(
+        ".private/reports/backblaze-machine-boot.json",
+        now,
+      ),
       ...assessBackblazeWatchdog(controllerState, gate, now, source),
       observedAtUtc: now.toISOString(),
       notificationSent: false,

@@ -1,4 +1,3 @@
-import { needsSourceRecovery } from "./weekly-backup.ts";
 import { main } from "./backup-runtime.ts";
 import { type BackupSchedule, currentWindow } from "./backup-schedule.ts";
 import { readPrivateJson, redactOcid, writePrivateJson } from "./oci.ts";
@@ -16,13 +15,7 @@ export async function runScheduledBackup(): Promise<void> {
   let claim: WindowClaim | undefined;
   try {
     await main(async (state) => {
-      // main holds the controller lock here. Check the clock after any wait
-      // for that lock, so a delayed invocation cannot cause a catch-up outage.
-      // An interrupted outage must recover even if the schedule is absent,
-      // invalid, or closed. It must not resume backup creation or retirement.
-      if (state && needsSourceRecovery(state.cycle)) {
-        return { recoveryOnly: true };
-      }
+      // The shared lock serializes capture; normal source activity stays online.
       const now = new Date();
       const schedule = await readPrivateJson<BackupSchedule>(
         ".private/backup-schedule.json",
@@ -66,13 +59,13 @@ export async function runScheduledBackup(): Promise<void> {
         await writePrivateJson(CLAIM, claim);
       }
       return {
-        beforeQuiesce: async () => {
+        beforeCapture: async () => {
           const latest = await readPrivateJson<BackupSchedule>(
             ".private/backup-schedule.json",
           );
           if (currentWindow(latest, new Date()) !== windowId) {
             throw new Error(
-              "Approved maintenance window closed before quiescence",
+              "Backup capture window closed before creation",
             );
           }
         },

@@ -5,6 +5,12 @@ export interface BackupSchedule {
   hour: number;
   minute: number;
   windowMinutes: number;
+  acceptanceWindow?: {
+    approvedAtUtc: string;
+    startsAtUtc: string;
+    expiresAtUtc: string;
+    exactOperation: "one online scheduler acceptance capture";
+  };
 }
 export function validateSchedule(schedule: BackupSchedule, now: Date): void {
   const approved = Date.parse(schedule.approvedAtUtc);
@@ -19,7 +25,7 @@ export function validateSchedule(schedule: BackupSchedule, now: Date): void {
     schedule.minute > 59 ||
     !Number.isInteger(schedule.windowMinutes) || schedule.windowMinutes < 1 ||
     schedule.windowMinutes > 720
-  ) throw new Error("An exact approved maintenance window is required");
+  ) throw new Error("An exact approved weekly schedule is required");
   new Intl.DateTimeFormat("en-US", { timeZone: schedule.timeZone }).format(now);
 }
 export function currentWindow(
@@ -27,6 +33,21 @@ export function currentWindow(
   now: Date,
 ): string | undefined {
   validateSchedule(schedule, now);
+  if (schedule.acceptanceWindow) {
+    const request = schedule.acceptanceWindow;
+    const approved = Date.parse(request.approvedAtUtc);
+    const starts = Date.parse(request.startsAtUtc);
+    const expires = Date.parse(request.expiresAtUtc);
+    if (
+      request.exactOperation !== "one online scheduler acceptance capture" ||
+      ![approved, starts, expires].every(Number.isFinite) ||
+      approved > starts || expires <= starts ||
+      expires - approved > 4 * 3_600_000
+    ) throw new Error("Invalid one-time scheduler acceptance approval");
+    if (now.getTime() >= starts && now.getTime() < expires) {
+      return `acceptance@${new Date(starts).toISOString()}`;
+    }
+  }
   const parts = Object.fromEntries(
     new Intl.DateTimeFormat("en-US", {
       timeZone: schedule.timeZone,
@@ -61,7 +82,7 @@ export function backupTimer(schedule: BackupSchedule, now: Date): string {
   const time = `${String(schedule.hour).padStart(2, "0")}:${
     String(schedule.minute).padStart(2, "0")
   }:00`;
-  return `[Unit]\nDescription=Approved weekly paired VPS backup\n\n[Timer]\nOnCalendar=${day} *-*-* ${time} ${schedule.timeZone}\nPersistent=false\nAccuracySec=1min\nRandomizedDelaySec=0\nUnit=weekly-backup.service\n\n[Install]\nWantedBy=timers.target\n`;
+  return `[Unit]\nDescription=Online weekly paired VPS backup\n\n[Timer]\nOnCalendar=${day} *-*-* ${time} ${schedule.timeZone}\nPersistent=false\nAccuracySec=1min\nRandomizedDelaySec=0\nUnit=weekly-backup.service\n\n[Install]\nWantedBy=timers.target\n`;
 }
 
 export interface BackupWatchdogState {
@@ -93,13 +114,8 @@ export function assessBackupWatchdog(
   if (
     ![
       "planned",
-      "quiescing",
-      "quiesced",
-      "stop-requested",
-      "stopped",
       "backing-up",
       "pair-available",
-      "start-requested",
       "source-accepted",
       "retiring",
       "complete",

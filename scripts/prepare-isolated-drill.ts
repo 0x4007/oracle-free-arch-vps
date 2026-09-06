@@ -37,7 +37,10 @@ export function acceptedDrillPair(state: AcceptedRuntime, now = new Date()) {
   const { cycle, policy } = state;
   if (
     cycle.phase !== "complete" || !cycle.bootId || !cycle.rootId ||
-    !cycle.sourceAcceptedAtUtc || !state.guest?.restored ||
+    !cycle.sourceAcceptedAtUtc ||
+    (cycle.mode === "online"
+      ? !cycle.captureIdentity
+      : !state.guest?.restored) ||
     !policy.retainPreviousPair || cycle.suffix === policy.acceptedPair.suffix ||
     JSON.stringify(cycle.source) !== JSON.stringify(policy.source) ||
     !Number.isFinite(Date.parse(cycle.createdAtUtc)) ||
@@ -49,7 +52,23 @@ export function acceptedDrillPair(state: AcceptedRuntime, now = new Date()) {
       "A fresh paired backup and accepted source recovery are required before preparing the drill",
     );
   }
-  return { suffix: cycle.suffix, bootId: cycle.bootId, rootId: cycle.rootId };
+  if (
+    cycle.mode === "online" && (
+      cycle.captureIdentity?.volumeGroupId !== policy.volumeGroupId ||
+      cycle.captureIdentity?.bootBackupId !== cycle.bootId ||
+      cycle.captureIdentity?.rootBackupId !== cycle.rootId ||
+      !cycle.captureIdentity?.volumeGroupBackupId ||
+      cycle.captureIdentity?.consistency !== "crash-consistent"
+    )
+  ) throw new Error("Online drill capture binding is incomplete");
+  return {
+    suffix: cycle.suffix,
+    bootId: cycle.bootId,
+    rootId: cycle.rootId,
+    ...(cycle.captureIdentity
+      ? { volumeGroupBackupId: cycle.captureIdentity.volumeGroupBackupId }
+      : {}),
+  };
 }
 
 /** Read-only plan preparation on the approved Pi. Creation and cleanup are
@@ -91,6 +110,15 @@ export async function prepareDrill(
     config.source.bootVolumeId,
     config.source.rootVolumeId,
     config.source.compartmentId,
+    pair.volumeGroupBackupId
+      ? {
+        volumeGroupId: state.policy.volumeGroupId,
+        volumeGroupBackupId: pair.volumeGroupBackupId,
+        group: inventory.volumeGroupBackups.find((item) =>
+          item.id === pair.volumeGroupBackupId
+        ) ?? {},
+      }
+      : undefined,
   );
   for (const backup of [boot, root]) {
     const created = Date.parse(stringField(backup, "time-created"));
@@ -201,6 +229,9 @@ export async function prepareDrill(
   const plan: DrillPlan = {
     source: config.source,
     pair,
+    ...(pair.volumeGroupBackupId
+      ? { volumeGroupId: state.policy.volumeGroupId }
+      : {}),
     sourceAcceptedAtUtc: state.cycle.sourceAcceptedAtUtc!,
     availabilityDomain: stringField(inventory.instance, "availability-domain"),
     productionReservedIpId: stringField(reserved[0], "id"),

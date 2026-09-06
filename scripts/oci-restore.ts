@@ -50,6 +50,8 @@ interface RestoreConfig {
   reservedPublicIpId: string;
   instanceId: string;
   expectedPairSuffix: string;
+  volumeGroupId?: string;
+  volumeGroupBackupId?: string;
   expectedRootUuid: string;
   stopWaitSeconds: number;
   approval: {
@@ -66,6 +68,8 @@ interface RestoreConfig {
       availabilityDomains: string[];
       subnetId: string;
       reservedPublicIpId: string;
+      volumeGroupId?: string;
+      volumeGroupBackupId?: string;
     };
   };
   softStopApproval?: {
@@ -142,6 +146,12 @@ export function validateConfig(config: RestoreConfig): void {
       availabilityDomains: config.availabilityDomains,
       subnetId: config.subnetId,
       reservedPublicIpId: config.reservedPublicIpId,
+      ...(config.volumeGroupBackupId
+        ? {
+          volumeGroupId: config.volumeGroupId,
+          volumeGroupBackupId: config.volumeGroupBackupId,
+        }
+        : {}),
     };
     if (
       !config.approval.approved ||
@@ -189,6 +199,11 @@ export function validateBackupPair(
   expectedBootSourceVolumeId?: string,
   expectedRootSourceVolumeId?: string,
   expectedCompartmentId?: string,
+  groupProof?: {
+    group: JsonRecord;
+    volumeGroupId: string;
+    volumeGroupBackupId: string;
+  },
 ): void {
   if (stringField(boot, "lifecycle-state") !== "AVAILABLE") {
     throw new Error("The staging backup is not AVAILABLE");
@@ -209,7 +224,28 @@ export function validateBackupPair(
   }
   const bootSuffix = pairSuffix(stringField(boot, "display-name"));
   const rootSuffix = pairSuffix(stringField(root, "display-name"));
-  if (
+  if (groupProof) {
+    const { group, volumeGroupId, volumeGroupBackupId } = groupProof;
+    const members = group["volume-backup-ids"];
+    const captureTime = Date.parse(String(group["time-created"]));
+    if (
+      !volumeGroupId || !volumeGroupBackupId ||
+      group.id !== volumeGroupBackupId ||
+      group["volume-group-id"] !== volumeGroupId ||
+      group["lifecycle-state"] !== "AVAILABLE" || group.type !== "FULL" ||
+      group["compartment-id"] !== expectedCompartmentId ||
+      !Array.isArray(members) || members.length !== 2 ||
+      new Set(members).size !== 2 || !members.includes(boot.id) ||
+      !members.includes(root.id) ||
+      boot["volume-group-backup-id"] !== volumeGroupBackupId ||
+      root["volume-group-backup-id"] !== volumeGroupBackupId ||
+      !Number.isFinite(captureTime) ||
+      [boot, root].some((member) =>
+        !Number.isFinite(Date.parse(String(member["time-created"]))) ||
+        Date.parse(String(member["time-created"])) + 1000 < captureTime
+      )
+    ) throw new Error("Live volume group backup membership is not proved");
+  } else if (
     stringField(boot, "display-name") !==
       `arch-stage-golden-${expectedSuffix}` ||
     stringField(root, "display-name") !==
@@ -395,6 +431,28 @@ async function readInventory(config: RestoreConfig, runner: CommandRunner) {
       runner,
     ),
   );
+  if (Boolean(config.volumeGroupId) !== Boolean(config.volumeGroupBackupId)) {
+    throw new Error("Both source group and group backup IDs are required");
+  }
+  const groupProof = config.volumeGroupBackupId
+    ? {
+      volumeGroupId: config.volumeGroupId!,
+      volumeGroupBackupId: config.volumeGroupBackupId,
+      group: dataObject(
+        await runJson(
+          config.ociCliPath,
+          ociArgs(config, [
+            "bv",
+            "volume-group-backup",
+            "get",
+            "--volume-group-backup-id",
+            config.volumeGroupBackupId,
+          ]),
+          runner,
+        ),
+      ),
+    }
+    : undefined;
   validateBackupPair(
     bootBackup,
     rootBackup,
@@ -402,6 +460,7 @@ async function readInventory(config: RestoreConfig, runner: CommandRunner) {
     config.expectedBootSourceVolumeId,
     config.expectedRootSourceVolumeId,
     config.compartmentId,
+    groupProof,
   );
 
   const blockVolumes = dataArray(

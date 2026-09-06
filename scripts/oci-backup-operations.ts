@@ -1,7 +1,6 @@
 import type { SourceContinuityEvidence } from "./online-backup-contract.ts";
 import {
   type CommandRunner,
-  dataArray,
   dataObject,
   defaultRunner,
   type JsonRecord,
@@ -19,7 +18,6 @@ import {
   type BackupOperations,
   type BackupPair,
   type BackupPolicy,
-  validateBackupPairForPolicy,
   validateStandingApproval,
 } from "./weekly-backup.ts";
 

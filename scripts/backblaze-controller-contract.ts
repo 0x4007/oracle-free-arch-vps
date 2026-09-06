@@ -617,10 +617,12 @@ function validateStandingApprovalRecord(value: unknown): void {
   if (!isRecord(value)) {
     throw new Error("Oracle state policy.standingApproval must be an object");
   }
-  const approvedAt = canonicalUtcMillis(
-    value.approvedAtUtc,
-    "policy.standingApproval.approvedAtUtc",
-  );
+  const approvedAt = typeof value.approvedAtUtc === "string"
+    ? Date.parse(value.approvedAtUtc)
+    : NaN;
+  if (!Number.isFinite(approvedAt)) {
+    throw new Error("Oracle standing approval timestamp is invalid");
+  }
   if (approvedAt > Date.now()) {
     throw new Error("Oracle standing approval is in the future");
   }

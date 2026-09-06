@@ -1,4 +1,5 @@
 import {
+  backupControllerEvidence,
   verifyFreeSubscription,
   verifyPublishedFreeLimits,
 } from "../scripts/backup-controller-evidence.ts";
@@ -77,4 +78,40 @@ Deno.test("suspended versioning still counts older Object Storage versions", asy
     });
   });
   assert(versionsRead && storage.bytes === 300 && storage.storedObjects === 2);
+});
+
+Deno.test("online controller permits ordinary SSH but refuses infrastructure writers", async () => {
+  let processes =
+    "1 0 init init\n20 1 ssh ssh codex@vps.pavlovcik.com true\n21 1 chromium chromium\n22 1 bash bash";
+  const evidence = backupControllerEvidence({
+    ociCliPath: "oci",
+    ociProfile: "DEFAULT",
+    tenancyId: "tenancy",
+    source: {
+      instanceId: "instance",
+      bootVolumeId: "boot",
+      rootVolumeId: "root",
+      compartmentId: "tenancy",
+      region: "region",
+    },
+  }, () => Promise.resolve({ code: 0, stdout: processes, stderr: "" }));
+  await evidence.assertNoOtherController();
+  for (
+    const writer of [
+      "30 1 oci oci bv backup create",
+      "31 1 deno deno run scripts/backup-runtime.ts",
+      "32 1 rsync rsync files pi:/home/pi/ops/weekly-backup-controller",
+    ]
+  ) {
+    const original = processes;
+    processes += "\n" + writer;
+    let rejected = false;
+    try {
+      await evidence.assertNoOtherController();
+    } catch {
+      rejected = true;
+    }
+    assert(rejected);
+    processes = original;
+  }
 });

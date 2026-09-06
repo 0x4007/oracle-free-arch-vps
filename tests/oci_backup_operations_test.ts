@@ -167,6 +167,8 @@ function createState(
 }
 
 function runnerFor(state: MockState) {
+  // The synchronous fixture still implements the asynchronous command runner.
+  // deno-lint-ignore require-await
   return async (_command: string, args: string[]): Promise<CommandResult> => {
     state.calls.push(args);
 

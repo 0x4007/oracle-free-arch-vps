@@ -571,6 +571,7 @@ export async function runBackupCycle(
         if (current.allBackupCount + 2 > limit) {
           throw new Error("Backup allowance changed before group creation");
         }
+        await control.beforeCapture?.();
         // This save is the durable create intent and completes before OCI sees
         // the request. The returned ID is saved by the next save before wait.
         journal.volumeGroupBackupIntent = true;

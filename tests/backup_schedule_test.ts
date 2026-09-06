@@ -15,6 +15,40 @@ const schedule: BackupSchedule = {
 function assert(value: unknown): asserts value {
   if (!value) throw new Error("Assertion failed");
 }
+Deno.test("one-time online acceptance uses real bounded time without changing weekly schedule", () => {
+  const acceptance: BackupSchedule = {
+    ...schedule,
+    acceptanceWindow: {
+      approvedAtUtc: "2026-09-06T15:00:00Z",
+      startsAtUtc: "2026-09-06T15:05:00Z",
+      expiresAtUtc: "2026-09-06T18:00:00Z",
+      exactOperation: "one online scheduler acceptance capture",
+    },
+  };
+  assert(
+    currentWindow(acceptance, new Date("2026-09-06T15:04:59Z")) === undefined,
+  );
+  assert(
+    currentWindow(acceptance, new Date("2026-09-06T15:05:00Z")) ===
+      "acceptance@2026-09-06T15:05:00.000Z",
+  );
+  assert(
+    currentWindow(acceptance, new Date("2026-09-06T18:00:00Z")) === undefined,
+  );
+  assert(
+    currentWindow(acceptance, new Date("2026-09-13T08:00:00Z")) ===
+      "2026-09-13@America/New_York",
+  );
+  const invalid = structuredClone(acceptance);
+  invalid.acceptanceWindow!.expiresAtUtc = "2026-09-07T18:00:00Z";
+  let refused = false;
+  try {
+    currentWindow(invalid, new Date("2026-09-06T16:00:00Z"));
+  } catch {
+    refused = true;
+  }
+  assert(refused);
+});
 Deno.test("maintenance window follows New York daylight-saving time", () => {
   assert(
     currentWindow(schedule, new Date("2026-09-06T08:00:00Z")) ===

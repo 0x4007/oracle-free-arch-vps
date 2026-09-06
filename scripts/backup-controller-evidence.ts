@@ -134,6 +134,8 @@ export function backupControllerEvidence(
         // Use the conservative decimal-GB bound, including every stored version.
         objectStorageWithinLimit: storage.inventoryComplete &&
           storage.bytes <= 20_000_000_000,
+        objectStorageBytes: storage.bytes,
+        objectStorageHeadroomBytes: 20_000_000_000 - storage.bytes,
       };
     },
     assertNoOtherController: async () => {
@@ -162,14 +164,16 @@ export function backupControllerEvidence(
       if (
         processes.some((p) =>
           !ancestry.has(p.pid) && (
-            /^(ssh|sshd-session|scp|sftp|rsync|rclone|oci)$/.test(
+            /^oci$/.test(
               p.name.split("/").at(-1)!,
             ) ||
             /(?:^|\s|\/)oci(?:\s|$)/.test(p.args) ||
-            /(?:backup-runtime|oci-restore|weekly-backup)\.ts/.test(p.args)
+            /(?:backup-runtime|backup-scheduled|backup-recovery|oci-restore|weekly-backup|backblaze-file-backup)\.ts/
+              .test(p.args) ||
+            /(?:scp|sftp|rsync).*weekly-backup-controller/.test(p.args)
           )
         )
-      ) throw new Error("Another controller or SSH writer is active");
+      ) throw new Error("Another backup or infrastructure writer is active");
     },
   };
 }
