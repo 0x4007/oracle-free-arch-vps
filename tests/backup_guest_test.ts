@@ -70,3 +70,31 @@ Deno.test("online acceptance reports an inactive service without repairing it", 
 Deno.test("shell quoting retains literal metacharacters", () => {
   assert(shellQuote("a'b$(x)") === "'a'\\''b$(x)'");
 });
+
+Deno.test("SSH transport failure is retryable but a failed remote assertion is blocked", async () => {
+  const { RetryableObservationError } = await import(
+    "../scripts/online-backup-contract.ts"
+  );
+  for (const code of [255, 1]) {
+    const control = backupGuestControl(
+      {
+        host: "codex@vps.pavlovcik.com",
+        rootUuid: "a".repeat(36),
+        stagingUuid: "b".repeat(36),
+        activityScriptPath: "/home/codex/ops/backup-guest-activity.ts",
+      },
+      () => Promise.resolve({ code, stdout: "", stderr: "private diagnostic" }),
+    );
+    for (const observe of [control.observeSource, control.acceptSource]) {
+      let failure: unknown;
+      try {
+        await observe();
+      } catch (error) {
+        failure = error;
+      }
+      assert(failure instanceof Error);
+      assert((failure instanceof RetryableObservationError) === (code === 255));
+      assert(!failure.message.includes("private diagnostic"));
+    }
+  }
+});
