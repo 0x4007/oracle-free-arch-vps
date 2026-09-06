@@ -69,6 +69,7 @@ import {
   type PrivateSeam,
   PUBLIC_HOME_BASE,
   pumpGpgStdout,
+  realPrivateSeam,
   realRemoteSeam,
   realTunnelSeam,
   type RemoteRunner,
@@ -610,9 +611,17 @@ interface HarnessOptions {
   now: Date;
   observed?: (unitName: string, jobId: string) => ObservedUnit;
   rootResponder?: (script: string) => CommandResult | undefined;
+  launchUnitOverride?: (spec: {
+    unitName: string;
+    runtimeDir: string;
+    remainingSec: number;
+  }) => Promise<CommandResult>;
   versions?: B2Object[];
   gateValue?: BackupControllerGate | null;
   socket?: { socket: string; defaultSocket: string };
+  socketResolver?: (
+    publicHome: string,
+  ) => Promise<{ socket: string; defaultSocket: string }>;
   seedPrivate?: (map: Map<string, unknown | Uint8Array>) => void;
 }
 
@@ -683,6 +692,9 @@ function harness(options: HarnessOptions): Harness {
         remainingSec: spec.remainingSec,
       });
       events.push(`launch:${spec.unitName}`);
+      if (options.launchUnitOverride !== undefined) {
+        return options.launchUnitOverride(spec);
+      }
       return Promise.resolve({ code: 0, stdout: "", stderr: "" });
     },
     observe: (unitName, jobId) =>
@@ -694,7 +706,10 @@ function harness(options: HarnessOptions): Harness {
           reachable: false,
         },
       ),
-    resolveAgentSocket() {
+    resolveAgentSocket(publicHome) {
+      if (options.socketResolver !== undefined) {
+        return options.socketResolver(publicHome);
+      }
       return Promise.resolve(
         options.socket ?? {
           socket: "/run/user/1002/gnupg/custom/S.gpg-agent",
@@ -2633,26 +2648,43 @@ function deferred<T>() {
 /** A small synthetic ssh child: the readiness acknowledgement (or silence),
  * a stderr line, and a status that settles only when stdin is closed, like
  * the real remote `cat` exiting on EOF. `streamError` makes the readiness
- * stream reject instead of delivering the acknowledgement. */
+ * stream reject instead of delivering the acknowledgement. `manualExit`
+ * leaves the status settlement to the caller (`settleStatus`) so a test can
+ * reproduce a natural child exit after readiness. */
 function syntheticTunnelChild(opts: {
   ack: boolean;
   statusError?: Error;
   streamError?: Error;
+  manualExit?: boolean;
 }): {
   factory: TunnelChildFactory;
   argv: string[];
   stdinClosed: Promise<void>;
   status: Promise<Deno.CommandStatus>;
   statusSettled: () => boolean;
+  settleStatus: (code: number) => void;
 } {
   const stdinClosed = deferred<void>();
   const argv: string[] = [];
   let settled = false;
-  const status = stdinClosed.promise.then(() => {
-    settled = true;
-    if (opts.statusError !== undefined) throw opts.statusError;
-    return { success: true, code: 0, signal: null } as Deno.CommandStatus;
+  let settle: ((code: number) => void) | undefined;
+  const status = new Promise<Deno.CommandStatus>((resolve, reject) => {
+    settle = (code) => {
+      settled = true;
+      if (opts.statusError !== undefined) {
+        reject(opts.statusError);
+      } else {
+        resolve({
+          success: code === 0,
+          code,
+          signal: null,
+        } as Deno.CommandStatus);
+      }
+    };
   });
+  if (!opts.manualExit) {
+    void stdinClosed.promise.then(() => settle?.(0));
+  }
   const factory: TunnelChildFactory = (args) => {
     argv.push(...args);
     const stdin = new WritableStream<Uint8Array>({
@@ -2687,6 +2719,7 @@ function syntheticTunnelChild(opts: {
     stdinClosed: stdinClosed.promise,
     status,
     statusSettled: () => settled,
+    settleStatus: (code) => settle!(code),
   };
 }
 
@@ -2794,6 +2827,73 @@ Deno.test("tunnel: a close failure propagates instead of silently claiming clean
       threw = true;
     }
     assert(threw, "a failed tunnel exit must never be swallowed");
+  } finally {
+    await Deno.remove(dir, { recursive: true }).catch(() => {});
+  }
+});
+
+Deno.test("tunnel: a natural child exit after readiness invalidates only its own handle and the next open creates a new tunnel", async () => {
+  if (!(await fsPermissionsGranted())) {
+    console.log("tunnel natural exit: skipped without write/run permissions");
+    return;
+  }
+  const remoteSocket = "/run/user/1002/gnupg/verifier/S.gpg-agent";
+  const runner: RemoteRunner = (command, args) => {
+    if (command !== "gpgconf") {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    const text = args.join(" ");
+    return Promise.resolve({
+      code: 0,
+      stdout: text.includes("agent-extra-socket")
+        ? "/home/pi/keyring/S.gpg-agent.extra\n"
+        : "/home/pi/keyring/S.gpg-agent\n",
+      stderr: "",
+    });
+  };
+  const dead = syntheticTunnelChild({ ack: true, manualExit: true });
+  const replacement = syntheticTunnelChild({ ack: true });
+  const dir = await Deno.makeTempDir({ prefix: "m09-tunnel-exit-" });
+  try {
+    let spawned = 0;
+    const seam = realTunnelSeam(runner, `${dir}/keyring`, (args) => {
+      spawned += 1;
+      return (spawned === 1 ? dead : replacement).factory(args);
+    });
+    const handle = await seam.open(remoteSocket);
+    assert(seam.current() === handle, "the acknowledged handle is active");
+    // The owned SSH transport dies after readiness (a disconnected SSH
+    // exits 255 without any stdin close or signal).
+    dead.settleStatus(255);
+    const deadline = Date.now() + 5_000;
+    while (seam.current() !== null && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    assert(
+      seam.current() === null,
+      "a terminal child exit must invalidate the dead active handle",
+    );
+    const reopened = await seam.open(remoteSocket);
+    assert(
+      spawned === 2,
+      "a later open must create a second child after the terminal exit",
+    );
+    assert(
+      replacement.statusSettled() === false,
+      "the replacement is still connected before the explicit close",
+    );
+    assert(seam.current() === reopened, "the replacement handle is active");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert(
+      seam.current() === reopened,
+      "a live tunnel stays open until an explicit close",
+    );
+    await seam.close();
+    assert(seam.current() === null);
+    assert(
+      replacement.statusSettled(),
+      "the explicit close proves the replacement natural exit",
+    );
   } finally {
     await Deno.remove(dir, { recursive: true }).catch(() => {});
   }
@@ -3083,6 +3183,314 @@ Deno.test("orchestration: a surviving worker gate after the WORKER_TERMINAL pers
     h.launches[0].unitName,
   );
   assert(h.tunnels.length === 1);
+});
+
+Deno.test("orchestration: a transient verifier setup transport failure stays resumable in WORKER_TERMINAL with its exact gate", async () => {
+  const fixture = generationFixture(45, WINDOW_START);
+  const state = stateWithJob(fixture, "WORKER_TERMINAL", {
+    workerStatus: workerPendingStatus(fixture, INVOCATION_A),
+    resultSha256: "77".repeat(32),
+  });
+  let resolves = 0;
+  const h = harness({
+    now: new Date(WINDOW_START + 60_000),
+    socketResolver: () => {
+      resolves += 1;
+      if (resolves === 1) return Promise.reject(new Error("transport down"));
+      return Promise.resolve({
+        socket: "/run/user/1002/gnupg/custom/S.gpg-agent",
+        defaultSocket: "/run/user/1002/gnupg/S.gpg-agent",
+      });
+    },
+  });
+  const launches = h.launches;
+  const assertLaunchCount = (expected: number, message: string): void => {
+    if (launches.length !== expected) throw new Error(message);
+  };
+  const first = await stepBackupController(state, h.deps, h.deps.now());
+  assert(
+    first.job!.phase === "WORKER_TERMINAL",
+    `a transient failure stays on the same phase: ${first.job!.phase}`,
+  );
+  assert(
+    first.job!.failure === undefined,
+    "no false FAILED on a transient setup transport failure",
+  );
+  assertLaunchCount(0, "no verifier launch before a resolved transport");
+  assert(
+    h.gate.value !== null && h.gate.value.jobId === fixture.request.jobId &&
+      h.gate.value.unitName === verifyUnitName(fixture.generation) &&
+      h.gate.value.state === "active",
+    "the exact verifier gate survives the transient failure",
+  );
+  const second = await stepBackupController(first, h.deps, h.deps.now());
+  assert(
+    second.job!.phase === "VERIFIER_LAUNCHED",
+    `the restored transport completes setup: ${second.job!.phase}`,
+  );
+  assert(second.job!.failure === undefined);
+  assert(second.job!.envelope.request.jobId === fixture.request.jobId);
+  assertLaunchCount(
+    1,
+    "exactly one verifier invocation, never a worker relaunch",
+  );
+  assert(
+    launches[0].unitName === verifyUnitName(fixture.generation),
+    launches[0].unitName,
+  );
+  assert(
+    h.tunnels.length === 1,
+    "the tunnel opens only after the transport returns",
+  );
+  // The run-level view must never produce a B2_BACKUP_FAILED report either.
+  const report = await runBackblazeCycle(h.deps, 2);
+  assert(
+    report.status.startsWith("B2_BACKUP_INCOMPLETE") &&
+      !report.status.includes("FAILED"),
+    `no false FAILED report: ${report.status}`,
+  );
+  assertLaunchCount(1, "the resume never relaunches the verifier");
+});
+
+Deno.test("orchestration: an absent verifier invocation (empty or missing InvocationID) behind an already-open tunnel still launches exactly once", async () => {
+  const fixture = generationFixture(33, WINDOW_START);
+  // REAL VPS observation: a named but absent unit answers reachable=true
+  // with LoadState=not-found and either an empty InvocationID or the
+  // property missing entirely. Neither is a running invocation: the open
+  // tunnel reconcile must not claim VERIFIER_LAUNCHED and skip the launch.
+  const absentProps: Map<string, string>[] = [
+    new Map<string, string>([
+      ["LoadState", "not-found"],
+      ["ActiveState", "inactive"],
+      ["SubState", "dead"],
+      ["Result", ""],
+      ["MainPID", "0"],
+      ["ControlPID", "0"],
+      ["InvocationID", ""],
+    ]),
+    new Map<string, string>([
+      ["LoadState", "not-found"],
+      ["ActiveState", "inactive"],
+      ["SubState", "dead"],
+      ["Result", ""],
+      ["MainPID", "0"],
+      ["ControlPID", "0"],
+    ]),
+  ];
+  for (const props of absentProps) {
+    const state = stateWithJob(fixture, "WORKER_TERMINAL", {
+      workerStatus: workerPendingStatus(fixture, INVOCATION_A),
+      resultSha256: "77".repeat(32),
+    });
+    const h = harness({
+      now: new Date(WINDOW_START + 60_000),
+      gateValue: deriveVerifierGate(fixture.request, fixture.requestSha256),
+      observed: (unitName) =>
+        unitName.startsWith("arch-vps-b2-verify-")
+          ? { props, status: null, lockFree: false, reachable: true }
+          : {
+            props: new Map(),
+            status: null,
+            lockFree: false,
+            reachable: false,
+          },
+    });
+    await h.deps.tunnel.open("/run/user/1002/gnupg/custom/S.gpg-agent");
+    const next = await stepBackupController(state, h.deps, h.deps.now());
+    assert(
+      next.job!.phase === "VERIFIER_LAUNCHED",
+      `the intended launch proceeds, never a false resume: ${next.job!.phase}`,
+    );
+    assert(next.job!.failure === undefined, "no false failure on the absence");
+    assert(
+      h.launches.length === 1,
+      "the intended verifier launch happens exactly once",
+    );
+    assert(
+      h.launches[0].unitName === verifyUnitName(fixture.generation),
+      h.launches[0].unitName,
+    );
+    assert(
+      h.gate.value !== null &&
+        h.gate.value.state === "active" &&
+        h.gate.value.jobId === fixture.request.jobId &&
+        h.gate.value.unitName === verifyUnitName(fixture.generation) &&
+        h.gate.value.unitInvocationId === null,
+      "the exact saved verifier gate survives unbound",
+    );
+    assert(
+      !h.events.includes("gate:create"),
+      "the saved gate is never replaced",
+    );
+  }
+});
+
+Deno.test("orchestration: a real existing verifier invocation behind an already-open tunnel resumes with no new launch and binds the same id", async () => {
+  const fixture = generationFixture(34, WINDOW_START);
+  const state = stateWithJob(fixture, "WORKER_TERMINAL", {
+    workerStatus: workerPendingStatus(fixture, INVOCATION_A),
+    resultSha256: "77".repeat(32),
+  });
+  const h = harness({
+    now: new Date(WINDOW_START + 60_000),
+    gateValue: deriveVerifierGate(fixture.request, fixture.requestSha256),
+    observed: (unitName) =>
+      unitName.startsWith("arch-vps-b2-verify-")
+        ? {
+          props: new Map<string, string>([
+            ["LoadState", "loaded"],
+            ["ActiveState", "active"],
+            ["SubState", "running"],
+            ["Result", "success"],
+            ["MainPID", "123"],
+            ["ControlPID", "0"],
+            ["InvocationID", INVOCATION_B],
+          ]),
+          status: null,
+          lockFree: false,
+          reachable: true,
+        }
+        : {
+          props: new Map(),
+          status: null,
+          lockFree: false,
+          reachable: false,
+        },
+  });
+  await h.deps.tunnel.open("/run/user/1002/gnupg/custom/S.gpg-agent");
+  const first = await stepBackupController(state, h.deps, h.deps.now());
+  assert(
+    first.job!.phase === "VERIFIER_LAUNCHED",
+    `a real existing unit resumes as launched: ${first.job!.phase}`,
+  );
+  assert(h.launches.length === 0, "no new launch for a real invocation");
+  assert(
+    h.gate.value !== null && h.gate.value.state === "active",
+    "the exact verifier gate is never replaced or cleared",
+  );
+  const second = await stepBackupController(first, h.deps, h.deps.now());
+  assert(
+    second.job!.phase === "VERIFIER_RUNNING",
+    `phase=${second.job!.phase}`,
+  );
+  assert(
+    second.job!.verifierInvocationId === INVOCATION_B,
+    "the exact existing invocation binds",
+  );
+  assert(
+    h.launches.length === 0,
+    "the reconcile must never assume a second launch is needed",
+  );
+});
+
+Deno.test("orchestration: a malformed nonempty verifier invocation fails closed without any launch or bind", async () => {
+  const fixture = generationFixture(35, WINDOW_START);
+  const state = stateWithJob(fixture, "WORKER_TERMINAL", {
+    workerStatus: workerPendingStatus(fixture, INVOCATION_A),
+    resultSha256: "77".repeat(32),
+  });
+  const h = harness({
+    now: new Date(WINDOW_START + 60_000),
+    gateValue: deriveVerifierGate(fixture.request, fixture.requestSha256),
+    observed: (unitName) =>
+      unitName.startsWith("arch-vps-b2-verify-")
+        ? {
+          props: new Map<string, string>([
+            ["LoadState", "loaded"],
+            ["ActiveState", "active"],
+            ["SubState", "running"],
+            ["Result", "success"],
+            ["MainPID", "123"],
+            ["ControlPID", "0"],
+            ["InvocationID", "not-a-real-invocation-id"],
+          ]),
+          status: null,
+          lockFree: false,
+          reachable: true,
+        }
+        : {
+          props: new Map(),
+          status: null,
+          lockFree: false,
+          reachable: false,
+        },
+  });
+  await h.deps.tunnel.open("/run/user/1002/gnupg/custom/S.gpg-agent");
+  let threw = false;
+  try {
+    await stepBackupController(state, h.deps, h.deps.now());
+  } catch {
+    threw = true;
+  }
+  assert(threw, "a malformed nonempty invocation must fail closed");
+  assert(h.launches.length === 0, "no launch may follow a malformed identity");
+  assert(
+    h.gate.value !== null && h.gate.value.unitInvocationId === null,
+    "the gate is never silently bound to a malformed identity",
+  );
+});
+
+Deno.test("orchestration: a lost verifier launch transport response reconciles the exact unit before any second launch", async () => {
+  const fixture = generationFixture(47, WINDOW_START);
+  const state = stateWithJob(fixture, "WORKER_TERMINAL", {
+    workerStatus: workerPendingStatus(fixture, INVOCATION_A),
+    resultSha256: "77".repeat(32),
+  });
+  let launchesAttempted = 0;
+  const verifierObservation: ObservedUnit = {
+    props: new Map<string, string>([
+      ["LoadState", "loaded"],
+      ["ActiveState", "active"],
+      ["SubState", "running"],
+      ["Result", "success"],
+      ["MainPID", "123"],
+      ["ControlPID", "0"],
+      ["InvocationID", INVOCATION_B],
+    ]),
+    status: null,
+    lockFree: false,
+    reachable: true,
+  };
+  const h = harness({
+    now: new Date(WINDOW_START + 60_000),
+    observed: (unitName) =>
+      unitName.startsWith("arch-vps-b2-verify-")
+        ? verifierObservation
+        : { props: new Map(), status: null, lockFree: false, reachable: false },
+    launchUnitOverride: () => {
+      launchesAttempted += 1;
+      return Promise.reject(new Error("launch response lost"));
+    },
+  });
+  const first = await stepBackupController(state, h.deps, h.deps.now());
+  assert(
+    first.job!.phase === "VERIFIER_LAUNCHED",
+    `a confirmed existing unit resumes as launched: ${first.job!.phase}`,
+  );
+  assert(
+    first.job!.failure === undefined,
+    "no false FAILED on launch uncertainty",
+  );
+  assert(launchesAttempted === 1, "one launch attempt");
+  assert(
+    h.gate.value !== null &&
+      h.gate.value.unitName === verifyUnitName(fixture.generation) &&
+      h.gate.value.state === "active",
+    "the exact verifier gate is never replaced or cleared",
+  );
+  const second = await stepBackupController(first, h.deps, h.deps.now());
+  assert(
+    second.job!.phase === "VERIFIER_RUNNING",
+    `phase=${second.job!.phase}`,
+  );
+  assert(
+    second.job!.verifierInvocationId === INVOCATION_B,
+    "the exact existing named unit binds the invocation",
+  );
+  assert(
+    launchesAttempted === 1,
+    "the reconcile must never assume a second launch is needed",
+  );
 });
 
 Deno.test("orchestration: a surviving verifier gate after the ACCEPTED persist is revalidated and cleared before pruning", async () => {
@@ -3655,6 +4063,332 @@ Deno.test("cleanup: a normal capture/upload/index directory is accepted; foreign
     script.includes('test -z "$(find "$home/$name" -mindepth 1'),
     "nonempty private-keys-v1.d must stay rejected",
   );
+});
+
+/** NUL-separated synthetic `find -printf "%y %P\0"` records. */
+function encodeNulRecords(records: string[]): Uint8Array {
+  const parts = records.map((record) =>
+    new TextEncoder().encode(`${record}\0`)
+  );
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+Deno.test("cleanup: the emitted parser executes synthetic NUL records, accepting normal names and rejecting foreign whitespace/newline names", async () => {
+  if (!(await fsPermissionsGranted())) {
+    console.log("cleanup parser: skipped without write/run permissions");
+    return;
+  }
+  const fixture = generationFixture(46, WINDOW_START);
+  const emitted = buildCleanupScript(fixture.generation);
+  const dir = await Deno.makeTempDir({ prefix: "m09-cleanup-parser-" });
+  const stubDir = `${dir}/stubs`;
+  await Deno.mkdir(`${dir}/base-backup`, { recursive: true });
+  await Deno.mkdir(`${dir}/base-backup/${fixture.generation}`, {
+    recursive: true,
+  });
+  await Deno.mkdir(
+    `${dir}/base-backup/${fixture.generation}/gpg-public-home`,
+    { recursive: true },
+  );
+  await Deno.mkdir(
+    `${dir}/base-backup/${fixture.generation}/index-public-home`,
+    { recursive: true },
+  );
+  try {
+    // The parser under test is the EXACT emitted code; only the hardcoded
+    // deployment bases are redirected into the sandbox, and find/stat/
+    // readlink/flock/rm are stubs so synthetic NUL records drive the loop.
+    const sandboxed = emitted
+      .replaceAll("/var/tmp/arch-vps-file-backup", `${dir}/base-backup`)
+      .replaceAll("/var/tmp/arch-vps-file-recovery", `${dir}/base-recovery`)
+      .replaceAll(
+        "/var/tmp/arch-vps-file-verification",
+        `${dir}/base-verification`,
+      );
+    await Deno.mkdir(stubDir, { recursive: true });
+    await Deno.writeTextFile(
+      `${stubDir}/stat`,
+      [
+        "#!/bin/sh",
+        'case "$2" in',
+        "  %u) echo 0 ;;",
+        "  %a) echo 700 ;;",
+        "  *) exit 1 ;;",
+        "esac",
+      ].join("\n"),
+    );
+    await Deno.writeTextFile(
+      `${stubDir}/readlink`,
+      [
+        "#!/bin/sh",
+        'echo "$2"',
+      ].join("\n"),
+    );
+    await Deno.writeTextFile(
+      `${stubDir}/flock`,
+      ["#!/bin/sh", "exit 0"].join("\n"),
+    );
+    for (const name of ["stat", "readlink", "flock"]) {
+      await Deno.chmod(`${stubDir}/${name}`, 0o755);
+    }
+    const run = async (
+      genRecords: string[],
+      gpgRecords: string[],
+    ): Promise<
+      { code: number; stdout: string; stderr: string; rmLog: string }
+    > => {
+      const genPath = `${dir}/gen.records`;
+      const gpgPath = `${dir}/gpg.records`;
+      const rmLog = `${dir}/rm.log`;
+      await Deno.writeFile(genPath, encodeNulRecords(genRecords));
+      await Deno.writeFile(gpgPath, encodeNulRecords(gpgRecords));
+      await Deno.writeTextFile(
+        `${stubDir}/find`,
+        [
+          "#!/bin/sh",
+          'case "$1" in',
+          "  *private-keys-v1.d) exit 0 ;;",
+          `  */gpg-public-home|*/index-public-home) cat ${
+            shellQuote(gpgPath)
+          } ;;`,
+          `  *) cat ${shellQuote(genPath)} ;;`,
+          "esac",
+        ].join("\n"),
+      );
+      await Deno.writeTextFile(
+        `${stubDir}/rm`,
+        [
+          "#!/bin/sh",
+          `printf '%s\\n' "$*" >> ${shellQuote(rmLog)}`,
+        ].join("\n"),
+      );
+      await Deno.remove(rmLog).catch(() => {});
+      await Deno.chmod(`${stubDir}/find`, 0o755);
+      await Deno.chmod(`${stubDir}/rm`, 0o755);
+      await Deno.writeTextFile(`${dir}/cleanup.sh`, sandboxed);
+      const child = new Deno.Command("/bin/bash", {
+        args: ["cleanup.sh"],
+        cwd: dir,
+        env: { PATH: `${stubDir}:/usr/bin:/bin` },
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn();
+      const output = await child.output();
+      const status = await child.status;
+      let rmLogText = "";
+      try {
+        rmLogText = await Deno.readTextFile(rmLog);
+      } catch {
+        // No removal was attempted.
+      }
+      return {
+        code: status.code,
+        stdout: new TextDecoder().decode(output.stdout),
+        stderr: new TextDecoder().decode(output.stderr),
+        rmLog: rmLogText,
+      };
+    };
+    const normalGen = [
+      "f exclusions.txt",
+      "f recipient.asc",
+      "f oracle-root.swapfile.stat",
+      "f staging-boot.sha.before",
+      "f staging-boot.sha.after",
+      "f lvm-ocivolume.vg",
+      "f manifest.json",
+      "f capture-error.txt",
+      "f boot-before.stderr.log",
+      "f sample.root.Image",
+      "f sample.root.Image.partial",
+      "f root.tar.zst.gpg",
+      "f root.tar.zst.gpg.partial",
+      "f upload-journal.json",
+      "f recovery-index.json",
+      "f recovery-index.json.gpg",
+      "f recovery-index.json.gpg.partial",
+      "f recovery-index-receipt.json",
+      "f recovery-index-state.json",
+      "f index-recipient.asc",
+      `f .upload-journal.json.${crypto.randomUUID()}.tmp`,
+      "d gpg-public-home",
+      "d index-public-home",
+    ];
+    const normalGpg = [
+      "f pubring.kbx",
+      "f pubring.kbx.lock",
+      "f pubring.gpg",
+      "f pubring.gpg.lock",
+      "f trustdb.gpg",
+      "f trustdb.gpg.lock",
+      "f gpg.conf",
+      "f common.conf",
+      "f random_seed",
+      "s S.gpg-agent",
+      "s S.gpg-agent.extra",
+      "f S.gpg-agent.lock",
+      "f S.gpg-agent.bak",
+      "d private-keys-v1.d",
+    ];
+    // A completely normal generation directory is accepted and removed.
+    const accepted = await run(normalGen, normalGpg);
+    assert(
+      accepted.code === 0,
+      `normal records must be accepted: ${accepted.stdout}${accepted.stderr}`,
+    );
+    assert(accepted.stdout.includes("CLEANUP_OK"), accepted.stdout);
+    assert(
+      accepted.rmLog.includes(fixture.generation),
+      "the exact generation directory is the removal target",
+    );
+    assert(
+      accepted.rmLog.split("\n").filter((line) => line !== "").length === 1,
+      "only the one generation directory may be removed",
+    );
+    // Foreign plain, whitespace, newline and symlink names must each fail
+    // the parser BEFORE any removal.
+    const foreign = await run(
+      ["f root.tar.zst.gpg", "f foreign.txt"],
+      normalGpg,
+    );
+    assert(
+      foreign.code === 9,
+      `foreign.txt must be rejected: ${foreign.stdout}`,
+    );
+    assert(foreign.stdout.includes("UNEXPECTED_FILE"));
+    assert(foreign.stdout.includes("foreign.txt"));
+    assert(foreign.rmLog === "", "no removal after a foreign rejection");
+    const spaced = await run(
+      ["f root.tar.zst.gpg", "f evil name with spaces.txt"],
+      normalGpg,
+    );
+    assert(
+      spaced.code === 9 &&
+        spaced.stdout.includes("evil name with spaces.txt"),
+      `a whitespace-containing foreign name must be rejected whole: ${spaced.stdout}`,
+    );
+    assert(spaced.rmLog === "");
+    const newlined = await run(
+      ["f root.tar.zst.gpg", "f evil\nnewline.txt"],
+      normalGpg,
+    );
+    assert(
+      newlined.code === 9 && newlined.stdout.includes("UNEXPECTED_FILE") &&
+        newlined.stdout.includes("evil\nnewline.txt"),
+      `a newline-containing foreign name must be rejected whole: ${newlined.stdout}`,
+    );
+    assert(newlined.rmLog === "");
+    const symlinked = await run(
+      ["f root.tar.zst.gpg", "l sneaky-link"],
+      normalGpg,
+    );
+    assert(
+      symlinked.code === 9 &&
+        symlinked.stdout.includes("UNEXPECTED_SYMLINK") &&
+        symlinked.stdout.includes("sneaky-link"),
+      symlinked.stdout,
+    );
+    assert(symlinked.rmLog === "");
+    // The public-home loop uses the same NUL parser: a foreign gpg file
+    // inside gpg-public-home is rejected too.
+    const gpgForeign = await run(
+      ["f root.tar.zst.gpg", "d gpg-public-home", "d index-public-home"],
+      ["f pubring.kbx", "f secret.key"],
+    );
+    assert(
+      gpgForeign.code === 9 &&
+        gpgForeign.stdout.includes("UNEXPECTED_GPG_FILE") &&
+        gpgForeign.stdout.includes("secret.key"),
+      gpgForeign.stdout,
+    );
+    assert(gpgForeign.rmLog === "");
+  } finally {
+    await Deno.remove(dir, { recursive: true }).catch(() => {});
+  }
+});
+
+Deno.test("source config: the public exclusions read accepts 0644 while credentials stay strict", async () => {
+  if (!(await fsPermissionsGranted())) {
+    console.log(
+      "source config permissions: skipped without write/run permissions",
+    );
+    return;
+  }
+  const dir = await Deno.makeTempDir({ prefix: "m09-source-config-" });
+  const previous = Deno.cwd();
+  try {
+    await Deno.mkdir(`${dir}/config`, { recursive: true });
+    await Deno.mkdir(`${dir}/.private`, { recursive: true });
+    await Deno.writeTextFile(`${dir}/config/restic-excludes.txt`, "/tmp\n");
+    await Deno.chmod(`${dir}/config/restic-excludes.txt`, 0o644);
+    const oversized = "/".repeat(64 * 1024 + 1);
+    await Deno.writeTextFile(`${dir}/config/oversized.txt`, oversized);
+    await Deno.chmod(`${dir}/config/oversized.txt`, 0o644);
+    await Deno.writeTextFile(`${dir}/config/group-writable.txt`, "/tmp\n");
+    await Deno.chmod(`${dir}/config/group-writable.txt`, 0o664);
+    await Deno.writeTextFile(`${dir}/config/target.txt`, "/target\n");
+    await Deno.writeTextFile(`${dir}/.private/cred.txt`, "s3cret");
+    await Deno.chmod(`${dir}/.private/cred.txt`, 0o644);
+    Deno.chdir(dir);
+    const seam = realPrivateSeam();
+    const exclusions = await seam.readText(
+      "config/restic-excludes.txt",
+      64 * 1024,
+    );
+    assert(
+      exclusions === "/tmp\n",
+      `a 0644 public exclusions file must read: ${exclusions}`,
+    );
+    let threw = false;
+    try {
+      await seam.readBytes("config/restic-excludes.txt", 64 * 1024);
+    } catch {
+      threw = true;
+    }
+    assert(
+      threw,
+      "the strict private readBytes path still rejects the 0644 exclusions",
+    );
+    threw = false;
+    try {
+      await seam.readText(".private/cred.txt", 64 * 1024);
+    } catch {
+      threw = true;
+    }
+    assert(threw, "0644 credentials must stay rejected by the strict path");
+    threw = false;
+    try {
+      await seam.readText("config/oversized.txt", 64 * 1024);
+    } catch {
+      threw = true;
+    }
+    assert(threw, "an oversized public exclusions file must stay bounded");
+    threw = false;
+    try {
+      await seam.readText("config/group-writable.txt", 64 * 1024);
+    } catch {
+      threw = true;
+    }
+    assert(threw, "group/world-writable public exclusions must be rejected");
+    await Deno.remove("config/restic-excludes.txt");
+    await Deno.symlink("target.txt", "config/restic-excludes.txt");
+    threw = false;
+    try {
+      await seam.readText("config/restic-excludes.txt", 64 * 1024);
+    } catch {
+      threw = true;
+    }
+    assert(threw, "a symlinked public exclusions file must be rejected");
+  } finally {
+    Deno.chdir(previous);
+    await Deno.remove(dir, { recursive: true }).catch(() => {});
+  }
 });
 
 Deno.test("service: permission flags grant the controller reads and host validation stays in B2Store", async () => {

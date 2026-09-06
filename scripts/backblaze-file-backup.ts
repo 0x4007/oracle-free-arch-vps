@@ -1154,6 +1154,21 @@ export interface ObservedUnit {
   reachable: boolean;
 }
 
+/** Normalize an observed unit's invocation id. `systemctl show` answers
+ * reachable=true for a named but absent unit (LoadState=not-found) and
+ * prints an empty InvocationID or omits the property entirely, so both
+ * undefined and "" mean "no invocation" and must never count as a running
+ * one. A nonempty value is validated and returned exactly: a malformed
+ * identity fails closed instead of silently binding or launching a
+ * replacement. */
+function normalizeObservedInvocation(
+  props: Map<string, string>,
+): string | null {
+  const value = props.get("InvocationID");
+  if (value === undefined || value === "") return null;
+  return validateUnitInvocationId(value);
+}
+
 export interface RemoteSeam {
   source(script: string): Promise<CommandResult>;
   root(script: string): Promise<CommandResult>;
@@ -1640,7 +1655,29 @@ export function realTunnelSeam(
         },
       };
       active = handle;
+      // Observe the owned child's natural exit (a dead SSH transport ends
+      // the connection without any signal): the active handle is invalidated
+      // ONLY if it still is this child's handle, so a later replacement is
+      // never cleared. A rejected status is consumed (this seam's own
+      // close path reports it); the owned stdin is released on the already
+      // terminated child without any signal or kill.
+      const exitWatch = (async () => {
+        try {
+          await child.status;
+        } catch {
+          // The exit status never resolved: the owned connection still
+          // ended, and the invalidation below remains the only consequence.
+        }
+        if (active === handle) active = null;
+        try {
+          await child.stdin.getWriter().close();
+        } catch {
+          // The remote command is already gone; EOF on a closed pipe is
+          // neither a cleanup failure nor a signal.
+        }
+      })();
       void stderrDrain;
+      void exitWatch;
       return handle;
     },
     async close() {
@@ -1759,10 +1796,48 @@ export function realPrivateSeam(): PrivateSeam {
       await Deno.rename(temp, path);
     },
     async readText(path, maxBytes) {
+      if (path === "config/restic-excludes.txt") {
+        return await readPublicConfigText(path, maxBytes);
+      }
       const bytes = await this.readBytes(path, maxBytes);
       return bytes === undefined ? undefined : new TextDecoder().decode(bytes);
     },
   };
+}
+
+/** Bounded read of the single public config file
+ * (`config/restic-excludes.txt`): regular non-symlink, canonical path,
+ * owner-writable only (0600 and 0644 accepted; any group/world WRITE is
+ * rejected), size bounded. Every other readText path stays on the strict
+ * private readBytes path, which rejects even group/other read access. */
+async function readPublicConfigText(
+  path: string,
+  maxBytes: number,
+): Promise<string | undefined> {
+  try {
+    const info = await Deno.lstat(path);
+    if (!info.isFile) {
+      throw new Error(`${path} is not a regular file`);
+    }
+    if (info.mode !== null && (info.mode & 0o022) !== 0) {
+      throw new Error(
+        `${path} must not grant group or other write permissions`,
+      );
+    }
+    if (info.size > maxBytes) {
+      throw new Error(`${path} exceeds the read bound`);
+    }
+    const resolved = await Deno.realPath(path);
+    const workspace = await Deno.realPath(".");
+    const lexical = path.startsWith("/") ? path : `${workspace}/${path}`;
+    if (resolved !== lexical) {
+      throw new Error(`${path} is not canonical`);
+    }
+    return await Deno.readTextFile(path);
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) return undefined;
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3846,7 +3921,8 @@ export async function stepBackupController(
           return await beat(deps, state, "REQUESTED");
         }
         if (
-          existing.reachable && existing.props.get("InvocationID") !== null
+          existing.reachable &&
+          normalizeObservedInvocation(existing.props) !== null
         ) {
           return await beat(deps, state, "WORKER_LAUNCHED");
         }
@@ -3861,7 +3937,8 @@ export async function stepBackupController(
           request.jobId,
         );
         if (
-          !existing.reachable || existing.props.get("InvocationID") === null
+          !existing.reachable ||
+          normalizeObservedInvocation(existing.props) === null
         ) {
           return await beat(deps, state, "WORKER_LAUNCHED");
         }
@@ -4076,7 +4153,42 @@ export async function stepBackupController(
         await deps.gate.create(derived);
       }
       const publicHome = `${PUBLIC_HOME_BASE}/${generation}`;
-      const sockets = await deps.remote.resolveAgentSocket(publicHome);
+      let existing: ObservedUnit;
+      // An already-open tunnel means a previous WORKER_TERMINAL step in
+      // this process opened one and its launch outcome was lost to a
+      // transport error (the tunnel is process-local, so a fresh setup
+      // never owns one): reconcile the exact named verifier unit before
+      // assuming another launch is needed -- a reachable unit with a real
+      // invocation resumes as VERIFIER_LAUNCHED without a second launch,
+      // and its tunnel is reopened by that phase if none is open.
+      if (deps.tunnel.current() !== null) {
+        try {
+          existing = await deps.remote.observe(
+            verifyUnitName(generation),
+            request.jobId,
+          );
+        } catch {
+          // Transport still down: keep the same WORKER_TERMINAL job and
+          // the exact verifier gate (never fail terminally, never claim a
+          // launch); the next poll retries the reconcile.
+          return await beat(deps, state, "WORKER_TERMINAL");
+        }
+        if (
+          existing.reachable &&
+          normalizeObservedInvocation(existing.props) !== null
+        ) {
+          return await beat(deps, state, "VERIFIER_LAUNCHED");
+        }
+      }
+      let sockets: { socket: string; defaultSocket: string };
+      try {
+        sockets = await deps.remote.resolveAgentSocket(publicHome);
+      } catch {
+        // Transient transport failure after the exact verifier gate was
+        // created and preserved: stay on the same WORKER_TERMINAL
+        // job/generation so the gate survives and the retry resumes it.
+        return await beat(deps, state, "WORKER_TERMINAL");
+      }
       if (sockets.socket === sockets.defaultSocket) {
         await deps.gate.orphan(derived, "UNIT_IDENTITY_MISMATCH");
         return await failJob(deps, state, "AGENT_SOCKET_DEFAULT");
@@ -4085,24 +4197,55 @@ export async function stepBackupController(
       // the -R forward succeeded) before the verifier is launched, and it
       // stays open across every later verifier step: closing it right after
       // the detached launch breaks every decryption.
-      const handle = await deps.tunnel.open(sockets.socket);
-      const launch = await deps.remote.launchUnit({
-        unitName: verifyUnitName(generation),
-        runtimeDir: `${JOBS_RUNTIME_ROOT}/${request.jobId}`,
-        remainingSec,
-        args: [
-          "/usr/local/bin/deno",
-          "run",
-          "--allow-read",
-          "--allow-write",
-          "--allow-run",
-          "--allow-env",
-          "--allow-net",
-          ENTRY_VERIFY_FILE,
-        ],
-      });
+      let handle: TunnelHandle;
+      try {
+        handle = await deps.tunnel.open(sockets.socket);
+      } catch {
+        // Same transient transport handling: the seam proves its own
+        // readiness failure cleanup; the retry reopens the tunnel with the
+        // exact gate still in place.
+        return await beat(deps, state, "WORKER_TERMINAL");
+      }
+      let launch: CommandResult;
+      try {
+        launch = await deps.remote.launchUnit({
+          unitName: verifyUnitName(generation),
+          runtimeDir: `${JOBS_RUNTIME_ROOT}/${request.jobId}`,
+          remainingSec,
+          args: [
+            "/usr/local/bin/deno",
+            "run",
+            "--allow-read",
+            "--allow-write",
+            "--allow-run",
+            "--allow-env",
+            "--allow-net",
+            ENTRY_VERIFY_FILE,
+          ],
+        });
+      } catch {
+        // A throw or lost response may follow an actual systemd launch:
+        // never replace or clear the exact verifier gate, never relaunch
+        // blindly. Observe the same named unit to distinguish an
+        // already-launched resume from a plain retry.
+        try {
+          existing = await deps.remote.observe(
+            verifyUnitName(generation),
+            request.jobId,
+          );
+        } catch {
+          return await beat(deps, state, "WORKER_TERMINAL");
+        }
+        if (
+          existing.reachable &&
+          normalizeObservedInvocation(existing.props) !== null
+        ) {
+          return await beat(deps, state, "VERIFIER_LAUNCHED");
+        }
+        return await beat(deps, state, "WORKER_TERMINAL");
+      }
       if (launch.code !== 0) {
-        const existing = await deps.remote.observe(
+        existing = await deps.remote.observe(
           verifyUnitName(generation),
           request.jobId,
         );
@@ -4111,7 +4254,7 @@ export async function stepBackupController(
           // invocation resumable; the poll pair orphans at the deadline.
           return await beat(deps, state, "VERIFIER_LAUNCHED");
         }
-        if (existing.props.get("InvocationID") === null) {
+        if (normalizeObservedInvocation(existing.props) === null) {
           throw new Error(`Verifier unit launch failed (${launch.code})`);
         }
       }
@@ -4865,9 +5008,13 @@ export function buildCleanupScript(generation: string): string {
     // Only DIRECT children of the generation directory are validated here;
     // each allowed public-key home is enumerated separately at its own
     // depth below, and any other nested descendant is rejected through its
-    // unknown direct parent.
-    "  while IFS= read -r kind name; do",
-    '    test -n "$name" || continue',
+    // unknown direct parent. `find` emits NUL-separated records (kind char,
+    // one space, exact name), and kind/name are derived from fixed character
+    // positions: names containing spaces, globs or newlines are preserved
+    // verbatim and a record is never silently skipped.
+    "  while IFS= read -r -d '' entry; do",
+    "    kind=${entry:0:1}",
+    "    name=${entry:2}",
     '    case "$kind" in',
     "      f)",
     `        case "$name" in ${filePatterns}|${tempPatterns}) ;; *) echo "UNEXPECTED_FILE $base $name"; exit 9 ;; esac`,
@@ -4879,12 +5026,13 @@ export function buildCleanupScript(generation: string): string {
     '        echo "UNEXPECTED_SYMLINK $base $name"; exit 9 ;;',
     '      *) echo "UNEXPECTED_ENTRY $base $name"; exit 9 ;;',
     "    esac",
-    '  done < <(find "$dir" -mindepth 1 -maxdepth 1 -printf "%y %P\\n")',
+    '  done < <(find "$dir" -mindepth 1 -maxdepth 1 -printf "%y %P\\0")',
     "  for publicName in gpg-public-home index-public-home; do",
     '    home="$dir/$publicName"',
     '    if test -d "$home"; then',
-    "      while IFS= read -r kind name; do",
-    '        test -n "$name" || continue',
+    "      while IFS= read -r -d '' entry; do",
+    "        kind=${entry:0:1}",
+    "        name=${entry:2}",
     '        case "$kind" in',
     "          f)",
     `            case "$name" in ${gpgNames}) ;; *) echo "UNEXPECTED_GPG_FILE $base $name"; exit 9 ;; esac`,
@@ -4900,7 +5048,7 @@ export function buildCleanupScript(generation: string): string {
     '            echo "UNEXPECTED_GPG_SYMLINK $base $name"; exit 9 ;;',
     '          *) echo "UNEXPECTED_GPG_ENTRY $base $name"; exit 9 ;;',
     "        esac",
-    '      done < <(find "$home" -mindepth 1 -maxdepth 1 -printf "%y %P\\n")',
+    '      done < <(find "$home" -mindepth 1 -maxdepth 1 -printf "%y %P\\0")',
     "    fi",
     "  done",
     '  rm -rf --one-file-system -- "$dir"',
