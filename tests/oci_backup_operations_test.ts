@@ -1,6 +1,11 @@
 import { ociBackupOperations } from "../scripts/oci-backup-operations.ts";
+import { OnlineBackupRetryableError } from "../scripts/weekly-backup.ts";
 import type { BackupInventoryConfig } from "../scripts/oci-backup-inventory.ts";
-import type { CommandResult, JsonRecord } from "../scripts/oci.ts";
+import type {
+  CommandResult,
+  CommandRunner,
+  JsonRecord,
+} from "../scripts/oci.ts";
 import type { BackupGuestControl } from "../scripts/oci-backup-operations.ts";
 import type { BackupPair, BackupPolicy } from "../scripts/weekly-backup.ts";
 
@@ -293,7 +298,11 @@ function runnerFor(state: MockState) {
   };
 }
 
-function operations(state: MockState, selectedPolicy = policy()) {
+function operations(
+  state: MockState,
+  selectedPolicy = policy(),
+  customRunner?: CommandRunner,
+) {
   const guest: BackupGuestControl = {
     acceptSource: () => Promise.resolve(),
     observeSource: () =>
@@ -320,7 +329,7 @@ function operations(state: MockState, selectedPolicy = policy()) {
     guest,
     evidence,
     () => Promise.resolve(),
-    runnerFor(state),
+    customRunner ?? runnerFor(state),
     {
       now: () => new Date("2026-09-06T08:00:00.000Z"),
       sleep: () => Promise.resolve(),
@@ -359,6 +368,34 @@ Deno.test("group creation checks the live source and uses one OCI group request"
       args.includes("volume-group-backup") && args.includes("create")
     ).length === 1,
     "The adapter issued more than one group create",
+  );
+});
+
+Deno.test("create transport loss is typed as recorded-operation retry", async () => {
+  const state = createState();
+  const base = runnerFor(state);
+  const runner: CommandRunner = async (command, args) => {
+    if (
+      args.includes("bv") && args.includes("volume-group-backup") &&
+      args.includes("create")
+    ) throw new Error("transport unavailable");
+    return await base(command, args);
+  };
+  const ops = operations(state, policy(), runner);
+  let caught: unknown;
+  try {
+    await ops.createBackupGroup(suffix);
+  } catch (error) {
+    caught = error;
+  }
+  assert(caught instanceof OnlineBackupRetryableError);
+  assert(caught.kind === "recorded-operation");
+  assert(caught.resumePhase === "backing-up");
+  assert(
+    !state.calls.some((args) =>
+      args.includes("volume-group-backup") && args.includes("create")
+    ),
+    "the failed runner did not prove a provider mutation",
   );
 });
 
@@ -492,4 +529,21 @@ Deno.test("online operations expose no outage or recovery methods", () => {
   ) {
     assert(!(method in ops), `Legacy method remains exposed: ${method}`);
   }
+});
+
+Deno.test("final creation inventory refuses exhausted replacement headroom", async () => {
+  const state = createState();
+  state.bootBackups = [0, 1, 2, 3].map((n) =>
+    member("boot", `unrelated-${n}`, null)
+  );
+  state.rootBackups = [];
+  await rejects(
+    () => operations(state).createBackupGroup(suffix),
+    "Four retained members leave only one free slot",
+  );
+  assert(
+    !state.calls.some((args) =>
+      args.includes("volume-group-backup") && args.includes("create")
+    ),
+  );
 });

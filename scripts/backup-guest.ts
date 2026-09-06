@@ -1,4 +1,7 @@
-import type { SourceContinuityEvidence } from "./online-backup-contract.ts";
+import {
+  RetryableObservationError,
+  type SourceContinuityEvidence,
+} from "./online-backup-contract.ts";
 import { type CommandRunner, defaultRunner } from "./oci.ts";
 
 export interface GuestPolicy {
@@ -65,6 +68,9 @@ export function backupGuestControl(
     ]);
     // Remote output can contain configuration or credentials. Keep failures
     // terse; private diagnostics must be collected deliberately.
+    if (result.code === 255) {
+      throw new RetryableObservationError("Source SSH observation unavailable");
+    }
     if (result.code !== 0) {
       throw new Error(`Guest observation failed (${result.code})`);
     }
@@ -163,19 +169,9 @@ export function backupGuestControl(
       };
     },
     acceptSource: async () => {
-      // SSH may be unavailable while the source finishes booting. Retry only
-      // reads; do not replay a failed application mutation blindly.
-      let reachable = false;
-      for (let attempt = 0; attempt < 60; attempt++) {
-        try {
-          await remote("true");
-          reachable = true;
-          break;
-        } catch {
-          await new Promise((resolve) => setTimeout(resolve, 5_000));
-        }
-      }
-      if (!reachable) throw new Error("Source SSH did not recover");
+      // The online engine owns durable backoff. A transport outage must not
+      // become a terminal journal failure after an in-process retry loop.
+      await remote("true");
       await bootProof();
       const containers = await inspectContainers();
       if (

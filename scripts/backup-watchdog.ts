@@ -7,6 +7,7 @@ import {
 import { readPrivateJson, writePrivateJson } from "./oci.ts";
 import { notifyMac } from "./backup-mac-alert.ts";
 import { readGate } from "./backblaze-controller-gate.ts";
+import type { OnlineBackupRetry } from "./online-backup-contract.ts";
 import {
   assessBackblazeWatchdog,
   type ControllerState,
@@ -19,6 +20,42 @@ import {
 export const B2_REPORT_PATH = ".private/reports/backblaze-file-backup.json";
 export const ORACLE_REPORT_PATH = ".private/reports/backup-watchdog.json";
 export const B2_STATE_PATH = ".private/file-backup/controller.json";
+
+/** Retry is an unresolved backup failure, even when automatic recovery is due.
+ * Keep its deadline and prior usable capture visible to the operator. */
+export function assessOracleRetry(
+  cycle: { phase: string; retry?: OnlineBackupRetry } | undefined,
+  now: Date,
+) {
+  if (cycle?.phase !== "failed" || !cycle.retry) return undefined;
+  const retry = cycle.retry;
+  const next = Date.parse(retry.nextAttemptAtUtc);
+  const first = Date.parse(retry.firstFailureAtUtc);
+  const deadline = Date.parse(retry.deadlineAtUtc);
+  if (
+    ![next, first, deadline].every(Number.isFinite) ||
+    first > now.getTime() || deadline <= first || next < first ||
+    !Number.isInteger(retry.attempts) || retry.attempts < 1 ||
+    !["retryable", "blocked"].includes(retry.disposition) ||
+    !["planned", "backing-up", "pair-available", "source-accepted", "retiring"]
+      .includes(retry.resumePhase)
+  ) return { status: "INVALID_RETRY_STATE", healthy: false };
+  return {
+    status: retry.disposition === "blocked"
+      ? "BACKUP_BLOCKED_RECONCILIATION"
+      : now.getTime() >= next
+      ? "BACKUP_RETRY_DUE"
+      : next > deadline
+      ? "BACKUP_RETRY_COOLDOWN"
+      : "BACKUP_RETRY_WAITING",
+    healthy: false,
+    retryDisposition: retry.disposition,
+    retryAttempts: retry.attempts,
+    retryResumePhase: retry.resumePhase,
+    nextAttemptAtUtc: retry.nextAttemptAtUtc,
+    retryDeadlineAtUtc: retry.deadlineAtUtc,
+  };
+}
 
 /** Dated boot evidence is independent of per-generation archive verification. */
 export async function readBootDrillEvidence(path: string, now: Date) {
@@ -87,6 +124,7 @@ export async function main(): Promise<void> {
       lastSuccessfulCaptureAtUtc?: string;
       cycle: BackupWatchdogState & {
         captureIdentity?: { captureTimeUtc: string };
+        retry?: OnlineBackupRetry;
       };
     } | undefined;
     try {
@@ -96,6 +134,7 @@ export async function main(): Promise<void> {
     }
     oracleReport = {
       ...assessBackupWatchdog(state?.cycle, now, schedule),
+      ...assessOracleRetry(state?.cycle, now),
       lastSuccessfulCaptureAtUtc: state?.cycle.phase === "complete"
         ? state.cycle.captureIdentity?.captureTimeUtc ??
           state.lastSuccessfulCaptureAtUtc ?? null

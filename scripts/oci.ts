@@ -11,6 +11,10 @@ export type CommandRunner = (
   args: string[],
 ) => Promise<CommandResult>;
 
+/** A failed CLI request is distinct from contradictory provider evidence.
+ * Callers still reconcile a recorded mutation before any retry. */
+export class OciCommandError extends Error {}
+
 export const defaultRunner: CommandRunner = async (command, args) => {
   const child = new Deno.Command(command, {
     args,
@@ -33,7 +37,9 @@ export async function runJson(
   const result = await runner(command, [...args, "--output", "json"]);
   if (result.code !== 0) {
     const message = redactOcid(result.stderr.trim() || result.stdout.trim());
-    throw new Error(`OCI command failed (${result.code}): ${message}`);
+    throw new OciCommandError(
+      `OCI command failed (${result.code}): ${message}`,
+    );
   }
   if (result.stdout.trim() === "") return { data: [] };
   return JSON.parse(result.stdout) as JsonRecord;

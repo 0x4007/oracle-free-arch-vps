@@ -1,4 +1,7 @@
-import type { BackupInventoryConfig } from "./oci-backup-inventory.ts";
+import {
+  type BackupInventoryConfig,
+  readFreeResourceSurfaceEvidence,
+} from "./oci-backup-inventory.ts";
 import type { BackupControllerEvidence } from "./oci-backup-operations.ts";
 import {
   type CommandRunner,
@@ -9,9 +12,19 @@ import {
   stringField,
 } from "./oci.ts";
 import { objectStorage } from "./oci-weekly-audit.ts";
+import { RetryableObservationError } from "./online-backup-contract.ts";
 
 export const FREE_LIMITS_URL =
   "https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm";
+
+export const SUBSCRIPTION_API_URL =
+  "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/organizations/subscription/get.html";
+
+export const CUSTOM_IMAGE_COST_URL =
+  "https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/managingcustomimages.htm";
+
+export const VOLUME_PERFORMANCE_URL =
+  "https://docs.oracle.com/en-us/iaas/Content/Block/Concepts/blockvolumebalancedperformance.htm";
 
 /** Refuse changed or missing published terms rather than assuming an old
  * allowance remains valid. These are the supported zero-cost limits, not the
@@ -49,24 +62,36 @@ export function verifyFreeSubscription(
     subscription["payment-model"] !== "FREE_TRIAL"
   ) {
     throw new Error(
-      "Current subscription is not the verified Free Tier account",
+      "Current subscription is not the verified Free Tier account; the post-trial representation is unverified",
     );
   }
-  // Promotion expiry governs a paid drill, not the Always Free allowances.
-  // An unfamiliar post-trial API representation fails closed for reconciliation.
+  // Oracle's public Organizations API schema does not document a stable
+  // post-trial Always Free enum mapping. Keep unknown representations refused
+  // until a dated provider source and live account response establish one.
 }
 
 export function backupControllerEvidence(
   config: BackupInventoryConfig,
   runner: CommandRunner = defaultRunner,
   fetchDocument: () => Promise<string> = async () => {
-    const response = await fetch(FREE_LIMITS_URL, {
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (!response.ok || new URL(response.url).hostname !== "docs.oracle.com") {
-      throw new Error("Official Always Free page is unavailable");
+    try {
+      const response = await fetch(FREE_LIMITS_URL, {
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (
+        !response.ok || new URL(response.url).hostname !== "docs.oracle.com"
+      ) {
+        throw new RetryableObservationError(
+          "Official Always Free page is unavailable",
+        );
+      }
+      return await response.text();
+    } catch (error) {
+      if (error instanceof RetryableObservationError) throw error;
+      throw new RetryableObservationError(
+        "Official Always Free page request failed",
+      );
     }
-    return await response.text();
   },
 ): BackupControllerEvidence {
   const call = (args: string[]) =>
@@ -83,12 +108,36 @@ export function backupControllerEvidence(
       ...args,
     ], runner);
   let officialProof: { checkedAt: number; limit: number } | undefined;
+  const boundedObjectStorageRunner: CommandRunner = (command, args) => {
+    const bounded = args.includes("--no-retry") &&
+      args.includes("--connection-timeout") && args.includes("--read-timeout");
+    return runner(
+      command,
+      bounded ? args : [
+        "--no-retry",
+        "--connection-timeout",
+        "10",
+        "--read-timeout",
+        "60",
+        ...args,
+      ],
+    );
+  };
   return {
     verify: async () => {
       if (!officialProof || Date.now() - officialProof.checkedAt > 300_000) {
+        let document: string;
+        try {
+          document = await fetchDocument();
+        } catch (error) {
+          if (error instanceof RetryableObservationError) throw error;
+          throw new RetryableObservationError(
+            "Official Always Free page request failed",
+          );
+        }
         officialProof = {
           checkedAt: Date.now(),
-          limit: verifyPublishedFreeLimits(await fetchDocument()),
+          limit: verifyPublishedFreeLimits(document),
         };
       }
       const collection = dataObject(
@@ -124,11 +173,13 @@ export function backupControllerEvidence(
         compartmentId: config.tenancyId,
         instanceId: config.source.instanceId,
         objectStorageLimitGb: 20,
-      }, runner);
+      }, boundedObjectStorageRunner);
+      const surfaces = await readFreeResourceSurfaceEvidence(config, runner);
       return {
         accountAndLimitsProved:
           subscription["subscription-tier"] === "FREE_AND_TRIAL" &&
-          officialProof.limit === 5,
+          subscription["payment-model"] === "FREE_TRIAL" &&
+          officialProof.limit === 5 && surfaces.freeResourceSurfaceProved,
         backupLimit: officialProof.limit,
         objectStorageComplete: storage.inventoryComplete,
         // Use the conservative decimal-GB bound, including every stored version.

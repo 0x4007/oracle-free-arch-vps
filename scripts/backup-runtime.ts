@@ -259,6 +259,9 @@ export async function main(
           ?.captureTimeUtc;
       }
       await writePrivateJson(STATE, state);
+      // Finalize the scheduler claim while this same controller lock still
+      // protects the authoritative journal. A later trigger cannot race it.
+      await control?.afterCycle?.(cycle);
     }
     console.log(
       JSON.stringify({
