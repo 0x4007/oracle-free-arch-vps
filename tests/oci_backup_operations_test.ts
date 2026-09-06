@@ -398,18 +398,18 @@ Deno.test("recorded group identity drift refuses cascading deletion", async () =
   );
 });
 
-Deno.test("group waiter observes pending and AVAILABLE states", async () => {
+Deno.test("group waiter waits through COMMITTED until AVAILABLE", async () => {
   const state = createState({
     grouped: true,
-    groupGetStates: ["CREATING", "AVAILABLE"],
+    groupGetStates: ["CREATING", "COMMITTED", "AVAILABLE"],
   });
   const ops = operations(state);
   await ops.waitBackupGroup(sourceGroupBackupId);
-  assert(state.groupGetIndex === 2, "Waiter did not observe the final state");
+  assert(state.groupGetIndex === 3, "Waiter did not observe the final state");
   assert(
     state.calls.filter((args) =>
       args.includes("volume-group-backup") && args.includes("get")
-    ).length === 2,
+    ).length === 3,
     "Waiter did not poll the group backup",
   );
 });

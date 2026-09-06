@@ -300,6 +300,7 @@ export function ociBackupOperations(
       wait(() => groupBackupGet(id), "AVAILABLE", [
         "REQUEST_RECEIVED",
         "CREATING",
+        "COMMITTED",
         "PROVISIONING",
       ], 3600),
     deleteBackupGroup: async (id, members) => {
