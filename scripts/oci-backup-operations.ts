@@ -65,8 +65,13 @@ function member(
   item: JsonRecord,
   kind: "boot" | "root",
   policy: BackupPolicy,
+  allowTerminating = false,
 ): void {
-  if (stringField(item, "lifecycle-state") !== "AVAILABLE") {
+  if (
+    !["AVAILABLE", ...(allowTerminating ? ["TERMINATING"] : [])].includes(
+      stringField(item, "lifecycle-state"),
+    )
+  ) {
     throw new Error(`The ${kind} backup is not AVAILABLE`);
   }
   if (stringField(item, "type") !== "FULL") {
@@ -185,16 +190,6 @@ export function ociBackupOperations(
     }
     return current;
   };
-  const backupGet = async (kind: "boot" | "root", id: string) =>
-    dataObject(
-      await call([
-        "bv",
-        kind === "boot" ? "boot-volume-backup" : "backup",
-        "get",
-        kind === "boot" ? "--boot-volume-backup-id" : "--volume-backup-id",
-        id,
-      ]),
-    );
   const groupBackupGet = async (id: string) =>
     dataObject(
       await call([
@@ -223,6 +218,26 @@ export function ociBackupOperations(
         throw new Error(`OCI ${desired} wait timed out; last state ${state}`);
       }
       await time.sleep(5_000);
+    }
+  };
+  const waitAbsent = async (ids: string[]) => {
+    const deadline = time.now().getTime() + 1200_000;
+    while (true) {
+      // A successful tenancy-wide LIST proves disappearance. GET 404 alone
+      // cannot distinguish deletion from lost permission.
+      const current = await readBackupInventory(inventoryConfig(), runner);
+      if (
+        ![
+          ...current.bootBackups,
+          ...current.rootBackups,
+          ...current.volumeGroupBackups,
+        ]
+          .some((item) => ids.includes(String(item.id)))
+      ) return;
+      if (time.now().getTime() >= deadline) {
+        throw new Error("Backup deletion inventory wait timed out");
+      }
+      await time.sleep(5000);
     }
   };
   return {
@@ -294,38 +309,50 @@ export function ociBackupOperations(
       if (source.value["lifecycle-state"] !== "RUNNING") {
         throw new Error("Source must remain RUNNING during retention");
       }
-      const group = await groupBackupGet(id);
       if (
-        group.id !== id ||
-        group["volume-group-id"] !== policy.volumeGroupId ||
-        group["compartment-id"] !== policy.source.compartmentId ||
-        !sameMembers(group["volume-backup-ids"], members) ||
-        stringField(group, "type") !== "FULL" ||
-        !["AVAILABLE", "TERMINATING"].includes(
-          stringField(group, "lifecycle-state"),
+        id !== policy.acceptedPair.volumeGroupBackupId ||
+        members.bootId !== policy.acceptedPair.bootId ||
+        members.rootId !== policy.acceptedPair.rootId
+      ) {
+        throw new Error(
+          "Retention refuses a group outside the exact accepted pair",
+        );
+      }
+      const inventory = await readBackupInventory(inventoryConfig(), runner);
+      const group = inventory.volumeGroupBackups.find((item) => item.id === id);
+      if (
+        group && (
+          group.id !== id ||
+          group["volume-group-id"] !== policy.volumeGroupId ||
+          group["compartment-id"] !== policy.source.compartmentId ||
+          !sameMembers(group["volume-backup-ids"], members) ||
+          stringField(group, "type") !== "FULL" ||
+          !["AVAILABLE", "TERMINATING"].includes(
+            stringField(group, "lifecycle-state"),
+          )
         )
       ) {
         throw new Error(
           "Recorded group backup identity changed before deletion",
         );
       }
-      const inventory = await readBackupInventory(inventoryConfig(), runner);
       const boot = inventory.bootBackups.find((item) =>
         item.id === members.bootId
       );
       const root = inventory.rootBackups.find((item) =>
         item.id === members.rootId
       );
-      if (!boot || !root) {
+      const deleting = !group || group["lifecycle-state"] === "TERMINATING";
+      if ((!boot || !root) && !deleting) {
         throw new Error("Recorded group backup member is missing");
       }
-      member(boot, "boot", policy);
-      member(root, "root", policy);
+      if (boot) member(boot, "boot", policy, deleting);
+      if (root) member(root, "root", policy, deleting);
       if (
-        boot["volume-group-backup-id"] !== id ||
-        root["volume-group-backup-id"] !== id
+        (boot && boot["volume-group-backup-id"] !== id) ||
+        (root && root["volume-group-backup-id"] !== id)
       ) throw new Error("Recorded member is not bound to the group backup");
-      if (stringField(group, "lifecycle-state") !== "TERMINATING") {
+      if (!deleting) {
         await call([
           "bv",
           "volume-group-backup",
@@ -335,15 +362,7 @@ export function ociBackupOperations(
           "--force",
         ]);
       }
-      await wait(() => groupBackupGet(id), "TERMINATED", ["TERMINATING"], 1200);
-      // Group deletion cascades members. Require a successful complete
-      // inventory and prove both recorded member IDs disappeared.
-      const after = await readBackupInventory(inventoryConfig(), runner);
-      if (
-        after.bootBackups.some((item) => item.id === members.bootId) ||
-        after.rootBackups.some((item) => item.id === members.rootId) ||
-        after.volumeGroupBackups.some((item) => item.id === id)
-      ) throw new Error("Group deletion did not remove its exact members");
+      await waitAbsent([id, members.bootId, members.rootId]);
     },
     deleteBackup: async (kind, id) => {
       authorize();
@@ -368,7 +387,7 @@ export function ociBackupOperations(
         (kind === "boot" ? inventory.bootBackups : inventory.rootBackups)
           .find((backup) => backup.id === id);
       if (!item) return;
-      member(item, kind, policy);
+      member(item, kind, policy, true);
       if (
         item["volume-group-backup-id"] !== null &&
         item["volume-group-backup-id"] !== undefined
@@ -385,19 +404,7 @@ export function ociBackupOperations(
           "--force",
         ]);
       }
-      await wait(
-        () => backupGet(kind, id),
-        "TERMINATED",
-        ["TERMINATING"],
-        1200,
-      );
-      const after = await readBackupInventory(inventoryConfig(), runner);
-      const items = kind === "boot" ? after.bootBackups : after.rootBackups;
-      if (items.some((backup) => backup.id === id)) {
-        throw new Error(
-          "Standalone backup deletion was not observed in inventory",
-        );
-      }
+      await waitAbsent([id]);
     },
   };
 }

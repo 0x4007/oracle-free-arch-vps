@@ -238,7 +238,15 @@ function runnerFor(state: MockState) {
     if (
       args.includes("bv") && args.includes("volume-group-backup") &&
       args.includes("list")
-    ) return json(state.deleted || !state.group ? [] : [state.group]);
+    ) {
+      const result = state.deleted || !state.group ? [] : [{ ...state.group }];
+      if (state.group?.["lifecycle-state"] === "TERMINATING") {
+        state.deleted = true;
+        state.bootBackups = [];
+        state.rootBackups = [];
+      }
+      return json(result);
+    }
     if (args.includes("network") && args.includes("public-ip")) {
       return json([{ id: "public-ip", "lifecycle-state": "ASSIGNED" }]);
     }
@@ -275,8 +283,10 @@ function runnerFor(state: MockState) {
       args.includes("delete")
     ) {
       assert(state.group, "The mock group is absent");
-      state.groupGetStates = ["TERMINATING", "TERMINATED"];
-      state.groupGetIndex = 0;
+      // OCI can remove the object before GET can ever return TERMINATED.
+      state.deleted = true;
+      state.bootBackups = [];
+      state.rootBackups = [];
       return json([]);
     }
     throw new Error(`Unhandled OCI command: ${args.join(" ")}`);
@@ -443,6 +453,25 @@ Deno.test("grouped retention deletes one wrapper and proves member cascade", asy
     inventoryLists.length >= 2,
     "Cascade was not checked with a later inventory",
   );
+});
+
+Deno.test("group deletion resumes with a missing member and never repeats DELETE", async () => {
+  const state = createState({ grouped: true });
+  state.group!["lifecycle-state"] = "TERMINATING";
+  state.bootBackups = [];
+  state.rootBackups[0]["lifecycle-state"] = "TERMINATING";
+  const selected = policy({
+    suffix: "20260905T080000Z",
+    bootId: sourceBootId,
+    rootId: sourceRootId,
+    volumeGroupBackupId: sourceGroupBackupId,
+  });
+  await operations(state, selected).deleteBackupGroup(sourceGroupBackupId, {
+    bootId: sourceBootId,
+    rootId: sourceRootId,
+  });
+  assert(!state.calls.some((args) => args.includes("delete")));
+  assert(state.deleted);
 });
 
 Deno.test("online operations expose no outage or recovery methods", () => {

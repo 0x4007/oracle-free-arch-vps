@@ -109,6 +109,19 @@ bind the selected backups and reserved IP; group IDs are also approval-bound.
 The proposed QEMU disks use SCSI behind a virtio SCSI controller so their full
 serial strings remain distinct. Virtio block's shorter ID field cannot retain
 the requested strings. The target sizes, files and serials are unchanged.
-The B2 reconstruction module remains pending integration after review found
-plaintext/ciphertext descriptor and rescue-mount accounting defects. No disk
-rebuild or boot is proved by these source changes.
+The B2 worker incorrectly merged its own fb73cc5 commit into canonical as
+3046c06. The primary preserved that ancestry, corrected ownership, and then
+validated the integrated result. The worker's later 59c5194 option replacement
+was rejected and remains unintegrated. Only the primary writes canonical now.
+Pure mapping against the actual first-generation kit passed; no disk rebuild
+or boot is proved by these source changes.
+
+Local review round 1 examined c7ed4e9 against 4733f8d and returned a usable
+verdict with three restore blockers and four migration/retention findings.
+Corrections pass the captured LVM metadata to pvcreate, create nested mount
+directories after their parent is mounted, remove the unsupported tar option,
+accept normally completed legacy journals after live checks, and poll complete
+inventory for deletion. Resume permits only the filesystem work completed at
+the saved stage and can observe an already-running deletion cascade.
+GNU tar 1.35 accepted the corrected arguments in a read-only version check.
+The deployment and both real restore drills remain unperformed.

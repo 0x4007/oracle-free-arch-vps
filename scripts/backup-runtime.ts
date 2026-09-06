@@ -136,7 +136,8 @@ export async function main(
     if (state && state.cycle.mode !== "online") {
       if (
         state.cycle.phase !== "complete" || state.guest?.restored !== true ||
-        state.cycle.recoveryStatus !== "running-accepted" ||
+        state.cycle.recoveryStatus === "needed" ||
+        state.cycle.recoveryStatus === "failed" ||
         !state.cycle.bootId || !state.cycle.rootId
       ) {
         throw new Error(

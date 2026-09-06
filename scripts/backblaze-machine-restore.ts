@@ -989,6 +989,7 @@ function hasPartition(node: TargetNode, part: number): boolean {
 function assertPartitionShape(
   s: TargetSnapshot,
   requireFilesystems: boolean,
+  requireLvm = true,
 ): void {
   if (
     !hasPartition(s.boot, 1) || !hasPartition(s.boot, 2) ||
@@ -1004,9 +1005,9 @@ function assertPartitionShape(
     ): value is string => typeof value === "string"),
   );
   if (
-    !["vfat", "xfs", "ext4", "LVM2_member"].every((value) =>
-      fsByUuid.has(value)
-    )
+    !["vfat", "xfs", "ext4", ...(requireLvm ? ["LVM2_member"] : [])].every((
+      value,
+    ) => fsByUuid.has(value))
   ) {
     fail("target:filesystems");
   }
@@ -1281,7 +1282,6 @@ function tarExtractionArgs(archivePath: string, mountPath: string): string[] {
     "--xattrs-include=*",
     "--sparse",
     "--keep-directory-symlink",
-    "--no-absolute-filenames",
   ];
 }
 
@@ -1420,6 +1420,8 @@ async function mountOne(
   label: string,
 ): Promise<void> {
   await guardBeforeWrite(runner, metadata, target, label);
+  // Parent mounts can hide directories created on the rescue filesystem.
+  await Deno.mkdir(mountPath, { recursive: true, mode: 0o700 });
   await checked(runner, "mount", [device, mountPath], label);
 }
 
@@ -1524,7 +1526,7 @@ async function verifyJournalStage(
     stage === "filesystems-created" || stage === "lvm-restored" ||
     stage === "filesystem-rebuilt"
   ) {
-    assertPartitionShape(current, true);
+    assertPartitionShape(current, true, stage !== "filesystems-created");
     if (current.mountedSources.length > 0) fail("journal:mounted-partial");
   } else {
     // A mounted stage is resumable only while all of the expected target
@@ -1677,6 +1679,8 @@ export async function restoreMachine(
       "--force",
       "--uuid",
       layout.pvUuid,
+      "--restorefile",
+      lvmPath,
       layout.bootDisk.partitions.lvm,
     ], "lvm:pvcreate");
     await guardBeforeWrite(runner, input.metadata, input.target, "lvm:restore");
