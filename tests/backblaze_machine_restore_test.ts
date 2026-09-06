@@ -16,6 +16,7 @@ import {
   restoreTarArgs,
   rewriteSfdiskDump,
   scopeTargetMountEntries,
+  validateRestoreMountBindings,
 } from "../scripts/backblaze-machine-restore.ts";
 import {
   type IndexArchiveRecord,
@@ -377,4 +378,54 @@ Deno.test("m02 scopes findmnt evidence to target mounts", () => {
       entry.target.startsWith(`${workDirectory}/mounts/`)
     ),
   );
+});
+
+Deno.test("restore mount bindings reject a nested-path substitute or a different device", () => {
+  const sources = metadata(makeIndex()).sources;
+  const work = "/run/uos-restore-20260906";
+  const relative: Record<string, string> = {
+    root: "root",
+    efi: "root/efi",
+    "staging-boot": "staging-boot",
+    "staging-efi": "staging-boot/efi",
+    "oracle-root": "oracle-root",
+    "oracle-oled": "oracle-oled",
+  };
+  const nodes = sources.map((source) => ({
+    uuid: source.uuid,
+    fstype: source.filesystem,
+    path: `/dev/${source.name}`,
+  }));
+  const entries = sources.map((source) => ({
+    target: `${work}/mounts/${relative[source.name]}`,
+    source: `/dev/${source.name}`,
+    uuid: source.uuid,
+    fstype: source.filesystem,
+  }));
+  validateRestoreMountBindings(entries, sources, nodes, work);
+  for (
+    const changed of [
+      entries.map((entry) =>
+        entry.source === "/dev/root"
+          ? { ...entry, target: `${work}/mounts/root/efi/child` }
+          : entry
+      ),
+      entries.map((entry) =>
+        entry.source === "/dev/root"
+          ? { ...entry, source: "/dev/unrelated" }
+          : entry
+      ),
+      entries.map((entry) =>
+        entry.source === "/dev/root" ? { ...entry, uuid: "wrong-uuid" } : entry
+      ),
+    ]
+  ) {
+    let refused = false;
+    try {
+      validateRestoreMountBindings(changed, sources, nodes, work);
+    } catch {
+      refused = true;
+    }
+    assert(refused);
+  }
 });

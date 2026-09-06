@@ -246,11 +246,14 @@ interface TargetSnapshot {
   root: TargetNode;
   mountedSources: readonly string[];
   mountedTargets: readonly string[];
+  mountedEntries: readonly MachineMountEntry[];
 }
 
 export interface MachineMountEntry {
   target: string;
   source: string;
+  uuid?: string;
+  fstype?: string;
 }
 
 interface RestoreJournal {
@@ -793,7 +796,12 @@ function collectMountEntries(
     for (const item of value) collectMountEntries(item, out);
   } else if (isRecord(value)) {
     if (typeof value.target === "string" && typeof value.source === "string") {
-      out.push({ target: value.target, source: value.source });
+      out.push({
+        target: value.target,
+        source: value.source,
+        uuid: typeof value.uuid === "string" ? value.uuid : undefined,
+        fstype: typeof value.fstype === "string" ? value.fstype : undefined,
+      });
     }
     for (const item of Object.values(value)) {
       collectMountEntries(item, out);
@@ -903,6 +911,15 @@ async function snapshot(
       if (!targetNodes.has(node)) fail("target:source-present");
     }
   }
+  for (const node of targetNodes) {
+    if (
+      mountpointValues(node).some((path) =>
+        !path.startsWith(`${target.workDirectory}/mounts/`)
+      )
+    ) {
+      fail("target:mounted-outside-restore");
+    }
+  }
   for (const disk of [boot, root]) {
     if (!allowMounted && mountpointValues(disk).length > 0) {
       fail("target:mounted");
@@ -950,6 +967,7 @@ async function snapshot(
     root,
     mountedSources,
     mountedTargets: mountedEntries.map((entry) => entry.target),
+    mountedEntries,
   };
 }
 
@@ -1285,6 +1303,58 @@ function tarExtractionArgs(archivePath: string, mountPath: string): string[] {
   ];
 }
 
+/** Sources and node paths must first be canonicalized by the live caller. */
+export function validateRestoreMountBindings(
+  entries: readonly MachineMountEntry[],
+  sources: readonly MachineSourceRecord[],
+  nodes: readonly MachineBlockNode[],
+  workDirectory: string,
+): void {
+  const mounts = expectedMounts(workDirectory);
+  if (entries.length !== sources.length) fail("mount:unexpected-count");
+  for (const source of sources) {
+    const matches = entries.filter((entry) =>
+      entry.target === mounts[source.name]
+    );
+    const devices = nodes.filter((node) =>
+      node.uuid?.toLowerCase() === source.uuid.toLowerCase()
+    );
+    if (
+      matches.length !== 1 || devices.length !== 1 ||
+      matches[0].uuid?.toLowerCase() !== source.uuid.toLowerCase() ||
+      matches[0].fstype !== source.filesystem ||
+      devices[0].fstype !== source.filesystem ||
+      !devices[0].path || matches[0].source !== devices[0].path
+    ) fail("mount:filesystem-binding");
+  }
+}
+
+async function assertMountedFilesystems(
+  current: TargetSnapshot,
+  metadata: MachineRecoveryMetadata,
+  workDirectory: string,
+): Promise<void> {
+  const nodes = flattenNodes([current.boot, current.root]);
+  const canonicalNodes = await Promise.all(
+    nodes.map(async (node) => ({
+      ...node,
+      path: node.path ? await Deno.realPath(node.path) : undefined,
+    })),
+  );
+  const entries = await Promise.all(
+    current.mountedEntries.map(async (entry) => ({
+      ...entry,
+      source: await Deno.realPath(entry.source),
+    })),
+  );
+  validateRestoreMountBindings(
+    entries,
+    metadata.sources,
+    canonicalNodes,
+    workDirectory,
+  );
+}
+
 /** Exported pure command mapping for focused tests and the primary runbook. */
 export function restoreTarArgs(
   archivePath: string,
@@ -1379,14 +1449,43 @@ async function recreateSwap(
   swap: RestoreLayout["swap"],
 ): Promise<void> {
   const path = `${rootMount}${swap.path}`;
+  const current = await guardBeforeWrite(runner, metadata, target, "swap");
+  await assertMountedFilesystems(current, metadata, target.workDirectory);
   try {
     const existing = await Deno.lstat(path);
     if (
       !existing.isFile || existing.isSymlink || existing.size !== swap.bytes ||
-      existing.mode === null || (existing.mode & 0o777) !== swap.mode
+      existing.mode === null || (existing.mode & 0o777) !== swap.mode ||
+      existing.uid !== swap.uid || existing.gid !== swap.gid
     ) {
       fail("swap:conflict");
     }
+    const signature = await runner("blkid", [
+      "-p",
+      "-s",
+      "TYPE",
+      "-o",
+      "value",
+      path,
+    ]);
+    if (signature.code === 0 && signature.stdout.trim() === "swap") return;
+    if (signature.code !== 2 || signature.stdout.trim()) fail("swap:signature");
+    // A journal-bound, correctly owned allocation may have stopped before mkswap.
+    await checked(
+      runner,
+      "mkswap",
+      ["-U", "random", path],
+      "swap:resume-mkswap",
+    );
+    const verified = await checked(runner, "blkid", [
+      "-p",
+      "-s",
+      "TYPE",
+      "-o",
+      "value",
+      path,
+    ], "swap:verify");
+    if (verified.stdout.trim() !== "swap") fail("swap:signature");
     return;
   } catch (error) {
     if (error instanceof Error && error.message.startsWith(FAIL_PREFIX)) {
@@ -1409,6 +1508,15 @@ async function recreateSwap(
     "swap:chown",
   );
   await checked(runner, "mkswap", ["-U", "random", path], "swap:mkswap");
+  const verified = await checked(runner, "blkid", [
+    "-p",
+    "-s",
+    "TYPE",
+    "-o",
+    "value",
+    path,
+  ], "swap:verify");
+  if (verified.stdout.trim() !== "swap") fail("swap:signature");
 }
 
 async function mountOne(
@@ -1455,7 +1563,13 @@ async function extractArchives(
     if (result.bytes !== archive.bytes || result.sha256 !== archive.sha256) {
       fail(`archive:${role}:hash`);
     }
-    await guardBeforeWrite(runner, metadata, target, `extract:${role}`);
+    const current = await guardBeforeWrite(
+      runner,
+      metadata,
+      target,
+      `extract:${role}`,
+    );
+    await assertMountedFilesystems(current, metadata, target.workDirectory);
     await checked(
       runner,
       "tar",
@@ -1507,7 +1621,6 @@ async function verifyJournalStage(
   runner: CommandRunner,
   metadata: MachineRecoveryMetadata,
   target: MachineRestoreTarget,
-  mounts: Record<RestoreArchiveRole, string>,
 ): Promise<void> {
   const current = await snapshot(
     runner,
@@ -1532,10 +1645,7 @@ async function verifyJournalStage(
     // A mounted stage is resumable only while all of the expected target
     // mountpoints are still visible; a half-mounted or vanished target is
     // deliberately treated as unknown partial state.
-    const text = current.mountedTargets.join("\n");
-    for (const mountPath of Object.values(mounts)) {
-      if (!text.includes(mountPath)) fail("journal:mounts");
-    }
+    await assertMountedFilesystems(current, metadata, target.workDirectory);
   }
 }
 
@@ -1599,7 +1709,6 @@ export async function restoreMachine(
       runner,
       input.metadata,
       input.target,
-      mounts,
     );
   } else {
     // This first inventory is the only state in which formatting is allowed
@@ -1789,7 +1898,7 @@ export async function restoreMachine(
       runner,
       input.metadata,
       input.target,
-      mounts.root,
+      mounts["oracle-root"],
       layout.swap,
     );
     await checked(runner, "sync", [], "swap:sync");
