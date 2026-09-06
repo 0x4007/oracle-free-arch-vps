@@ -34,3 +34,24 @@ export interface MachineRestoreProof {
   bootedAtUtc?: string;
   status: "FILESYSTEMS_REBUILT" | "RESTORE_DRILL_PROVED";
 }
+
+/** A failed operation retains its transaction identity and resumable phase.
+ * Unknown identity is blocked; transport failures are retried only after fresh
+ * evidence. Exhausting a burst cools down, never authorizes a new capture.
+ */
+export interface OnlineBackupRetry {
+  disposition: "retryable" | "blocked";
+  resumePhase: Exclude<OnlineBackupPhase, "failed" | "complete">;
+  attempts: number;
+  firstFailureAtUtc: string;
+  nextAttemptAtUtc: string;
+  deadlineAtUtc: string;
+}
+
+export const ONLINE_RETRY_POLICY = {
+  initialDelayMs: 15 * 60_000,
+  maximumDelayMs: 60 * 60_000,
+  burstDeadlineMs: 4 * 60 * 60_000,
+  maximumAttempts: 6,
+  cooldownMs: 24 * 60 * 60_000,
+} as const;
