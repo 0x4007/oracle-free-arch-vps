@@ -4,6 +4,7 @@ import {
   verifyPublishedFreeLimits,
 } from "../scripts/backup-controller-evidence.ts";
 import { objectStorage } from "../scripts/oci-weekly-audit.ts";
+import { RetryableObservationError } from "../scripts/online-backup-contract.ts";
 
 function assert(value: unknown): asserts value {
   if (!value) throw new Error("Assertion failed");
@@ -47,6 +48,18 @@ Deno.test("account proof rejects paid, inactive and wrong-tenancy subscriptions"
     )
   );
   refuses(() => verifyFreeSubscription(account, "other-tenancy"));
+  refuses(() =>
+    verifyFreeSubscription(
+      { ...account, "subscription-tier": "FREE", "payment-model": "FREE" },
+      "tenancy",
+    )
+  );
+  refuses(() =>
+    verifyFreeSubscription(
+      { ...account, "subscription-tier": "ALWAYS_FREE" },
+      "tenancy",
+    )
+  );
 });
 Deno.test("suspended versioning still counts older Object Storage versions", async () => {
   let versionsRead = false;
@@ -114,4 +127,28 @@ Deno.test("online controller permits ordinary SSH but refuses infrastructure wri
     assert(rejected);
     processes = original;
   }
+});
+
+Deno.test("official terms transport failure is retryable before OCI reads", async () => {
+  const evidence = backupControllerEvidence({
+    ociCliPath: "oci",
+    ociProfile: "DEFAULT",
+    tenancyId: "tenancy",
+    source: {
+      instanceId: "instance",
+      bootVolumeId: "boot",
+      rootVolumeId: "root",
+      compartmentId: "tenancy",
+      region: "region",
+    },
+  }, () => {
+    throw new Error("OCI should not be called after an unavailable terms page");
+  }, () => Promise.reject(new Error("network unavailable")));
+  let failure: unknown;
+  try {
+    await evidence.verify();
+  } catch (error) {
+    failure = error;
+  }
+  assert(failure instanceof RetryableObservationError);
 });
