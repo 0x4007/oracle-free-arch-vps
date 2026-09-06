@@ -60,10 +60,13 @@ import {
 import type { ReconstructedGeneration } from "./backblaze-recovery.ts";
 import { reconstructGeneration } from "./backblaze-recovery.ts";
 import {
+  CAPTURE_RESULT_FILE,
   deriveWorkerGate,
+  INDEX_RESULT_FILE,
   requestSha256Of,
   runSourceWorker,
   sourceConfigSha256,
+  UPLOAD_RESULT_FILE,
   validateRequest,
   validateRequestEnvelope,
   validateStatus as validateWorkerStatus,
@@ -5073,6 +5076,16 @@ const CLEANUP_INDEX_FIXED = [
   "index-recipient.asc",
 ] as const;
 
+/** Source worker contract (exact fixed names in
+ * backblaze-source-worker.ts): one phase result receipt per capture, upload
+ * and index phase persisted into the generation stage. Only these exact
+ * names are accepted; no broader `*-result.json` pattern is ever generated. */
+const CLEANUP_SOURCE_WORKER_RESULTS = [
+  CAPTURE_RESULT_FILE,
+  UPLOAD_RESULT_FILE,
+  INDEX_RESULT_FILE,
+] as const;
+
 /** Atomic write temp prefixes of the upload journal and index publisher
  * (`.${basename}.${crypto.randomUUID()}.tmp` in backblaze-upload.ts and
  * backblaze-index.ts); a crash mid-write may leave one behind. Only the
@@ -5112,6 +5125,7 @@ export function cleanupAllowedNames(): {
     ...CLEANUP_BOOT_SAMPLES.map((sample) => `${sample}.partial`),
     ...CLEANUP_UPLOAD_FIXED,
     ...CLEANUP_INDEX_FIXED,
+    ...CLEANUP_SOURCE_WORKER_RESULTS,
   ]);
   const dirs = new Set<string>(["gpg-public-home", "index-public-home"]);
   for (const role of UPLOAD_ROLE_ORDER) {

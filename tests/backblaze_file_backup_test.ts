@@ -19,7 +19,10 @@ import type {
   WorkerStatus,
 } from "../scripts/backblaze-source-worker.ts";
 import {
+  CAPTURE_RESULT_FILE,
+  INDEX_RESULT_FILE,
   sourceConfigSha256,
+  UPLOAD_RESULT_FILE,
   workerUnitName,
 } from "../scripts/backblaze-source-worker.ts";
 import type {
@@ -4067,6 +4070,41 @@ Deno.test("cleanup: allowed names derive from the output contracts and reject fo
   assert(!cleanupAllowedName(".secret.tmp", false));
   assert(!cleanupGpgHomeAllowedName("id_rsa"));
   assert(!cleanupGpgHomeAllowedName("private-keys-v1.d/key"));
+});
+
+Deno.test("cleanup: the three source-worker stage receipts are accepted, foreign result.json stays rejected", () => {
+  const fixture = generationFixture(25, WINDOW_START);
+  // Regression: a successful worker run persists exactly one receipt per
+  // phase (capture, upload, index) into the generation stage, so omitting
+  // them aborts the final scratch cleanup on UNEXPECTED_FILE.
+  for (
+    const name of [
+      CAPTURE_RESULT_FILE,
+      UPLOAD_RESULT_FILE,
+      INDEX_RESULT_FILE,
+    ]
+  ) {
+    assert(cleanupAllowedName(name, false), `worker stage receipt ${name}`);
+  }
+  // Only the exact producer names are whitelisted; an arbitrary foreign
+  // `*-result.json` receipt must never be accepted.
+  assert(!cleanupAllowedName("foreign-result.json", false));
+  assert(!cleanupAllowedName("capture-result.json.bak", false));
+  assert(!cleanupAllowedName("upload-result.json.extra", false));
+  assert(!cleanupAllowedName("index-result.json.partial", false));
+  const script = buildCleanupScript(fixture.generation);
+  for (
+    const name of [
+      CAPTURE_RESULT_FILE,
+      UPLOAD_RESULT_FILE,
+      INDEX_RESULT_FILE,
+    ]
+  ) {
+    assert(
+      script.includes(name),
+      `the emitted cleanup pattern includes ${name}`,
+    );
+  }
 });
 
 Deno.test("cleanup: script rejects mounts at/below, symlinks and unknown descendants", () => {
