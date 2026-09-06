@@ -614,3 +614,31 @@ Deno.test("grouped pair validator uses IDs and source metadata, never member dis
     f.policy,
   );
 });
+
+Deno.test("a failed final pre-create read withdraws only the unsent intent", async () => {
+  const f = fixture();
+  const create = f.ops.createBackupGroup;
+  let attempts = 0;
+  let now = Date.parse(DATE);
+  f.ops.now = () => new Date(now);
+  f.ops.createBackupGroup = async (suffix) => {
+    if (++attempts === 1) {
+      throw new OnlineBackupRetryableError(
+        "final inventory unavailable",
+        "backing-up",
+        "external-read",
+      );
+    }
+    return await create(suffix);
+  };
+  await rejects(
+    () => runBackupCycle(f.policy, f.journal, f.ops),
+    "the failed read must remain visible",
+  );
+  assert(f.journal.volumeGroupBackupIntent === false);
+  assert(f.journal.retry?.disposition === "retryable");
+  now = Date.parse(f.journal.retry!.nextAttemptAtUtc);
+  await runBackupCycle(f.policy, f.journal, f.ops);
+  assert(f.journal.phase === "complete");
+  assert(f.calls.filter((call) => call === "create-group").length === 1);
+});

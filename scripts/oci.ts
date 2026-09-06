@@ -37,7 +37,9 @@ export async function runJson(
   const result = await runner(command, [...args, "--output", "json"]);
   if (result.code !== 0) {
     const message = redactOcid(result.stderr.trim() || result.stdout.trim());
-    throw new OciCommandError(`OCI command failed (${result.code}): ${message}`);
+    throw new OciCommandError(
+      `OCI command failed (${result.code}): ${message}`,
+    );
   }
   if (result.stdout.trim() === "") return { data: [] };
   return JSON.parse(result.stdout) as JsonRecord;

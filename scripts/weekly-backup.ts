@@ -773,7 +773,20 @@ export async function runBackupCycle(
         // the request. The returned ID is saved by the next save before wait.
         journal.volumeGroupBackupIntent = true;
         await save();
-        groupBackupId = await ops.createBackupGroup(journal.suffix);
+        try {
+          groupBackupId = await ops.createBackupGroup(journal.suffix);
+        } catch (error) {
+          // The adapter can prove that its final read failed before sending
+          // CREATE. Only that typed boundary can withdraw this fresh intent.
+          // A lost mutation response retains intent for exact reconciliation.
+          if (
+            error instanceof OnlineBackupRetryableError &&
+            error.kind === "external-read" &&
+            (error.resumePhase === undefined ||
+              error.resumePhase === "backing-up")
+          ) journal.volumeGroupBackupIntent = false;
+          throw error;
+        }
         if (!validId(groupBackupId)) {
           throw new Error("OCI returned no group backup ID");
         }
