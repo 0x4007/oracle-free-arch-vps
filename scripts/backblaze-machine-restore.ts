@@ -857,6 +857,22 @@ async function snapshot(
   if (!Array.isArray(rawNodes)) fail("target:lsblk-shape");
   const nodes = rawNodes.filter(isRecord) as MachineBlockNode[];
   const flat = flattenNodes(nodes);
+  // Alpine's lsblk can omit SCSI serials. Read the device's actual page-80
+  // serial from udev, rather than its shorter page-83 device identifier.
+  for (const node of flat) {
+    if (node.type !== "disk" || typeof node.path !== "string") continue;
+    if (!/^\/dev\/sd[a-z]+$/.test(node.path)) continue;
+    const properties = await checked(
+      runner,
+      "udevadm",
+      ["info", "--query=property", "--name=" + node.path],
+      "target:scsi-serial",
+    );
+    const serials = properties.stdout.split("\n")
+      .filter((line) => line.startsWith("ID_SCSI_SERIAL="));
+    if (serials.length !== 1) fail("target:scsi-serial");
+    node.serial = serials[0].slice("ID_SCSI_SERIAL=".length);
+  }
   const serialNodes = flat.filter((node): node is TargetNode =>
     typeof node.serial === "string" && typeof node.path === "string" &&
     typeof node.size === "number" && typeof node.type === "string"
