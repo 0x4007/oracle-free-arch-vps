@@ -153,7 +153,7 @@ export function backupTimer(schedule: BackupSchedule, now: Date): string {
   const time = `${String(schedule.hour).padStart(2, "0")}:${
     String(schedule.minute).padStart(2, "0")
   }:00`;
-  return `[Unit]\nDescription=Online weekly paired VPS backup\n\n[Timer]\nOnCalendar=${day} *-*-* ${time} ${schedule.timeZone}\nOnStartupSec=15min\nOnBootSec=15min\nOnUnitActiveSec=15min\nPersistent=true\nAccuracySec=1min\nRandomizedDelaySec=0\nUnit=weekly-backup.service\n\n[Install]\nWantedBy=timers.target\n`;
+  return `[Unit]\nDescription=Online weekly paired VPS backup\n\n[Timer]\nOnCalendar=${day} *-*-* ${time} ${schedule.timeZone}\nOnStartupSec=15min\nOnBootSec=15min\nOnUnitInactiveSec=15min\nPersistent=true\nAccuracySec=1min\nRandomizedDelaySec=0\nUnit=weekly-backup.service\n\n[Install]\nWantedBy=timers.target\n`;
 }
 
 export interface BackupWatchdogState {

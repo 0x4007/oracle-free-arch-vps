@@ -83,7 +83,7 @@ Deno.test("late and early timer invocations retain a due period", () => {
   const timer = backupTimer(schedule, new Date("2026-09-06T08:00:00Z"));
   assert(timer.includes("Persistent=true"));
   assert(timer.includes("OnStartupSec=15min"));
-  assert(timer.includes("OnUnitActiveSec=15min"));
+  assert(timer.includes("OnUnitInactiveSec=15min"));
 });
 Deno.test("repeated DST hours share a single maintenance identity", () => {
   const repeated = { ...schedule, hour: 1 };
