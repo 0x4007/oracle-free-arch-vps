@@ -40,7 +40,7 @@ export interface ScheduledRuntimeState {
 }
 
 export type ScheduledDecision =
-  | { action: "skip"; reason: string }
+  | { action: "skip"; reason: string; completedClaim?: WindowClaim }
   | { action: "run"; claim: WindowClaim };
 
 const CLAIM = ".private/backup-scheduled-window.json";
@@ -164,7 +164,20 @@ export function planScheduledClaim(
   if (
     cycleComplete && !acceptanceDue && periodIsSatisfied(schedule, due, state)
   ) {
-    return { action: "skip", reason: "PERIOD_ALREADY_SATISFIED" };
+    return {
+      action: "skip",
+      reason: "PERIOD_ALREADY_SATISFIED",
+      ...(existing?.status === "started" && state?.cycle?.suffix &&
+          state.cycle.suffix !== existing.previousCycleSuffix
+        ? {
+          completedClaim: {
+            ...existing,
+            status: "complete" as const,
+            updatedAtUtc: now.toISOString(),
+          },
+        }
+        : {}),
+    };
   }
 
   const retry = retryDecision(state, now);
@@ -222,6 +235,11 @@ export async function runScheduledBackup(): Promise<void> {
       const runtime = state as unknown as ScheduledRuntimeState | undefined;
       const decision = planScheduledClaim(schedule, now, runtime, existing);
       if (decision.action === "skip") {
+        // Repair a crash between durable runtime completion and afterCycle
+        // before releasing the shared lock or allowing the B2 launch gate.
+        if (decision.completedClaim) {
+          await writePrivateJson(CLAIM, decision.completedClaim);
+        }
         if (
           [
             "BACKUP_RETRY_BLOCKED",
