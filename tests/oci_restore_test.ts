@@ -76,6 +76,68 @@ Deno.test("activeVolumeTotal excludes terminal volumes", () => {
   );
 });
 
+Deno.test("group restore requires exact live membership even with provider-generated names", () => {
+  const common = {
+    "display-name": "provider-generated",
+    "lifecycle-state": "AVAILABLE",
+    type: "FULL",
+    "compartment-id": "compartment",
+    "volume-group-backup-id": "capture",
+    "time-created": "2026-09-06T15:00:01Z",
+  };
+  const boot = {
+    ...common,
+    id: "boot-backup",
+    "size-in-gbs": 50,
+    "boot-volume-id": "boot-source",
+  };
+  const root = {
+    ...common,
+    id: "root-backup",
+    "size-in-gbs": 150,
+    "volume-id": "root-source",
+  };
+  const group = {
+    id: "capture",
+    "volume-group-id": "group",
+    "compartment-id": "compartment",
+    "lifecycle-state": "AVAILABLE",
+    type: "FULL",
+    "time-created": "2026-09-06T15:00:00Z",
+    "volume-backup-ids": ["boot-backup", "root-backup"],
+  };
+  const validate = (record = group) =>
+    validateBackupPair(
+      boot,
+      root,
+      "20260906T150000Z",
+      "boot-source",
+      "root-source",
+      "compartment",
+      {
+        group: record,
+        volumeGroupId: "group",
+        volumeGroupBackupId: "capture",
+      },
+    );
+  validate();
+  for (
+    const record of [
+      { ...group, "volume-backup-ids": ["boot-backup", "unrelated"] },
+      { ...group, "volume-group-id": "another-group" },
+      { ...group, type: "INCREMENTAL" },
+    ]
+  ) {
+    let rejected = false;
+    try {
+      validate(record);
+    } catch {
+      rejected = true;
+    }
+    assertEquals(rejected, true);
+  }
+});
+
 Deno.test("restore state rejects an unapproved availability domain", () => {
   let rejected = false;
   try {

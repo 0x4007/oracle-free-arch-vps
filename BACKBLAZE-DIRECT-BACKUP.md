@@ -32,9 +32,14 @@ On 2026-09-06, two generations passed the following real checks:
 
 The temporary GPG-agent connection closed after verification. The VPS custom
 socket was removed, and its public-only key home contained no private keys.
-Filesystem archive data stayed between the VPS and Backblaze; only small
-recovery records crossed the home connection. A full machine boot restore
-remains unproved.
+During capture verification, archive data stayed between the VPS and Backblaze.
+A separately approved independent drill later downloaded the first generation
+to the Mac, rebuilt two empty disks, and booted the retained EFI/staging chain
+into Arch at 17:15:23 UTC. SSH, mounts, boot parity, preserved Codex data,
+containers, Guacamole and a visually inspected Xfce desktop passed. Network
+isolation blocked Internet and cloud metadata access. Temporary drill disks and
+payloads were removed; reports and tested tooling remain in the recovery kit.
+See `ONLINE-BACKUP-CONTRACT.md` for corrections and exact evidence boundaries.
 
 The measured namespace contains 277 exact versions and 17,713,370,053 bytes
 across two generations, including both encrypted indexes. At $6.95 per decimal
@@ -100,11 +105,12 @@ The weekly timer is enabled and active. Its next trigger is Sunday, September
 successful runs; two accepted points currently exist. The Pi image mirror is
 absent, with 3.19 GiB reclaimed.
 
-The queued Oracle run missed its maintenance window during initial setup. An
-approval timestamp-format mismatch was corrected without changing its time or
-authority; the real Oracle entrypoint identity check passed without invoking an
-Oracle mutation. That Oracle cycle was not rerun. Its missed-window alert is
-separate from the successful Backblaze archive verification.
+The Oracle controller now uses online group capture. Its real scheduler
+acceptance completed on September 6 without source interruption. Existing
+backups were preserved through initial acceptance. The user subsequently approved
+retiring the old Oracle pair and deferring the separate Oracle boot test for this
+development delivery. Retirement leaves two free slots for the next weekly
+capture. See `ONLINE-BACKUP-CONTRACT.md`.
 
 The final release passed 379 repository tests, including 71 controller tests,
 plus type, format, and lint checks. Its watchdog reports the accepted Backblaze

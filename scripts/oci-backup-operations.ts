@@ -1,9 +1,10 @@
+import type { SourceContinuityEvidence } from "./online-backup-contract.ts";
 import {
   type CommandRunner,
-  dataArray,
   dataObject,
   defaultRunner,
   type JsonRecord,
+  numberField,
   runJson,
   stringField,
 } from "./oci.ts";
@@ -15,15 +16,16 @@ import {
 import {
   type BackupJournal,
   type BackupOperations,
+  type BackupPair,
   type BackupPolicy,
   validateStandingApproval,
 } from "./weekly-backup.ts";
 
+/** The guest adapter is read-only. It cannot stop, start, freeze, kill or
+ * otherwise repair the production source. */
 export interface BackupGuestControl {
-  assertNoActiveWork(): Promise<void>;
-  quiesce(): Promise<void>;
-  verifyQuiesced(): Promise<void>;
   acceptSource(): Promise<void>;
+  observeSource(): Promise<SourceContinuityEvidence>;
 }
 
 export interface BackupControllerEvidence {
@@ -32,6 +34,10 @@ export interface BackupControllerEvidence {
     backupLimit: number;
     objectStorageComplete: boolean;
     objectStorageWithinLimit: boolean;
+    objectStorageBytes?: number;
+    objectStorageHeadroomBytes?: number;
+    /** Optional until the primary's live group SKU/accounting audit passes. */
+    groupAccountingProved?: boolean;
   }>;
   assertNoOtherController(): Promise<void>;
 }
@@ -40,16 +46,71 @@ export interface BackupClock {
   now(): Date;
   sleep(milliseconds: number): Promise<void>;
 }
+
 const clock: BackupClock = {
   now: () => new Date(),
   sleep: (milliseconds) =>
     new Promise((resolve) => setTimeout(resolve, milliseconds)),
 };
 
-/** Creates real OCI operations, but performs nothing until called by the
- * journaled state machine under the controller lock. No CLI waiter is attached
- * to creation: the returned ID must be saved before polling begins.
- */
+function active(items: JsonRecord[]): JsonRecord[] {
+  return items.filter((item) => item["lifecycle-state"] !== "TERMINATED");
+}
+
+function validId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function member(
+  item: JsonRecord,
+  kind: "boot" | "root",
+  policy: BackupPolicy,
+  allowTerminating = false,
+): void {
+  if (
+    !["AVAILABLE", ...(allowTerminating ? ["TERMINATING"] : [])].includes(
+      stringField(item, "lifecycle-state"),
+    )
+  ) {
+    throw new Error(`The ${kind} backup is not AVAILABLE`);
+  }
+  if (stringField(item, "type") !== "FULL") {
+    throw new Error(`The ${kind} backup is not FULL`);
+  }
+  if (numberField(item, "size-in-gbs") !== (kind === "boot" ? 50 : 150)) {
+    throw new Error(`The ${kind} backup size changed`);
+  }
+  const sourceKey = kind === "boot" ? "boot-volume-id" : "volume-id";
+  const sourceId = kind === "boot"
+    ? policy.source.bootVolumeId
+    : policy.source.rootVolumeId;
+  if (
+    item[sourceKey] !== sourceId ||
+    item["compartment-id"] !== policy.source.compartmentId ||
+    !validId(item.id)
+  ) throw new Error(`The ${kind} backup source changed`);
+  if (
+    typeof item["time-created"] !== "string" ||
+    !Number.isFinite(Date.parse(item["time-created"]))
+  ) {
+    throw new Error(`The ${kind} backup timestamp is invalid`);
+  }
+}
+
+function sameMembers(
+  ids: unknown,
+  members: Pick<BackupPair, "bootId" | "rootId">,
+): boolean {
+  return Array.isArray(ids) && ids.length === 2 &&
+    new Set(ids).size === 2 &&
+    ids.every((id) => typeof id === "string") &&
+    (ids as string[]).includes(members.bootId) &&
+    (ids as string[]).includes(members.rootId);
+}
+
+/** Creates real OCI operations, but performs no mutation until called by the
+ * journaled online state machine under the controller lock. The returned group
+ * backup ID is persisted by the caller before waitBackupGroup is invoked. */
 export function ociBackupOperations(
   config: BackupInventoryConfig,
   policy: BackupPolicy,
@@ -61,6 +122,10 @@ export function ociBackupOperations(
 ): BackupOperations {
   const authorize = () => {
     validateStandingApproval(policy, time.now());
+    if (
+      config.volumeGroupId !== undefined &&
+      config.volumeGroupId !== policy.volumeGroupId
+    ) throw new Error("OCI volume group differs from standing approval");
     for (
       const key of [
         "instanceId",
@@ -75,6 +140,10 @@ export function ociBackupOperations(
       }
     }
   };
+  const inventoryConfig = (): BackupInventoryConfig => ({
+    ...config,
+    volumeGroupId: policy.volumeGroupId,
+  });
   const call = (args: string[]) =>
     runJson(config.ociCliPath, [
       "--profile",
@@ -106,16 +175,31 @@ export function ociBackupOperations(
     ) throw new Error("Source instance identity changed");
     return { value, etag: stringField(response, "etag") };
   };
-  const guard = async (expected: string, checkGuest: boolean) => {
+  const sourceInventory = async () => {
     authorize();
     await evidence.assertNoOtherController();
-    if (checkGuest) await guest.assertNoActiveWork();
-    const current = await instance();
-    if (current.value["lifecycle-state"] !== expected) {
-      throw new Error(`Source must be ${expected} before mutation`);
+    const current = await readBackupInventory(inventoryConfig(), runner);
+    if (
+      current.instance["lifecycle-state"] !== "RUNNING" ||
+      !current.sourceAttachmentsProved ||
+      !current.sourceVolumeGroupProved
+    ) {
+      throw new Error(
+        "Source is not running with the approved volume group bound",
+      );
     }
     return current;
   };
+  const groupBackupGet = async (id: string) =>
+    dataObject(
+      await call([
+        "bv",
+        "volume-group-backup",
+        "get",
+        "--volume-group-backup-id",
+        id,
+      ]),
+    );
   const wait = async (
     read: () => Promise<JsonRecord>,
     desired: string,
@@ -131,220 +215,187 @@ export function ociBackupOperations(
         throw new Error(`Unexpected OCI lifecycle state: ${state}`);
       }
       if (time.now().getTime() >= deadline) {
-        // The read above is the mandatory final state observation, including
-        // on SOFTSTOP timeout. There is no hard-stop or reset fallback.
         throw new Error(`OCI ${desired} wait timed out; last state ${state}`);
       }
       await time.sleep(5_000);
     }
   };
-  const backupGet = async (kind: "boot" | "root", id: string) =>
-    dataObject(
-      await call([
-        "bv",
-        kind === "boot" ? "boot-volume-backup" : "backup",
-        "get",
-        kind === "boot" ? "--boot-volume-backup-id" : "--volume-backup-id",
-        id,
-      ]),
-    );
+  const waitAbsent = async (ids: string[]) => {
+    const deadline = time.now().getTime() + 1200_000;
+    while (true) {
+      // A successful tenancy-wide LIST proves disappearance. GET 404 alone
+      // cannot distinguish deletion from lost permission.
+      const current = await readBackupInventory(inventoryConfig(), runner);
+      if (
+        ![
+          ...current.bootBackups,
+          ...current.rootBackups,
+          ...current.volumeGroupBackups,
+        ]
+          .some((item) => ids.includes(String(item.id)))
+      ) return;
+      if (time.now().getTime() >= deadline) {
+        throw new Error("Backup deletion inventory wait timed out");
+      }
+      await time.sleep(5000);
+    }
+  };
   return {
     now: time.now,
     save,
     snapshot: async () => {
+      authorize();
       const proof = await evidence.verify();
       if (
-        !Number.isInteger(proof.backupLimit) || proof.backupLimit < 2 ||
-        proof.backupLimit > 5
-      ) {
-        throw new Error("Current free backup allowance is not proved");
-      }
+        !Number.isInteger(proof.backupLimit) ||
+        proof.backupLimit < 2 || proof.backupLimit > 5
+      ) throw new Error("Current free backup allowance is not proved");
       await evidence.assertNoOtherController();
-      const inventory = await readBackupInventory(config, runner);
-      if (inventory.instance["lifecycle-state"] === "RUNNING") {
-        await guest.assertNoActiveWork();
-      }
+      const inventory = await readBackupInventory(inventoryConfig(), runner);
       return backupSnapshot(inventory, {
         accountAndLimitsProved: proof.accountAndLimitsProved &&
           proof.objectStorageComplete && proof.objectStorageWithinLimit,
         backupLimit: proof.backupLimit,
+        groupAccountingProved: proof.groupAccountingProved,
         writersAbsent: true,
       });
     },
-    recoverySnapshot: async () => {
+    observeSource: () => guest.observeSource(),
+    acceptSource: () => guest.acceptSource(),
+    createBackupGroup: async (suffix) => {
       authorize();
-      await evidence.assertNoOtherController();
-      const current = await instance();
-      const bootAttachments = dataArray(
-        await call([
-          "compute",
-          "boot-volume-attachment",
-          "list",
-          "--compartment-id",
-          policy.source.compartmentId,
-          "--instance-id",
-          policy.source.instanceId,
-          "--availability-domain",
-          stringField(current.value, "availability-domain"),
-          "--all",
-        ]),
-      ).filter((item) => item["lifecycle-state"] !== "DETACHED");
-      const rootAttachments = dataArray(
-        await call([
-          "compute",
-          "volume-attachment",
-          "list",
-          "--compartment-id",
-          policy.source.compartmentId,
-          "--instance-id",
-          policy.source.instanceId,
-          "--all",
-        ]),
-      ).filter((item) => item["lifecycle-state"] !== "DETACHED");
-      const bound = bootAttachments.length === 1 &&
-        rootAttachments.length === 1 &&
-        bootAttachments[0]["boot-volume-id"] === policy.source.bootVolumeId &&
-        rootAttachments[0]["volume-id"] === policy.source.rootVolumeId &&
-        rootAttachments[0]["attachment-type"] === "paravirtualized" &&
-        [...bootAttachments, ...rootAttachments].every((item) =>
-          item["instance-id"] === policy.source.instanceId &&
-          item["lifecycle-state"] === "ATTACHED"
-        );
-      if (!bound) throw new Error("Recovery source attachments changed");
-      // New guest work must prevent shutdown, but must not prevent restoring
-      // applications that this transaction already stopped. Recovery preserves
-      // that work; source identity, attachments and controller ownership still
-      // have to match, and START retains its separate stopped-ETag guard.
-      return {
-        source: policy.source,
-        instanceState: stringField(current.value, "lifecycle-state"),
-        stoppedEpoch: current.value["lifecycle-state"] === "STOPPED"
-          ? current.etag
-          : undefined,
-        sourceAttachmentsProved: bound,
-        writersAbsent: true,
-      };
-    },
-    quiesce: async () => {
-      await guard("RUNNING", true);
-      await guest.quiesce();
-    },
-    verifyQuiesced: () => guest.verifyQuiesced(),
-    softStop: async () => {
-      const before = await guard("RUNNING", true);
-      await guest.verifyQuiesced();
-      try {
-        await call([
-          "compute",
-          "instance",
-          "action",
-          "--instance-id",
-          policy.source.instanceId,
-          "--action",
-          "SOFTSTOP",
-          "--if-match",
-          before.etag,
-        ]);
-      } catch (error) {
-        // Observe the same source after an ambiguous command result. Even if
-        // STOPPED, fail this backup cycle and let its recovery path restart it.
-        try {
-          await instance();
-        } catch { /* original failure remains authoritative */ }
-        throw error;
-      }
-    },
-    waitStopped: () =>
-      wait(async () => (await instance()).value, "STOPPED", [
-        "RUNNING",
-        "STOPPING",
-      ], 1200),
-    createBackup: async (kind, suffix, stoppedEpoch) => {
-      const before = await guard("STOPPED", false);
-      if (!stoppedEpoch || before.etag !== stoppedEpoch) {
-        throw new Error("Source stopped epoch changed before backup creation");
-      }
       if (!/^\d{8}T\d{6}Z$/.test(suffix)) {
         throw new Error("Invalid backup suffix");
+      }
+      // This is the final source/group/attachment check before mutation. It
+      // also gives an ambiguous provider response a complete inventory to
+      // reconcile, rather than blindly issuing a second create.
+      const inventory = await sourceInventory();
+      const displayName = `arch-online-golden-${suffix}`;
+      if (
+        active(inventory.volumeGroupBackups).some((item) =>
+          item["display-name"] === displayName
+        )
+      ) {
+        throw new Error(
+          "Matching group backup already exists; reconcile intent",
+        );
       }
       const response = dataObject(
         await call([
           "bv",
-          kind === "boot" ? "boot-volume-backup" : "backup",
+          "volume-group-backup",
           "create",
-          kind === "boot" ? "--boot-volume-id" : "--volume-id",
-          kind === "boot"
-            ? policy.source.bootVolumeId
-            : policy.source.rootVolumeId,
+          "--volume-group-id",
+          policy.volumeGroupId,
           "--type",
           "FULL",
           "--display-name",
-          `arch-${kind === "boot" ? "stage" : "root"}-golden-${suffix}`,
+          displayName,
         ]),
       );
       return stringField(response, "id");
     },
-    waitBackup: (kind, id) =>
-      wait(() => backupGet(kind, id), "AVAILABLE", [
+    waitBackupGroup: (id) =>
+      wait(() => groupBackupGet(id), "AVAILABLE", [
         "REQUEST_RECEIVED",
         "CREATING",
+        "COMMITTED",
+        "PROVISIONING",
       ], 3600),
-    start: async (stoppedEpoch) => {
-      const before = await guard("STOPPED", false);
-      if (!stoppedEpoch || before.etag !== stoppedEpoch) {
-        throw new Error("Source stopped epoch changed before START");
+    deleteBackupGroup: async (id, members) => {
+      authorize();
+      await evidence.assertNoOtherController();
+      const source = await instance();
+      if (source.value["lifecycle-state"] !== "RUNNING") {
+        throw new Error("Source must remain RUNNING during retention");
       }
-      await call([
-        "compute",
-        "instance",
-        "action",
-        "--instance-id",
-        policy.source.instanceId,
-        "--action",
-        "START",
-        "--if-match",
-        before.etag,
-      ]);
-    },
-    acceptSource: async () => {
-      await wait(
-        async () => (await instance()).value,
-        "RUNNING",
-        ["STARTING"],
-        1200,
+      if (
+        id !== policy.acceptedPair.volumeGroupBackupId ||
+        members.bootId !== policy.acceptedPair.bootId ||
+        members.rootId !== policy.acceptedPair.rootId
+      ) {
+        throw new Error(
+          "Retention refuses a group outside the exact accepted pair",
+        );
+      }
+      const inventory = await readBackupInventory(inventoryConfig(), runner);
+      const group = inventory.volumeGroupBackups.find((item) => item.id === id);
+      if (
+        group && (
+          group.id !== id ||
+          group["volume-group-id"] !== policy.volumeGroupId ||
+          group["compartment-id"] !== policy.source.compartmentId ||
+          !sameMembers(group["volume-backup-ids"], members) ||
+          stringField(group, "type") !== "FULL" ||
+          !["AVAILABLE", "TERMINATING"].includes(
+            stringField(group, "lifecycle-state"),
+          )
+        )
+      ) {
+        throw new Error(
+          "Recorded group backup identity changed before deletion",
+        );
+      }
+      const boot = inventory.bootBackups.find((item) =>
+        item.id === members.bootId
       );
-      await guest.acceptSource();
+      const root = inventory.rootBackups.find((item) =>
+        item.id === members.rootId
+      );
+      const deleting = !group || group["lifecycle-state"] === "TERMINATING";
+      if ((!boot || !root) && !deleting) {
+        throw new Error("Recorded group backup member is missing");
+      }
+      if (boot) member(boot, "boot", policy, deleting);
+      if (root) member(root, "root", policy, deleting);
+      if (
+        (boot && boot["volume-group-backup-id"] !== id) ||
+        (root && root["volume-group-backup-id"] !== id)
+      ) throw new Error("Recorded member is not bound to the group backup");
+      if (!deleting) {
+        await call([
+          "bv",
+          "volume-group-backup",
+          "delete",
+          "--volume-group-backup-id",
+          id,
+          "--force",
+        ]);
+      }
+      await waitAbsent([id, members.bootId, members.rootId]);
     },
     deleteBackup: async (kind, id) => {
-      await guard("RUNNING", true);
+      authorize();
+      await evidence.assertNoOtherController();
+      const source = await instance();
+      if (source.value["lifecycle-state"] !== "RUNNING") {
+        throw new Error("Source must remain RUNNING during retention");
+      }
       if (
-        policy.retainPreviousPair ||
+        policy.acceptedPair.volumeGroupBackupId ||
         id !==
           (kind === "boot"
             ? policy.acceptedPair.bootId
             : policy.acceptedPair.rootId)
       ) {
         throw new Error(
-          "Retention refuses a backup outside the exact previous pair",
+          "Retention refuses a backup outside the exact standalone pair",
         );
       }
-      const backup = await backupGet(kind, id);
-      const sourceKey = kind === "boot" ? "boot-volume-id" : "volume-id";
-      const sourceId = kind === "boot"
-        ? policy.source.bootVolumeId
-        : policy.source.rootVolumeId;
+      const inventory = await readBackupInventory(inventoryConfig(), runner);
+      const item =
+        (kind === "boot" ? inventory.bootBackups : inventory.rootBackups)
+          .find((backup) => backup.id === id);
+      if (!item) return;
+      member(item, kind, policy, true);
       if (
-        backup[sourceKey] !== sourceId ||
-        backup["compartment-id"] !== policy.source.compartmentId ||
-        backup["display-name"] !==
-          `arch-${
-            kind === "boot" ? "stage" : "root"
-          }-golden-${policy.acceptedPair.suffix}`
+        item["volume-group-backup-id"] !== null &&
+        item["volume-group-backup-id"] !== undefined
       ) {
-        throw new Error("Previous backup identity changed before deletion");
+        throw new Error("Grouped members must be deleted through their group");
       }
-      if (backup["lifecycle-state"] === "TERMINATED") return;
-      if (backup["lifecycle-state"] !== "TERMINATING") {
+      if (stringField(item, "lifecycle-state") !== "TERMINATING") {
         await call([
           "bv",
           kind === "boot" ? "boot-volume-backup" : "backup",
@@ -354,27 +405,7 @@ export function ociBackupOperations(
           "--force",
         ]);
       }
-      await wait(
-        async () => {
-          // Deleted objects can return an ambiguous NotAuthorizedOrNotFound
-          // from GET. Require a successful complete inventory after deletion
-          // instead of interpreting that error as proof of removal.
-          const remaining = dataArray(
-            await call([
-              "bv",
-              kind === "boot" ? "boot-volume-backup" : "backup",
-              "list",
-              "--compartment-id",
-              policy.source.compartmentId,
-              "--all",
-            ]),
-          ).find((item) => item.id === id);
-          return remaining ?? { "lifecycle-state": "TERMINATED" };
-        },
-        "TERMINATED",
-        ["TERMINATING"],
-        1200,
-      );
+      await waitAbsent([id]);
     },
   };
 }

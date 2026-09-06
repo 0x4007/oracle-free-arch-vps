@@ -15,6 +15,10 @@ export interface BackupInventoryConfig {
   ociProfile: string;
   tenancyId: string;
   source: BackupSource;
+  /** Existing source group; it is never created by the inventory reader. */
+  volumeGroupId?: string;
+  /** Set only after the primary has proved provider wrapper accounting live. */
+  groupAccountingProved?: boolean;
 }
 
 export interface BackupInventory {
@@ -30,6 +34,10 @@ export interface BackupInventory {
   rootAttachments: JsonRecord[];
   bootBackups: JsonRecord[];
   rootBackups: JsonRecord[];
+  volumeGroups: JsonRecord[];
+  volumeGroupBackups: JsonRecord[];
+  sourceVolumeGroup?: JsonRecord;
+  sourceVolumeGroupProved: boolean;
   publicIps: JsonRecord[];
   totals: {
     instances: number;
@@ -37,9 +45,62 @@ export interface BackupInventory {
     memoryGb: number;
     liveVolumeGb: number;
     backups: number;
+    volumeGroupBackups: number;
+    volumeGroups: number;
     publicIps: number;
   };
   sourceAttachmentsProved: boolean;
+  groupAccountingProved: boolean;
+}
+
+function active(items: JsonRecord[]): JsonRecord[] {
+  return items.filter((item) => item["lifecycle-state"] !== "TERMINATED");
+}
+
+function uniqueById(items: JsonRecord[]): JsonRecord[] {
+  const byId = new Map<string, JsonRecord>();
+  for (const item of items) {
+    const id = item.id;
+    if (typeof id === "string") byId.set(id, item);
+    else byId.set(`${byId.size}:${JSON.stringify(item)}`, item);
+  }
+  return [...byId.values()];
+}
+
+function volumeIds(group: JsonRecord): string[] {
+  const value = group["volume-ids"];
+  if (!Array.isArray(value) || value.some((id) => typeof id !== "string")) {
+    throw new Error("Source volume group has no valid volume member list");
+  }
+  return value as string[];
+}
+
+function proveSourceVolumeGroup(
+  groups: JsonRecord[],
+  config: BackupInventoryConfig,
+  availabilityDomain: string,
+): JsonRecord | undefined {
+  if (!config.volumeGroupId) return undefined;
+  const matches = active(groups).filter((item) =>
+    item.id === config.volumeGroupId
+  );
+  if (matches.length !== 1) {
+    throw new Error("Exact source volume group is missing or duplicated");
+  }
+  const group = matches[0];
+  const ids = volumeIds(group);
+  if (
+    group["compartment-id"] !== config.source.compartmentId ||
+    group["availability-domain"] !== availabilityDomain ||
+    ids.length !== 2 || new Set(ids).size !== 2 ||
+    !ids.includes(config.source.bootVolumeId) ||
+    !ids.includes(config.source.rootVolumeId)
+  ) {
+    throw new Error(
+      "Source volume group does not bind exactly both source volumes",
+    );
+  }
+  return group;
 }
 
 /** All calls are read-only. Inaccessible compartments or malformed responses
@@ -67,7 +128,7 @@ export async function readBackupInventory(
     );
   }
   // Any additional subscription must be accounted for before mutation. This
-  // first deployment has exactly one region; do not silently omit another.
+  // controller has one home-region accounting boundary.
   if (subscriptions.length !== 1) {
     throw new Error("Additional regions require tenancy-wide accounting");
   }
@@ -103,12 +164,14 @@ export async function readBackupInventory(
     ]),
   );
   if (domains.length === 0) throw new Error("No availability domains returned");
-  const instances: JsonRecord[] = [],
-    bootVolumes: JsonRecord[] = [],
-    rootVolumes: JsonRecord[] = [];
-  const bootBackups: JsonRecord[] = [],
-    rootBackups: JsonRecord[] = [],
-    publicIps: JsonRecord[] = [];
+  const instances: JsonRecord[] = [];
+  const bootVolumes: JsonRecord[] = [];
+  const rootVolumes: JsonRecord[] = [];
+  const bootBackups: JsonRecord[] = [];
+  const rootBackups: JsonRecord[] = [];
+  const volumeGroups: JsonRecord[] = [];
+  const volumeGroupBackups: JsonRecord[] = [];
+  const publicIps: JsonRecord[] = [];
   for (const id of ids) {
     for (
       const [target, args] of [
@@ -116,6 +179,7 @@ export async function readBackupInventory(
         [rootVolumes, ["bv", "volume", "list"]],
         [bootBackups, ["bv", "boot-volume-backup", "list"]],
         [rootBackups, ["bv", "backup", "list"]],
+        [volumeGroupBackups, ["bv", "volume-group-backup", "list"]],
         [publicIps, ["network", "public-ip", "list", "--scope", "REGION"]],
       ] as [JsonRecord[], string[]][]
     ) {
@@ -124,6 +188,7 @@ export async function readBackupInventory(
       );
     }
     for (const domain of domains) {
+      const domainName = stringField(domain, "name");
       bootVolumes.push(
         ...dataArray(
           await call([
@@ -133,7 +198,21 @@ export async function readBackupInventory(
             "--compartment-id",
             id,
             "--availability-domain",
-            stringField(domain, "name"),
+            domainName,
+            "--all",
+          ]),
+        ),
+      );
+      volumeGroups.push(
+        ...dataArray(
+          await call([
+            "bv",
+            "volume-group",
+            "list",
+            "--compartment-id",
+            id,
+            "--availability-domain",
+            domainName,
             "--all",
           ]),
         ),
@@ -151,15 +230,20 @@ export async function readBackupInventory(
             "--scope",
             "AVAILABILITY_DOMAIN",
             "--availability-domain",
-            stringField(domain, "name"),
+            domainName,
             "--all",
           ]),
         ),
       );
     }
   }
-  const active = (items: JsonRecord[]) =>
-    items.filter((item) => item["lifecycle-state"] !== "TERMINATED");
+  const allInstances = uniqueById(instances);
+  const allBootVolumes = uniqueById(bootVolumes);
+  const allRootVolumes = uniqueById(rootVolumes);
+  const allBootBackups = uniqueById(bootBackups);
+  const allRootBackups = uniqueById(rootBackups);
+  const allVolumeGroups = uniqueById(volumeGroups);
+  const allVolumeGroupBackups = uniqueById(volumeGroupBackups);
   const exact = (items: JsonRecord[], id: string, label: string) => {
     const matches = active(items).filter((item) => item.id === id);
     if (matches.length !== 1) {
@@ -167,11 +251,7 @@ export async function readBackupInventory(
     }
     return matches[0];
   };
-  exact(
-    instances,
-    config.source.instanceId,
-    "source instance",
-  );
+  exact(allInstances, config.source.instanceId, "source instance");
   const instanceResponse = await call([
     "compute",
     "instance",
@@ -182,12 +262,12 @@ export async function readBackupInventory(
   const instance = dataObject(instanceResponse);
   const instanceEtag = stringField(instanceResponse, "etag");
   const bootVolume = exact(
-    bootVolumes,
+    allBootVolumes,
     config.source.bootVolumeId,
     "source boot volume",
   );
   const rootVolume = exact(
-    rootVolumes,
+    allRootVolumes,
     config.source.rootVolumeId,
     "source root volume",
   );
@@ -196,6 +276,7 @@ export async function readBackupInventory(
       throw new Error("Source compartment changed");
     }
   }
+  const availabilityDomain = stringField(instance, "availability-domain");
   if (
     instance.shape !== "VM.Standard.A1.Flex" ||
     numberField(bootVolume, "size-in-gbs") !== 50 ||
@@ -213,7 +294,7 @@ export async function readBackupInventory(
       "--instance-id",
       config.source.instanceId,
       "--availability-domain",
-      stringField(instance, "availability-domain"),
+      availabilityDomain,
       "--all",
     ]),
   );
@@ -245,12 +326,22 @@ export async function readBackupInventory(
     attachedRoot[0]["lifecycle-state"] === "ATTACHED" &&
     String(attachedRoot[0]["attachment-type"]).toLowerCase() ===
       "paravirtualized";
-  let ocpus = 0, memoryGb = 0;
-  for (const item of active(instances)) {
+  const sourceVolumeGroup = proveSourceVolumeGroup(
+    allVolumeGroups,
+    config,
+    availabilityDomain,
+  );
+  let ocpus = 0;
+  let memoryGb = 0;
+  for (const item of active(allInstances)) {
     const shape = dataObject({ data: item["shape-config"] });
     ocpus += numberField(shape, "ocpus");
     memoryGb += numberField(shape, "memory-in-gbs");
   }
+  const activeBootBackups = active(allBootBackups);
+  const activeRootBackups = active(allRootBackups);
+  const activeGroups = active(allVolumeGroups);
+  const activeGroupBackups = active(allVolumeGroupBackups);
   return {
     observedAtUtc: new Date().toISOString(),
     source: config.source,
@@ -262,51 +353,64 @@ export async function readBackupInventory(
     rootVolume,
     bootAttachments,
     rootAttachments,
-    bootBackups,
-    rootBackups,
-    publicIps,
+    bootBackups: activeBootBackups,
+    rootBackups: activeRootBackups,
+    volumeGroups: activeGroups,
+    volumeGroupBackups: activeGroupBackups,
+    sourceVolumeGroup,
+    sourceVolumeGroupProved: sourceVolumeGroup !== undefined,
+    publicIps: uniqueById(publicIps),
     totals: {
-      instances: active(instances).length,
+      instances: active(allInstances).length,
       ocpus,
       memoryGb,
-      liveVolumeGb: active([...bootVolumes, ...rootVolumes]).reduce(
+      liveVolumeGb: active([...allBootVolumes, ...allRootVolumes]).reduce(
         (n, item) => n + numberField(item, "size-in-gbs"),
         0,
       ),
-      backups: active([...bootBackups, ...rootBackups]).length,
-      publicIps: new Set(publicIps.map((item) => stringField(item, "id"))).size,
+      backups: activeBootBackups.length + activeRootBackups.length,
+      volumeGroupBackups: activeGroupBackups.length,
+      volumeGroups: activeGroups.length,
+      publicIps: uniqueById(publicIps).length,
     },
     sourceAttachmentsProved,
+    groupAccountingProved: config.groupAccountingProved === true,
   };
 }
 
 /** Account/official-limit and writer evidence must come from the controller's
- * separate current checks, not from resource metadata alone.
- */
+ * separate current checks, not from resource metadata alone. */
 export function backupSnapshot(
   inventory: BackupInventory,
   evidence: {
     accountAndLimitsProved: boolean;
     writersAbsent: boolean;
     backupLimit: number;
+    groupAccountingProved?: boolean;
   },
 ): BackupSnapshot {
   const totals = inventory.totals;
+  const groupAccountingProved = evidence.groupAccountingProved === true ||
+    inventory.groupAccountingProved === true;
   return {
     source: inventory.source,
     instanceState: stringField(inventory.instance, "lifecycle-state"),
-    stoppedEpoch: inventory.instance["lifecycle-state"] === "STOPPED"
-      ? inventory.instanceEtag
-      : undefined,
     bootBackups: inventory.bootBackups,
     rootBackups: inventory.rootBackups,
     allBackupCount: totals.backups,
+    allVolumeGroupBackupCount: totals.volumeGroupBackups,
     freeBackupLimit: evidence.backupLimit,
+    volumeGroups: inventory.volumeGroups,
+    volumeGroupBackups: inventory.volumeGroupBackups,
     sourceAttachmentsProved: inventory.sourceAttachmentsProved,
+    sourceVolumeGroupProved: inventory.sourceVolumeGroupProved,
+    groupAccountingProved,
     freeEligibilityProved: evidence.accountAndLimitsProved &&
       totals.instances === 1 &&
       totals.ocpus <= 2 && totals.memoryGb <= 12 &&
-      totals.liveVolumeGb === 200 && totals.publicIps === 1,
+      totals.liveVolumeGb === 200 && totals.publicIps === 1 &&
+      inventory.sourceAttachmentsProved && inventory.sourceVolumeGroupProved &&
+      groupAccountingProved,
     writersAbsent: evidence.writersAbsent,
   };
 }
@@ -318,7 +422,9 @@ if (import.meta.main) {
   try {
     const config = await readPrivateJson<
       BackupInventoryConfig & { action: string }
-    >(".private/weekly-backup.json");
+    >(
+      ".private/weekly-backup.json",
+    );
     if (config.action !== "inventory") {
       throw new Error("This entry point only permits read-only inventory");
     }
@@ -335,6 +441,7 @@ if (import.meta.main) {
         compartments: inventory.compartments,
         totals: inventory.totals,
         sourceAttachmentsProved: inventory.sourceAttachmentsProved,
+        sourceVolumeGroupProved: inventory.sourceVolumeGroupProved,
         backupCreated: false,
         restoreDrillProved: false,
       },

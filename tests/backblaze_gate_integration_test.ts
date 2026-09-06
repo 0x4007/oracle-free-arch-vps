@@ -163,10 +163,12 @@ function runtimeConfigFixture(
     ociCliPath: "/usr/bin/oci",
     ociProfile: "DEFAULT",
     tenancyId: "ocid1.tenancy.oc1..aaaa",
+    volumeGroupId: "source-group",
     source: { ...SOURCE },
     action,
     policy: {
       source: { ...SOURCE },
+      volumeGroupId: "source-group",
       standingApproval: {
         approvedAtUtc: iso(Date.now() - 86_400_000),
         exactOperation: "weekly paired backup rotation",
@@ -294,7 +296,7 @@ runtimeTest(
       const message = await assertThrowsAsync(async () => {
         await runtimeMain(() => {
           calls++;
-          return Promise.resolve({ recoveryOnly: true });
+          return Promise.resolve({});
         });
       }, "gate");
       assert(/gate/.test(message));
@@ -313,7 +315,7 @@ runtimeTest(
       await assertThrowsAsync(async () => {
         await runtimeMain(() => {
           calls++;
-          return Promise.resolve({ recoveryOnly: true });
+          return Promise.resolve({});
         });
       }, "gate");
       assert(calls === 0);
@@ -331,7 +333,7 @@ runtimeTest("runtime.main fails closed on malformed gate state", async () => {
     await assertThrowsAsync(async () => {
       await runtimeMain(() => {
         calls++;
-        return Promise.resolve({ recoveryOnly: true });
+        return Promise.resolve({});
       });
     }, "schemaVersion must be 1");
     assert(calls === 0);
@@ -359,7 +361,7 @@ runtimeTest(
 );
 
 runtimeTest(
-  "runtime.main absence permits a recoveryOnly callback to run",
+  "runtime.main absence permits the online schedule callback to run",
   async () => {
     await withTempWorkdir(async () => {
       await writePrivateJsonFile(
@@ -370,12 +372,12 @@ runtimeTest(
       await assertThrowsAsync(async () => {
         await runtimeMain(() => {
           probe.called = true;
-          return Promise.resolve({ recoveryOnly: true });
+          return Promise.reject(new Error("ONLINE_SCHEDULE_REACHED"));
         });
-      }, "No interrupted source outage requires recovery");
+      }, "ONLINE_SCHEDULE_REACHED");
       assert(
         probe.called === true,
-        "The recoveryOnly callback must reach the next gate",
+        "The online schedule callback must reach the next gate",
       );
     });
   },

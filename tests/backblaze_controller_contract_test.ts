@@ -842,3 +842,12 @@ Deno.test("launch preflight rejects started or unknown claims and permits finish
   const failed = { ...started, status: "failed" };
   assertBackblazeLaunchAllowed(stateFixture(), failed);
 });
+
+Deno.test("standing approval accepts equivalent ISO timestamp text without rewriting it", () => {
+  const state = stateFixture();
+  const policy = state.policy as Record<string, unknown>;
+  const approval = policy.standingApproval as Record<string, unknown>;
+  approval.approvedAtUtc = "2026-09-05T01:51:00Z";
+  assertBackblazeLaunchAllowed(state, undefined);
+  assertEquals(approval.approvedAtUtc, "2026-09-05T01:51:00Z");
+});

@@ -5,6 +5,7 @@ import { validateBackupPair } from "./oci-restore.ts";
 export interface DrillPlan {
   source: BackupSource;
   pair: BackupPair;
+  volumeGroupId?: string;
   sourceAcceptedAtUtc: string;
   availabilityDomain: string;
   productionReservedIpId: string;
@@ -95,6 +96,7 @@ export async function validateDrillApproval(
   bootBackup: JsonRecord,
   rootBackup: JsonRecord,
   now: Date,
+  groupBackup?: JsonRecord,
 ): Promise<void> {
   validateBackupPair(
     bootBackup,
@@ -103,6 +105,13 @@ export async function validateDrillApproval(
     plan.source.bootVolumeId,
     plan.source.rootVolumeId,
     plan.source.compartmentId,
+    plan.pair.volumeGroupBackupId
+      ? {
+        volumeGroupId: plan.volumeGroupId ?? "",
+        volumeGroupBackupId: plan.pair.volumeGroupBackupId,
+        group: groupBackup ?? {},
+      }
+      : undefined,
   );
   if (
     bootBackup.id !== plan.pair.bootId || rootBackup.id !== plan.pair.rootId

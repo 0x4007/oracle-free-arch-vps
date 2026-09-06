@@ -3,7 +3,6 @@ import {
   type BackupPolicy,
   newBackupJournal,
 } from "../scripts/weekly-backup.ts";
-import type { GuestJournal } from "../scripts/backup-guest.ts";
 function assert(value: unknown): asserts value {
   if (!value) throw new Error("Assertion failed");
 }
@@ -16,7 +15,7 @@ function rejects(run: () => unknown) {
   }
   assert(failed);
 }
-Deno.test("drill preparation requires the fresh cycle and accepted source recovery", () => {
+Deno.test("drill preparation requires a fresh online capture and accepted running source", () => {
   const source = {
     instanceId: "source",
     bootVolumeId: "boot",
@@ -26,6 +25,7 @@ Deno.test("drill preparation requires the fresh cycle and accepted source recove
   };
   const policy: BackupPolicy = {
     source,
+    volumeGroupId: "source-group",
     standingApproval: {
       source,
       approvedAtUtc: "2026-09-05T01:51:00Z",
@@ -40,24 +40,25 @@ Deno.test("drill preparation requires the fresh cycle and accepted source recove
     allowFifthSlot: true,
   };
   const cycle = newBackupJournal(policy, new Date("2026-09-05T08:00:00Z"));
-  const guest: GuestJournal = {
-    rootUuid: "root-uuid",
-    stagingUuid: "stage-uuid",
-    containers: [],
-    units: [],
-    restored: true,
-  };
-  const state = { policy, cycle, guest };
+  const state = { policy, cycle };
   const now = new Date("2026-09-05T10:00:00Z");
   rejects(() => acceptedDrillPair(state, now));
   cycle.phase = "complete";
   cycle.bootId = "new-boot";
   cycle.rootId = "new-root";
   cycle.sourceAcceptedAtUtc = "2026-09-05T09:00:00Z";
+  rejects(() => acceptedDrillPair(state, now));
+  cycle.captureIdentity = {
+    kind: "oci-volume-group",
+    volumeGroupId: policy.volumeGroupId,
+    volumeGroupBackupId: "new-capture",
+    captureTimeUtc: "2026-09-05T08:01:00Z",
+    bootBackupId: cycle.bootId,
+    rootBackupId: cycle.rootId,
+    consistency: "crash-consistent",
+  };
   assert(acceptedDrillPair(state, now).bootId === "new-boot");
-  rejects(() =>
-    acceptedDrillPair({ ...state, guest: { ...guest, restored: false } }, now)
-  );
+  assert(acceptedDrillPair(state, now).volumeGroupBackupId === "new-capture");
   rejects(() =>
     acceptedDrillPair({
       ...state,
