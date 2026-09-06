@@ -221,7 +221,16 @@ export async function runScheduledBackup(): Promise<void> {
       const existing = await readClaim();
       const runtime = state as unknown as ScheduledRuntimeState | undefined;
       const decision = planScheduledClaim(schedule, now, runtime, existing);
-      if (decision.action === "skip") throw new Skipped(decision.reason);
+      if (decision.action === "skip") {
+        if (
+          [
+            "BACKUP_RETRY_BLOCKED",
+            "BACKUP_RETRY_METADATA_INVALID",
+            "ACCEPTANCE_WINDOW_EXPIRED",
+          ].includes(decision.reason)
+        ) throw new Error(decision.reason);
+        throw new Skipped(decision.reason);
+      }
       claim = decision.claim;
       await writePrivateJson(CLAIM, claim);
       return {
