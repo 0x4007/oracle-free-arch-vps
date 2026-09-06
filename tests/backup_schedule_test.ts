@@ -3,7 +3,13 @@ import {
   type BackupSchedule,
   backupTimer,
   currentWindow,
+  duePeriod,
+  periodAt,
 } from "../scripts/backup-schedule.ts";
+import {
+  planScheduledClaim,
+  type ScheduledRuntimeState,
+} from "../scripts/backup-scheduled.ts";
 const schedule: BackupSchedule = {
   approvedAtUtc: "2026-09-05T01:51:00Z",
   timeZone: "America/New_York",
@@ -26,14 +32,16 @@ Deno.test("one-time online acceptance uses real bounded time without changing we
     },
   };
   assert(
-    currentWindow(acceptance, new Date("2026-09-06T15:04:59Z")) === undefined,
+    currentWindow(acceptance, new Date("2026-09-06T15:04:59Z")) ===
+      "2026-09-06@America/New_York",
   );
   assert(
     currentWindow(acceptance, new Date("2026-09-06T15:05:00Z")) ===
       "acceptance@2026-09-06T15:05:00.000Z",
   );
   assert(
-    currentWindow(acceptance, new Date("2026-09-06T18:00:00Z")) === undefined,
+    currentWindow(acceptance, new Date("2026-09-06T18:00:00Z")) ===
+      "2026-09-06@America/New_York",
   );
   assert(
     currentWindow(acceptance, new Date("2026-09-13T08:00:00Z")) ===
@@ -59,21 +67,23 @@ Deno.test("maintenance window follows New York daylight-saving time", () => {
       "2026-11-08@America/New_York",
   );
   assert(
-    currentWindow(schedule, new Date("2026-11-08T08:00:00Z")) === undefined,
+    currentWindow(schedule, new Date("2026-11-08T08:00:00Z")) ===
+      "2026-11-01@America/New_York",
   );
 });
-Deno.test("late and early timer invocations cannot claim a maintenance window", () => {
+Deno.test("late and early timer invocations retain a due period", () => {
   assert(
-    currentWindow(schedule, new Date("2026-09-06T07:59:00Z")) === undefined,
+    currentWindow(schedule, new Date("2026-09-06T07:59:00Z")) ===
+      "2026-08-30@America/New_York",
   );
   assert(
-    currentWindow(schedule, new Date("2026-09-06T10:00:00Z")) === undefined,
+    currentWindow(schedule, new Date("2026-09-06T10:00:00Z")) ===
+      "2026-09-06@America/New_York",
   );
-  assert(
-    backupTimer(schedule, new Date("2026-09-06T08:00:00Z")).includes(
-      "Persistent=false",
-    ),
-  );
+  const timer = backupTimer(schedule, new Date("2026-09-06T08:00:00Z"));
+  assert(timer.includes("Persistent=true"));
+  assert(timer.includes("OnStartupSec=15min"));
+  assert(timer.includes("OnUnitActiveSec=15min"));
 });
 Deno.test("repeated DST hours share a single maintenance identity", () => {
   const repeated = { ...schedule, hour: 1 };
@@ -146,4 +156,109 @@ Deno.test("watchdog detects a missed window as it closes, not a day later", () =
       schedule,
     ).status === "UNKNOWN_BACKUP_PHASE",
   );
+});
+
+Deno.test("due periods coalesce missed weeks and keep the preferred civil time", () => {
+  assert(
+    duePeriod(schedule, new Date("2026-09-13T08:00:00Z")) ===
+      "2026-09-13@America/New_York",
+  );
+  assert(
+    duePeriod(schedule, new Date("2026-09-15T15:00:00Z")) ===
+      "2026-09-13@America/New_York",
+  );
+  assert(
+    duePeriod(schedule, new Date("2026-09-20T07:59:59Z")) ===
+      "2026-09-13@America/New_York",
+  );
+  assert(
+    periodAt(schedule, new Date("2026-09-13T08:00:00Z")) ===
+      "2026-09-13@America/New_York",
+  );
+});
+
+Deno.test("a completed capture satisfies the current period after timer replay", () => {
+  const state: ScheduledRuntimeState = {
+    cycle: {
+      phase: "complete",
+      suffix: "20260906T164037Z",
+      captureIdentity: { captureTimeUtc: "2026-09-06T16:51:34.128Z" },
+    },
+  };
+  const decision = planScheduledClaim(
+    schedule,
+    new Date("2026-09-06T20:00:00Z"),
+    state,
+    {
+      windowId: "acceptance@2026-09-06T15:05:00.000Z",
+      status: "started",
+      updatedAtUtc: "2026-09-06T16:00:00Z",
+    },
+  );
+  assert(decision.action === "skip");
+  if (decision.action === "skip") {
+    assert(decision.reason === "PERIOD_ALREADY_SATISFIED");
+  }
+});
+
+Deno.test("an unfinished journal resumes its claim across a later period", () => {
+  const decision = planScheduledClaim(
+    schedule,
+    new Date("2026-09-20T15:00:00Z"),
+    { cycle: { phase: "backing-up", suffix: "20260913T040000Z" } },
+    {
+      windowId: "2026-09-13@America/New_York",
+      periodId: "2026-09-13@America/New_York",
+      status: "failed",
+      updatedAtUtc: "2026-09-13T06:00:00Z",
+    },
+  );
+  assert(decision.action === "run");
+  if (decision.action === "run") {
+    assert(decision.claim.windowId === "2026-09-13@America/New_York");
+    assert(decision.claim.periodId === "2026-09-13@America/New_York");
+    assert(decision.claim.status === "started");
+  }
+});
+
+Deno.test("durable retry metadata defers or blocks a failed journal", () => {
+  const base = {
+    cycle: {
+      phase: "failed",
+      retry: {
+        disposition: "retryable" as const,
+        resumePhase: "backing-up" as const,
+        attempts: 1,
+        firstFailureAtUtc: "2026-09-13T05:00:00Z",
+        nextAttemptAtUtc: "2026-09-13T05:15:00Z",
+        deadlineAtUtc: "2026-09-13T09:00:00Z",
+      },
+    },
+  } satisfies ScheduledRuntimeState;
+  const deferred = planScheduledClaim(
+    schedule,
+    new Date("2026-09-13T05:10:00Z"),
+    base,
+    undefined,
+  );
+  assert(deferred.action === "skip");
+  if (deferred.action === "skip") {
+    assert(deferred.reason === "BACKUP_RETRY_NOT_DUE");
+  }
+
+  const blocked = planScheduledClaim(
+    schedule,
+    new Date("2026-09-13T05:20:00Z"),
+    {
+      cycle: {
+        ...base.cycle,
+        retry: { ...base.cycle.retry, disposition: "blocked" },
+      },
+    },
+    undefined,
+  );
+  assert(blocked.action === "skip");
+  if (blocked.action === "skip") {
+    assert(blocked.reason === "BACKUP_RETRY_BLOCKED");
+  }
 });
