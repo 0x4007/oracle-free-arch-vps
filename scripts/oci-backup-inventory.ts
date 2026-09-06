@@ -21,6 +21,22 @@ export interface BackupInventoryConfig {
   groupAccountingProved?: boolean;
 }
 
+export interface FreeResourceSurfaceEvidence {
+  /** Every active boot/block volume was observed with the balanced setting. */
+  volumePerformanceProved: boolean;
+  /** Every active boot/block volume explicitly reports autotune disabled. */
+  volumeAutotuneProved: boolean;
+  /** Every active boot/block volume explicitly reports no replica members. */
+  volumeReplicationProved: boolean;
+  /** Every active image returned by the tenancy inventory has zero billable size. */
+  customImagesProved: boolean;
+  /** No cost-sensitive surface was missing or outside the free-only envelope. */
+  freeResourceSurfaceProved: boolean;
+  activeBootVolumes: JsonRecord[];
+  activeBlockVolumes: JsonRecord[];
+  activeImages: JsonRecord[];
+}
+
 export interface BackupInventory {
   observedAtUtc: string;
   source: BackupSource;
@@ -65,6 +81,218 @@ function uniqueById(items: JsonRecord[]): JsonRecord[] {
     else byId.set(`${byId.size}:${JSON.stringify(item)}`, item);
   }
   return [...byId.values()];
+}
+
+function activeImages(items: JsonRecord[]): JsonRecord[] {
+  return items.filter((item) =>
+    !["TERMINATED", "DELETED"].includes(String(item["lifecycle-state"]))
+  );
+}
+
+function hasEmptyList(item: JsonRecord, field: string): boolean {
+  return Array.isArray(item[field]) && item[field].length === 0;
+}
+
+/**
+ * Validate the provider fields that determine whether volume resources can
+ * remain in the Always Free envelope. Missing fields are unknown evidence and
+ * therefore fail closed. The field names are the OCI API response names.
+ */
+export function proveFreeVolumeSettings(
+  volumes: JsonRecord[],
+  replicaField: "boot-volume-replicas" | "block-volume-replicas",
+): {
+  performanceProved: boolean;
+  autotuneProved: boolean;
+  replicationProved: boolean;
+} {
+  const activeVolumes = active(volumes);
+  return {
+    performanceProved: activeVolumes.every((item) =>
+      item["vpus-per-gb"] === 10
+    ),
+    autotuneProved: activeVolumes.every((item) =>
+      item["is-auto-tune-enabled"] === false &&
+      hasEmptyList(item, "autotune-policies")
+    ),
+    replicationProved: activeVolumes.every((item) =>
+      hasEmptyList(item, replicaField)
+    ),
+  };
+}
+
+/**
+ * A platform image is not stored tenant data. A custom image has a positive
+ * billable size in the Compute Image response. Treat missing or non-numeric
+ * billing metadata as unproved so a partial image response cannot authorize
+ * a free-only cycle.
+ */
+export function proveNoBillableCustomImages(
+  images: JsonRecord[],
+): boolean {
+  return activeImages(images).every((image) =>
+    typeof image["billable-size-in-gbs"] === "number" &&
+    image["billable-size-in-gbs"] === 0
+  );
+}
+
+/**
+ * Prove the cost-sensitive surfaces that are outside the paired backup
+ * identity. The caller must supply the complete tenancy inventory; an
+ * inaccessible or malformed list must reject before reaching this function.
+ */
+export function proveFreeResourceSurfaces(
+  bootVolumes: JsonRecord[],
+  blockVolumes: JsonRecord[],
+  images: JsonRecord[],
+): FreeResourceSurfaceEvidence {
+  const bootProof = proveFreeVolumeSettings(
+    bootVolumes,
+    "boot-volume-replicas",
+  );
+  const blockProof = proveFreeVolumeSettings(
+    blockVolumes,
+    "block-volume-replicas",
+  );
+  const customImagesProved = proveNoBillableCustomImages(images);
+  const volumePerformanceProved = bootProof.performanceProved &&
+    blockProof.performanceProved;
+  const volumeAutotuneProved = bootProof.autotuneProved &&
+    blockProof.autotuneProved;
+  const volumeReplicationProved = bootProof.replicationProved &&
+    blockProof.replicationProved;
+  return {
+    volumePerformanceProved,
+    volumeAutotuneProved,
+    volumeReplicationProved,
+    customImagesProved,
+    freeResourceSurfaceProved: volumePerformanceProved &&
+      volumeAutotuneProved && volumeReplicationProved && customImagesProved,
+    activeBootVolumes: bootVolumes,
+    activeBlockVolumes: blockVolumes,
+    activeImages: images,
+  };
+}
+
+/**
+ * Read the cost-sensitive resource surfaces that are outside the paired
+ * backup inventory. All calls are read-only. Any inaccessible or malformed
+ * response rejects through runJson/dataArray instead of becoming zero use.
+ */
+export async function readFreeResourceSurfaceEvidence(
+  config: BackupInventoryConfig,
+  runner: CommandRunner = defaultRunner,
+): Promise<FreeResourceSurfaceEvidence> {
+  const call = (args: string[]) =>
+    runJson(config.ociCliPath, [
+      "--profile",
+      config.ociProfile,
+      "--region",
+      config.source.region,
+      "--no-retry",
+      "--connection-timeout",
+      "10",
+      "--read-timeout",
+      "60",
+      ...args,
+    ], runner);
+  const compartments = dataArray(
+    await call([
+      "iam",
+      "compartment",
+      "list",
+      "--compartment-id",
+      config.tenancyId,
+      "--compartment-id-in-subtree",
+      "true",
+      "--access-level",
+      "ANY",
+      "--all",
+    ]),
+  );
+  const compartmentIds = [
+    config.tenancyId,
+    ...compartments.filter((item) => item["lifecycle-state"] === "ACTIVE")
+      .map((item) => stringField(item, "id")),
+  ];
+  const domains = dataArray(
+    await call([
+      "iam",
+      "availability-domain",
+      "list",
+      "--compartment-id",
+      config.tenancyId,
+    ]),
+  );
+  if (domains.length === 0) throw new Error("No availability domains returned");
+  const bootVolumes: JsonRecord[] = [];
+  const blockVolumes: JsonRecord[] = [];
+  const images: JsonRecord[] = [];
+  for (const compartmentId of compartmentIds) {
+    images.push(
+      ...dataArray(
+        await call([
+          "compute",
+          "image",
+          "list",
+          "--compartment-id",
+          compartmentId,
+          "--all",
+        ]),
+      ),
+    );
+    for (const domain of domains) {
+      const availabilityDomain = stringField(domain, "name");
+      bootVolumes.push(
+        ...dataArray(
+          await call([
+            "bv",
+            "boot-volume",
+            "list",
+            "--compartment-id",
+            compartmentId,
+            "--availability-domain",
+            availabilityDomain,
+            "--all",
+          ]),
+        ),
+      );
+      blockVolumes.push(
+        ...dataArray(
+          await call([
+            "bv",
+            "volume",
+            "list",
+            "--compartment-id",
+            compartmentId,
+            "--availability-domain",
+            availabilityDomain,
+            "--all",
+          ]),
+        ),
+      );
+    }
+  }
+  const activeBootVolumes = uniqueById(bootVolumes).filter((item) =>
+    item["lifecycle-state"] !== "TERMINATED"
+  );
+  const activeBlockVolumes = uniqueById(blockVolumes).filter((item) =>
+    item["lifecycle-state"] !== "TERMINATED"
+  );
+  const activeImagesList = uniqueById(images).filter((item) =>
+    !["TERMINATED", "DELETED"].includes(String(item["lifecycle-state"]))
+  );
+  const surface = proveFreeResourceSurfaces(
+    activeBootVolumes,
+    activeBlockVolumes,
+    activeImagesList,
+  );
+  return {
+    ...surface,
+    activeBootVolumes,
+    activeBlockVolumes,
+    activeImages: activeImagesList,
+  };
 }
 
 function volumeIds(group: JsonRecord): string[] {
@@ -116,6 +344,11 @@ export async function readBackupInventory(
       config.ociProfile,
       "--region",
       config.source.region,
+      "--no-retry",
+      "--connection-timeout",
+      "10",
+      "--read-timeout",
+      "60",
       ...args,
     ], runner);
   const subscriptions = dataArray(
