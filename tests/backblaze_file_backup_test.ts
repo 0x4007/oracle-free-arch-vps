@@ -1415,6 +1415,83 @@ Deno.test("watchdog: active/stale/orphan/pending/missed/complete", () => {
   assert(assessment.status.startsWith("B2_STATE_UNKNOWN"));
 });
 
+Deno.test(
+  "watchdog: previous-period complete is current only with its exact catalog proof",
+  () => {
+    // The previous-period job completed, but its verification and acceptance
+    // both happened inside the current Sunday window.
+    const now = new Date(WINDOW_START + 2 * 3_600_000);
+    const acceptedAt = WINDOW_START + 3_600_000;
+    const fixture = generationFixture(23, WINDOW_START - 8 * 3_600_000);
+    const complete = stateWithJob(fixture, "COMPLETE");
+    const previousPeriod = {
+      ...complete,
+      job: {
+        ...complete.job!,
+        envelope: {
+          ...complete.job!.envelope,
+          request: {
+            ...complete.job!.envelope.request,
+            periodKey: "2026-08-30",
+          },
+        },
+      },
+    } as ControllerState;
+    const entry = catalogEntry(fixture, acceptedAt);
+    const proved = {
+      ...previousPeriod,
+      catalog: [{
+        ...entry,
+        receipt: { ...entry.receipt, verifiedAtUtc: iso(acceptedAt) },
+      }],
+    } as ControllerState;
+    const current = assessBackblazeWatchdog(proved, null, now);
+    assert(current.healthy);
+    assert(current.status === `B2_BACKUP_CURRENT:${fixture.jobId}`);
+
+    const missed = (state: ControllerState) => {
+      const assessment = assessBackblazeWatchdog(state, null, now);
+      assert(!assessment.healthy);
+      assert(assessment.status.startsWith("B2_PERIOD_MISSED"));
+    };
+    // An acceptance from before the current window is not a current point.
+    missed({
+      ...previousPeriod,
+      catalog: [{
+        ...entry,
+        receipt: { ...entry.receipt, verifiedAtUtc: iso(acceptedAt) },
+        acceptedAtUtc: iso(WINDOW_START - 3_600_000),
+      }],
+    } as ControllerState);
+    // An unrelated (newer) catalog generation never satisfies the old job.
+    missed({
+      ...previousPeriod,
+      catalog: [
+        catalogEntry(generationFixture(31, acceptedAt - 3_600_000), acceptedAt),
+      ],
+    } as ControllerState);
+    // Future verification and acceptance timestamps are not in-window proof.
+    missed({
+      ...previousPeriod,
+      catalog: [{
+        ...entry,
+        receipt: {
+          ...entry.receipt,
+          verifiedAtUtc: iso(now.getTime() + 3_600_000),
+        },
+      }],
+    } as ControllerState);
+    missed({
+      ...previousPeriod,
+      catalog: [{
+        ...entry,
+        receipt: { ...entry.receipt, verifiedAtUtc: iso(acceptedAt) },
+        acceptedAtUtc: iso(now.getTime() + 3_600_000),
+      }],
+    } as ControllerState);
+  },
+);
+
 Deno.test("watchdog: source heartbeat never falls back to Pi polling time", () => {
   const fixture = generationFixture(15, WINDOW_START);
   const workerGate: BackupControllerGate = {

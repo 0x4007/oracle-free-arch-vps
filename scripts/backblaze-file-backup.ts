@@ -2687,6 +2687,23 @@ export function assessBackblazeWatchdog(
     if (job.envelope.request.periodKey === window.periodKey) {
       return { status: `B2_BACKUP_CURRENT:${jobId}`, healthy: true };
     }
+    // A previous-period job that completed may still be the current recovery
+    // point when its exact catalog generation carries a proved restore receipt
+    // and an acceptance both inside this window. Completion alone, or an
+    // unrelated catalog generation, never counts.
+    const windowStartMs = Date.parse(window.startAtUtc);
+    const nowMs = now.getTime();
+    const acceptedInWindow = (state?.catalog ?? []).some((entry) =>
+      entry.index.generation === job.envelope.request.generation &&
+      entry.receipt.decryptedRestoreProved === true &&
+      Date.parse(entry.receipt.verifiedAtUtc) >= windowStartMs &&
+      Date.parse(entry.receipt.verifiedAtUtc) <= nowMs &&
+      Date.parse(entry.acceptedAtUtc) >= windowStartMs &&
+      Date.parse(entry.acceptedAtUtc) <= nowMs
+    );
+    if (acceptedInWindow) {
+      return { status: `B2_BACKUP_CURRENT:${jobId}`, healthy: true };
+    }
     return {
       status: `B2_PERIOD_MISSED:${window.periodKey}`,
       healthy: false,
