@@ -532,12 +532,11 @@ Deno.test("online operations expose no outage or recovery methods", () => {
 });
 
 Deno.test("final creation inventory refuses exhausted replacement headroom", async () => {
-  const state = createState({
-    bootBackups: [0, 1, 2, 3].map((n) =>
-      member("boot", `unrelated-${n}`, null)
-    ),
-    rootBackups: [],
-  });
+  const state = createState();
+  state.bootBackups = [0, 1, 2, 3].map((n) =>
+    member("boot", `unrelated-${n}`, null)
+  );
+  state.rootBackups = [];
   await rejects(
     () => operations(state).createBackupGroup(suffix),
     "Four retained members leave only one free slot",
