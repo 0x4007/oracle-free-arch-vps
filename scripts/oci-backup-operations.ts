@@ -5,9 +5,11 @@ import {
   defaultRunner,
   type JsonRecord,
   numberField,
+  OciCommandError,
   runJson,
   stringField,
 } from "./oci.ts";
+import { RetryableObservationError } from "./online-backup-contract.ts";
 import {
   type BackupInventoryConfig,
   backupSnapshot,
@@ -18,6 +20,9 @@ import {
   type BackupOperations,
   type BackupPair,
   type BackupPolicy,
+  OnlineBackupBlockedError,
+  OnlineBackupRetryableError,
+  type ResumableBackupPhase,
   validateStandingApproval,
 } from "./weekly-backup.ts";
 
@@ -144,27 +149,53 @@ export function ociBackupOperations(
     ...config,
     volumeGroupId: policy.volumeGroupId,
   });
-  const call = (args: string[]) =>
-    runJson(config.ociCliPath, [
-      "--profile",
-      config.ociProfile,
-      "--region",
-      config.source.region,
-      "--no-retry",
-      "--connection-timeout",
-      "10",
-      "--read-timeout",
-      "60",
-      ...args,
-    ], runner);
-  const instance = async () => {
+  const transportRunner: CommandRunner = async (command, args) => {
+    try {
+      return await runner(command, args);
+    } catch {
+      throw new RetryableObservationError("OCI command transport failed");
+    }
+  };
+  const call = async (
+    args: string[],
+    resumePhase: ResumableBackupPhase,
+    kind: "external-read" | "recorded-operation" = "external-read",
+  ) => {
+    try {
+      return await runJson(config.ociCliPath, [
+        "--profile",
+        config.ociProfile,
+        "--region",
+        config.source.region,
+        "--no-retry",
+        "--connection-timeout",
+        "10",
+        "--read-timeout",
+        "60",
+        ...args,
+      ], transportRunner);
+    } catch (error) {
+      if (
+        error instanceof RetryableObservationError ||
+        error instanceof OciCommandError
+      ) {
+        throw new OnlineBackupRetryableError(
+          "OCI command transport failed",
+          resumePhase,
+          kind,
+        );
+      }
+      throw error;
+    }
+  };
+  const instance = async (resumePhase: ResumableBackupPhase) => {
     const response = await call([
       "compute",
       "instance",
       "get",
       "--instance-id",
       policy.source.instanceId,
-    ]);
+    ], resumePhase);
     const value = dataObject(response);
     if (
       value.id !== policy.source.instanceId ||
@@ -175,10 +206,25 @@ export function ociBackupOperations(
     ) throw new Error("Source instance identity changed");
     return { value, etag: stringField(response, "etag") };
   };
-  const sourceInventory = async () => {
+  const sourceInventory = async (resumePhase: ResumableBackupPhase) => {
     authorize();
     await evidence.assertNoOtherController();
-    const current = await readBackupInventory(inventoryConfig(), runner);
+    let current;
+    try {
+      current = await readBackupInventory(inventoryConfig(), transportRunner);
+    } catch (error) {
+      if (
+        error instanceof RetryableObservationError ||
+        error instanceof OciCommandError
+      ) {
+        throw new OnlineBackupRetryableError(
+          "OCI inventory transport failed",
+          resumePhase,
+          "external-read",
+        );
+      }
+      throw error;
+    }
     if (
       current.instance["lifecycle-state"] !== "RUNNING" ||
       !current.sourceAttachmentsProved ||
@@ -190,7 +236,10 @@ export function ociBackupOperations(
     }
     return current;
   };
-  const groupBackupGet = async (id: string) =>
+  const groupBackupGet = async (
+    id: string,
+    resumePhase: ResumableBackupPhase,
+  ) =>
     dataObject(
       await call([
         "bv",
@@ -198,34 +247,64 @@ export function ociBackupOperations(
         "get",
         "--volume-group-backup-id",
         id,
-      ]),
+      ], resumePhase),
     );
   const wait = async (
     read: () => Promise<JsonRecord>,
     desired: string,
     pending: string[],
     seconds: number,
+    resumePhase: ResumableBackupPhase,
+    kind: "external-read" | "recorded-operation" = "external-read",
   ) => {
     const deadline = time.now().getTime() + seconds * 1000;
     while (true) {
-      const item = await read();
+      let item: JsonRecord;
+      try {
+        item = await read();
+      } catch (error) {
+        if (error instanceof OnlineBackupRetryableError) throw error;
+        throw error;
+      }
       const state = stringField(item, "lifecycle-state");
       if (state === desired) return;
       if (!pending.includes(state)) {
         throw new Error(`Unexpected OCI lifecycle state: ${state}`);
       }
       if (time.now().getTime() >= deadline) {
-        throw new Error(`OCI ${desired} wait timed out; last state ${state}`);
+        throw new OnlineBackupRetryableError(
+          `OCI ${desired} wait timed out; last state ${state}`,
+          resumePhase,
+          kind,
+        );
       }
       await time.sleep(5_000);
     }
   };
-  const waitAbsent = async (ids: string[]) => {
+  const waitAbsent = async (
+    ids: string[],
+    resumePhase: ResumableBackupPhase,
+  ) => {
     const deadline = time.now().getTime() + 1200_000;
     while (true) {
       // A successful tenancy-wide LIST proves disappearance. GET 404 alone
       // cannot distinguish deletion from lost permission.
-      const current = await readBackupInventory(inventoryConfig(), runner);
+      let current;
+      try {
+        current = await readBackupInventory(inventoryConfig(), transportRunner);
+      } catch (error) {
+        if (
+          error instanceof RetryableObservationError ||
+          error instanceof OciCommandError
+        ) {
+          throw new OnlineBackupRetryableError(
+            "OCI inventory transport failed while waiting for deletion",
+            resumePhase,
+            "external-read",
+          );
+        }
+        throw error;
+      }
       if (
         ![
           ...current.bootBackups,
@@ -235,7 +314,11 @@ export function ociBackupOperations(
           .some((item) => ids.includes(String(item.id)))
       ) return;
       if (time.now().getTime() >= deadline) {
-        throw new Error("Backup deletion inventory wait timed out");
+        throw new OnlineBackupRetryableError(
+          "Backup deletion inventory wait timed out",
+          resumePhase,
+          "recorded-operation",
+        );
       }
       await time.sleep(5000);
     }
@@ -245,13 +328,46 @@ export function ociBackupOperations(
     save,
     snapshot: async () => {
       authorize();
-      const proof = await evidence.verify();
+      let proof;
+      try {
+        proof = await evidence.verify();
+      } catch (error) {
+        if (
+          error instanceof RetryableObservationError ||
+          error instanceof OciCommandError
+        ) {
+          throw new OnlineBackupRetryableError(
+            "Controller evidence transport failed",
+            undefined,
+            "external-read",
+          );
+        }
+        throw error;
+      }
       if (
         !Number.isInteger(proof.backupLimit) ||
         proof.backupLimit < 2 || proof.backupLimit > 5
       ) throw new Error("Current free backup allowance is not proved");
       await evidence.assertNoOtherController();
-      const inventory = await readBackupInventory(inventoryConfig(), runner);
+      let inventory;
+      try {
+        inventory = await readBackupInventory(
+          inventoryConfig(),
+          transportRunner,
+        );
+      } catch (error) {
+        if (
+          error instanceof RetryableObservationError ||
+          error instanceof OciCommandError
+        ) {
+          throw new OnlineBackupRetryableError(
+            "OCI inventory transport failed",
+            undefined,
+            "external-read",
+          );
+        }
+        throw error;
+      }
       return backupSnapshot(inventory, {
         accountAndLimitsProved: proof.accountAndLimitsProved &&
           proof.objectStorageComplete && proof.objectStorageWithinLimit,
@@ -260,8 +376,34 @@ export function ociBackupOperations(
         writersAbsent: true,
       });
     },
-    observeSource: () => guest.observeSource(),
-    acceptSource: () => guest.acceptSource(),
+    observeSource: async () => {
+      try {
+        return await guest.observeSource();
+      } catch (error) {
+        if (error instanceof RetryableObservationError) {
+          throw new OnlineBackupRetryableError(
+            "Guest observation transport failed",
+            undefined,
+            "external-read",
+          );
+        }
+        throw error;
+      }
+    },
+    acceptSource: async () => {
+      try {
+        await guest.acceptSource();
+      } catch (error) {
+        if (error instanceof RetryableObservationError) {
+          throw new OnlineBackupRetryableError(
+            "Guest acceptance transport failed",
+            "pair-available",
+            "external-read",
+          );
+        }
+        throw error;
+      }
+    },
     createBackupGroup: async (suffix) => {
       authorize();
       if (!/^\d{8}T\d{6}Z$/.test(suffix)) {
@@ -270,43 +412,55 @@ export function ociBackupOperations(
       // This is the final source/group/attachment check before mutation. It
       // also gives an ambiguous provider response a complete inventory to
       // reconcile, rather than blindly issuing a second create.
-      const inventory = await sourceInventory();
+      const inventory = await sourceInventory("backing-up");
       const displayName = `arch-online-golden-${suffix}`;
       if (
         active(inventory.volumeGroupBackups).some((item) =>
           item["display-name"] === displayName
         )
       ) {
-        throw new Error(
+        throw new OnlineBackupBlockedError(
           "Matching group backup already exists; reconcile intent",
+          "backing-up",
         );
       }
       const response = dataObject(
-        await call([
-          "bv",
-          "volume-group-backup",
-          "create",
-          "--volume-group-id",
-          policy.volumeGroupId,
-          "--type",
-          "FULL",
-          "--display-name",
-          displayName,
-        ]),
+        await call(
+          [
+            "bv",
+            "volume-group-backup",
+            "create",
+            "--volume-group-id",
+            policy.volumeGroupId,
+            "--type",
+            "FULL",
+            "--display-name",
+            displayName,
+          ],
+          "backing-up",
+          "recorded-operation",
+        ),
       );
       return stringField(response, "id");
     },
     waitBackupGroup: (id) =>
-      wait(() => groupBackupGet(id), "AVAILABLE", [
-        "REQUEST_RECEIVED",
-        "CREATING",
-        "COMMITTED",
-        "PROVISIONING",
-      ], 3600),
+      wait(
+        () => groupBackupGet(id, "backing-up"),
+        "AVAILABLE",
+        [
+          "REQUEST_RECEIVED",
+          "CREATING",
+          "COMMITTED",
+          "PROVISIONING",
+        ],
+        3600,
+        "backing-up",
+        "recorded-operation",
+      ),
     deleteBackupGroup: async (id, members) => {
       authorize();
       await evidence.assertNoOtherController();
-      const source = await instance();
+      const source = await instance("retiring");
       if (source.value["lifecycle-state"] !== "RUNNING") {
         throw new Error("Source must remain RUNNING during retention");
       }
@@ -319,7 +473,7 @@ export function ociBackupOperations(
           "Retention refuses a group outside the exact accepted pair",
         );
       }
-      const inventory = await readBackupInventory(inventoryConfig(), runner);
+      const inventory = await sourceInventory("retiring");
       const group = inventory.volumeGroupBackups.find((item) => item.id === id);
       if (
         group && (
@@ -354,21 +508,25 @@ export function ociBackupOperations(
         (root && root["volume-group-backup-id"] !== id)
       ) throw new Error("Recorded member is not bound to the group backup");
       if (!deleting) {
-        await call([
-          "bv",
-          "volume-group-backup",
-          "delete",
-          "--volume-group-backup-id",
-          id,
-          "--force",
-        ]);
+        await call(
+          [
+            "bv",
+            "volume-group-backup",
+            "delete",
+            "--volume-group-backup-id",
+            id,
+            "--force",
+          ],
+          "retiring",
+          "recorded-operation",
+        );
       }
-      await waitAbsent([id, members.bootId, members.rootId]);
+      await waitAbsent([id, members.bootId, members.rootId], "retiring");
     },
     deleteBackup: async (kind, id) => {
       authorize();
       await evidence.assertNoOtherController();
-      const source = await instance();
+      const source = await instance("retiring");
       if (source.value["lifecycle-state"] !== "RUNNING") {
         throw new Error("Source must remain RUNNING during retention");
       }
@@ -383,7 +541,7 @@ export function ociBackupOperations(
           "Retention refuses a backup outside the exact standalone pair",
         );
       }
-      const inventory = await readBackupInventory(inventoryConfig(), runner);
+      const inventory = await sourceInventory("retiring");
       const item =
         (kind === "boot" ? inventory.bootBackups : inventory.rootBackups)
           .find((backup) => backup.id === id);
@@ -396,16 +554,20 @@ export function ociBackupOperations(
         throw new Error("Grouped members must be deleted through their group");
       }
       if (stringField(item, "lifecycle-state") !== "TERMINATING") {
-        await call([
-          "bv",
-          kind === "boot" ? "boot-volume-backup" : "backup",
-          "delete",
-          kind === "boot" ? "--boot-volume-backup-id" : "--volume-backup-id",
-          id,
-          "--force",
-        ]);
+        await call(
+          [
+            "bv",
+            kind === "boot" ? "boot-volume-backup" : "backup",
+            "delete",
+            kind === "boot" ? "--boot-volume-backup-id" : "--volume-backup-id",
+            id,
+            "--force",
+          ],
+          "retiring",
+          "recorded-operation",
+        );
       }
-      await waitAbsent([id]);
+      await waitAbsent([id], "retiring");
     },
   };
 }

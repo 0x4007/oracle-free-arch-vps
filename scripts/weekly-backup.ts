@@ -1,7 +1,9 @@
 import type {
+  OnlineBackupRetry,
   OnlineCaptureIdentity,
   SourceContinuityEvidence,
 } from "./online-backup-contract.ts";
+import { ONLINE_RETRY_POLICY } from "./online-backup-contract.ts";
 import { type JsonRecord, numberField, stringField } from "./oci.ts";
 
 const SUFFIX_PATTERN = /^\d{8}T\d{6}Z$/;
@@ -55,6 +57,47 @@ export type BackupPhase =
   | "complete"
   | "failed";
 
+export type ResumableBackupPhase = Exclude<BackupPhase, "failed" | "complete">;
+
+/**
+ * The engine accepts retry classification only through typed failures.  OCI
+ * and guest adapters must wrap a transport/read failure before it reaches the
+ * state machine; arbitrary error messages are deliberately never inspected.
+ */
+export type OnlineBackupRetryKind = "external-read" | "recorded-operation";
+
+export class OnlineBackupRetryableError extends Error {
+  readonly retryable = true as const;
+
+  constructor(
+    message: string,
+    readonly resumePhase: ResumableBackupPhase | undefined,
+    readonly kind: OnlineBackupRetryKind,
+  ) {
+    super(message);
+    this.name = "OnlineBackupRetryableError";
+  }
+}
+
+export class OnlineBackupBlockedError extends Error {
+  readonly blocked = true as const;
+
+  constructor(
+    message: string,
+    readonly resumePhase?: ResumableBackupPhase,
+  ) {
+    super(message);
+    this.name = "OnlineBackupBlockedError";
+  }
+}
+
+class RetryNotDueError extends Error {
+  constructor(readonly nextAttemptAtUtc: string) {
+    super(`Online backup retry is deferred until ${nextAttemptAtUtc}`);
+    this.name = "RetryNotDueError";
+  }
+}
+
 export interface BackupJournal {
   mode: "online";
   source: BackupSource;
@@ -63,6 +106,9 @@ export interface BackupJournal {
   phase: BackupPhase;
   createdAtUtc: string;
   updatedAtUtc: string;
+
+  /** Failed phase remains visible while this metadata controls a safe resume. */
+  retry?: OnlineBackupRetry;
 
   /** Durable group create intent and returned ID. Intent is saved before the
    * provider call and the ID is saved before any waiter is started. */
@@ -125,6 +171,8 @@ export interface BackupOperations {
 
 export interface BackupRunControl {
   beforeCapture?: () => Promise<void>;
+  /** Runtime-only hook invoked after the final journal write. */
+  afterCycle?: (cycle: BackupJournal) => Promise<void>;
 }
 
 function equalSource(a: BackupSource, b: BackupSource): boolean {
@@ -479,6 +527,151 @@ export function reconcileBackupGroupCreation(
   return undefined;
 }
 
+const RESUMABLE_PHASES: readonly ResumableBackupPhase[] = [
+  "planned",
+  "backing-up",
+  "pair-available",
+  "source-accepted",
+  "retiring",
+];
+
+function isResumablePhase(value: unknown): value is ResumableBackupPhase {
+  return typeof value === "string" &&
+    (RESUMABLE_PHASES as readonly string[]).includes(value);
+}
+
+function isoAt(milliseconds: number): string {
+  return new Date(milliseconds).toISOString();
+}
+
+function retryMetadata(
+  value: OnlineBackupRetry,
+  nowMs?: number,
+): { firstFailureMs: number; nextAttemptMs: number; deadlineMs: number } {
+  if (
+    (value.disposition !== "retryable" && value.disposition !== "blocked") ||
+    !isResumablePhase(value.resumePhase) ||
+    !Number.isInteger(value.attempts) ||
+    value.attempts < (value.disposition === "retryable" ? 1 : 0) ||
+    value.attempts > ONLINE_RETRY_POLICY.maximumAttempts
+  ) {
+    throw new OnlineBackupBlockedError(
+      "Online backup retry metadata is invalid",
+    );
+  }
+  const firstFailureMs = parseUtc(
+    value.firstFailureAtUtc,
+    "Online backup first failure time",
+  );
+  const nextAttemptMs = parseUtc(
+    value.nextAttemptAtUtc,
+    "Online backup next attempt time",
+  );
+  const deadlineMs = parseUtc(
+    value.deadlineAtUtc,
+    "Online backup retry deadline",
+  );
+  if (deadlineMs < firstFailureMs || nextAttemptMs < firstFailureMs) {
+    throw new OnlineBackupBlockedError("Online backup retry times are invalid");
+  }
+  if (nowMs !== undefined && firstFailureMs > nowMs) {
+    throw new OnlineBackupBlockedError(
+      "Online backup retry begins in the future",
+    );
+  }
+  return { firstFailureMs, nextAttemptMs, deadlineMs };
+}
+
+function retryForFailure(
+  previous: OnlineBackupRetry | undefined,
+  nowMs: number,
+  resumePhase: ResumableBackupPhase,
+  disposition: OnlineBackupRetry["disposition"],
+): OnlineBackupRetry {
+  const nowUtc = isoAt(nowMs);
+  const previousMetadata = previous && retryMetadata(previous);
+  if (disposition === "blocked") {
+    return {
+      disposition,
+      resumePhase,
+      attempts: Math.max(1, previous?.attempts ?? 0),
+      firstFailureAtUtc: previous?.firstFailureAtUtc ?? nowUtc,
+      nextAttemptAtUtc: nowUtc,
+      deadlineAtUtc: previous?.deadlineAtUtc ??
+        isoAt(nowMs + ONLINE_RETRY_POLICY.burstDeadlineMs),
+    };
+  }
+
+  const coolingDown = previousMetadata !== undefined &&
+    previousMetadata.nextAttemptMs <= nowMs &&
+    (previous!.attempts >= ONLINE_RETRY_POLICY.maximumAttempts ||
+      nowMs >= previousMetadata.deadlineMs);
+  const firstFailureMs = coolingDown
+    ? nowMs
+    : previousMetadata?.firstFailureMs ?? nowMs;
+  const attempts = coolingDown ? 1 : Math.min(
+    (previous?.attempts ?? 0) + 1,
+    ONLINE_RETRY_POLICY.maximumAttempts,
+  );
+  const deadlineMs = firstFailureMs + ONLINE_RETRY_POLICY.burstDeadlineMs;
+  const delayMs = Math.min(
+    ONLINE_RETRY_POLICY.initialDelayMs * 2 ** (attempts - 1),
+    ONLINE_RETRY_POLICY.maximumDelayMs,
+  );
+  const exhausted = attempts >= ONLINE_RETRY_POLICY.maximumAttempts ||
+    nowMs >= deadlineMs || nowMs + delayMs >= deadlineMs;
+  return {
+    disposition,
+    resumePhase,
+    attempts,
+    firstFailureAtUtc: isoAt(firstFailureMs),
+    nextAttemptAtUtc: isoAt(
+      nowMs + (exhausted ? ONLINE_RETRY_POLICY.cooldownMs : delayMs),
+    ),
+    deadlineAtUtc: isoAt(deadlineMs),
+  };
+}
+
+function failureText(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.length > 512 ? `${text.slice(0, 509)}...` : text;
+}
+
+function prepareResume(
+  journal: BackupJournal,
+  nowMs: number,
+): { resumePhase: ResumableBackupPhase; previousRetry?: OnlineBackupRetry } {
+  if (journal.phase !== "failed") {
+    if (!isResumablePhase(journal.phase)) {
+      throw new OnlineBackupBlockedError(
+        "Online backup phase cannot be resumed",
+      );
+    }
+    return { resumePhase: journal.phase };
+  }
+  const retry = journal.retry;
+  if (!retry) {
+    throw new OnlineBackupBlockedError(
+      "Failed online cycle has no resume metadata; operator reconciliation is required",
+    );
+  }
+  const metadata = retryMetadata(retry, nowMs);
+  if (retry.disposition !== "retryable") {
+    throw new OnlineBackupBlockedError(
+      "Failed online cycle is blocked; operator reconciliation is required",
+      retry.resumePhase,
+    );
+  }
+  if (metadata.nextAttemptMs > nowMs) {
+    throw new RetryNotDueError(retry.nextAttemptAtUtc);
+  }
+  const previousRetry = structuredClone(retry);
+  journal.phase = retry.resumePhase;
+  journal.retry = undefined;
+  journal.failure = undefined;
+  return { resumePhase: journal.phase, previousRetry };
+}
+
 export async function runBackupCycle(
   policy: BackupPolicy,
   journal: BackupJournal,
@@ -506,11 +699,10 @@ export async function runBackupCycle(
     !SUFFIX_PATTERN.test(journal.suffix) ||
     journal.suffix === journal.previousPair.suffix
   ) throw new Error("Backup journal belongs to another source or rotation");
-  if (journal.phase === "failed") {
-    throw new Error("Failed online cycle requires operator reconciliation");
-  }
+  let failureResumePhase: ResumableBackupPhase | undefined;
   const save = async (phase: BackupPhase = journal.phase) => {
     journal.phase = phase;
+    if (isResumablePhase(phase)) failureResumePhase = phase;
     journal.updatedAtUtc = ops.now().toISOString();
     await ops.save(structuredClone(journal));
   };
@@ -530,6 +722,11 @@ export async function runBackupCycle(
     );
     return;
   }
+
+  const prepared = prepareResume(journal, ops.now().getTime());
+  const retryBeforeAttempt = prepared.previousRetry;
+  const resumePhase = prepared.resumePhase;
+  failureResumePhase = resumePhase;
 
   try {
     if (journal.phase === "planned") {
@@ -709,7 +906,16 @@ export async function runBackupCycle(
       await save("complete");
     }
   } catch (error) {
-    journal.failure = error instanceof Error ? error.message : String(error);
+    const attemptedPhase = failureResumePhase ?? resumePhase;
+    const retryable = error instanceof OnlineBackupRetryableError &&
+      (error.resumePhase === undefined || error.resumePhase === attemptedPhase);
+    journal.failure = failureText(error);
+    journal.retry = retryForFailure(
+      retryBeforeAttempt,
+      ops.now().getTime(),
+      attemptedPhase,
+      retryable ? "retryable" : "blocked",
+    );
     try {
       await save("failed");
     } catch (writeError) {

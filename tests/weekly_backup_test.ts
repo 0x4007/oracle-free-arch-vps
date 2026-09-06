@@ -1,4 +1,5 @@
 import type { SourceContinuityEvidence } from "../scripts/online-backup-contract.ts";
+import { ONLINE_RETRY_POLICY } from "../scripts/online-backup-contract.ts";
 import {
   type BackupJournal,
   type BackupOperations,
@@ -6,6 +7,7 @@ import {
   type BackupPolicy,
   type BackupSnapshot,
   newBackupJournal,
+  OnlineBackupRetryableError,
   reconcileBackupGroupCreation,
   runBackupCycle,
   validateBackupPairForPolicy,
@@ -261,6 +263,150 @@ Deno.test("online group capture accepts source without outage operations", async
   );
 });
 
+Deno.test("typed transient inventory failure persists backoff and resumes", async () => {
+  const f = fixture();
+  let nowMs = Date.parse(DATE);
+  let snapshotCalls = 0;
+  const snapshot = f.ops.snapshot;
+  f.ops.now = () => new Date(nowMs);
+  f.ops.snapshot = async () => {
+    snapshotCalls++;
+    if (snapshotCalls === 1) {
+      throw new OnlineBackupRetryableError(
+        "inventory transport failed",
+        undefined,
+        "external-read",
+      );
+    }
+    return snapshot();
+  };
+
+  await rejects(
+    () => runBackupCycle(f.policy, f.journal, f.ops),
+    "the first transient failure must be reported",
+  );
+  assert(f.journal.phase === "failed");
+  assert(f.journal.retry?.disposition === "retryable");
+  assert(f.journal.retry?.resumePhase === "planned");
+  assert(f.journal.retry?.attempts === 1);
+  assert(
+    Date.parse(f.journal.retry!.nextAttemptAtUtc) ===
+      nowMs + ONLINE_RETRY_POLICY.initialDelayMs,
+    "the first retry uses the durable initial delay",
+  );
+  const callsBeforeEarlyRetry = snapshotCalls;
+  await rejects(
+    () => runBackupCycle(f.policy, f.journal, f.ops),
+    "a retry before its durable deadline must not run an operation",
+  );
+  assert(snapshotCalls === callsBeforeEarlyRetry);
+
+  nowMs = Date.parse(f.journal.retry!.nextAttemptAtUtc);
+  await runBackupCycle(f.policy, f.journal, f.ops);
+  assert((f.journal as BackupJournal).phase === "complete");
+  assert(f.journal.retry === undefined);
+});
+
+Deno.test("retry burst cools down after the bounded deadline", async () => {
+  const f = fixture();
+  let nowMs = Date.parse(DATE);
+  f.ops.now = () => new Date(nowMs);
+  f.ops.snapshot = () =>
+    Promise.reject(
+      new OnlineBackupRetryableError(
+        "inventory transport failed",
+        undefined,
+        "external-read",
+      ),
+    );
+
+  for (
+    let attempt = 1;
+    attempt <= ONLINE_RETRY_POLICY.maximumAttempts;
+    attempt++
+  ) {
+    await rejects(
+      () => runBackupCycle(f.policy, f.journal, f.ops),
+      `bounded attempt ${attempt} must remain observable`,
+    );
+    assert(f.journal.retry?.attempts === attempt);
+    if (attempt < ONLINE_RETRY_POLICY.maximumAttempts) {
+      nowMs = Date.parse(f.journal.retry!.nextAttemptAtUtc);
+    }
+  }
+  assert(f.journal.phase === "failed");
+  assert(f.journal.retry?.disposition === "retryable");
+  assert(
+    Date.parse(f.journal.retry!.nextAttemptAtUtc) >=
+      nowMs + ONLINE_RETRY_POLICY.cooldownMs,
+    "an exhausted burst must wait for a cooldown",
+  );
+  assert(
+    Date.parse(f.journal.retry!.deadlineAtUtc) ===
+      Date.parse(DATE) + ONLINE_RETRY_POLICY.burstDeadlineMs,
+    "the burst deadline remains durable",
+  );
+});
+
+Deno.test("failed journal without resume metadata stays blocked", async () => {
+  const f = fixture();
+  f.journal.phase = "failed";
+  await rejects(
+    () => runBackupCycle(f.policy, f.journal, f.ops),
+    "an old ambiguous failure must not be replayed",
+  );
+  assert(f.calls.length === 0);
+  assert(f.journal.retry === undefined);
+});
+
+Deno.test("lost create response reconciles the same group without a duplicate", async () => {
+  const f = fixture();
+  let createCalls = 0;
+  f.ops.createBackupGroup = async (suffix) => {
+    createCalls++;
+    assert(suffix === f.journal.suffix);
+    assert(f.journal.volumeGroupBackupIntent === true);
+    if (createCalls === 1) {
+      f.state.bootBackups.push(backup("boot", "new-boot", "new-group"));
+      f.state.rootBackups.push(backup("root", "new-root", "new-group"));
+      f.state.volumeGroupBackups!.push(
+        groupBackup(
+          "new-group",
+          "new-boot",
+          "new-root",
+          CAPTURE,
+          f.journal.suffix,
+        ),
+      );
+      f.state.allBackupCount = 4;
+      f.state.allVolumeGroupBackupCount = 1;
+      throw new OnlineBackupRetryableError(
+        "create response was lost",
+        "backing-up",
+        "recorded-operation",
+      );
+    }
+    throw new Error("duplicate create was attempted");
+  };
+  f.ops.waitBackupGroup = async (id) => {
+    f.calls.push("wait-group");
+    assert(id === "new-group");
+  };
+
+  await rejects(
+    () => runBackupCycle(f.policy, f.journal, f.ops),
+    "lost create response must leave a retryable journal",
+  );
+  assert(f.journal.phase === "failed");
+  assert(f.journal.retry?.resumePhase === "backing-up");
+  const retryAt = f.journal.retry!.nextAttemptAtUtc;
+  f.ops.now = () => new Date(retryAt);
+  await runBackupCycle(f.policy, f.journal, f.ops);
+  assert(createCalls === 1, "the reconciled group must be created once");
+  assert((f.journal as BackupJournal).phase === "complete");
+  assert(f.journal.volumeGroupBackupId === "new-group");
+});
+
 Deno.test("first online point keeps standalone previous pair until drill acceptance", async () => {
   const f = fixture(false, true);
   await runBackupCycle(f.policy, f.journal, f.ops);
@@ -275,6 +421,39 @@ Deno.test("grouped previous pair is retired through one cascading group delete",
   assert(f.journal.phase === "complete");
   assert(f.calls.includes("delete-group"));
   assert(!f.calls.includes("delete-boot") && !f.calls.includes("delete-root"));
+  assert(!f.state.volumeGroupBackups!.some((item) => item.id === "old-group"));
+});
+
+Deno.test("partial retention resumes from fresh evidence", async () => {
+  const f = fixture(true, false);
+  const deleteGroup = f.ops.deleteBackupGroup;
+  let attempts = 0;
+  f.ops.deleteBackupGroup = async (id, members) => {
+    attempts++;
+    if (attempts === 1) {
+      f.calls.push("delete-group-started");
+      f.state.volumeGroupBackups![0]["lifecycle-state"] = "TERMINATING";
+      f.state.bootBackups[0]["lifecycle-state"] = "TERMINATING";
+      f.state.rootBackups[0]["lifecycle-state"] = "TERMINATING";
+      throw new OnlineBackupRetryableError(
+        "retention response was lost",
+        "retiring",
+        "recorded-operation",
+      );
+    }
+    await deleteGroup(id, members);
+  };
+  await rejects(
+    () => runBackupCycle(f.policy, f.journal, f.ops),
+    "partial retention must remain resumable",
+  );
+  assert(f.journal.phase === "failed");
+  assert(f.journal.retry?.resumePhase === "retiring");
+  const retryAt = f.journal.retry!.nextAttemptAtUtc;
+  f.ops.now = () => new Date(retryAt);
+  await runBackupCycle(f.policy, f.journal, f.ops);
+  assert((f.journal as BackupJournal).phase === "complete");
+  assert(attempts === 2, "the second retention attempt uses fresh evidence");
   assert(!f.state.volumeGroupBackups!.some((item) => item.id === "old-group"));
 });
 
@@ -297,6 +476,8 @@ Deno.test("boot or service invocation drift fails capture and never retires old 
     "drift must fail",
   );
   assert(f.journal.phase === "failed");
+  assert(f.journal.retry?.disposition === "blocked");
+  assert(f.journal.retry?.attempts === 1);
   assert(!f.calls.some((call) => call.startsWith("delete")));
   assert(f.state.instanceState === "RUNNING");
 });
@@ -341,6 +522,30 @@ Deno.test("intent with empty inventory never creates a duplicate group backup", 
     () => runBackupCycle(f.policy, f.journal, f.ops),
     "ambiguous intent must fail closed",
   );
+  assert(!f.calls.includes("create-group"));
+});
+
+Deno.test("wrong recorded create identity becomes a visible block", async () => {
+  const f = fixture();
+  f.journal.phase = "failed";
+  f.journal.volumeGroupBackupIntent = true;
+  f.journal.volumeGroupBackupId = "wrong-group";
+  f.journal.retry = {
+    disposition: "retryable",
+    resumePhase: "backing-up",
+    attempts: 1,
+    firstFailureAtUtc: DATE,
+    nextAttemptAtUtc: DATE,
+    deadlineAtUtc: new Date(
+      Date.parse(DATE) + ONLINE_RETRY_POLICY.burstDeadlineMs,
+    ).toISOString(),
+  };
+  await rejects(
+    () => runBackupCycle(f.policy, f.journal, f.ops),
+    "a wrong recorded identity must block",
+  );
+  assert(f.journal.phase === "failed");
+  assert(f.journal.retry?.disposition === "blocked");
   assert(!f.calls.includes("create-group"));
 });
 
