@@ -125,6 +125,7 @@ export interface BackupOperations {
 
 export interface BackupRunControl {
   beforeCapture?: () => Promise<void>;
+  afterCycle?: (cycle: BackupJournal) => Promise<void>;
 }
 
 function equalSource(a: BackupSource, b: BackupSource): boolean {

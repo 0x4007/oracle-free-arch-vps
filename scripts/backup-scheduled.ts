@@ -158,7 +158,12 @@ export function planScheduledClaim(
   if (existing) validateClaim(existing);
 
   const cycleComplete = state?.cycle?.phase === "complete";
-  if (cycleComplete && periodIsSatisfied(schedule, due, state)) {
+  const acceptanceDue = isAcceptanceWindowId(triggerId) &&
+    (captureTimestamp(state) ?? -Infinity) <
+      Date.parse(triggerId.slice("acceptance@".length));
+  if (
+    cycleComplete && !acceptanceDue && periodIsSatisfied(schedule, due, state)
+  ) {
     return { action: "skip", reason: "PERIOD_ALREADY_SATISFIED" };
   }
 
@@ -220,6 +225,13 @@ export async function runScheduledBackup(): Promise<void> {
       claim = decision.claim;
       await writePrivateJson(CLAIM, claim);
       return {
+        afterCycle: async (cycle) => {
+          await writePrivateJson(CLAIM, {
+            ...claim,
+            status: cycle.phase === "complete" ? "complete" : "failed",
+            updatedAtUtc: new Date().toISOString(),
+          });
+        },
         beforeCapture: async () => {
           const latest = await readPrivateJson<BackupSchedule>(
             ".private/backup-schedule.json",
@@ -235,25 +247,13 @@ export async function runScheduledBackup(): Promise<void> {
         },
       };
     });
-    if (claim) {
-      await writePrivateJson(CLAIM, {
-        ...claim,
-        status: "complete",
-        updatedAtUtc: new Date().toISOString(),
-      });
-    }
   } catch (error) {
     if (error instanceof Skipped) {
       console.log(error.message);
       return;
     }
-    if (claim) {
-      await writePrivateJson(CLAIM, {
-        ...claim,
-        status: "failed",
-        updatedAtUtc: new Date().toISOString(),
-      });
-    }
+    // Before the runtime starts a journal, leave the durable claim started.
+    // Once it starts, afterCycle owns finalization under the shared lock.
     throw error;
   }
 }

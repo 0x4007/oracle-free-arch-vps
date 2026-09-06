@@ -262,3 +262,39 @@ Deno.test("durable retry metadata defers or blocks a failed journal", () => {
     assert(blocked.reason === "BACKUP_RETRY_BLOCKED");
   }
 });
+
+Deno.test("a new exact acceptance window permits one capture then suppresses replay", () => {
+  const acceptedSchedule: BackupSchedule = {
+    ...schedule,
+    acceptanceWindow: {
+      approvedAtUtc: "2026-09-06T22:00:00Z",
+      startsAtUtc: "2026-09-06T22:05:00Z",
+      expiresAtUtc: "2026-09-07T01:00:00Z",
+      exactOperation: "one online scheduler acceptance capture",
+    },
+  };
+  const state = {
+    cycle: {
+      phase: "complete",
+      suffix: "20260906T160000Z",
+      captureIdentity: { captureTimeUtc: "2026-09-06T16:00:00Z" },
+    },
+  };
+  assert(
+    planScheduledClaim(
+      acceptedSchedule,
+      new Date("2026-09-06T22:10:00Z"),
+      state,
+      undefined,
+    ).action === "run",
+  );
+  state.cycle.captureIdentity.captureTimeUtc = "2026-09-06T22:15:00Z";
+  assert(
+    planScheduledClaim(
+      acceptedSchedule,
+      new Date("2026-09-06T22:30:00Z"),
+      state,
+      undefined,
+    ).action === "skip",
+  );
+});
