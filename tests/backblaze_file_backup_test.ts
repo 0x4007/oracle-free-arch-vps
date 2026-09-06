@@ -3736,6 +3736,138 @@ Deno.test("orchestration: prior period closes allow a fresh next Sunday job", as
   );
 });
 
+Deno.test("cycle: a closed previous-week job must not cut the fresh next-Sunday run short", async () => {
+  // Regression: runBackblazeCycle computed the deadline bound from the
+  // PRE-step job, so a previous-week COMPLETE/FAILED (whose own deadline
+  // long passed) made the cycle break immediately after the step allocated
+  // the new REQUESTED next-Sunday job, returning B2_BACKUP_INCOMPLETE with
+  // "Request deadline reached" before the new job was even installed or
+  // launched. The bound must come from the resulting/current immutable job
+  // identity, and the same run must continue through allocation to work.
+  const nextSunday = WINDOW_START + 7 * 86_400_000;
+  const workerInvocation = "3".repeat(32);
+  const verifierInvocation = "4".repeat(32);
+  for (const phase of ["COMPLETE", "FAILED"] as const) {
+    const previous = generationFixture(72, WINDOW_START);
+    const closed = validateControllerState({
+      schemaVersion: 1,
+      catalog: [catalogEntry(previous, WINDOW_START + 1000)],
+      job: {
+        ...stateWithJob(previous, phase).job!,
+        ...(phase === "FAILED"
+          ? { failure: { code: "X", atUtc: iso(WINDOW_START + 1000) } }
+          : {}),
+      },
+    });
+    let current: GenerationFixture | undefined;
+    let resultText: string | undefined;
+    let receiptText: string | undefined;
+    const ensureFixture = (): GenerationFixture => {
+      if (current === undefined) {
+        const envelope =
+          (h.privateMap.get(CONTROLLER_STATE_PATH) as ControllerState)
+            .job!.envelope;
+        const base = generationFixtureFor(
+          envelope.request.jobId.slice("job-".length),
+          Date.parse(envelope.request.requestedAtUtc),
+        );
+        current = {
+          ...base,
+          request: envelope.request,
+          requestSha256: envelope.requestSha256,
+          workerResult: {
+            envelope,
+            capture: base.capture,
+            upload: base.upload,
+            publishedIndex: base.publishedIndex,
+          },
+        };
+        h.store.versionsList.push(...inventoryFor([current]));
+        resultText = JSON.stringify(current.workerResult);
+        receiptText = JSON.stringify(current.receipt);
+      }
+      return current;
+    };
+    const h: Harness = harness({
+      now: new Date(nextSunday + 1000),
+      observed: (unitName) => {
+        // The allocation step runs at nextSunday+1000 with the terminal
+        // status timestamps relative to the requested instant; poll the
+        // work of the fresh job from a slightly later instant.
+        h.clock.current = new Date(nextSunday + 60_000);
+        const fixture = ensureFixture();
+        if (unitName.startsWith("arch-vps-b2-worker-")) {
+          const status = workerPendingStatus(fixture, workerInvocation);
+          status.resultSha256 = sha256HexSync(
+            new TextEncoder().encode(resultText!),
+          );
+          return terminalObserved(status);
+        }
+        return terminalObserved(verifierAcceptedStatus(
+          fixture,
+          verifierInvocation,
+          sha256HexSync(new TextEncoder().encode(receiptText!)),
+        ));
+      },
+      rootResponder: (script) => {
+        if (script.includes("result.json")) {
+          return { code: 0, stdout: resultText!, stderr: "" };
+        }
+        if (script.includes("receipt.json")) {
+          return { code: 0, stdout: receiptText!, stderr: "" };
+        }
+        return undefined;
+      },
+      seedPrivate: (map) => {
+        map.set(".private/backup-runtime.json", ORACLE_STATE_FIXTURE);
+        map.set(
+          ".private/backup-scheduled-window.json",
+          SCHEDULED_CLAIM_FIXTURE,
+        );
+      },
+    });
+    h.store.versionsList.push(...inventoryFor([previous]));
+    await h.deps.private.write(CONTROLLER_STATE_PATH, closed);
+    const report = await runBackblazeCycle(h.deps);
+    assert(
+      report.status.startsWith("B2_BACKUP_COMPLETE"),
+      `phase=${phase} status=${report.status} detail=${
+        report.detail ?? "none"
+      }`,
+    );
+    assert(report.jobId !== previous.jobId, `phase=${phase}`);
+    const persisted = h.privateMap.get(
+      CONTROLLER_STATE_PATH,
+    ) as ControllerState;
+    assert(
+      persisted.job!.envelope.request.periodKey === "2026-09-13",
+      `phase=${phase} fresh job period`,
+    );
+    assert(persisted.job!.phase === "COMPLETE", `phase=${phase}`);
+    assert(
+      persisted.catalog.some((entry) =>
+        entry.index.generation === persisted.job!.envelope.request.generation
+      ),
+      `phase=${phase} the fresh generation is accepted`,
+    );
+    assert(
+      persisted.catalog.some((entry) =>
+        entry.index.generation === previous.generation
+      ),
+      `phase=${phase} the previous catalog entry is preserved`,
+    );
+    assert(
+      h.launches.length === 2,
+      `phase=${phase} the same run installs/launches the fresh job (launches=${h.launches.length})`,
+    );
+    assert(
+      !report.status.includes("INCOMPLETE") &&
+        !report.status.includes("FAILED"),
+      `phase=${phase} report=${report.status}`,
+    );
+  }
+});
+
 Deno.test("retention: resume revalidates plan IDs and trims a zero-remaining plan", () => {
   const fixtures = [1, 2, 3, 4, 5, 6].map((seed) =>
     generationFixture(seed, WINDOW_START + seed * 3_600_000)

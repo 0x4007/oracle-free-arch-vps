@@ -5336,12 +5336,6 @@ export async function runBackblazeCycle(
   let deadlineExpired = false;
   try {
     for (let step = 0; step < maxSteps; step += 1) {
-      // The immutable request deadline bounds the default lifetime; it is
-      // re-checked between steps, never derived from the step counter.
-      const deadline = state.job?.envelope.request.deadlineAtUtc;
-      const atDeadline = deadline !== undefined &&
-        Date.parse(deadline) <= deps.now().getTime();
-      if (atDeadline) deadlineExpired = true;
       const before = state.job?.phase ?? "none";
       let next: ControllerState;
       try {
@@ -5376,12 +5370,20 @@ export async function runBackblazeCycle(
           // The error followed a durable transition: resume from the
           // latest persisted state instead of forcing a terminal FAILED.
           state = durable!;
+          // The deadline bound is taken from the resulting job identity,
+          // never from the pre-step predecessor: the failing step may have
+          // allocated a fresh next-Sunday job whose own deadline has not
+          // passed. The SAME expired job still gets exactly one final
+          // expiry assessment per run before it reports incomplete.
+          const boundary = state.job!.envelope.request.deadlineAtUtc;
           if (
-            atDeadline && durable!.job!.phase !== "COMPLETE" &&
-            durable!.job!.phase !== "FAILED"
+            Date.parse(boundary) <= deps.now().getTime() &&
+            state.job!.phase !== "COMPLETE" &&
+            state.job!.phase !== "FAILED"
           ) {
             // The final expiry assessment already ran this iteration; a
             // terminal durable transition is reported on the next one.
+            deadlineExpired = true;
             break;
           }
           continue;
@@ -5434,7 +5436,22 @@ export async function runBackblazeCycle(
         return reportValue;
       }
       state = next;
-      if (atDeadline) break;
+      // The immutable request deadline bounds the default lifetime; it is
+      // re-checked between steps against the CURRENT resulting job
+      // identity, never derived from the step counter and never taken
+      // from the pre-step predecessor: a step may allocate a fresh
+      // next-Sunday job (closed previous-period COMPLETE/FAILED) whose own
+      // deadline has not passed, and that allocation must not be cut short
+      // by the old deadline. The SAME expired job gets exactly one final
+      // step -- its phase's own expiry assessment -- before the run
+      // reports incomplete truthfully.
+      const deadline = state.job?.envelope.request.deadlineAtUtc;
+      const atDeadline = deadline !== undefined &&
+        Date.parse(deadline) <= deps.now().getTime();
+      if (atDeadline) {
+        deadlineExpired = true;
+        break;
+      }
       await deps.sleep(POLL_INTERVAL_MS);
     }
   } finally {
