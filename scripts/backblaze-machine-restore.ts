@@ -1441,7 +1441,13 @@ async function formatFilesystem(
     await checked(runner, "mkfs.xfs", [
       "-f",
       "-m",
-      `uuid=${fs.uuid}`,
+      // Keep the retained GRUB 2.06 and Oracle fallback kernel able to read
+      // these filesystems; current mkfs.xfs enables incompatible features.
+      `uuid=${fs.uuid},crc=1,finobt=1,rmapbt=0,reflink=1,bigtime=0,inobtcount=0,metadir=0`,
+      "-i",
+      "nrext64=0,exchange=0",
+      "-n",
+      "parent=0",
       fs.device,
     ], `format:${fs.role}`);
   } else {
