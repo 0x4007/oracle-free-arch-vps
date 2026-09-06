@@ -69,12 +69,14 @@ Deno.test("free volume proof refuses missing or paid volume settings", () => {
 Deno.test("custom image proof requires explicit zero billable size", () => {
   assert(proveNoBillableCustomImages([{
     id: "platform",
+    "compartment-id": null,
     "lifecycle-state": "AVAILABLE",
     "billable-size-in-gbs": 0,
   }]));
   assert(
     !proveNoBillableCustomImages([{
       id: "custom",
+      "compartment-id": "tenancy",
       "lifecycle-state": "AVAILABLE",
       "billable-size-in-gbs": 50,
     }]),
@@ -104,6 +106,7 @@ Deno.test("resource surface inventory reads every cost-sensitive API", async () 
     else if (args.includes("compute") && args.includes("image")) {
       data = [{
         id: "platform",
+        "compartment-id": null,
         "lifecycle-state": "AVAILABLE",
         "billable-size-in-gbs": 0,
       }];
@@ -138,5 +141,53 @@ Deno.test("resource surface inventory reads every cost-sensitive API", async () 
       args.includes("--no-retry") && args.includes("--connection-timeout") &&
       args.includes("--read-timeout")
     ),
+  );
+});
+
+Deno.test("provider null replicas and platform image sizes do not imply paid resources", () => {
+  for (
+    const field of ["boot-volume-replicas", "block-volume-replicas"] as const
+  ) {
+    assert(
+      proveFreeVolumeSettings(
+        [{ ...compliantBootVolume, [field]: null }],
+        field,
+      ).replicationProved,
+    );
+    assert(
+      !proveFreeVolumeSettings(
+        [{ ...compliantBootVolume, [field]: undefined }],
+        field,
+      ).replicationProved,
+    );
+    assert(
+      !proveFreeVolumeSettings([{
+        ...compliantBootVolume,
+        [field]: [{ id: "replica" }],
+      }], field).replicationProved,
+    );
+  }
+  assert(
+    proveNoBillableCustomImages([{
+      id: "oracle-platform",
+      "compartment-id": null,
+      "lifecycle-state": "AVAILABLE",
+      "billable-size-in-gbs": 6,
+    }]),
+  );
+  assert(
+    !proveNoBillableCustomImages([{
+      id: "tenant-custom",
+      "compartment-id": "tenancy",
+      "lifecycle-state": "AVAILABLE",
+      "billable-size-in-gbs": 6,
+    }]),
+  );
+  assert(
+    !proveNoBillableCustomImages([{
+      id: "unknown",
+      "lifecycle-state": "AVAILABLE",
+      "billable-size-in-gbs": 0,
+    }]),
   );
 });

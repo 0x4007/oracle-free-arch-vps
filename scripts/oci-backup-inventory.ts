@@ -116,23 +116,25 @@ export function proveFreeVolumeSettings(
       hasEmptyList(item, "autotune-policies")
     ),
     replicationProved: activeVolumes.every((item) =>
-      hasEmptyList(item, replicaField)
+      item[replicaField] === null || hasEmptyList(item, replicaField)
     ),
   };
 }
 
 /**
- * A platform image is not stored tenant data. A custom image has a positive
- * billable size in the Compute Image response. Treat missing or non-numeric
- * billing metadata as unproved so a partial image response cannot authorize
- * a free-only cycle.
+ * Oracle platform images have an explicit null compartment. Their size fields
+ * are not tenant storage charges. Require identity and compartment metadata;
+ * tenant-owned images must explicitly have zero billable size.
  */
 export function proveNoBillableCustomImages(
   images: JsonRecord[],
 ): boolean {
   return activeImages(images).every((image) =>
-    typeof image["billable-size-in-gbs"] === "number" &&
-    image["billable-size-in-gbs"] === 0
+    typeof image.id === "string" && image.id.length > 0 &&
+    (image["compartment-id"] === null ||
+      (typeof image["compartment-id"] === "string" &&
+        image["compartment-id"].length > 0 &&
+        image["billable-size-in-gbs"] === 0))
   );
 }
 

@@ -298,3 +298,21 @@ Deno.test("a new exact acceptance window permits one capture then suppresses rep
     ).action === "skip",
   );
 });
+
+Deno.test("schedule reapproval does not reject an older completed capture", () => {
+  const reapproved = { ...schedule, approvedAtUtc: "2026-09-07T00:00:00Z" };
+  const state = {
+    cycle: {
+      phase: "complete",
+      captureIdentity: { captureTimeUtc: "2026-09-06T16:00:00Z" },
+    },
+  };
+  assert(
+    planScheduledClaim(
+      reapproved,
+      new Date("2026-09-13T12:00:00Z"),
+      state,
+      undefined,
+    ).action === "run",
+  );
+});

@@ -89,6 +89,12 @@ function validateAcceptanceWindow(
  */
 export function duePeriod(schedule: BackupSchedule, now: Date): string {
   validateSchedule(schedule, now);
+  return periodAt(schedule, now);
+}
+
+/** Calculate a historical civil period after the caller validates current
+ * authority. A capture may legitimately predate the schedule approval. */
+export function periodAt(schedule: BackupSchedule, now: Date): string {
   const parts = localParts(schedule, now);
   const date = civilDate(parts);
   const localWeekday = date.getUTCDay();
@@ -100,15 +106,6 @@ export function duePeriod(schedule: BackupSchedule, now: Date): string {
     date.setUTCDate(date.getUTCDate() - 7);
   }
   return `${isoCivilDate(date)}@${schedule.timeZone}`;
-}
-
-/** Derive the weekly period for a completed capture timestamp. Acceptance
- * windows never change the period identity used for duplicate prevention. */
-export function periodAt(
-  schedule: BackupSchedule,
-  at: Date,
-): string {
-  return duePeriod(schedule, at);
 }
 
 export function periodDate(period: string): string {
