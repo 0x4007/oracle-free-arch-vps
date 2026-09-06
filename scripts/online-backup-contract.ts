@@ -55,3 +55,7 @@ export const ONLINE_RETRY_POLICY = {
   maximumAttempts: 6,
   cooldownMs: 24 * 60 * 60_000,
 } as const;
+
+/** Only transport/read boundaries may produce this error. Failed policy or
+ * identity checks must retain their ordinary error and block mutation. */
+export class RetryableObservationError extends Error {}
