@@ -88,3 +88,64 @@ GitHub review/CI/merge loop remain separate from the candidate checks above. No
 new Oracle backup, B2 generation, home payload download, restore disk write, or
 service restart has been performed by this continuation as of this report's
 initial entry.
+
+## Deployment and review update, 23:34 UTC
+
+All three worker tips are integrated in canonical ancestry:
+179a2c918e0d49352be0b8a66ad89c3b423f34ac (catch-up),
+65fb39618683f2ba51c54ecc94525a998bbefbe4 (safe resume), and
+77abe9213e1d47bc60973d550dbc66d0e0a81c33 (free eligibility). Primary integration
+corrected final claim locking, post-completion timer timing, final slot
+accounting, and retry of a provably unsent create intent.
+
+Code revision 7ba7017e1fa8466dcbed2945677bb9f8b61af3f4 passed type, format,
+lint, and whitespace checks. The default suite passed 263 tests; 137
+permission-gated checks were ignored. Focused changed-path tests passed without
+ignored cases.
+
+Local review round one reported two P1 eligibility defects and one P2 historical
+schedule defect. The corrections recognize explicit null replica fields and
+Oracle-owned platform images, keep missing metadata and paid tenant resources
+refused, and calculate historical periods after validating current approval. The
+original failed candidate result was retained. A corrected read-only live check
+at 23:30:03 UTC passed current account, terms, Object Storage, volume
+performance/autotune/replication, and image cost-surface proof.
+
+Review round two exited successfully with no P0/P1 findings and two unresolved
+P2 findings. The configured review policy prohibits starting another correction
+round for lower-severity findings alone:
+
+1. A crash after runtime completion but before claim completion can leave a
+   started Oracle claim. A satisfied-period skip does not repair it, and the
+   Backblaze launch gate can remain blocked until a later Oracle cycle or an
+   operator reconciles it.
+2. If an attempt crosses its burst deadline while running, failure handling can
+   reset the burst and schedule 15-minute backoff instead of the intended
+   24-hour cooldown. The cooldown implementation is therefore not fully proved.
+
+These are unresolved reliability defects, not owner-authorized deferrals. They
+keep full unattended acceptance unproved despite the passing checks above.
+
+The Pi received all 19 deployment-manifest files with exact checked hashes.
+Runtime revision: 7ba7017e1fa8466dcbed2945677bb9f8b61af3f4. Both unit files were
+updated with guarded prior hashes; systemd configuration was reloaded without
+restarting a production service. The timer remains active and persistent. It
+fired at 23:32:33 UTC and its oneshot finished successfully at 23:32:37 UTC. A
+direct invocation of the installed scheduler also returned
+PERIOD_ALREADY_SATISFIED. Next automatic recheck: 23:47:37 UTC. This proves
+installed timer/duplicate-suppression behavior; it is not a new capture under
+the modified engine. This week's accepted Oracle capture was preserved.
+
+At 23:33:45 UTC, the installed watchdog reported both layers current and
+healthy, with no pending alerts and no notification sent. Existing B2
+capture/archive verification and dated repaired-boot evidence remain separate.
+No extra B2 history was manufactured. Source boot identity, VNC identity, and
+running Guacamole containers were preserved across deployment. The separately
+managed sales-browser invocation changed at 23:23:10 UTC, before this
+deployment; this continuation issued no source service restart and does not
+claim all source service identities were unchanged for the whole observation
+period.
+
+The full charter and goal remain unproved: the two P2 defects, post-trial API
+mapping, a new-engine capture acceptance if required, clean B2 repeatability,
+and the owner-deferred Oracle boot drill remain distinct requirements.
