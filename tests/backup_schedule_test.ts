@@ -316,3 +316,30 @@ Deno.test("schedule reapproval does not reject an older completed capture", () =
     ).action === "run",
   );
 });
+
+Deno.test("satisfied period repairs a stale claim only after a different cycle completes", () => {
+  const now = new Date("2026-09-06T20:00:00Z");
+  const state: ScheduledRuntimeState = {
+    cycle: {
+      phase: "complete",
+      suffix: "20260906T164037Z",
+      captureIdentity: { captureTimeUtc: "2026-09-06T16:51:34.128Z" },
+    },
+  };
+  const claim = {
+    windowId: "2026-09-06@America/New_York",
+    status: "started" as const,
+    previousCycleSuffix: "20260830T040000Z",
+    updatedAtUtc: "2026-09-06T16:00:00Z",
+  };
+  const repaired = planScheduledClaim(schedule, now, state, claim);
+  assert(repaired.action === "skip");
+  assert(repaired.completedClaim?.status === "complete");
+  assert(repaired.completedClaim?.windowId === claim.windowId);
+  const unchanged = planScheduledClaim(schedule, now, state, {
+    ...claim,
+    previousCycleSuffix: state.cycle!.suffix,
+  });
+  assert(unchanged.action === "skip");
+  assert(unchanged.completedClaim === undefined);
+});

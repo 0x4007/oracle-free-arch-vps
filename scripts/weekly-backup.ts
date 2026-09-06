@@ -604,8 +604,9 @@ function retryForFailure(
 
   const coolingDown = previousMetadata !== undefined &&
     previousMetadata.nextAttemptMs <= nowMs &&
-    (previous!.attempts >= ONLINE_RETRY_POLICY.maximumAttempts ||
-      nowMs >= previousMetadata.deadlineMs);
+    // A scheduled retry beyond the burst deadline records a cooldown.
+    // Crossing that deadline during this attempt does not finish a cooldown.
+    previousMetadata.nextAttemptMs >= previousMetadata.deadlineMs;
   const firstFailureMs = coolingDown
     ? nowMs
     : previousMetadata?.firstFailureMs ?? nowMs;

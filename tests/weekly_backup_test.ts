@@ -643,3 +643,51 @@ Deno.test("a failed final pre-create read withdraws only the unsent intent", asy
   assert(f.journal.phase === "complete");
   assert(f.calls.filter((call) => call === "create-group").length === 1);
 });
+
+Deno.test("an attempt crossing the deadline waits a full cooldown before a new burst", async () => {
+  const f = fixture();
+  let nowMs = Date.parse(DATE);
+  f.ops.now = () => new Date(nowMs);
+  f.ops.snapshot = () =>
+    Promise.reject(
+      new OnlineBackupRetryableError("timeout", undefined, "external-read"),
+    );
+  await rejects(
+    () => runBackupCycle(f.policy, f.journal, f.ops),
+    "first failure",
+  );
+  const firstFailure = f.journal.retry!.firstFailureAtUtc;
+  const deadline = Date.parse(f.journal.retry!.deadlineAtUtc);
+  nowMs = Date.parse(f.journal.retry!.nextAttemptAtUtc);
+  f.ops.snapshot = () => {
+    nowMs = deadline + 60_000;
+    return Promise.reject(
+      new OnlineBackupRetryableError("timeout", undefined, "external-read"),
+    );
+  };
+  await rejects(
+    () => runBackupCycle(f.policy, f.journal, f.ops),
+    "deadline-crossing failure",
+  );
+  assert(f.journal.retry!.firstFailureAtUtc === firstFailure);
+  assert(f.journal.retry!.attempts === 2);
+  assert(
+    Date.parse(f.journal.retry!.nextAttemptAtUtc) ===
+      nowMs + ONLINE_RETRY_POLICY.cooldownMs,
+  );
+  nowMs = Date.parse(f.journal.retry!.nextAttemptAtUtc);
+  f.ops.snapshot = () =>
+    Promise.reject(
+      new OnlineBackupRetryableError("timeout", undefined, "external-read"),
+    );
+  await rejects(
+    () => runBackupCycle(f.policy, f.journal, f.ops),
+    "new burst failure",
+  );
+  assert(Number(f.journal.retry!.attempts) === 1);
+  assert(Date.parse(f.journal.retry!.firstFailureAtUtc) === nowMs);
+  assert(
+    Date.parse(f.journal.retry!.nextAttemptAtUtc) ===
+      nowMs + ONLINE_RETRY_POLICY.initialDelayMs,
+  );
+});

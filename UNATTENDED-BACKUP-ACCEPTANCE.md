@@ -149,3 +149,30 @@ period.
 The full charter and goal remain unproved: the two P2 defects, post-trial API
 mapping, a new-engine capture acceptance if required, clean B2 repeatability,
 and the owner-deferred Oracle boot drill remain distinct requirements.
+
+## Authorized correction and final review, 23:46 UTC
+
+The owner approved correction of the two round-two P2 defects. Satisfied-period
+skips now return and persist a completed stale claim under the runtime lock when
+a different completed cycle proves progress beyond the claim's previous cycle.
+Retry bursts reset only after an already-scheduled cooldown has elapsed; an
+attempt crossing its deadline preserves exhaustion and waits 24 hours.
+
+Validation: 32 focused tests passed without skips; the default suite reported
+265 passed and 137 permission-gated tests ignored. All 11 B2 gate integration
+tests passed with local read/write permission. Type, format, lint and whitespace
+checks passed.
+
+The third and final local review used base
+7be42b95e4851d42a9cfce193b8488f990fd3b45 and exited successfully. It did not
+repeat either corrected finding. It found one new P2: the weekly beforeCapture
+path reads the latest schedule but does not validate a changed approval because
+currentWindow is called only for acceptance claims. A removed or future
+approvedAtUtc during preflight can therefore go unnoticed. This remains an
+unresolved defect, not an owner deferral. The three-round review limit is reached;
+no fourth review or further correction pass was started.
+
+The earlier deployment receipt remains historical evidence until the correction
+has a separate installed-hash and live scheduler receipt. Post-trial mapping,
+clean B2 restore repeatability, and the owner-deferred Oracle boot drill remain
+separate outstanding requirements.
