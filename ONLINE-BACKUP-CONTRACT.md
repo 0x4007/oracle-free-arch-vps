@@ -36,8 +36,9 @@ files match source revision `63fe190e0b9d0d11742b3e3fca151cff9021c989`.
 The service exited successfully and its scheduler claim is complete.
 
 - One FULL group and its two members are AVAILABLE, totaling 200 GB.
-- The live free-backup counter reports five used and zero available. The wrapper
-  does not consume a sixth slot. All three previous backups remain intact.
+- At capture acceptance, the free-backup counter reported five used and zero
+  available. The wrapper does not consume a sixth slot. All three previous
+  backups were preserved until the later approved retirement below.
 - Production remains one instance, 2 OCPUs, 12 GB RAM, 200 GB live volumes and
   one public IP. Account and current official free-limit checks passed.
 - Complete Object Storage accounting is 1,453,785,088 bytes, with
@@ -104,17 +105,23 @@ The private kit retains the exact tested host/rescue commands and library hashes
 
 The Oracle group members pass live identity and restore-validator checks, but the
 new Oracle point has not been restored and booted. Historical stopped-pair boot
-proof and the independent B2 boot proof do not establish that result. The two
-approved requests excluded a new OCI clone. Production already uses the full
-200 GB live-storage allowance, so a separate Oracle boot target needs a new
-scope/resource decision.
+proof and the independent B2 boot proof do not establish that result. At 19:52 UTC
+on September 6, the user explicitly deferred this separate Oracle boot test and
+approved delivery as a system under active development. No clone is required for
+this accepted scope; Oracle evidence remains METADATA_PROVED.
 
-`retainPreviousPair` remains true. All five backup slots are occupied; another
-capture cannot proceed until an approved retention action frees two slots.
-Neither existing-backup deletion nor a new Oracle clone was included in this
-acceptance run. Do not describe recurring rotation or the entire handoff as
-complete while these boundaries remain unresolved.
+The user approved retirement of the previous 50/150 GB Oracle pair at 19:52 UTC.
+Both old members were deleted after fresh source and replacement checks.
+`retainPreviousPair` is false in the installed policy and journal. Three backup
+members remain, leaving two slots for the next weekly capture. The new group,
+unrelated historical backup and both B2 generations are preserved. No additional
+capture or source stop/start occurred during retirement. Exact before-state,
+deletion records and final inventory are saved in the private retirement reports.
+
+This development acceptance proves one real online scheduler capture and the
+retirement path. It does not claim a later unattended weekly rotation has run.
 
 The three permitted local review rounds were used before live acceptance. The
 live corrections received focused tests and actual runtime checks; no fourth
-review was run. PR #9 remains draft pending the remaining acceptance decision.
+review was run. The user approved completion and merge of PR #9 under the
+development scope above. This is not a production-readiness claim.

@@ -107,8 +107,10 @@ absent, with 3.19 GiB reclaimed.
 
 The Oracle controller now uses online group capture. Its real scheduler
 acceptance completed on September 6 without source interruption. Existing
-backups remain preserved; Oracle clone boot acceptance and the retention
-decision are still separate gates. See `ONLINE-BACKUP-CONTRACT.md`.
+backups were preserved through initial acceptance. The user subsequently approved
+retiring the old Oracle pair and deferring the separate Oracle boot test for this
+development delivery. Retirement leaves two free slots for the next weekly
+capture. See `ONLINE-BACKUP-CONTRACT.md`.
 
 The final release passed 379 repository tests, including 71 controller tests,
 plus type, format, and lint checks. Its watchdog reports the accepted Backblaze
