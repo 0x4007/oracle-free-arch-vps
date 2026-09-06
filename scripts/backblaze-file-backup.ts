@@ -1595,16 +1595,11 @@ export function realTunnelSeam(
       const timeout = new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => reject(timeoutError), TUNNEL_READY_TIMEOUT_MS);
       });
-      try {
-        await Promise.race([ready, timeout]);
-      } finally {
-        clearTimeout(timer);
-      }
-      if (!ackSeen) {
-        // No acknowledgement: close stdin so the remote `cat` gets EOF and
-        // exits, which ends the SSH session naturally (ServerAlive bounds a
-        // dead transport). Drain stderr fully; never signal ssh or any
-        // agent and never claim a cleanup we did not prove.
+      const closeOwnedChild = async (): Promise<void> => {
+        // Close stdin so the remote `cat` gets EOF and exits, which ends
+        // the SSH session naturally (ServerAlive bounds a dead transport).
+        // Await the terminal exit and drain stderr for proof. Never signal
+        // ssh or any agent and never claim a cleanup we did not prove.
         const writer = child.stdin.getWriter();
         try {
           await writer.close();
@@ -1613,23 +1608,35 @@ export function realTunnelSeam(
         }
         await child.status;
         await stderrDrain;
+      };
+      try {
+        await Promise.race([ready, timeout]);
+      } catch (error) {
+        // A readiness timeout OR a readiness stream error rejects the race
+        // while this owned child may still hold stdin open (the remote
+        // `cat` waits for EOF): close the child's stdin, await its natural
+        // exit and stderr drain, then rethrow the original failure. Never
+        // signal or kill the SSH child or an agent.
+        try {
+          await closeOwnedChild();
+        } catch {
+          // The readiness failure is the reportable one; never replace it
+          // with a partial cleanup error or claim more than proved.
+        }
+        throw error;
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!ackSeen) {
+        // The stream ended before the acknowledgement: the child may still
+        // hold stdin open, so the same owned-child close proof runs before
+        // the failure is reported.
+        await closeOwnedChild();
         throw ackError ?? timeoutError;
       }
       const handle: TunnelHandle = {
         async close() {
-          // Close stdin so the remote `cat` reads EOF and exits, which
-          // ends the SSH session naturally (ServerAlive bounds transport
-          // failure). Await the terminal exit and drain stderr for proof;
-          // the remote EXIT trap removes exactly this custom source
-          // socket, and no signal is ever sent to ssh or an agent.
-          const writer = child.stdin.getWriter();
-          try {
-            await writer.close();
-          } catch {
-            // Already closed.
-          }
-          await child.status;
-          await stderrDrain;
+          await closeOwnedChild();
         },
       };
       active = handle;
@@ -3490,6 +3497,62 @@ async function observeProof(
   };
 }
 
+/** A durable terminal phase (WORKER_TERMINAL, ACCEPTED or FAILED) may
+ * resume with its matching gate still alive after a crash between the
+ * durable persist and the gate removal: the terminal unit must be
+ * re-observed, a FRESH terminal proof revalidated against the exact
+ * surviving gate, and only then the gate is removed — before any next
+ * launch or prune. A gate already absent is idempotently fine in those
+ * durable phases; a foreign or identity-mismatched gate is never cleared
+ * and throws, while a transiently unreachable or not-yet-terminal unit
+ * keeps the gate and returns false so the poll pair retries. */
+async function clearSurvivingTerminalGate(
+  deps: PiDeps,
+  job: ControllerJob,
+  unitName: string,
+  status: WorkerStatus | VerifierStatus,
+): Promise<boolean> {
+  const request = job.envelope.request;
+  const gate = await deps.gate.read();
+  if (gate === null) return true;
+  if (
+    gate.state !== "active" ||
+    gate.jobId !== request.jobId ||
+    gate.periodKey !== request.periodKey ||
+    gate.generation !== request.generation ||
+    gate.requestSha256 !== job.envelope.requestSha256 ||
+    gate.unitName !== unitName
+  ) {
+    throw new Error("Surviving terminal gate does not match the job or unit");
+  }
+  let observation: ClearProofObservation;
+  try {
+    observation = await observeProof(deps, job, unitName);
+  } catch {
+    // Source unreachable at resume time: keep the gate and let the next
+    // poll re-observe; nothing is launched or pruned meanwhile.
+    return false;
+  }
+  if (observation.props.get("InvocationID") !== status.invocationId) {
+    throw new Error(
+      "Surviving terminal gate unit invocation no longer matches the status",
+    );
+  }
+  const active = observation.props.get("ActiveState");
+  const sub = observation.props.get("SubState");
+  if (active !== "failed" && !(active === "active" && sub === "exited")) {
+    // Not terminal yet (or a fresh nonterminal observation): keep the gate.
+    return false;
+  }
+  const proof = buildClearProof(observation, gate, status.state, {
+    updatedAtUtc: status.updatedAtUtc,
+    heartbeatAtUtc: status.heartbeatAtUtc,
+    finishedAtUtc: status.finishedAtUtc ?? deps.now().toISOString(),
+  });
+  await deps.gate.clear(gate, proof);
+  return true;
+}
+
 async function installTransportRuntime(
   deps: PiDeps,
   job: ControllerJob,
@@ -3900,13 +3963,18 @@ export async function stepBackupController(
         await deps.gate.orphan(proofGate, reason);
         return await failJob(deps, state, `ORPHANED_${reason}`);
       }
-      await deps.gate.clear(proofGate, proof);
+      // The durable terminal state is persisted BEFORE the gate is removed:
+      // a crash between the two leaves WORKER_TERMINAL with the surviving
+      // worker gate, which that phase re-observes and revalidates; a gate
+      // must never be removed while a previously unused state remains.
       if (status!.state === "FAILED") {
-        return await failJob(
+        const failed = await failJob(
           deps,
           { ...state, job: { ...state.job!, workerStatus: status } },
           status!.errorCode ?? "WORKER_FAILED",
         );
+        await deps.gate.clear(proofGate, proof);
+        return failed;
       }
       const resultBytes = await fetchBoundedFile(
         deps,
@@ -3955,9 +4023,36 @@ export async function stepBackupController(
         workerStatus: status,
         resultSha256,
       };
-      return await persist(deps, { ...state, job: terminal });
+      const terminalPersisted = await persist(deps, {
+        ...state,
+        job: terminal,
+      });
+      await deps.gate.clear(proofGate, proof);
+      return terminalPersisted;
     }
     case "WORKER_TERMINAL": {
+      // A worker gate may survive a crash between the durable
+      // WORKER_TERMINAL persist and its removal: it must be re-observed
+      // and revalidated with a fresh terminal proof before anything is
+      // launched. A gate already absent is idempotently fine.
+      const workerGate = await deps.gate.read();
+      if (
+        workerGate !== null &&
+        workerGate.unitName === workerUnitName(generation)
+      ) {
+        if (job.workerStatus === undefined) {
+          throw new Error(
+            "Terminal worker gate survives without a saved status",
+          );
+        }
+        const cleared = await clearSurvivingTerminalGate(
+          deps,
+          job,
+          workerUnitName(generation),
+          job.workerStatus,
+        );
+        if (!cleared) return state;
+      }
       const derived = deriveVerifierGate(
         request,
         job.envelope.requestSha256,
@@ -3966,8 +4061,7 @@ export async function stepBackupController(
       if (gate !== null) {
         // A resume may already own the derived verifier gate (crash after
         // gate creation); it must bind this exact job/unit identity and be
-        // active. A surviving worker gate means the terminal proof never
-        // cleared it.
+        // active.
         if (
           gate.state !== "active" ||
           gate.jobId !== request.jobId ||
@@ -4129,13 +4223,18 @@ export async function stepBackupController(
         await deps.gate.orphan(proofGate, reason);
         return await failJob(deps, state, `ORPHANED_${reason}`);
       }
-      await deps.gate.clear(proofGate, proof);
+      // The durable terminal state is persisted BEFORE the gate is removed:
+      // a crash between the two leaves ACCEPTED with the surviving verifier
+      // gate, which that phase re-observes and revalidates; a gate must
+      // never be removed while a previously unused state remains.
       if (status!.state === "FAILED") {
-        return await failJob(
+        const failed = await failJob(
           deps,
           { ...state, job: { ...state.job!, verifierStatus: status } },
           status!.errorCode ?? "VERIFIER_FAILED",
         );
+        await deps.gate.clear(proofGate, proof);
+        return failed;
       }
       const acceptedState = await acceptCatalogEntry(
         deps,
@@ -4144,14 +4243,48 @@ export async function stepBackupController(
         status!,
         now,
       );
+      // Catalog membership and the ACCEPTED phase are persisted in ONE
+      // recoverable write before the gate is removed: there is no
+      // crash-dependent two-state acceptance.
       const accepted = {
         ...acceptedState.job!,
         phase: "ACCEPTED" as ControllerPhase,
         verifierStatus: status,
       };
-      return await persist(deps, { ...acceptedState, job: accepted });
+      const acceptedPersisted = await persist(deps, {
+        ...acceptedState,
+        job: accepted,
+      });
+      await deps.gate.clear(proofGate, proof);
+      return acceptedPersisted;
     }
-    case "ACCEPTED":
+    case "ACCEPTED": {
+      // A verifier gate may survive a crash between the durable ACCEPTED
+      // persist and its removal: it must be re-observed and revalidated
+      // with a fresh terminal proof before any prune runs. A gate already
+      // absent is idempotently fine.
+      const verifierGate = await deps.gate.read();
+      if (
+        verifierGate !== null &&
+        verifierGate.unitName === verifyUnitName(generation)
+      ) {
+        if (job.verifierStatus === undefined) {
+          throw new Error(
+            "Accepted verifier gate survives without a saved status",
+          );
+        }
+        const cleared = await clearSurvivingTerminalGate(
+          deps,
+          job,
+          verifyUnitName(generation),
+          job.verifierStatus,
+        );
+        if (!cleared) return state;
+      } else if (verifierGate !== null) {
+        throw new Error("Accepted job gate does not match the verifier unit");
+      }
+      return await pruneStep(deps, state, now);
+    }
     case "PRUNING": {
       return await pruneStep(deps, state, now);
     }
@@ -4160,8 +4293,29 @@ export async function stepBackupController(
       return await cleanupStep(deps, state, now);
     }
     case "COMPLETE":
-    case "FAILED":
       return state;
+    case "FAILED": {
+      // A failure may resume with its matching terminal gate still alive
+      // (crash between the durable FAILED persist and its removal): the
+      // same fresh-proof revalidation clears it; the gate is never removed
+      // silently and a foreign gate is never cleared.
+      const unitName = job.verifierStatus !== undefined
+        ? verifyUnitName(generation)
+        : workerUnitName(generation);
+      const status = job.verifierStatus ?? job.workerStatus;
+      if (status !== undefined) {
+        try {
+          await clearSurvivingTerminalGate(deps, job, unitName, status);
+        } catch (error) {
+          deps.logger(
+            `Surviving terminal gate could not be cleared: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
+      return state;
+    }
   }
 }
 
@@ -4230,7 +4384,9 @@ async function acceptCatalogEntry(
     receipt,
     acceptedAtUtc: now.toISOString(),
   });
-  await persist(deps, { ...state, catalog });
+  // No durable write here: the ACCEPTED phase and the catalog entry are
+  // persisted together by the caller in one recoverable state, so a crash
+  // never splits acceptance into two crash-dependent states.
   deps.logger(
     `Backblaze generation ${request.generation} accepted into the catalog`,
   );
@@ -4551,6 +4707,47 @@ const CLEANUP_BOOT_SAMPLES = [
   "sample.staging-boot.arch-initrd.img",
 ] as const;
 
+/** Uploader contract: the fixed owner-only resume journal written by
+ * backblaze-upload.ts into the generation stage. */
+const CLEANUP_UPLOAD_FIXED = ["upload-journal.json"] as const;
+
+/** Index publisher contract (exact fixed names in backblaze-index.ts): the
+ * plaintext, ciphertext, receipt and state journals, the staged pinned
+ * recipient copy, and the task-owned ciphertext `.partial` that stays when
+ * the create-new commit cannot complete. `index-public-home/` is a
+ * directory, treated like the capture `gpg-public-home`. */
+const CLEANUP_INDEX_FIXED = [
+  "recovery-index.json",
+  "recovery-index.json.gpg",
+  "recovery-index.json.gpg.partial",
+  "recovery-index-receipt.json",
+  "recovery-index-state.json",
+  "index-recipient.asc",
+] as const;
+
+/** Atomic write temp prefixes of the upload journal and index publisher
+ * (`.${basename}.${crypto.randomUUID()}.tmp` in backblaze-upload.ts and
+ * backblaze-index.ts); a crash mid-write may leave one behind. Only the
+ * exact prefix plus a v4 UUID plus `.tmp` is accepted. */
+const CLEANUP_ATOMIC_TEMP_PREFIXES = [
+  ".upload-journal.json",
+  ".recovery-index.json",
+  ".recovery-index-receipt.json",
+  ".recovery-index-state.json",
+  ".index-recipient.asc",
+] as const;
+
+const CLEANUP_UUID_PATTERN =
+  "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+
+const CLEANUP_ATOMIC_TEMP_PATTERN = new RegExp(
+  `^\\.(${
+    CLEANUP_ATOMIC_TEMP_PREFIXES.map((prefix) =>
+      prefix.slice(1).replaceAll(".", "\\.")
+    ).join("|")
+  })\\.${CLEANUP_UUID_PATTERN}\\.tmp$`,
+);
+
 /** Public-only gpg home entries permitted inside `gpg-public-home`
  * (pubring/trustdb/agent sockets and empty key dirs, never private data). */
 const CLEANUP_GPG_HOME_PATTERN =
@@ -4565,8 +4762,10 @@ export function cleanupAllowedNames(): {
     ...CLEANUP_LOG_LABELS.map((label) => `${label}.stderr.log`),
     ...CLEANUP_BOOT_SAMPLES,
     ...CLEANUP_BOOT_SAMPLES.map((sample) => `${sample}.partial`),
+    ...CLEANUP_UPLOAD_FIXED,
+    ...CLEANUP_INDEX_FIXED,
   ]);
-  const dirs = new Set<string>(["gpg-public-home"]);
+  const dirs = new Set<string>(["gpg-public-home", "index-public-home"]);
   for (const role of UPLOAD_ROLE_ORDER) {
     const format = role === "recovery" ? "json.zst" : "tar.zst";
     // Recovery finals use the full `${role}.${format}.gpg` name; the
@@ -4584,12 +4783,14 @@ export function cleanupAllowedNames(): {
   return { files, dirs };
 }
 
-/** Whether one direct descendant of a generation scratch directory is an
- * expected capture/recovery/verifier output. Unknown contents are
- * preserved: the cleanup aborts instead of deleting them. */
+/** Whether one DIRECT child of a generation scratch directory is an
+ * expected capture/recovery/verifier/upload/index output. Unknown contents
+ * are preserved: the cleanup aborts instead of deleting them. */
 export function cleanupAllowedName(name: string, isDir: boolean): boolean {
   const allowed = cleanupAllowedNames();
-  return isDir ? allowed.dirs.has(name) : allowed.files.has(name);
+  return isDir
+    ? allowed.dirs.has(name)
+    : allowed.files.has(name) || CLEANUP_ATOMIC_TEMP_PATTERN.test(name);
 }
 
 /** Whether a direct descendant of `gpg-public-home` is a known public-only
@@ -4625,6 +4826,17 @@ export function buildCleanupScript(generation: string): string {
     "S.gpg-agent.lock",
     "S.gpg-agent.bak",
   ].sort().join("|");
+  // Atomic temp convention of the upload journal and index publisher:
+  // exact prefix + v4 UUID + .tmp, each class hexed one by one so the case
+  // pattern never matches a broader name.
+  const hexClass = "[0-9a-f]";
+  const group = (n: number): string => Array(n).fill(hexClass).join("");
+  const uuidGlob = `${group(8)}-${group(4)}-4${group(3)}-[89ab]${group(3)}-${
+    group(12)
+  }`;
+  const tempPatterns = CLEANUP_ATOMIC_TEMP_PREFIXES.map((prefix) =>
+    `${prefix}.${uuidGlob}.tmp`
+  ).sort().join("|");
   return [
     "set -eu",
     `exec 9<>${shellQuote(SOURCE_LOCK_PATH)}`,
@@ -4650,37 +4862,47 @@ export function buildCleanupScript(generation: string): string {
     '  if awk -v p="$dir" \'$2 == p || substr($2, 1, length(p) + 1) == p "/" {print}\' /proc/self/mounts | grep -q .; then',
     '    echo "MOUNT_AT_OR_BELOW $base"; exit 8;',
     "  fi",
+    // Only DIRECT children of the generation directory are validated here;
+    // each allowed public-key home is enumerated separately at its own
+    // depth below, and any other nested descendant is rejected through its
+    // unknown direct parent.
     "  while IFS= read -r kind name; do",
     '    test -n "$name" || continue',
     '    case "$kind" in',
     "      f)",
-    `        case "$name" in ${filePatterns}) ;; *) echo "UNEXPECTED_FILE $base $name"; exit 9 ;; esac`,
+    `        case "$name" in ${filePatterns}|${tempPatterns}) ;; *) echo "UNEXPECTED_FILE $base $name"; exit 9 ;; esac`,
     "        ;;",
     "      d)",
-    '        test "$name" = gpg-public-home || { echo "UNEXPECTED_DIR $base $name"; exit 9; }',
+    '        test "$name" = gpg-public-home -o "$name" = index-public-home || { echo "UNEXPECTED_DIR $base $name"; exit 9; }',
     "        ;;",
+    "      l)",
+    '        echo "UNEXPECTED_SYMLINK $base $name"; exit 9 ;;',
     '      *) echo "UNEXPECTED_ENTRY $base $name"; exit 9 ;;',
     "    esac",
-    '  done < <(find "$dir" -mindepth 1 -printf "%y %P\\n")',
-    '  home="$dir/gpg-public-home"',
-    '  if test -d "$home"; then',
-    "    while IFS= read -r kind name; do",
-    '      test -n "$name" || continue',
-    '      case "$kind" in',
-    "        f)",
-    `          case "$name" in ${gpgNames}) ;; *) echo "UNEXPECTED_GPG_FILE $base $name"; exit 9 ;; esac`,
-    "          ;;",
-    "        d)",
-    '          test "$name" = private-keys-v1.d || { echo "UNEXPECTED_GPG_DIR $base $name"; exit 9; }',
-    '          test -z "$(find "$home/$name" -mindepth 1 -print -quit)" || { echo "GPG_PRIVATE_KEYS $base"; exit 10; }',
-    "          ;;",
-    "        s)",
-    '          test "$name" = S.gpg-agent -o "$name" = S.gpg-agent.extra || { echo "UNEXPECTED_GPG_SOCKET $base $name"; exit 9; }',
-    "          ;;",
-    '        *) echo "UNEXPECTED_GPG_ENTRY $base $name"; exit 9 ;;',
-    "      esac",
-    '    done < <(find "$home" -mindepth 1 -printf "%y %P\\n")',
-    "  fi",
+    '  done < <(find "$dir" -mindepth 1 -maxdepth 1 -printf "%y %P\\n")',
+    "  for publicName in gpg-public-home index-public-home; do",
+    '    home="$dir/$publicName"',
+    '    if test -d "$home"; then',
+    "      while IFS= read -r kind name; do",
+    '        test -n "$name" || continue',
+    '        case "$kind" in',
+    "          f)",
+    `            case "$name" in ${gpgNames}) ;; *) echo "UNEXPECTED_GPG_FILE $base $name"; exit 9 ;; esac`,
+    "            ;;",
+    "          d)",
+    '            test "$name" = private-keys-v1.d || { echo "UNEXPECTED_GPG_DIR $base $name"; exit 9; }',
+    '            test -z "$(find "$home/$name" -mindepth 1 -print -quit)" || { echo "GPG_PRIVATE_KEYS $base"; exit 10; }',
+    "            ;;",
+    "          s)",
+    '            test "$name" = S.gpg-agent -o "$name" = S.gpg-agent.extra || { echo "UNEXPECTED_GPG_SOCKET $base $name"; exit 9; }',
+    "            ;;",
+    "          l)",
+    '            echo "UNEXPECTED_GPG_SYMLINK $base $name"; exit 9 ;;',
+    '          *) echo "UNEXPECTED_GPG_ENTRY $base $name"; exit 9 ;;',
+    "        esac",
+    '      done < <(find "$home" -mindepth 1 -maxdepth 1 -printf "%y %P\\n")',
+    "    fi",
+    "  done",
     '  rm -rf --one-file-system -- "$dir"',
     '  echo "CLEANED $dir"',
     "}",

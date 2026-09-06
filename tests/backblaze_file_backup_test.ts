@@ -138,6 +138,36 @@ const RECIPIENT_TEXT = [
   "-----END PGP PUBLIC KEY BLOCK-----",
   "",
 ].join("\n");
+
+/** Exact fixed diagnostic labels of the capture module's runBash children;
+ * every one produces `${label.replaceAll(":", "-")}.stderr.log`. This pins
+ * the cleanup contract independently of the controller internals. */
+const CLEANUP_LABELS = [
+  "boot-before",
+  "boot-after",
+  "packages-before",
+  "packages-after",
+  "recipient-key",
+  "layout-initial",
+  "layout-final",
+  "guard-initial",
+  "guard-final",
+  "recovery-efivars",
+  "recovery-findmnt",
+  "recovery-mount-options",
+  "recovery-sfdisk",
+  "recovery-lvm",
+  "recovery-cmdline",
+  "recovery-fstab",
+  "recovery-encrypt",
+  "recovery-compress",
+  "hash-recovery",
+  "tools-tar",
+  "tools-zstd",
+  "tools-gpg",
+  "tools-sfdisk",
+  "tools-vgcfgbackup",
+] as const;
 const RECIPIENT_SHA256 = sha256HexSync(
   new TextEncoder().encode(RECIPIENT_TEXT),
 );
@@ -2602,14 +2632,17 @@ function deferred<T>() {
 
 /** A small synthetic ssh child: the readiness acknowledgement (or silence),
  * a stderr line, and a status that settles only when stdin is closed, like
- * the real remote `cat` exiting on EOF. */
+ * the real remote `cat` exiting on EOF. `streamError` makes the readiness
+ * stream reject instead of delivering the acknowledgement. */
 function syntheticTunnelChild(opts: {
   ack: boolean;
   statusError?: Error;
+  streamError?: Error;
 }): {
   factory: TunnelChildFactory;
   argv: string[];
   stdinClosed: Promise<void>;
+  status: Promise<Deno.CommandStatus>;
   statusSettled: () => boolean;
 } {
   const stdinClosed = deferred<void>();
@@ -2633,7 +2666,9 @@ function syntheticTunnelChild(opts: {
     });
     const stdout = new ReadableStream<Uint8Array>({
       start(controller) {
-        if (opts.ack) {
+        if (opts.streamError !== undefined) {
+          controller.error(opts.streamError);
+        } else if (opts.ack) {
           controller.enqueue(new TextEncoder().encode("TUNNEL_READY\n"));
         }
       },
@@ -2650,6 +2685,7 @@ function syntheticTunnelChild(opts: {
     factory,
     argv,
     stdinClosed: stdinClosed.promise,
+    status,
     statusSettled: () => settled,
   };
 }
@@ -2758,6 +2794,66 @@ Deno.test("tunnel: a close failure propagates instead of silently claiming clean
       threw = true;
     }
     assert(threw, "a failed tunnel exit must never be swallowed");
+  } finally {
+    await Deno.remove(dir, { recursive: true }).catch(() => {});
+  }
+});
+
+Deno.test("tunnel: readiness rejection closes stdin, awaits the natural exit and leaves no active handle", async () => {
+  if (!(await fsPermissionsGranted())) {
+    console.log(
+      "tunnel readiness rejection: skipped without write/run permissions",
+    );
+    return;
+  }
+  const remoteSocket = "/run/user/1002/gnupg/verifier/S.gpg-agent";
+  const runner: RemoteRunner = (command, args) => {
+    if (command !== "gpgconf") {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    const text = args.join(" ");
+    return Promise.resolve({
+      code: 0,
+      stdout: text.includes("agent-extra-socket")
+        ? "/home/pi/keyring/S.gpg-agent.extra\n"
+        : "/home/pi/keyring/S.gpg-agent\n",
+      stderr: "",
+    });
+  };
+  const streamError = new Error("ssh closed the readiness stream");
+  const childFixture = syntheticTunnelChild({
+    ack: false,
+    streamError,
+  });
+  const dir = await Deno.makeTempDir({ prefix: "m09-tunnel-reject-" });
+  try {
+    const seam = realTunnelSeam(
+      runner,
+      `${dir}/keyring`,
+      childFixture.factory,
+    );
+    let threw: unknown = null;
+    try {
+      await seam.open(remoteSocket);
+    } catch (error) {
+      threw = error;
+    }
+    assert(
+      threw instanceof Error && threw.message.includes("readiness stream"),
+      `the original readiness stream error must propagate: ${String(threw)}`,
+    );
+    await childFixture.stdinClosed;
+    await Promise.race([
+      childFixture.status,
+      new Promise((_resolve) => setTimeout(() => {}, 10_000)),
+    ]).catch(() => {});
+    assert(
+      childFixture.statusSettled(),
+      "the owned child must be closed (stdin EOF) and awaited before the throw",
+    );
+    if (seam.current() !== null) {
+      throw new Error("a rejected open leaves no active handle");
+    }
   } finally {
     await Deno.remove(dir, { recursive: true }).catch(() => {});
   }
@@ -2927,6 +3023,204 @@ Deno.test("acceptance: idempotent replay keeps one catalog entry and the accepte
     accepted.catalog[0].index.generation === fixture.generation,
     "the original accepted generation is preserved",
   );
+});
+
+/** A failed systemd proof observation (failed/failed with exit-code). */
+function failedTerminalObserved(
+  status: Record<string, unknown>,
+): ObservedUnit {
+  const props = new Map<string, string>([
+    ["LoadState", "loaded"],
+    ["ActiveState", "failed"],
+    ["SubState", "failed"],
+    ["Result", "exit-code"],
+    ["MainPID", "0"],
+    ["ControlPID", "0"],
+    ["ControlGroup", ""],
+    ["InvocationID", String(status.invocationId)],
+  ]);
+  return { props, status, lockFree: true, reachable: true };
+}
+
+Deno.test("orchestration: a surviving worker gate after the WORKER_TERMINAL persist is revalidated and cleared before the verifier launch", async () => {
+  const fixture = generationFixture(40, WINDOW_START);
+  const workerStatus = workerPendingStatus(fixture, INVOCATION_A);
+  // The state the controller persisted BEFORE removing the worker gate:
+  // a crash in that exact window resumes here.
+  const state = stateWithJob(fixture, "WORKER_TERMINAL", {
+    workerStatus,
+    workerInvocationId: INVOCATION_A,
+    resultSha256: "77".repeat(32),
+  });
+  const gate = {
+    ...deriveVerifierGate(fixture.request, fixture.requestSha256),
+    unitName: workerUnitName(fixture.generation),
+    unitInvocationId: INVOCATION_A,
+  };
+  const h = harness({
+    now: new Date(WINDOW_START + 60_000),
+    gateValue: gate,
+    observed: () => terminalObserved(workerStatus),
+  });
+  const next = await stepBackupController(state, h.deps, h.deps.now());
+  assert(
+    next.job!.phase === "VERIFIER_LAUNCHED",
+    `phase=${next.job!.phase}`,
+  );
+  assert(next.job!.failure === undefined, "no false failure on resume");
+  const clearAt = h.events.indexOf("gate:clear");
+  const createAt = h.events.indexOf("gate:create");
+  const launchAt = h.events.findIndex((entry) => entry.startsWith("launch:"));
+  assert(
+    clearAt !== -1 && clearAt < createAt && createAt < launchAt,
+    `fresh proof clears the surviving gate before the verifier is created: ${
+      h.events.join("|")
+    }`,
+  );
+  assert(h.launches.length === 1, "the worker unit is never relaunched");
+  assert(
+    h.launches[0].unitName.startsWith("arch-vps-b2-verify-"),
+    h.launches[0].unitName,
+  );
+  assert(h.tunnels.length === 1);
+});
+
+Deno.test("orchestration: a surviving verifier gate after the ACCEPTED persist is revalidated and cleared before pruning", async () => {
+  const fixture = generationFixture(41, WINDOW_START);
+  const receiptText = JSON.stringify(fixture.receipt);
+  const receiptSha256 = sha256HexSync(new TextEncoder().encode(receiptText));
+  const status = verifierAcceptedStatus(fixture, INVOCATION_B, receiptSha256);
+  // The single recoverable acceptance state: catalog + ACCEPTED in one
+  // durable write, with the verifier gate still alive (crash before clear).
+  const state = validateControllerState({
+    schemaVersion: 1,
+    catalog: [catalogEntry(fixture, WINDOW_START + 1000)],
+    job: {
+      ...stateWithJob(fixture, "ACCEPTED", {
+        verifierStatus: status,
+        verifierInvocationId: INVOCATION_B,
+        workerInvocationId: INVOCATION_A,
+      }).job!,
+    },
+  });
+  const gate = {
+    ...deriveVerifierGate(fixture.request, fixture.requestSha256),
+    unitName: verifyUnitName(fixture.generation),
+    unitInvocationId: INVOCATION_B,
+  };
+  const h = harness({
+    now: new Date(WINDOW_START + 60_000),
+    gateValue: gate,
+    observed: () => terminalObserved(status),
+    versions: inventoryFor([fixture]),
+    seedPrivate: (map) => {
+      map.set(
+        `${PIP_JOB_EVIDENCE_PATH}/${fixture.jobId}/result.json`,
+        new TextEncoder().encode(JSON.stringify(fixture.workerResult)),
+      );
+    },
+  });
+  let final = state;
+  for (let step = 0; step < 8; step += 1) {
+    final = await stepBackupController(final, h.deps, h.deps.now());
+    if (["COMPLETE", "FAILED"].includes(final.job!.phase)) break;
+  }
+  assert(final.job!.phase === "COMPLETE", `phase=${final.job!.phase}`);
+  assert(final.job!.failure === undefined, "no false failure on resume");
+  assert(final.catalog.length === 1, "exactly one catalog entry stays");
+  assert(
+    final.catalog[0].index.generation === fixture.generation,
+    "the accepted generation is preserved, never duplicated",
+  );
+  assert(h.gate.value === null, "the surviving gate is cleared before prune");
+  const clearAt = h.events.indexOf("gate:clear");
+  const firstRemoval = h.events.findIndex((entry) =>
+    entry.startsWith("remove:")
+  );
+  assert(
+    clearAt !== -1 && (firstRemoval === -1 || clearAt < firstRemoval),
+    "the gate is cleared before any prune removal",
+  );
+  assert(h.store.removed.length === 0, "nothing pruned for one generation");
+});
+
+Deno.test("orchestration: a foreign or mismatched surviving gate never clears and blocks the resume", async () => {
+  const fixture = generationFixture(42, WINDOW_START);
+  const foreign = generationFixture(43, WINDOW_START + 1000);
+  const workerStatus = workerPendingStatus(fixture, INVOCATION_A);
+  const state = stateWithJob(fixture, "WORKER_TERMINAL", {
+    workerStatus,
+    workerInvocationId: INVOCATION_A,
+    resultSha256: "77".repeat(32),
+  });
+  // The gate carries the foreign job identity but claims this worker unit.
+  const foreignGate = {
+    ...deriveVerifierGate(foreign.request, foreign.requestSha256),
+    unitName: workerUnitName(fixture.generation),
+    unitInvocationId: INVOCATION_A,
+  };
+  const h = harness({
+    now: new Date(WINDOW_START + 60_000),
+    gateValue: foreignGate,
+    observed: () => terminalObserved(workerStatus),
+  });
+  let threw = false;
+  try {
+    await stepBackupController(state, h.deps, h.deps.now());
+  } catch {
+    threw = true;
+  }
+  assert(threw, "a foreign gate must fail closed");
+  assert(h.gate.value !== null, "the foreign gate is never cleared");
+  assert(!h.events.includes("gate:clear"));
+  assert(h.launches.length === 0, "no launch may follow a foreign gate");
+});
+
+Deno.test("orchestration: a failed terminal unit resume revalidates and clears its surviving gate without losing failure evidence", async () => {
+  const fixture = generationFixture(44, WINDOW_START);
+  const raw = workerPendingStatus(fixture, INVOCATION_A);
+  delete raw.resultSha256;
+  const failedStatus = {
+    ...raw,
+    state: "FAILED",
+    errorCode: "CAPTURE_FAILED",
+  };
+  const state = validateControllerState({
+    schemaVersion: 1,
+    catalog: [],
+    job: {
+      ...stateWithJob(fixture, "FAILED", {
+        workerStatus: failedStatus,
+        workerInvocationId: INVOCATION_A,
+        failure: {
+          code: "CAPTURE_FAILED",
+          atUtc: iso(WINDOW_START + 60_000),
+        },
+      }).job!,
+    },
+  });
+  const gate = {
+    ...deriveVerifierGate(fixture.request, fixture.requestSha256),
+    unitName: workerUnitName(fixture.generation),
+    unitInvocationId: INVOCATION_A,
+  };
+  const h = harness({
+    now: new Date(WINDOW_START + 60_000),
+    gateValue: gate,
+    observed: () => failedTerminalObserved(failedStatus),
+  });
+  const after = await stepBackupController(state, h.deps, h.deps.now());
+  assert(after.job!.phase === "FAILED");
+  assert(
+    after.job!.failure!.code === "CAPTURE_FAILED",
+    "the original failure evidence is preserved",
+  );
+  assert(
+    h.gate.value === null,
+    "the failed terminal gate is cleared on resume",
+  );
+  assert(h.events.includes("gate:clear"));
+  assert(h.launches.length === 0);
 });
 
 Deno.test("orchestration: prior period closes allow a fresh next Sunday job", async () => {
@@ -3149,6 +3443,9 @@ Deno.test("cleanup: allowed names derive from the output contracts and reject fo
     assert(cleanupAllowedName(`${role}.${format}`, false), role);
     assert(cleanupAllowedName(`${role}.${format}.partial`, false), role);
     assert(cleanupAllowedName(`${role}.du.txt`, false), role);
+    assert(cleanupAllowedName(`space-${role}.stderr.log`, false), role);
+    assert(cleanupAllowedName(`encrypt-${role}.stderr.log`, false), role);
+    assert(cleanupAllowedName(`hash-${role}.stderr.log`, false), role);
   }
   assert(cleanupAllowedName("exclusions.txt", false));
   assert(cleanupAllowedName("recipient.asc", false));
@@ -3160,7 +3457,51 @@ Deno.test("cleanup: allowed names derive from the output contracts and reject fo
   assert(
     cleanupAllowedName("sample.staging-boot.arch-initrd.img.partial", false),
   );
+  for (const label of CLEANUP_LABELS) {
+    assert(cleanupAllowedName(`${label}.stderr.log`, false), label);
+  }
+  // Uploader contract (backblaze-upload.ts).
+  assert(cleanupAllowedName("upload-journal.json", false));
+  // Index publisher contract (backblaze-index.ts).
+  assert(cleanupAllowedName("recovery-index.json", false));
+  assert(cleanupAllowedName("recovery-index.json.gpg", false));
+  assert(cleanupAllowedName("recovery-index.json.gpg.partial", false));
+  assert(cleanupAllowedName("recovery-index-receipt.json", false));
+  assert(cleanupAllowedName("recovery-index-state.json", false));
+  assert(cleanupAllowedName("index-recipient.asc", false));
+  // Atomic temp convention of both modules (`.<name>.<v4 uuid>.tmp`).
+  assert(
+    cleanupAllowedName(
+      `.upload-journal.json.${crypto.randomUUID()}.tmp`,
+      false,
+    ),
+  );
+  assert(
+    cleanupAllowedName(
+      `.recovery-index.json.${crypto.randomUUID()}.tmp`,
+      false,
+    ),
+  );
+  assert(
+    cleanupAllowedName(
+      `.recovery-index-receipt.json.${crypto.randomUUID()}.tmp`,
+      false,
+    ),
+  );
+  assert(
+    cleanupAllowedName(
+      `.recovery-index-state.json.${crypto.randomUUID()}.tmp`,
+      false,
+    ),
+  );
+  assert(
+    cleanupAllowedName(
+      `.index-recipient.asc.${crypto.randomUUID()}.tmp`,
+      false,
+    ),
+  );
   assert(cleanupAllowedName("gpg-public-home", true));
+  assert(cleanupAllowedName("index-public-home", true));
   assert(cleanupGpgHomeAllowedName("pubring.kbx"));
   assert(cleanupGpgHomeAllowedName("trustdb.gpg"));
   assert(cleanupGpgHomeAllowedName("S.gpg-agent.extra"));
@@ -3169,6 +3510,17 @@ Deno.test("cleanup: allowed names derive from the output contracts and reject fo
   assert(!cleanupAllowedName("root.tar.zst.gpg.partial.bak", false));
   assert(!cleanupAllowedName("evil", false));
   assert(!cleanupAllowedName("nested", true));
+  assert(!cleanupAllowedName(".upload-journal.json.tmp", false));
+  assert(
+    !cleanupAllowedName(
+      `.upload-journal.json.${crypto.randomUUID()}.bak`,
+      false,
+    ),
+  );
+  assert(
+    !cleanupAllowedName(`.upload-journal.json.${"0".repeat(32)}.tmp`, false),
+  );
+  assert(!cleanupAllowedName(".secret.tmp", false));
   assert(!cleanupGpgHomeAllowedName("id_rsa"));
   assert(!cleanupGpgHomeAllowedName("private-keys-v1.d/key"));
 });
@@ -3179,12 +3531,15 @@ Deno.test("cleanup: script rejects mounts at/below, symlinks and unknown descend
   assert(script.includes('substr($2, 1, length(p) + 1) == p "/"'));
   assert(script.includes("MOUNT_AT_OR_BELOW"));
   assert(script.includes("UNEXPECTED_ENTRY"));
+  assert(script.includes("UNEXPECTED_SYMLINK"));
+  assert(script.includes("UNEXPECTED_GPG_SYMLINK"));
   assert(script.includes("UNEXPECTED_FILE"));
   assert(script.includes("UNEXPECTED_DIR"));
   assert(script.includes("GPG_PRIVATE_KEYS"));
   assert(script.includes("UNEXPECTED_GPG_FILE"));
   assert(script.includes('rm -rf --one-file-system -- "$dir"'));
   assert(script.includes("gpg-public-home"));
+  assert(script.includes("index-public-home"));
   assert(script.includes("root.tar.zst.gpg"));
   assert(script.includes("sample.root.Image"));
   assert(!script.includes("jobs/"), "only generation directories are removed");
@@ -3195,6 +3550,111 @@ Deno.test("cleanup: script rejects mounts at/below, symlinks and unknown descend
     "a regular file at the generation path is rejected",
   );
   assert(script.includes("NOT_DIRECTORY"));
+  assert(
+    script.includes("-mindepth 1 -maxdepth 1 -printf"),
+    "only direct children of the generation directory are validated",
+  );
+  assert(
+    script.includes("upload-journal.json"),
+    "the uploader resume journal is a known producer output",
+  );
+  assert(
+    script.includes("recovery-index-receipt.json"),
+    "the index publisher outputs are known producer outputs",
+  );
+  assert(
+    script.includes(".upload-journal.json.") === false ||
+      script.includes(".recovery-index.json."),
+    "atomic temp names use the exact producer prefix convention",
+  );
+});
+
+Deno.test("cleanup: a normal capture/upload/index directory is accepted; foreign, nested, symlink and private-key entries stay rejected", () => {
+  const fixture = generationFixture(23, WINDOW_START);
+  // Every output a fully successful capture + upload + index + verify run
+  // leaves in its generation scratch directory.
+  const normal: string[] = [
+    "exclusions.txt",
+    "recipient.asc",
+    "oracle-root.swapfile.stat",
+    "staging-boot.sha.before",
+    "staging-boot.sha.after",
+    "lvm-ocivolume.vg",
+    "manifest.json",
+    "capture-error.txt",
+    ...CLEANUP_LABELS.map((label) => `${label}.stderr.log`),
+    "sample.root.Image",
+    "sample.root.initramfs-linux.img",
+    "sample.staging-boot.arch-vmlinuz",
+    "sample.staging-boot.arch-initrd.img",
+    "sample.root.Image.partial",
+    "upload-journal.json",
+    "recovery-index.json",
+    "recovery-index.json.gpg",
+    "recovery-index.json.gpg.partial",
+    "recovery-index-receipt.json",
+    "recovery-index-state.json",
+    "index-recipient.asc",
+    `.upload-journal.json.${crypto.randomUUID()}.tmp`,
+    `.recovery-index.json.${crypto.randomUUID()}.tmp`,
+    `.recovery-index-receipt.json.${crypto.randomUUID()}.tmp`,
+    `.recovery-index-state.json.${crypto.randomUUID()}.tmp`,
+    `.index-recipient.asc.${crypto.randomUUID()}.tmp`,
+  ];
+  for (const role of UPLOAD_ROLE_ORDER) {
+    const format = role === "recovery" ? "json.zst" : "tar.zst";
+    normal.push(`${role}.${format}.gpg`);
+    normal.push(`${role}.${format}.gpg.partial`);
+    normal.push(`${role}.${format}`);
+    normal.push(`${role}.${format}.partial`);
+    normal.push(`${role}.du.txt`);
+    normal.push(`space-${role}.stderr.log`);
+    normal.push(`encrypt-${role}.stderr.log`);
+    normal.push(`hash-${role}.stderr.log`);
+  }
+  for (const name of normal) {
+    assert(cleanupAllowedName(name, false), `normal producer output ${name}`);
+  }
+  assert(cleanupAllowedName("gpg-public-home", true));
+  assert(cleanupAllowedName("index-public-home", true));
+  // A normal public-only home (capture and index key homes).
+  for (
+    const name of [
+      "pubring.kbx",
+      "pubring.kbx.lock",
+      "trustdb.gpg",
+      "trustdb.gpg.lock",
+      "random_seed",
+      "S.gpg-agent.extra",
+      "private-keys-v1.d",
+      "crls.d",
+    ]
+  ) {
+    assert(cleanupGpgHomeAllowedName(name), `public home entry ${name}`);
+  }
+  // Foreign, nested, symlink and private-key contents are never a normal
+  // accepted directory.
+  assert(!cleanupAllowedName("id_rsa", false));
+  assert(!cleanupAllowedName("jobs", true));
+  assert(!cleanupAllowedName("nested-dir", true));
+  assert(!cleanupAllowedName("notes.txt", false));
+  assert(!cleanupAllowedName("private-keys-v1.d", false));
+  assert(!cleanupAllowedName("recovery-index.json.gpg.old", false));
+  assert(!cleanupGpgHomeAllowedName("secret-keys-v1.d"));
+  assert(!cleanupGpgHomeAllowedName("secring.gpg"));
+  // The script's direct-child and separate-home enumeration is generated
+  // from those contracts.
+  const script = buildCleanupScript(fixture.generation);
+  assert(script.includes('find "$dir" -mindepth 1 -maxdepth 1'));
+  assert(
+    script.includes(
+      "for publicName in gpg-public-home index-public-home; do",
+    ),
+  );
+  assert(
+    script.includes('test -z "$(find "$home/$name" -mindepth 1'),
+    "nonempty private-keys-v1.d must stay rejected",
+  );
 });
 
 Deno.test("service: permission flags grant the controller reads and host validation stays in B2Store", async () => {
