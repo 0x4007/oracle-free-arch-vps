@@ -4,7 +4,45 @@ The owner-controlled charter remains unchanged at
 `/Users/nv/repos/0x4007/oracle-free-arch-vps/PROJECT-VISION.md`.
 This report records evidence and disposition; it does not change requirements.
 
-## Current continuation — 20:46 UTC
+## Current continuation — 22:03 UTC
+
+Canonical and remote main were verified at `9da9171` before this correction.
+PR #30 removed unsupported OCI CLI retry-token arguments; its provisioner was
+installed on Pi at 21:34 UTC with 49 hashes verified. Installation is not
+replacement acceptance.
+
+The isolated trial network has six recorded resources. At 21:57 UTC, the Pi
+recovery journal had no pending create and no instance, boot or root volume ID.
+Production boot, Docker and Caddy identities were unchanged at 21:55 UTC.
+No source interruption or home-network archive transfer occurred in this work.
+
+Recovery preflight stopped on the competing-writer guard while the scheduled
+backup waited for the same lock. Source inspection proves that the guard counts
+named waiting controllers; service timing supports this attribution, but the
+historical matching PID was not captured. A separate disposable-lock probe on Pi
+proved that kernel lock records distinguish the current holder from its waiter
+by PID, path, device, inode and blocker. The pending correction uses only this
+proof for a narrow waiter exception; OCI and transfer processes still block.
+DeepSeek completed the implementation and a separate regression edit with
+verified provider/model/max request headers and terminal completed results.
+Primary type checking, formatting and the focused evidence suite passed at
+22:05 UTC, including 17 invalid-proof cases and a valid waiter. It is not yet
+merged, deployed or live-accepted.
+
+The exact provisioning approval expired at 21:54:45 UTC and was not renewed by
+an agent. The test's resource lifetime still ends at 00:54:45 UTC on September 8.
+Creation needs renewed exact authority; generic trial-budget approval remains
+valid. Preserve the recorded network resources for approved continuation or
+cleanup. Four existing Oracle backup members leave only one free slot, so normal
+paired rotation still needs the separate retention decision in
+[issue #29](https://github.com/0x4007/oracle-free-arch-vps/issues/29).
+
+The full vision remains incomplete: Pi-led restored boot and application/desktop
+acceptance, separate online Oracle-group boot proof, naturally accumulated fourth
+weekly B2 point, temporary-resource cleanup, and lasting free-tier evidence remain.
+The older entries below retain their original dates and evidence boundaries.
+
+## Earlier continuation — 20:46 UTC
 
 Earlier entries below are dated history, not the current authority or inventory.
 The owner now permits temporary development within one shared USD 300 Oracle

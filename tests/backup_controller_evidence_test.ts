@@ -153,3 +153,120 @@ Deno.test("official terms transport failure is retryable before OCI reads", asyn
   }
   assert(failure instanceof RetryableObservationError);
 });
+
+Deno.test("controller guard accepts only fixture-backed named writer proof", async () => {
+  const lockPath = "/fixture/.private/backup-controller.lock";
+  const holderRow = (overrides: Record<string, unknown> = {}) => ({
+    pid: Deno.pid,
+    type: "FLOCK",
+    mode: "WRITE",
+    path: lockPath,
+    blocker: null,
+    inode: 123,
+    "maj:min": "179:2",
+    ...overrides,
+  });
+  const waiterRow = (overrides: Record<string, unknown> = {}) => ({
+    pid: 10000000,
+    type: "FLOCK",
+    mode: "WRITE*",
+    path: lockPath,
+    blocker: Deno.pid,
+    inode: 123,
+    "maj:min": "179:2",
+    ...overrides,
+  });
+  const processes = [
+    "1 0 init init",
+    `${Deno.pid} 1 deno deno test`,
+    "10000000 1 deno deno run scripts/backup-scheduled.ts",
+  ].join("\n");
+  type Fixture = {
+    processes?: string;
+    locks?: unknown[];
+    lockOutput?: string;
+    lslocksCode?: number;
+  };
+  const cases: Fixture[] = [
+    { locks: [holderRow()] },
+    { locks: [waiterRow()] },
+    { locks: [holderRow(), holderRow(), waiterRow()] },
+    { locks: [holderRow(), waiterRow(), waiterRow()] },
+    {
+      locks: [holderRow(), waiterRow({ path: "/fixture/.private/other.lock" })],
+    },
+    { locks: [holderRow(), waiterRow({ "maj:min": "178:2" })] },
+    { locks: [holderRow(), waiterRow({ inode: 124 })] },
+    { locks: [holderRow(), waiterRow({ blocker: null })] },
+    { locks: [holderRow(), waiterRow({ type: "POSIX" })] },
+    { locks: [holderRow(), waiterRow({ mode: "WRITE" })] },
+    { locks: [holderRow({ inode: "123" }), waiterRow()] },
+    { locks: [] },
+    { locks: [null] },
+    { lockOutput: "not json" },
+    { lslocksCode: 1 },
+    {
+      processes: processes + "\n500 1 oci oci bv backup create",
+      locks: [holderRow(), waiterRow(), waiterRow({ pid: 500 })],
+    },
+    {
+      processes: processes +
+        "\n600 1 rsync rsync files pi:/home/pi/ops/weekly-backup-controller",
+      locks: [holderRow(), waiterRow(), waiterRow({ pid: 600 })],
+    },
+  ];
+  const options = {
+    ociCliPath: "oci",
+    ociProfile: "DEFAULT",
+    tenancyId: "tenancy",
+    source: {
+      instanceId: "instance",
+      bootVolumeId: "boot",
+      rootVolumeId: "root",
+      compartmentId: "tenancy",
+      region: "region",
+    },
+  };
+  const evidence = (fixture: Fixture) =>
+    backupControllerEvidence(options, (command: string) => {
+      if (command === "ps") {
+        return Promise.resolve({
+          code: 0,
+          stdout: fixture.processes ?? processes,
+          stderr: "",
+        });
+      }
+      if (command === "lslocks") {
+        return Promise.resolve({
+          code: fixture.lslocksCode ?? 0,
+          stdout: fixture.lockOutput ??
+            JSON.stringify({ locks: fixture.locks ?? [] }),
+          stderr: "",
+        });
+      }
+      throw new Error("Unexpected command");
+    });
+  const originalRealPath = Deno.realPath;
+  let seen = "";
+  try {
+    Deno.realPath = async (input: string | URL) => {
+      seen = String(input);
+      assert(input === ".private");
+      return "/fixture/.private";
+    };
+    await evidence({ locks: [holderRow(), waiterRow()] })
+      .assertNoOtherController();
+    assert(seen === ".private");
+    for (const fixture of cases) {
+      let rejected = false;
+      try {
+        await evidence(fixture).assertNoOtherController();
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) throw new Error("Guard accepted an invalid fixture");
+    }
+  } finally {
+    Deno.realPath = originalRealPath;
+  }
+});

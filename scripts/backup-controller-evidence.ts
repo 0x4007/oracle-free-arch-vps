@@ -213,19 +213,86 @@ export function backupControllerEvidence(
         ancestry.add(current);
         current = processes.find((p) => p.pid === current)?.parent ?? 0;
       }
+      const otherProcesses = processes.filter((p) => !ancestry.has(p.pid));
+      const writerActive = () =>
+        new Error("Another backup or infrastructure writer is active");
       if (
-        processes.some((p) =>
-          !ancestry.has(p.pid) && (
-            /^oci$/.test(
-              p.name.split("/").at(-1)!,
-            ) ||
-            /(?:^|\s|\/)oci(?:\s|$)/.test(p.args) ||
-            /(?:backup-runtime|backup-scheduled|backup-recovery|oci-restore|pi-machine-recovery|pi-recovery-session|weekly-backup|backblaze-file-backup)\.ts/
-              .test(p.args) ||
-            /(?:scp|sftp|rsync).*weekly-backup-controller/.test(p.args)
-          )
+        otherProcesses.some((p) =>
+          /^oci$/.test(
+            p.name.split("/").at(-1)!,
+          ) ||
+          /(?:^|\s|\/)oci(?:\s|$)/.test(p.args) ||
+          /(?:scp|sftp|rsync).*weekly-backup-controller/.test(p.args)
         )
-      ) throw new Error("Another backup or infrastructure writer is active");
+      ) throw writerActive();
+      const namedCandidates = otherProcesses.filter((p) =>
+        /(?:backup-runtime|backup-scheduled|backup-recovery|oci-restore|pi-machine-recovery|pi-recovery-session|weekly-backup|backblaze-file-backup)\.ts/
+          .test(p.args)
+      );
+      if (namedCandidates.length === 0) return;
+      const lockPath = (await Deno.realPath(".private")) +
+        "/backup-controller.lock";
+      const locksResult = await runner("lslocks", [
+        "--json",
+        "--notruncate",
+        "--output",
+        "PID,TYPE,MODE,PATH,BLOCKER,INODE,MAJ:MIN",
+      ]);
+      if (locksResult.code !== 0) throw writerActive();
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(locksResult.stdout);
+      } catch {
+        throw writerActive();
+      }
+      const locks = (parsed as { locks?: unknown } | null)?.locks;
+      if (
+        !Array.isArray(locks) ||
+        !locks.every((row): boolean =>
+          typeof row === "object" && row !== null && !Array.isArray(row)
+        )
+      ) throw writerActive();
+      const rows = locks as JsonRecord[];
+      const lockInode = (row: JsonRecord): number | null => {
+        const inode = row.inode;
+        return (
+            typeof inode === "number" && Number.isSafeInteger(inode) &&
+            inode > 0
+          )
+          ? inode
+          : null;
+      };
+      const lockDevice = (row: JsonRecord): string | null => {
+        const device = row["maj:min"];
+        return typeof device === "string" && /^\d+:\d+$/.test(device)
+          ? device
+          : null;
+      };
+      const holders = rows.filter((row) =>
+        row.pid === Deno.pid &&
+        row.type === "FLOCK" &&
+        row.mode === "WRITE" &&
+        row.path === lockPath &&
+        row.blocker === null &&
+        lockInode(row) !== null &&
+        lockDevice(row) !== null
+      );
+      if (holders.length !== 1) throw writerActive();
+      const holder = holders[0]!;
+      const holderInode = lockInode(holder)!;
+      const holderDevice = lockDevice(holder)!;
+      for (const candidate of namedCandidates) {
+        const proved = rows.filter((row) =>
+          row.pid === candidate.pid &&
+          row.type === "FLOCK" &&
+          row.mode === "WRITE*" &&
+          row.blocker === Deno.pid &&
+          row.path === lockPath &&
+          row.inode === holderInode &&
+          row["maj:min"] === holderDevice
+        ).length;
+        if (proved !== 1) throw writerActive();
+      }
     },
   };
 }
