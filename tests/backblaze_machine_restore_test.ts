@@ -60,6 +60,8 @@ const FINGERPRINT = "A09D9D4303E01A5EDF2A3B681672E156BF36E91C";
 const RECIPIENT_SHA = "5b".repeat(32);
 const TARGET: MachineRestoreTarget = {
   targetId: "uos-restore-20260906",
+  bootDiskSerial: "uos-restore-20260906-stage",
+  rootDiskSerial: "uos-restore-20260906-root",
   architecture: "aarch64",
   bootDiskPath: "/dev/disk/by-id/virtio-uos-restore-20260906-stage",
   rootDiskPath: "/dev/disk/by-id/virtio-uos-restore-20260906-root",
@@ -68,6 +70,8 @@ const TARGET: MachineRestoreTarget = {
   workDirectory: "/tmp/uos-restore-20260906",
   approval: {
     targetId: "uos-restore-20260906",
+    bootDiskSerial: "uos-restore-20260906-stage",
+    rootDiskSerial: "uos-restore-20260906-root",
     bootDiskPath: "/dev/disk/by-id/virtio-uos-restore-20260906-stage",
     rootDiskPath: "/dev/disk/by-id/virtio-uos-restore-20260906-root",
     approvedAtUtc: "2026-09-06T14:00:00.000Z",
@@ -509,4 +513,45 @@ Deno.test({
       await Deno.remove(workDirectory, { recursive: true });
     }
   },
+});
+
+Deno.test("restore accepts a new explicitly bound target and rejects stale approval", async () => {
+  const index = makeIndex();
+  const binding = {
+    targetId: "replacement-20260907",
+    bootDiskPath: "/dev/disk/by-id/scsi-new-boot",
+    rootDiskPath: "/dev/disk/by-id/scsi-new-root",
+    bootDiskSerial: "new-boot-hardware-serial",
+    rootDiskSerial: "new-root-hardware-serial",
+  };
+  const target = {
+    ...TARGET,
+    ...binding,
+    approval: { ...TARGET.approval, ...binding },
+  };
+  const layout = buildRestoreLayout(index, metadata(index), target);
+  assert(layout.bootDisk.targetPath === binding.bootDiskPath);
+  for (
+    const changed of [
+      { ...target, approval: TARGET.approval },
+      { ...target, bootDiskSerial: "substituted" },
+      { ...target, targetId: "different-target" },
+    ]
+  ) {
+    let calls = 0;
+    await rejects(
+      restoreMachine({
+        index,
+        indexSha256: machineRestoreIndexSha256(index),
+        metadata: metadata(index),
+        archives: [],
+        target: changed,
+      }, () => {
+        calls++;
+        return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+      }),
+      "target:approval",
+    );
+    assert(calls === 0);
+  }
 });
