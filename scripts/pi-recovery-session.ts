@@ -39,6 +39,7 @@ import {
   stepConsoleCapture,
 } from "./pi-recovery-console.ts";
 import {
+  assertRetainedProviderBinding,
   captureLoaderDiskIdentity,
   type LoaderDiskIdentity,
   type LoaderIdentityRequest,
@@ -57,6 +58,16 @@ import {
   type RecoverySshTarget,
   retainRecoveryHost,
 } from "./pi-recovery-ssh.ts";
+import {
+  buildRecoveryTargetBundle,
+  continueReplacementRestoration,
+  type RecoveryRestorationState,
+  type RecoveryTargetControlInput,
+  type RecoveryTargetInstallApproval,
+} from "./pi-recovery-restore.ts";
+import type { PreparationApproval } from "./pi-recovery-disk-preparation.ts";
+import type { B2Settings } from "./backblaze-storage.ts";
+import { validateCatalogEntry } from "./backblaze-file-backup.ts";
 
 const CONFIG = ".private/pi-machine-recovery.json";
 const STATE = ".private/pi-recovery-session.json";
@@ -67,6 +78,8 @@ interface SessionConfig extends ReplacementConfig {
     loaderConsole?: ConsoleCaptureApproval;
     ramConsole?: ConsoleCaptureApproval;
     rescueReboot?: RebootApproval;
+    restoreInstallation?: RecoveryTargetInstallApproval;
+    diskPreparation?: PreparationApproval;
   };
 }
 export interface RecoverySession {
@@ -439,7 +452,8 @@ export async function runRecoverySession(
       ) throw Error("Recovery approval configuration changed");
       return current.sessionApprovals;
     };
-    const status = await stepRecoverySession(
+    let acceptedTarget: RecoverySshTarget | undefined;
+    let status = await stepRecoverySession(
       state,
       request,
       config.compartmentId,
@@ -494,7 +508,11 @@ export async function runRecoverySession(
               a["vnic-id"] === privateIp["vnic-id"]
             )
           ) throw Error("Public address is not attached to the replacement");
-          return retainRecoveryHost(capture.host!, address["ip-address"]);
+          acceptedTarget = await retainRecoveryHost(
+            capture.host!,
+            address["ip-address"],
+          );
+          return acceptedTarget;
         },
         capture: async (plan, captureState, phase) => {
           const key = phase === "loader" ? "loaderConsole" : "ramConsole";
@@ -541,6 +559,85 @@ export async function runRecoverySession(
         },
       },
     );
+    if (status === "RAM_RESCUE_ACCEPTED") {
+      if (!acceptedTarget || !state.loaderIdentity || !state.ramAccepted) {
+        throw Error("Accepted RAM target is unavailable for restoration");
+      }
+      const inputPath = ".private/backblaze-machine-restore.json";
+      let input: RecoveryTargetControlInput | undefined;
+      try {
+        input = await readPrivateJson<RecoveryTargetControlInput>(inputPath);
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      }
+      if (!input) {
+        status = "RESTORE_CONFIGURATION_REQUIRED";
+        await writePrivateJson(REPORT, {
+          status,
+          restoreAccepted: false,
+          applicationAccepted: false,
+        });
+      } else {
+        if (
+          validateCatalogEntry(input.catalog).index.generation !==
+            config.generation
+        ) {
+          throw Error(
+            "Restoration generation differs from the replacement plan",
+          );
+        }
+        const inputDigest = hash(input);
+        const release = await readPrivateJson<{ sourceRevision: string }>(
+          ".private/reports/pi-session-deployment.json",
+        );
+        const bundle = await buildRecoveryTargetBundle({
+          sourceRoot: Deno.cwd(),
+          sourceRevision: release.sourceRevision,
+          input,
+          b2: await readPrivateJson<B2Settings>(".private/b2-file-backup.json"),
+          recipientBytes: await Deno.readFile(
+            ".private/file-backup/recipient.asc",
+          ),
+        });
+        const restorationPath = ".private/pi-recovery-restoration.json";
+        let retained: RecoveryRestorationState | undefined;
+        try {
+          retained = await readPrivateJson<RecoveryRestorationState>(
+            restorationPath,
+          );
+        } catch (error) {
+          if (!(error instanceof Deno.errors.NotFound)) throw error;
+        }
+        status = await continueReplacementRestoration(
+          acceptedTarget,
+          preparationBindingFromLoader(
+            state.loaderIdentity,
+            state.ramAccepted.bootId,
+            state.manifestSha256,
+          ),
+          bundle,
+          retained,
+          {
+            beforeMutation: async () => {
+              await beforeMutation();
+              if (hash(await readPrivateJson(inputPath)) !== inputDigest) {
+                throw Error("Restoration input or approval changed");
+              }
+              assertRetainedProviderBinding(
+                state.loaderIdentity!,
+                await provider(),
+              );
+            },
+            persist: (value) => writePrivateJson(restorationPath, value),
+            report: (value) => writePrivateJson(REPORT, value),
+            installationApproval: async () =>
+              (await approvals())?.restoreInstallation,
+            preparationApproval: async () =>
+              (await approvals())?.diskPreparation,
+          },
+        );
+      }
+    }
     console.log(
       JSON.stringify({
         status,

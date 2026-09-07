@@ -98,6 +98,23 @@ async function read(runner: CommandRunner, command: string, args: string[]) {
   }
   return result.stdout.trim();
 }
+
+/** Revalidate retained attachment identities after the loader has left. Guest
+ * serial/RAM checks remain separate and use the same immutable receipt. */
+export function assertRetainedProviderBinding(
+  receipt: LoaderDiskIdentity,
+  evidence: LoaderProviderEvidence,
+): void {
+  const { identitySha256, ...body } = receipt;
+  if (hash(body) !== identitySha256) {
+    throw Error("Loader identity receipt changed");
+  }
+  const attached = providerBinding(receipt.request, evidence);
+  if (
+    attached.bootAttachmentId !== receipt.bootAttachmentId ||
+    attached.rootAttachmentId !== receipt.rootAttachmentId
+  ) throw Error("Replacement attachments changed after loader acceptance");
+}
 interface Node {
   path: string;
   type: string;
