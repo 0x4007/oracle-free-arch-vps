@@ -28,9 +28,6 @@ import { validateRecoveryMetadata } from "./backblaze-verifier.ts";
 
 const CONFIG_PATH = ".private/backblaze-machine-restore.json";
 const JOURNAL_NAME = "backblaze-machine-restore.journal.json";
-const TARGET_ID = "uos-restore-20260906";
-const BOOT_SERIAL = `${TARGET_ID}-stage`;
-const ROOT_SERIAL = `${TARGET_ID}-root`;
 const EXPECTED_BOOT_BYTES = 50 * 1024 ** 3;
 const EXPECTED_ROOT_BYTES = 150 * 1024 ** 3;
 const EXPECTED_ARCHIVE_ROLES: readonly RestoreArchiveRole[] = [
@@ -55,7 +52,7 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const SHA256_ANY_PATTERN = /^[0-9a-f]{64}$/i;
 const UUID_PATTERN = /^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+$/;
 const ABSOLUTE_PATH_PATTERN = /^\/[A-Za-z0-9_.@+:-]+(?:\/[A-Za-z0-9_.@+:-]+)*$/;
-/** QEMU may expose the approved disks through virtio-blk or virtio-scsi. */
+/** Stable by-id paths must resolve to the separately approved hardware serials. */
 const TARGET_PATH_PATTERN =
   /^\/dev\/disk\/by-id\/(?:virtio|scsi)-[A-Za-z0-9_.+:-]+$/;
 const SAFE_NAME_PATTERN = /^[A-Za-z0-9_.+-]+$/;
@@ -72,12 +69,16 @@ export interface MachineRestoreTarget {
   rootDiskPath: string;
   bootDiskBytes: number;
   rootDiskBytes: number;
+  bootDiskSerial: string;
+  rootDiskSerial: string;
   /** Existing owner-only rescue scratch directory. */
   workDirectory: string;
   approval: {
     targetId: string;
     bootDiskPath: string;
     rootDiskPath: string;
+    bootDiskSerial: string;
+    rootDiskSerial: string;
     approvedAtUtc: string;
   };
 }
@@ -192,7 +193,7 @@ export interface MachineRestoreResult {
   status: "FILESYSTEMS_REBUILT";
   generation: string;
   indexSha256: string;
-  targetId: typeof TARGET_ID;
+  targetId: string;
   journalPath: string;
   stages: readonly RestoreStage[];
   restoredRoles: readonly RestoreArchiveRole[];
@@ -257,11 +258,13 @@ export interface MachineMountEntry {
 }
 
 interface RestoreJournal {
-  schemaVersion: 1;
-  targetId: typeof TARGET_ID;
+  schemaVersion: 2;
+  targetId: string;
   architecture: "aarch64";
   bootDiskPath: string;
   rootDiskPath: string;
+  bootDiskSerial: string;
+  rootDiskSerial: string;
   bootDiskBytes: typeof EXPECTED_BOOT_BYTES;
   rootDiskBytes: typeof EXPECTED_ROOT_BYTES;
   approval: MachineRestoreTarget["approval"];
@@ -327,7 +330,11 @@ function assertAbsolutePath(
 
 function assertTargetShape(target: MachineRestoreTarget): void {
   if (!isRecord(target)) fail("target:shape");
-  if (target.targetId !== TARGET_ID || target.architecture !== "aarch64") {
+  if (
+    typeof target.targetId !== "string" ||
+    !SAFE_NAME_PATTERN.test(target.targetId) ||
+    target.architecture !== "aarch64"
+  ) {
     fail("target:identity");
   }
   if (
@@ -344,12 +351,21 @@ function assertTargetShape(target: MachineRestoreTarget): void {
     target.workDirectory === target.bootDiskPath ||
     target.workDirectory === target.rootDiskPath
   ) fail("target:work-directory");
+  if (
+    typeof target.bootDiskSerial !== "string" ||
+    typeof target.rootDiskSerial !== "string" ||
+    !SAFE_NAME_PATTERN.test(target.bootDiskSerial) ||
+    !SAFE_NAME_PATTERN.test(target.rootDiskSerial) ||
+    target.bootDiskSerial === target.rootDiskSerial
+  ) fail("target:serial");
   const approval = target.approval;
   if (
     !isRecord(approval) ||
-    approval.targetId !== TARGET_ID ||
+    approval.targetId !== target.targetId ||
     approval.bootDiskPath !== target.bootDiskPath ||
     approval.rootDiskPath !== target.rootDiskPath ||
+    approval.bootDiskSerial !== target.bootDiskSerial ||
+    approval.rootDiskSerial !== target.rootDiskSerial ||
     typeof approval.approvedAtUtc !== "string" ||
     !isUtcTimestamp(approval.approvedAtUtc)
   ) fail("target:approval");
@@ -877,13 +893,15 @@ async function snapshot(
     typeof node.serial === "string" && typeof node.path === "string" &&
     typeof node.size === "number" && typeof node.type === "string"
   );
-  const boot = serialNodes.find((node) =>
-    node.serial === BOOT_SERIAL && node.type === "disk"
+  const boots = serialNodes.filter((node) =>
+    node.serial === target.bootDiskSerial && node.type === "disk"
   );
-  const root = serialNodes.find((node) =>
-    node.serial === ROOT_SERIAL && node.type === "disk"
+  const roots = serialNodes.filter((node) =>
+    node.serial === target.rootDiskSerial && node.type === "disk"
   );
-  if (!boot || !root) fail("target:serial");
+  if (boots.length !== 1 || roots.length !== 1) fail("target:serial");
+  const [boot] = boots;
+  const [root] = roots;
   if (boot.size !== EXPECTED_BOOT_BYTES || root.size !== EXPECTED_ROOT_BYTES) {
     fail("target:capacity");
   }
@@ -1190,7 +1208,7 @@ async function loadJournal(path: string): Promise<RestoreJournal | null> {
     fail("journal:json");
   }
   if (
-    !isRecord(value) || value.schemaVersion !== 1 ||
+    !isRecord(value) || value.schemaVersion !== 2 ||
     !Array.isArray(value.completedStages)
   ) fail("journal:shape");
   const stages = value.completedStages;
@@ -1200,7 +1218,9 @@ async function loadJournal(path: string): Promise<RestoreJournal | null> {
   if (stages.length === 0) fail("journal:stages");
   const journal = value as unknown as RestoreJournal;
   if (
-    journal.targetId !== TARGET_ID || journal.architecture !== "aarch64" ||
+    typeof journal.targetId !== "string" ||
+    !SAFE_NAME_PATTERN.test(journal.targetId) ||
+    journal.architecture !== "aarch64" ||
     !TARGET_PATH_PATTERN.test(journal.bootDiskPath) ||
     !TARGET_PATH_PATTERN.test(journal.rootDiskPath) ||
     journal.bootDiskBytes !== EXPECTED_BOOT_BYTES ||
@@ -1214,7 +1234,7 @@ async function loadJournal(path: string): Promise<RestoreJournal | null> {
   ) fail("journal:binding");
   if (
     !isRecord(journal.approval) ||
-    journal.approval.targetId !== TARGET_ID ||
+    journal.approval.targetId !== journal.targetId ||
     typeof journal.approval.bootDiskPath !== "string" ||
     typeof journal.approval.rootDiskPath !== "string" ||
     typeof journal.approval.approvedAtUtc !== "string"
@@ -1229,8 +1249,10 @@ function newJournal(
   indexSha256: string,
 ): RestoreJournal {
   return {
-    schemaVersion: 1,
-    targetId: TARGET_ID,
+    schemaVersion: 2,
+    targetId: input.target.targetId,
+    bootDiskSerial: input.target.bootDiskSerial,
+    rootDiskSerial: input.target.rootDiskSerial,
     architecture: "aarch64",
     bootDiskPath: input.target.bootDiskPath,
     rootDiskPath: input.target.rootDiskPath,
@@ -1413,7 +1435,8 @@ async function guardBeforeWrite(
 ): Promise<TargetSnapshot> {
   return await snapshot(runner, metadata, target, true).then((current) => {
     if (
-      current.boot.serial !== BOOT_SERIAL || current.root.serial !== ROOT_SERIAL
+      current.boot.serial !== target.bootDiskSerial ||
+      current.root.serial !== target.rootDiskSerial
     ) fail(`${label}:identity`);
     if (
       current.boot.size !== EXPECTED_BOOT_BYTES ||
@@ -1631,7 +1654,11 @@ function assertResumeBinding(
   if (
     journal.generation !== input.index.generation ||
     journal.indexSha256 !== indexSha256 ||
-    journal.targetId !== TARGET_ID ||
+    journal.targetId !== input.target.targetId ||
+    journal.bootDiskSerial !== input.target.bootDiskSerial ||
+    journal.rootDiskSerial !== input.target.rootDiskSerial ||
+    journal.approval.bootDiskSerial !== input.target.bootDiskSerial ||
+    journal.approval.rootDiskSerial !== input.target.rootDiskSerial ||
     journal.bootDiskPath !== input.target.bootDiskPath ||
     journal.rootDiskPath !== input.target.rootDiskPath ||
     journal.approval.bootDiskPath !== input.target.bootDiskPath ||
@@ -1962,7 +1989,7 @@ export async function restoreMachine(
     status: "FILESYSTEMS_REBUILT",
     generation: input.index.generation,
     indexSha256,
-    targetId: TARGET_ID,
+    targetId: input.target.targetId,
     journalPath,
     stages: [...journal.completedStages],
     restoredRoles: [...EXPECTED_ARCHIVE_ROLES],
