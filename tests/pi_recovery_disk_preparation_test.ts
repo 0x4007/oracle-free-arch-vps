@@ -135,7 +135,7 @@ function fixture() {
     } else if (command === "readlink") {
       value = args.at(-1) === binding.boot.path ? "/dev/sda" : "/dev/sdb";
     } else if (command === "udevadm" && args[0] === "info") {
-      value = "ID_SCSI_SERIAL=" +
+      value = "ID_SERIAL=" +
         (state.wrongSerial
           ? "different"
           : args.at(-1) === "--name=/dev/sda"

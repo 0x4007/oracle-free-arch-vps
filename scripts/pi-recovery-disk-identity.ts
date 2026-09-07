@@ -242,22 +242,30 @@ export async function captureLoaderDiskIdentity(
       "--query=property",
       "--name=" + resolved,
     ])).split("\n");
-    const serials = properties.filter((line) =>
-      line.startsWith("ID_SCSI_SERIAL=")
-    );
+    // Oracle volumes expose no page-80 ID_SCSI_SERIAL. The exact full udev
+    // ID_SERIAL is the stable SCSI identifier and is also what the stable
+    // scsi by-id alias encodes; never fall back to ID_SERIAL_SHORT.
+    const serials = properties.filter((line) => line.startsWith("ID_SERIAL="));
     const links = properties.filter((line) => line.startsWith("DEVLINKS="));
     if (serials.length !== 1 || links.length !== 1) {
-      throw Error("Loader SCSI identity or aliases are unavailable");
+      throw Error(
+        "Loader stable disk identity is unavailable or duplicated",
+      );
     }
-    const serial = serials[0].slice("ID_SCSI_SERIAL=".length);
+    const serial = serials[0].slice("ID_SERIAL=".length);
+    if (serial.length === 0) {
+      throw Error("Loader stable disk identity is empty");
+    }
     const path =
       links[0].slice("DEVLINKS=".length).split(/\s+/).filter((value) =>
         /^\/dev\/disk\/by-id\/scsi-[A-Za-z0-9_.+:-]+$/.test(value)
       ).sort()[0];
-    if (
-      !/^[A-Za-z0-9_.+:-]+$/.test(serial) || !path ||
-      await read(runner, "readlink", ["-f", path]) !== resolved
-    ) throw Error("Loader stable disk alias is not bound to its full serial");
+    if (!/^[A-Za-z0-9_.+:-]+$/.test(serial)) {
+      throw Error("Loader stable disk identity is unsafe");
+    }
+    if (!path || await read(runner, "readlink", ["-f", path]) !== resolved) {
+      throw Error("Loader stable disk alias is not bound to its full serial");
+    }
     captured.push({ volumeId, path, serial, bytes });
   }
   if (
