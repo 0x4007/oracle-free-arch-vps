@@ -997,7 +997,10 @@ export async function runReplacement(
           "--shape-config",
           JSON.stringify({ ocpus: 2, memoryInGBs: 12 }),
           "--launch-options",
-          JSON.stringify({ isConsistentVolumeNamingEnabled: true }),
+          JSON.stringify({
+            isConsistentVolumeNamingEnabled: true,
+            networkType: "PARAVIRTUALIZED",
+          }),
           "--source-details",
           JSON.stringify({
             sourceType: "image",
