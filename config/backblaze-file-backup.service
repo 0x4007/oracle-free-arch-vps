@@ -2,8 +2,6 @@
 Description=Pi-controlled weekly encrypted VPS file backup to Backblaze
 After=network-online.target weekly-backup.service
 Wants=network-online.target
-StartLimitIntervalSec=6h
-StartLimitBurst=3
 
 [Service]
 Type=oneshot
@@ -16,6 +14,6 @@ WorkingDirectory=/home/pi/ops/weekly-backup-controller
 # exact backblazeb2.com/backblaze.com namespace.
 ExecStart=/usr/local/bin/safepi deno run --allow-read=.,.private --allow-write=.private --allow-run --allow-net scripts/backblaze-file-backup.ts
 UMask=0077
-TimeoutStartSec=6h
+TimeoutStartSec=7h
 Restart=on-failure
 RestartSec=30min

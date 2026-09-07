@@ -2,7 +2,8 @@
  * m09 weekly Backblaze direct file-backup controller.
  *
  * The Raspberry Pi is control-only: it schedules one immutable request per
- * Sunday period (00:05 America/New_York, bounded six-hour catch-up), drives
+ * Sunday period (00:05 America/New_York; each period's catch-up window runs
+ * to the next Sunday 00:05, coalescing missed weeks into one job), drives
  * detached source-side worker/verify units under the shared controller lock,
  * keeps the m06 gate, downloads only small result/receipt JSON, accepts a
  * generation into the durable catalog only after a validated verifier
@@ -122,7 +123,6 @@ export const B2_REPORT_PATH = ".private/reports/backblaze-file-backup.json";
 export const SCHEDULE_ZONE = "America/New_York";
 export const SCHEDULE_HOUR = 0;
 export const SCHEDULE_MINUTE = 5;
-export const CATCH_UP_MS = GATE_DEADLINE_MS;
 export const HEARTBEAT_INTERVAL_MS = 30_000;
 export const POLL_INTERVAL_MS = 30_000;
 export const STALE_AFTER_MS = 3 * HEARTBEAT_INTERVAL_MS;
@@ -352,17 +352,18 @@ export interface WeekWindow {
   endAtUtc: string;
 }
 
-/** Most recent Sunday 00:05 zone window and its six-hour catch-up end. */
+/** Most recent Sunday 00:05 zone window; its end is the next Sunday 00:05
+ * solved in the zone, never a fixed 6h or 7*24h addend. */
 export function weekWindow(
   now: Date,
   zone: string = SCHEDULE_ZONE,
 ): WeekWindow {
   const parts = zoneParts(now, zone);
   const daysBack = parts.weekday;
-  const sunday = new Date(
+  let sunday = new Date(
     Date.UTC(parts.year, parts.month - 1, parts.day - daysBack),
   );
-  const start = instantForCivil(
+  let start = instantForCivil(
     zone,
     sunday.getUTCFullYear(),
     sunday.getUTCMonth() + 1,
@@ -370,10 +371,32 @@ export function weekWindow(
     SCHEDULE_HOUR,
     SCHEDULE_MINUTE,
   );
+  if (start > now.getTime()) {
+    // Before this Sunday's 00:05 the latest Sunday 00:05 is the previous
+    // Sunday's: the whole window shifts back one civil week.
+    sunday = new Date(sunday.getTime() - 7 * 86_400_000);
+    start = instantForCivil(
+      zone,
+      sunday.getUTCFullYear(),
+      sunday.getUTCMonth() + 1,
+      sunday.getUTCDate(),
+      SCHEDULE_HOUR,
+      SCHEDULE_MINUTE,
+    );
+  }
+  const nextSunday = new Date(sunday.getTime() + 7 * 86_400_000);
+  const end = instantForCivil(
+    zone,
+    nextSunday.getUTCFullYear(),
+    nextSunday.getUTCMonth() + 1,
+    nextSunday.getUTCDate(),
+    SCHEDULE_HOUR,
+    SCHEDULE_MINUTE,
+  );
   return {
     periodKey: sunday.toISOString().slice(0, 10),
     startAtUtc: new Date(start).toISOString(),
-    endAtUtc: new Date(start + CATCH_UP_MS).toISOString(),
+    endAtUtc: new Date(end).toISOString(),
   };
 }
 
@@ -3950,8 +3973,7 @@ export async function stepBackupController(
 ): Promise<ControllerState> {
   const state = validateControllerState(stateInput ?? emptyControllerState());
   const window = weekWindow(now);
-  const inWindow = now.getTime() >= Date.parse(window.startAtUtc) &&
-    now.getTime() < Date.parse(window.endAtUtc);
+  const inWindow = withinCatchUp(now);
   const requestNewJob = async (
     base: ControllerState,
     currentWindow: WeekWindow,
@@ -4022,6 +4044,13 @@ export async function stepBackupController(
       if (gate === null) {
         return await requestNewJob(state, window);
       }
+      // The next due period is blocked by the surviving active/orphaned
+      // gate: report blocked and never return the old COMPLETE as a
+      // healthy current week. The next polling run retries the same due
+      // period once the gate clears.
+      throw new Error(
+        "Backblaze gate is active while the current-period job is missing",
+      );
     }
     return state;
   }
@@ -5436,6 +5465,18 @@ export async function runBackblazeCycle(
         }
         const base = durable ?? state;
         if (base.job === undefined) {
+          return skip(`B2_SKIPPED:${message}`, message);
+        }
+        // Job creation for the next due period can fail (Oracle authority
+        // or scheduled claim blocked, transport/validation) while the
+        // closed previous-period job is still the durable terminal
+        // evidence with no new job persisted: report an unhealthy,
+        // retryable skip and never failJob over the predecessor.
+        if (
+          (base.job.phase === "COMPLETE" || base.job.phase === "FAILED") &&
+          base.job.envelope.request.periodKey !==
+            weekWindow(deps.now()).periodKey
+        ) {
           return skip(`B2_SKIPPED:${message}`, message);
         }
         const failed = await failJob(
