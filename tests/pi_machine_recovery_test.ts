@@ -43,6 +43,18 @@ const config: ReplacementConfig = {
   platformImageId: "ocid1.image.example",
   cloudInit: "#cloud-config\n{}\n",
 };
+/** Both provision mutations share the same OCI CLI contract: the unsupported
+ * --opc-retry-token option is never sent, while the global --no-retry policy
+ * and the exact-request ownership tag remain on the call. */
+function assertMutationContract(args: string[]): void {
+  assert(!args.includes("--opc-retry-token"));
+  assert(args.includes("--no-retry"));
+  const tagIndex = args.indexOf("--freeform-tags");
+  assert(tagIndex !== -1);
+  assert(
+    JSON.parse(args[tagIndex + 1]).uosRecoveryRequest === config.requestId,
+  );
+}
 function empty(): ReplacementInventory {
   return {
     bootVolumes: [],
@@ -435,6 +447,7 @@ Deno.test({
         } else if (line.includes("bv volume create")) {
           creates++;
           assert(eligibilityReads >= 2);
+          assertMutationContract(args);
           root = {
             id: "ocid1.volume.example",
             "size-in-gbs": 150,
@@ -466,6 +479,7 @@ Deno.test({
         } else if (line.includes("compute instance launch")) {
           launches++;
           assert(eligibilityReads >= 4);
+          assertMutationContract(args);
           assert(
             JSON.parse(args[args.indexOf("--launch-options") + 1])
               .isConsistentVolumeNamingEnabled === true,
