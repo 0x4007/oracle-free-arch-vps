@@ -139,7 +139,7 @@ function diskFixture() {
       value = boot !== state.swapPaths ? "/dev/sdb" : "/dev/sda";
     } else if (command === "udevadm") {
       const boot = args.at(-1) === "--name=/dev/sdb";
-      value = `ID_SCSI_SERIAL=${
+      value = `ID_SERIAL=${
         state.collide
           ? "same"
           : boot

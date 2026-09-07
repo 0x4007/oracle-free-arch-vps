@@ -211,16 +211,22 @@ export async function inspectPreparationDisks(
       throw Error("Replacement disk path or size differs");
     }
     const top = found[0];
+    // Oracle volumes expose no page-80 ID_SCSI_SERIAL and lsblk's SERIAL
+    // column is truncated: SCSI disks use the exact stable udev ID_SERIAL.
     if (/^\/dev\/sd[a-z]+$/.test(top.path)) {
       const serials = (await run(runner, "udevadm", [
         "info",
         "--query=property",
         "--name=" + top.path,
-      ])).split("\n").filter((line) => line.startsWith("ID_SCSI_SERIAL="));
-      if (serials.length !== 1) {
-        throw Error("Full SCSI hardware serial is unavailable");
+      ])).split("\n").filter((line) => line.startsWith("ID_SERIAL="));
+      if (
+        serials.length !== 1 || !serials[0].slice("ID_SERIAL=".length)
+      ) throw Error("Full udev ID_SERIAL is unavailable");
+      const serial = serials[0].slice("ID_SERIAL=".length);
+      if (!/^[A-Za-z0-9_.+:-]+$/.test(serial)) {
+        throw Error("Full udev ID_SERIAL is unsafe");
       }
-      top.serial = serials[0].slice("ID_SCSI_SERIAL=".length);
+      top.serial = serial;
     }
     if (top.serial !== disk.serial) {
       throw Error("Replacement hardware serial differs");

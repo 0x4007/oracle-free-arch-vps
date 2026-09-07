@@ -132,7 +132,7 @@ function fixture() {
       value = boot !== state.swapPaths ? "/dev/sdb" : "/dev/sda";
     } else if (command === "udevadm") {
       const boot = args.at(-1) === "--name=/dev/sdb";
-      value = `ID_SCSI_SERIAL=${
+      value = `ID_SERIAL=${
         state.collide
           ? "same"
           : boot
@@ -266,5 +266,61 @@ Deno.test("receipt substitution and unchanged loader boot cannot authorize RAM d
       refused = true;
     }
     assert(refused);
+  }
+});
+Deno.test("loader keeps the full ID_SERIAL despite ID_SERIAL_SHORT and unrelated properties", async () => {
+  const f = fixture();
+  const runner: CommandRunner = async (command, args) => {
+    const result = await f.runner(command, args);
+    if (command === "udevadm") {
+      assert(!result.stdout.includes("ID_SCSI_SERIAL"));
+      result.stdout =
+        "ID_SERIAL_SHORT=short-id\nID_BUS=scsi\nID_MODEL=QEMU HARDDISK\n" +
+        result.stdout;
+    }
+    return result;
+  };
+  const receipt = await captureLoaderDiskIdentity(
+    request,
+    f.readProvider,
+    runner,
+  );
+  assert(
+    receipt.boot.serial === "platform-full-hardware-serial" &&
+      receipt.boot.path === "/dev/disk/by-id/scsi-platform" &&
+      receipt.root.serial === "root-full-hardware-serial",
+  );
+  assert(f.state.providerReads === 2);
+});
+Deno.test("loader rejects absent, empty, duplicated and unsafe ID_SERIAL outputs", async () => {
+  for (const variant of ["absent", "empty", "duplicate", "unsafe"] as const) {
+    const f = fixture();
+    const runner: CommandRunner = async (command, args) => {
+      const result = await f.runner(command, args);
+      if (command === "udevadm") {
+        const devlinks = result.stdout.match(/^DEVLINKS=.*$/m)?.[0];
+        if (variant === "absent") {
+          result.stdout = result.stdout.replace(/^ID_SERIAL=.*$/m, "");
+        } else if (variant === "empty") {
+          result.stdout = result.stdout.replace(
+            /^ID_SERIAL=.*$/m,
+            "ID_SERIAL=",
+          );
+        } else if (variant === "duplicate") {
+          result.stdout += "ID_SERIAL=duplicate\n";
+        } else {
+          result.stdout = result.stdout.replace(
+            /^ID_SERIAL=.*$/m,
+            "ID_SERIAL=bad/value",
+          );
+        }
+        assert(devlinks !== undefined && result.stdout.includes(devlinks));
+      }
+      return result;
+    };
+    await rejects(
+      captureLoaderDiskIdentity(request, f.readProvider, runner),
+      "identity",
+    );
   }
 });

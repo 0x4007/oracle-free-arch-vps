@@ -257,9 +257,9 @@ async function diskPartitions(
       "info",
       "--query=property",
       "--name=" + resolved,
-    ])).split("\n").filter((line) => line.startsWith("ID_SCSI_SERIAL="));
+    ])).split("\n").filter((line) => line.startsWith("ID_SERIAL="));
     if (
-      serials.length !== 1 || serials[0] !== "ID_SCSI_SERIAL=" + expected.serial
+      serials.length !== 1 || serials[0] !== "ID_SERIAL=" + expected.serial
     ) throw Error("Isolation disk serial changed");
     const uuid = role === "root" ? plan.rootUuid : plan.stagingUuid;
     const filesystem = role === "root" ? "ext4" : "xfs";

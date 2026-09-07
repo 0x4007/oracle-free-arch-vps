@@ -490,7 +490,7 @@ Deno.test({
               return Promise.resolve({
                 code: 0,
                 stderr: "",
-                stdout: "ID_SERIAL_SHORT=short-id\nID_SCSI_SERIAL=" +
+                stdout: "ID_SERIAL_SHORT=short-id\nID_SERIAL=" +
                   (args.at(-1) === "--name=/dev/sda"
                     ? "uos-restore-20260906-stage"
                     : substituted
