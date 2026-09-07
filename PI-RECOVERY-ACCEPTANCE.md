@@ -292,3 +292,27 @@ mounted/held/extra/read-only disks, changed serials, expired approval, failed Pi
 acknowledgements, changed state during acknowledgement, incomplete clearing and
 refusal to silently resume. These are synthetic command-runner checks plus
 actual shell syntax parsing, not proof of OCI device naming or real disk writes.
+
+The first local review found a P1 defect in this candidate: both `lsblk` calls
+omitted `--tree`, so real partition nodes would be flat even though the initial
+test fixtures were nested. Correction f9e068bf072fee4b7f21adb8458f887531f04a2c
+requests trees explicitly, refuses top-level partition records, and makes the
+fixtures return flat data when the option is absent. A read-only Pi probe at
+2026-09-07T02:30:20.927Z confirmed two top-level partitions without `--tree` and
+two nested partitions with it. No disk was modified by that probe.
+
+The corrected source passed type, format, lint and whitespace checks, 42 focused
+tests, and 313 default tests (144 permission-gated checks skipped). All 17 new
+disk-module tests passed on Pi under `safepi` at 2026-09-07T02:31:03.111Z.
+These Pi tests still use synthetic provider/command runners; the read-only
+`lsblk` probe is separate actual tool-behavior evidence. Local Codex review
+round two against 87ae6165d3575567333184fa6e362f9bd7931203 exited successfully
+with no further actionable findings. No new unresolved review finding requires
+a backlog issue; existing issues #12 and #16–#18 remain open.
+
+Private receipts: `pi-disk-focused-tests.txt`, `pi-disk-default-tests.txt`,
+`pi-disk-review-round1.txt`, `pi-disk-review-round2.txt`,
+`reports/pi-disk-tests.json`, and `reports/pi-lsblk-tree-contract.json` under
+`.private`. Alpine's published v3.24 AArch64 `util-linux-misc` file listing
+includes `/sbin/blockdev`, which the preparation stage needs; the existing RAM
+bootstrap already requests that package.
