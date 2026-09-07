@@ -63,8 +63,8 @@ RemainAfterExit=yes
 `,
       "etc/systemd/system/arch-drill.target": `[Unit]
 Description=Isolated Arch restore acceptance
-Requires=basic.target arch-drill-firewall.service systemd-networkd.service systemd-user-sessions.service systemd-logind.service sshd.service
-After=basic.target arch-drill-firewall.service systemd-networkd.service systemd-user-sessions.service systemd-logind.service sshd.service
+Requires=basic.target arch-drill-firewall.service systemd-networkd.service systemd-user-sessions.service systemd-logind.service sshd.service docker.service
+After=basic.target arch-drill-firewall.service systemd-networkd.service systemd-user-sessions.service systemd-logind.service sshd.service docker.service
 AllowIsolate=yes
 `,
       "etc/systemd/system/systemd-networkd.service.d/arch-drill.conf":

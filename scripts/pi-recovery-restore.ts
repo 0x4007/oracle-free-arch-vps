@@ -45,6 +45,8 @@ import {
   validateIsolationPlanDigest,
 } from "./pi-recovery-isolation.ts";
 import {
+  type IsolationExecutionApproval,
+  type IsolationExecutionReceipt,
   type IsolationInspection,
   validateIsolationInspection,
 } from "./pi-recovery-isolation-executor.ts";
@@ -536,7 +538,7 @@ if (!socket.success) throw new Error("Recovery public GPG home setup failed");
 console.log(JSON.stringify({ status: "RECOVERY_TARGET_RUNTIME_INSTALLED", requestId: payload.requestId, instanceId: payload.instanceId, sourceRevision: payload.sourceRevision, files: payload.files.length, publicHome: payload.publicHome }));
 `.trim();
 
-function defaultProcessFactory(
+export function defaultProcessFactory(
   command: string,
   args: string[],
 ): RecoveryTargetProcess {
@@ -955,6 +957,17 @@ export interface RecoveryRestorationState {
   filesystems?: MachineRestoreResult;
   isolationPlan?: RecoveryIsolationPlan;
   isolationInspection?: IsolationInspection;
+  isolationReceipt?: IsolationExecutionReceipt;
+  isolationIntent?: {
+    planSha256: string;
+    inspectionSha256: string;
+    intendedAtUtc: string;
+  };
+  restoredBootPlan?: import("./pi-recovery-acceptance.ts").RestoredBootPlan;
+  restoredBootIntent?: { planSha256: string; intendedAtUtc: string };
+  restoredHost?: import("./pi-recovery-ssh.ts").VerifiedRecoveryHost;
+  applicationAcceptance?:
+    import("./pi-recovery-acceptance.ts").RestoredApplicationAcceptance;
 }
 
 export interface RecoveryRestorationPorts {
@@ -967,6 +980,11 @@ export interface RecoveryRestorationPorts {
     RecoveryTargetInstallApproval | undefined
   >;
   preparationApproval: () => Promise<PreparationApproval | undefined>;
+  isolationApproval: () => Promise<IsolationExecutionApproval | undefined>;
+  restoredBootApproval: () => Promise<
+    import("./pi-recovery-acceptance.ts").RestoredBootApproval | undefined
+  >;
+  isolationEvent?: (value: unknown) => Promise<void>;
 }
 
 /** Join existing target operations without a source-host dependency. A lost
@@ -1032,19 +1050,111 @@ export async function continueReplacementRestoration(
     state.preparationEvents.length > 6
   ) throw Error("Retained restoration belongs to a different approved input");
   const save = () => ports.persist(structuredClone(state));
-  await save();
-  if (state.filesystems) {
+  const advancePostRestore = async (): Promise<string> => {
+    if (!state.isolationPlan || !state.isolationInspection) {
+      await ports.report({
+        status: "FILESYSTEMS_REBUILT",
+        filesystemsAccepted: true,
+        isolationApplied: false,
+        bootAccepted: false,
+        applicationAccepted: false,
+      });
+      return "FILESYSTEMS_REBUILT";
+    }
+    const acceptance = await import("./pi-recovery-acceptance.ts");
+    if (!state.isolationReceipt) {
+      if (state.isolationIntent) {
+        await ports.report({
+          status: "COPIED_ROOT_ISOLATION_RECONCILIATION_REQUIRED",
+          isolationIntent: state.isolationIntent,
+          isolationApplied: false,
+          bootAccepted: false,
+          applicationAccepted: false,
+        });
+        return "COPIED_ROOT_ISOLATION_RECONCILIATION_REQUIRED";
+      }
+      const approval = await ports.isolationApproval();
+      if (!approval) {
+        await ports.report({
+          status: "COPIED_ROOT_ISOLATION_APPROVAL_REQUIRED",
+          plan: state.isolationPlan,
+          inspection: state.isolationInspection,
+          isolationApplied: false,
+          bootAccepted: false,
+          applicationAccepted: false,
+        });
+        return "COPIED_ROOT_ISOLATION_APPROVAL_REQUIRED";
+      }
+      acceptance.validateIsolationExecutionApproval(
+        state.isolationPlan,
+        state.isolationInspection,
+        approval,
+      );
+      state.isolationIntent = {
+        planSha256: state.isolationPlan.planSha256,
+        inspectionSha256: state.isolationInspection.inspectionSha256,
+        intendedAtUtc: new Date().toISOString(),
+      };
+      await save();
+      state.isolationReceipt = await acceptance.applyCopiedRootIsolation(
+        target,
+        state.isolationPlan,
+        state.isolationInspection,
+        approval,
+        {
+          beforeMutation: ports.beforeMutation,
+          event: ports.isolationEvent,
+        },
+      );
+      await save();
+    }
+    if (!state.restoredBootPlan) {
+      state.restoredBootPlan = acceptance.restoredBootPlan(
+        binding,
+        state.isolationPlan,
+        state.isolationInspection,
+        state.isolationReceipt,
+      );
+      await save();
+    }
+    if (!state.restoredBootIntent) {
+      const approval = await ports.restoredBootApproval();
+      if (!approval) {
+        await ports.report({
+          status: "RESTORED_BOOT_APPROVAL_REQUIRED",
+          plan: state.restoredBootPlan,
+          isolationApplied: true,
+          bootAccepted: false,
+          applicationAccepted: false,
+        });
+        return "RESTORED_BOOT_APPROVAL_REQUIRED";
+      }
+      acceptance.validateRestoredBootApproval(state.restoredBootPlan, approval);
+      state.restoredBootIntent = {
+        planSha256: state.restoredBootPlan.planSha256,
+        intendedAtUtc: new Date().toISOString(),
+      };
+      await save();
+      await acceptance.requestRestoredBoot(
+        target,
+        state.restoredBootPlan,
+        approval,
+        { beforeMutation: ports.beforeMutation },
+      );
+    }
     await ports.report({
-      status: state.isolationPlan
-        ? "COPIED_ROOT_ISOLATION_PLANNED"
-        : "FILESYSTEMS_REBUILT",
-      isolationPlan: state.isolationPlan,
-      isolationInspection: state.isolationInspection,
-      isolationApplied: false,
+      status: "RESTORED_BOOT_PENDING",
+      isolationApplied: true,
       bootAccepted: false,
       applicationAccepted: false,
+      restoredBootPlan: state.restoredBootPlan,
+      restoredBootIntent: state.restoredBootIntent,
     });
-    return "FILESYSTEMS_REBUILT";
+    return "RESTORED_BOOT_PENDING";
+  };
+  await save();
+  if (state.filesystems) {
+    return await advancePostRestore();
   }
   if (state.restoreIntent) {
     await ports.report({
@@ -1169,17 +1279,7 @@ export async function continueReplacementRestoration(
   } finally {
     await tunnel.close();
   }
-  await ports.report({
-    status: state.isolationPlan
-      ? "COPIED_ROOT_ISOLATION_PLANNED"
-      : "FILESYSTEMS_REBUILT",
-    isolationPlan: state.isolationPlan,
-    isolationInspection: state.isolationInspection,
-    isolationApplied: false,
-    bootAccepted: false,
-    applicationAccepted: false,
-  });
-  return "FILESYSTEMS_REBUILT";
+  return await advancePostRestore();
 }
 
 export interface GpgTunnelChild {

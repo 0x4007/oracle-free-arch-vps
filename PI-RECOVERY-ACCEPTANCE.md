@@ -401,3 +401,32 @@ The corrected 59-test Pi selection passed at 2026-09-07T03:46:14.462Z under
 Issue #16's pending-write regression passes locally and on Pi. Issues #17 and
 #18 remain open for their full integrated/live acceptance; #18 also retains the
 P1 console-connection setup gap. Review receipt: `pi-session-review-round3.txt`.
+
+## First-release post-restore integration — source only
+
+The canonical source now connects the successful path after direct archive
+reconstruction. `pi-recovery-isolation-executor.ts` has a target-side command
+that accepts only the bounded plan, inspection and an exact isolation approval;
+it mounts the serial/UUID-bound copies, applies the copied-root firewall,
+timer/service masks, SSH host-key replacement and isolated default target, then
+releases its mounts. An isolation intent is persisted before writes; an
+interrupted or uncertain write reports reconciliation and is never replayed
+automatically.
+
+`pi-recovery-acceptance.ts` binds a second exact approval to the applied
+isolation receipt, requests a guest reboot into the reconstructed disks, and
+keeps a durable boot intent before the request. The session then captures the
+restored console marker, retains its host key, connects over pinned SSH and
+checks the restored architecture, root filesystem, recovery manifest, SSH,
+Docker service activity, both required Guacamole containers, the served
+Guacamole page and a live Xvnc process. The Codex remote service stays masked by
+the isolation policy, so its unit-file presence is not used as application
+evidence. The read-only result is recorded as `RESTORED_APPLICATIONS_ACCEPTED`
+only after every live check passes.
+
+This closes the source integration for the first-release successful path. It
+does not prove a real replacement: no OCI resource, disk, reboot, archive
+payload, production service or Pi installation was used for this continuation.
+The existing 200 GB Always Free coexistence gate, console-connection setup
+authority, restored boot/application acceptance and Pi deployment remain
+unproved and require the exact operational approvals described by `AGENTS.md`.

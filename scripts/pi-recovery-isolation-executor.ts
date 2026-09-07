@@ -487,12 +487,13 @@ export interface IsolationExecutionReceipt {
   bootAccepted: false;
   applicationAccepted: false;
 }
-function approvalMatches(
+export function validateIsolationExecutionApproval(
   plan: RecoveryIsolationPlan,
   inspection: IsolationInspection,
-  approval: IsolationExecutionApproval,
+  approval: IsolationExecutionApproval | undefined,
+  now = Date.now(),
 ) {
-  const age = Date.now() - Date.parse(approval?.approvedAtUtc);
+  const age = now - Date.parse(approval?.approvedAtUtc ?? "");
   if (
     !approval || approval.planSha256 !== plan.planSha256 ||
     approval.inspectionSha256 !== inspection.inspectionSha256 ||
@@ -500,6 +501,7 @@ function approvalMatches(
     age > 3600000
   ) throw Error("Current exact copied-root isolation approval is required");
 }
+const approvalMatches = validateIsolationExecutionApproval;
 async function writeCopy(
   relative: string,
   bytes: Uint8Array,
@@ -526,8 +528,8 @@ async function writeCopy(
     if (written === 0) throw Error("Copied-root write stalled");
     offset += written;
   }
-  await file.chmod(mode);
-  await file.chown(owner.uid, owner.gid);
+  await Deno.chmod(temporary, mode);
+  await Deno.chown(temporary, owner.uid, owner.gid);
   await file.sync();
   await Deno.rename(temporary, destination);
 }
@@ -704,6 +706,7 @@ export async function executeCopiedRootIsolation(
     inspection: IsolationInspection;
     receipt?: IsolationExecutionReceipt;
   } | undefined;
+  let releaseError: Error | undefined;
   try {
     await command(runner, "mount", [
       "-o",
@@ -751,11 +754,70 @@ export async function executeCopiedRootIsolation(
       }
     }
     if (errors.length) {
-      throw Error(
+      releaseError = Error(
         "Owned isolation mounts could not all be released; preserve the recovery intent",
       );
     }
   }
+  if (releaseError) throw releaseError;
   await diskPartitions(plan, runner, true);
   return result!;
+}
+
+/** Target-side entry point for the second, explicitly approved isolation
+ * stage. The Pi sends only the bounded plan, inspection and approval; the
+ * replacement performs the mounts and writes locally. */
+if (import.meta.main) {
+  try {
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for await (const chunk of Deno.stdin.readable) {
+      total += chunk.byteLength;
+      if (total > 128 * 1024) {
+        throw Error("Isolation control input is too large");
+      }
+      chunks.push(chunk);
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const payload = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    );
+    if (!payload || typeof payload !== "object") {
+      throw Error("Isolation control input is malformed");
+    }
+    const result = await executeCopiedRootIsolation(
+      payload.plan,
+      (inspection) => {
+        validateIsolationInspection(inspection, payload.plan);
+        if (JSON.stringify(inspection) !== JSON.stringify(payload.inspection)) {
+          return Promise.reject(
+            Error("Current copied-root inspection differs from the Pi receipt"),
+          );
+        }
+        return Promise.resolve(payload.approval);
+      },
+      async (event) => {
+        await Deno.stdout.write(
+          new TextEncoder().encode(
+            JSON.stringify({ kind: "recovery-isolation-event", event }) + "\n",
+          ),
+        );
+      },
+    );
+    await Deno.stdout.write(
+      new TextEncoder().encode(
+        JSON.stringify({ kind: "recovery-isolation-result", result }) + "\n",
+      ),
+    );
+  } catch (error) {
+    console.error(
+      error instanceof Error ? error.message : "Isolation execution failed",
+    );
+    Deno.exitCode = 1;
+  }
 }

@@ -96,7 +96,7 @@ export function consoleConnectionPlan(
     instanceId,
     compartmentId,
     publicKeySha256: digest(rsaPublicKey(publicKey)),
-    operation: OPERATION,
+    operation: OPERATION as typeof OPERATION,
   };
   return { ...body, planSha256: digest(body) };
 }
