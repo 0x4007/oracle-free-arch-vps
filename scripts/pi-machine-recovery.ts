@@ -28,6 +28,10 @@ const REPORT = ".private/reports/pi-machine-recovery-plan.json";
 const TAG = "uosRecoveryRequest";
 const OPERATION =
   "provision one 2 OCPU 12 GB replacement with 50 GB boot and 150 GB root and assign its existing unassigned reserved IP for direct Backblaze recovery";
+/** Trial provisioning is a distinct exact approval operation: an ordinary
+ * replacement approval never authorizes trial capacity and vice versa. */
+export const TRIAL_OPERATION =
+  "provision one trial-funded 2 OCPU 12 GB replacement alongside the running production 2 OCPU 12 GB instance with 50 GB boot and 150 GB root and assign its existing unassigned reserved IP for direct Backblaze recovery";
 
 export function assertReplacementApproval(
   config: ReplacementConfig,
@@ -43,14 +47,37 @@ export function assertReplacementApproval(
   const approval = config.approval;
   const age = now - Date.parse(approval?.approvedAtUtc ?? "");
   if (
-    !approval || approval.exactOperation !== OPERATION ||
+    !approval || approval.exactOperation !==
+      (config.trial !== undefined ? TRIAL_OPERATION : OPERATION) ||
     approval.planSha256 !== digest ||
     !Number.isFinite(age) || age < 0 || age > 3600000
   ) {
     throw Error("Current exact replacement approval is required");
   }
+  if (config.trial !== undefined) {
+    const approvedAt = Date.parse(approval.approvedAtUtc);
+    const expires = Date.parse(config.trial.expiresAtUtc);
+    if (
+      !Number.isFinite(approvedAt) || !Number.isFinite(expires) ||
+      expires <= now || expires - approvedAt > 4 * 3600000
+    ) {
+      throw Error(
+        "Trial replacement is authorized only while its expiry is future and within four hours of approval",
+      );
+    }
+  }
 }
 
+export interface ReplacementTrial {
+  /** Trial-funded spend bound; never described as a remaining credit balance. */
+  spendingCapUsd: number;
+  expiresAtUtc: string;
+}
+export interface ProductionBinding {
+  instanceId: string;
+  bootVolumeId: string;
+  rootVolumeId: string;
+}
 export interface ReplacementConfig {
   action: "plan" | "provision";
   requestId: string;
@@ -64,6 +91,8 @@ export interface ReplacementConfig {
   platformImageId: string;
   /** Public bootstrap configuration; no keys, credentials or archives. */
   cloudInit: string;
+  /** Optional bounded trial-funded capacity; absent keeps the free-only plan. */
+  trial?: ReplacementTrial;
   approval?: {
     approvedAtUtc: string;
     exactOperation: string;
@@ -101,7 +130,7 @@ const sum = (items: JsonRecord[], field: string) =>
   items.reduce((total, item) => total + quantity(item, field), 0);
 
 export function replacementPlanDigest(config: ReplacementConfig): string {
-  return createHash("sha256").update(JSON.stringify({
+  const plan: Record<string, unknown> = {
     requestId: config.requestId,
     generation: config.generation,
     tenancyId: config.tenancyId,
@@ -118,7 +147,11 @@ export function replacementPlanDigest(config: ReplacementConfig): string {
     rootGb: 150,
     consistentVolumeNaming: true,
     rootDevice: "/dev/oracleoci/oraclevdb",
-  })).digest("hex");
+  };
+  // Optional trial funding becomes part of the reviewed plan; its absence
+  // keeps the original free-only digest byte-identical.
+  if (config.trial !== undefined) plan["trial"] = config.trial;
+  return createHash("sha256").update(JSON.stringify(plan)).digest("hex");
 }
 export function validateReplacementConfig(config: ReplacementConfig): void {
   if (
@@ -146,11 +179,89 @@ export function validateReplacementConfig(config: ReplacementConfig): void {
   if (!/^ocid1\.(?:compartment|tenancy)\./.test(config.compartmentId)) {
     throw Error("Replacement compartment identity is malformed");
   }
+  const trial = config.trial as ReplacementTrial | null | undefined;
+  if (trial !== undefined) {
+    if (
+      trial === null || typeof trial.spendingCapUsd !== "number" ||
+      !Number.isFinite(trial.spendingCapUsd) || trial.spendingCapUsd <= 0 ||
+      trial.spendingCapUsd > 300 || typeof trial.expiresAtUtc !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(
+        trial.expiresAtUtc,
+      ) || !Number.isFinite(Date.parse(trial.expiresAtUtc))
+    ) throw Error("Replacement trial spending bound or expiry is invalid");
+  }
 }
-/** Count peak final use without treating orphaned production volumes as free. */
+/** Recognized production identity comes only from the trusted controller
+ * source; the trial configuration never names a production resource. */
+function productionBinding(
+  controller: BackupInventoryConfig,
+): ProductionBinding {
+  return {
+    instanceId: controller.source.instanceId,
+    bootVolumeId: controller.source.bootVolumeId,
+    rootVolumeId: controller.source.rootVolumeId,
+  };
+}
+
+/** Exact distinct production instance/boot/root must be present, running with
+ * the trusted 2 OCPU/12 GB shape and the exact 50/150 GB disks. Malformed or
+ * overlapping identities throw; a missing, changed or stopped production
+ * footprint returns undefined so the trial assessment fails closed. */
+function resolveProduction(
+  production: ProductionBinding,
+  boot: JsonRecord[],
+  root: JsonRecord[],
+  instances: JsonRecord[],
+  state?: ReplacementState,
+): { boot: JsonRecord; root: JsonRecord; instance: JsonRecord } | undefined {
+  const ids = [
+    production.instanceId,
+    production.bootVolumeId,
+    production.rootVolumeId,
+  ];
+  if (ids.some((id) => !id)) {
+    throw Error("Production identity is missing from the controller source");
+  }
+  if (new Set(ids).size !== ids.length) {
+    throw Error("Production identities are not distinct");
+  }
+  const replacementIds = [
+    state?.instanceId,
+    state?.bootVolumeId,
+    state?.rootVolumeId,
+  ].filter((id): id is string => Boolean(id));
+  if (replacementIds.some((id) => ids.includes(id))) {
+    throw Error("Production binding overlaps the replacement identity");
+  }
+  const exact = (items: JsonRecord[], id: string) =>
+    items.filter((item) => item.id === id).length === 1
+      ? items.find((item) => item.id === id)!
+      : undefined;
+  const instance = exact(instances, production.instanceId);
+  const bootVolume = exact(boot, production.bootVolumeId);
+  const rootVolume = exact(root, production.rootVolumeId);
+  if (!instance || !bootVolume || !rootVolume) return undefined;
+  const shape = dataObject({ data: instance["shape-config"] });
+  if (
+    instance["lifecycle-state"] !== "RUNNING" ||
+    instance.shape !== "VM.Standard.A1.Flex" ||
+    quantity(shape, "ocpus") !== 2 ||
+    quantity(shape, "memory-in-gbs") !== 12 ||
+    bootVolume["size-in-gbs"] !== 50 || rootVolume["size-in-gbs"] !== 150
+  ) {
+    return undefined;
+  }
+  return { boot: bootVolume, root: rootVolume, instance };
+}
+
+/** Count peak final use without treating orphaned production volumes as free.
+ * Without a production binding the assessment stays exactly free-only and
+ * rejects coexistence; with the binding the trial envelope applies only while
+ * the exact production footprint is present and running. */
 export function assessReplacementCapacity(
   inventory: ReplacementInventory,
   state?: ReplacementState,
+  production?: ProductionBinding,
 ) {
   const boot = inventory.bootVolumes.filter(alive);
   const root = inventory.rootVolumes.filter(alive);
@@ -182,6 +293,23 @@ export function assessReplacementCapacity(
     (n, v) => n + quantity(shape(v), "memory-in-gbs"),
     0,
   );
+  const productionProved = production
+    ? resolveProduction(production, boot, root, instances, state)
+    : undefined;
+  const recognized = new Set([
+    ...[
+      state?.bootVolumeId,
+      state?.rootVolumeId,
+      state?.instanceId,
+    ].filter((id): id is string => Boolean(id)),
+    ...(production
+      ? [
+        production.bootVolumeId,
+        production.rootVolumeId,
+        production.instanceId,
+      ]
+      : []),
+  ]);
   const peak = {
     liveVolumeGb: liveVolumeGb + (ownRoot ? 0 : 150) + (ownBoot ? 0 : 50),
     ocpus: ocpus + (ownInstance ? 0 : 2),
@@ -190,20 +318,32 @@ export function assessReplacementCapacity(
     publicIps: inventory.publicIps,
     objectStorageBytes: inventory.objectStorageBytes,
   };
-  const unowned = boot.some((v) => v.id !== state?.bootVolumeId) ||
-    root.some((v) => v.id !== state?.rootVolumeId) ||
-    instances.some((v) => v.id !== state?.instanceId);
+  // The ordinary free-only plan keeps the original per-family ownership
+  // predicates; the recognized reconciliation set is used only for the trial
+  // coexistence branch, where the exact production footprint is trusted too.
+  const unowned = production
+    ? boot.some((v) => !recognized.has(stringField(v, "id"))) ||
+      root.some((v) => !recognized.has(stringField(v, "id"))) ||
+      instances.some((v) => !recognized.has(stringField(v, "id")))
+    : boot.some((v) => v.id !== state?.bootVolumeId) ||
+      root.some((v) => v.id !== state?.rootVolumeId) ||
+      instances.some((v) => v.id !== state?.instanceId);
   const missing = Boolean(
     state?.rootVolumeId && !ownRoot ||
       state?.bootVolumeId && !ownBoot || state?.instanceId && !ownInstance,
   );
+  const withinCaps = production
+    ? peak.liveVolumeGb <= 400 && peak.ocpus <= 4 && peak.memoryGb <= 24 &&
+      peak.publicIps <= 2 && peak.backupMembers <= 5 &&
+      peak.objectStorageBytes <= 20_000_000_000
+    : peak.liveVolumeGb <= 200 && peak.ocpus <= 2 && peak.memoryGb <= 12 &&
+      peak.backupMembers <= 5 &&
+      peak.objectStorageBytes <= 20_000_000_000;
   return {
     current: { liveVolumeGb, ocpus, memoryGb },
     peak,
-    ready: !unowned && !missing && peak.liveVolumeGb <= 200 &&
-      peak.ocpus <= 2 &&
-      peak.memoryGb <= 12 && peak.backupMembers <= 5 &&
-      peak.objectStorageBytes <= 20_000_000_000,
+    ready: (!production || productionProved !== undefined) && !unowned &&
+      !missing && withinCaps,
   };
 }
 
@@ -342,6 +482,95 @@ async function inventory(
   };
 }
 
+/** Confirm the current Organizations subscription and USD promotion through
+ * the same bounded call interface before any trial cloud mutation. The
+ * promotion amount is a spending bound, never a remaining credit balance;
+ * reported usage and resource totals are the primary's separate checks. */
+export async function proveTrialFunding(
+  controller: BackupInventoryConfig,
+  config: ReplacementConfig,
+  runner: CommandRunner = defaultRunner,
+): Promise<void> {
+  if (config.trial === undefined || config.trial === null) {
+    throw Error("Trial funding proof requires trial configuration");
+  }
+  // Capture the guarded spending bound once: the promotion check below runs
+  // inside a callback, where the `config.trial` guard narrowing does not apply.
+  const spendingCapUsd = config.trial.spendingCapUsd;
+  const call = (args: string[]) =>
+    runJson(controller.ociCliPath, [
+      "--profile",
+      controller.ociProfile,
+      "--region",
+      controller.source.region,
+      "--no-retry",
+      "--connection-timeout",
+      "10",
+      "--read-timeout",
+      "60",
+      ...args,
+    ], runner);
+  const collection = dataObject(
+    await call([
+      "organizations",
+      "subscription",
+      "list",
+      "--compartment-id",
+      controller.tenancyId,
+      "--all",
+    ]),
+  );
+  if (!Array.isArray(collection.items) || collection.items.length !== 1) {
+    throw Error("A single current Organizations subscription is required");
+  }
+  const summary = collection.items[0] as JsonRecord;
+  const subscription = dataObject(
+    await call([
+      "organizations",
+      "subscription",
+      "get",
+      "--subscription-id",
+      stringField(summary, "id"),
+    ]),
+  );
+  if (
+    subscription.id !== summary.id ||
+    subscription["compartment-id"] !== controller.tenancyId ||
+    subscription["lifecycle-state"] !== "ACTIVE" ||
+    subscription["subscription-tier"] !== "FREE_AND_TRIAL" ||
+    subscription["payment-model"] !== "FREE_TRIAL"
+  ) {
+    throw Error(
+      "Current subscription is not the ACTIVE Free Trial account",
+    );
+  }
+  const trialExpiry = Date.parse(config.trial.expiresAtUtc);
+  const subscriptionEnd = Date.parse(
+    stringField(subscription, "end-date"),
+  );
+  if (
+    !Number.isFinite(trialExpiry) || !Number.isFinite(subscriptionEnd) ||
+    subscriptionEnd <= trialExpiry
+  ) {
+    throw Error("Trial replacement would outlive the current subscription");
+  }
+  const promotions = Array.isArray(subscription.promotion)
+    ? subscription.promotion
+    : [];
+  if (
+    !promotions.some((promotion: JsonRecord) => {
+      if (promotion["status"] !== "ACTIVE") return false;
+      if (promotion["currency-unit"] !== "USD") return false;
+      const amount = numberField(promotion, "amount");
+      return Number.isFinite(amount) && amount >= spendingCapUsd;
+    })
+  ) {
+    throw Error(
+      "The ACTIVE USD promotion does not cover the requested trial spending bound",
+    );
+  }
+}
+
 export async function runReplacement(
   runner: CommandRunner = defaultRunner,
   fetchDocument?: () => Promise<string>,
@@ -359,6 +588,9 @@ export async function runReplacement(
     throw Error("Replacement account or region differs from the controller");
   }
   const digest = replacementPlanDigest(config);
+  const production = config.trial !== undefined
+    ? productionBinding(controller)
+    : undefined;
   const call = (args: string[]) =>
     runJson(controller.ociCliPath, [
       "--profile",
@@ -548,11 +780,18 @@ export async function runReplacement(
       }
     };
     await reconcile();
-    const capacity = assessReplacementCapacity(resources, state);
+    if (config.trial !== undefined && config.action === "provision") {
+      // The initial trial capacity assessment runs under the same explicit
+      // trial authority that gates every pre-mutation reassessment.
+      assertReplacementApproval(config, digest);
+      await proveTrialFunding(controller, config, runner);
+    }
+    const capacity = assessReplacementCapacity(resources, state, production);
     await writePrivateJson(REPORT, {
       observedAtUtc: new Date().toISOString(),
       planSha256: digest,
       ...capacity,
+      ...(config.trial !== undefined ? { trial: config.trial } : {}),
       status: capacity.ready
         ? "REPLACEMENT_CAPACITY_READY"
         : "REPLACEMENT_CAPACITY_BLOCKED",
@@ -571,7 +810,9 @@ export async function runReplacement(
     }
     if (!capacity.ready) {
       throw Error(
-        "Replacement would exceed free capacity or touch unowned resources",
+        config.trial !== undefined
+          ? "Replacement would exceed trial capacity or touch unrecognized resources"
+          : "Replacement would exceed free capacity or touch unowned resources",
       );
     }
     const preMutation = async () => {
@@ -580,6 +821,9 @@ export async function runReplacement(
         .assertNoOtherController();
       const currentConfig = await readPrivateJson<ReplacementConfig>(CONFIG);
       assertReplacementApproval(currentConfig, digest);
+      if (currentConfig.trial !== undefined) {
+        await proveTrialFunding(controller, currentConfig, runner);
+      }
       await validateBootstrap?.(currentConfig);
       const image = dataObject(
         await call([
@@ -666,7 +910,7 @@ export async function runReplacement(
       }
       resources = await inventory(controller, runner, fetchDocument);
       await reconcile();
-      if (!assessReplacementCapacity(resources, state).ready) {
+      if (!assessReplacementCapacity(resources, state, production).ready) {
         throw Error("Fresh replacement capacity or ownership check failed");
       }
       assertReplacementApproval(

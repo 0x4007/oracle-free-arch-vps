@@ -1,17 +1,22 @@
 import {
   assertReplacementApproval,
   assessReplacementCapacity,
+  type ProductionBinding,
+  proveTrialFunding,
   type ReplacementConfig,
   type ReplacementInventory,
   replacementPlanDigest,
   type ReplacementState,
   runReplacement,
+  TRIAL_OPERATION,
   validateReplacementConfig,
 } from "../scripts/pi-machine-recovery.ts";
 import type { CommandRunner, JsonRecord } from "../scripts/oci.ts";
 
 const terms =
   "first 1,500 OCPU hours and 9,000 GB hours per month for free; equivalent to 2 OCPUs and 12 GB of memory; total of 200 GB of Block Volume storage, and five volume backups; amounts apply to both boot volumes and block volumes combined; 20 GB of combined Standard tier, Infrequent Access tier, and Archive tier data";
+const OPERATION_TEXT =
+  "provision one 2 OCPU 12 GB replacement with 50 GB boot and 150 GB root and assign its existing unassigned reserved IP for direct Backblaze recovery";
 
 function assert(value: unknown, message = "Assertion failed"): asserts value {
   if (!value) throw Error(message);
@@ -68,6 +73,96 @@ function owned(): { inventory: ReplacementInventory; state: ReplacementState } {
       }],
     },
   };
+}
+/** Exact running 2 OCPU/12 GB production footprint with the 50/150 GB disks. */
+function running(): ReplacementInventory {
+  return {
+    ...empty(),
+    bootVolumes: [{ id: "boot", "size-in-gbs": 50 }],
+    rootVolumes: [{ id: "root", "size-in-gbs": 150 }],
+    instances: [{
+      id: "instance",
+      shape: "VM.Standard.A1.Flex",
+      "shape-config": { ocpus: 2, "memory-in-gbs": 12 },
+      "lifecycle-state": "RUNNING",
+    }],
+  };
+}
+function productionBinding(): ProductionBinding {
+  return {
+    instanceId: "instance",
+    bootVolumeId: "boot",
+    rootVolumeId: "root",
+  };
+}
+const fundingNow = Date.parse("2026-09-07T01:00:00Z");
+const fundingController = {
+  ociCliPath: "oci",
+  ociProfile: "DEFAULT",
+  tenancyId: "ocid1.tenancy.example",
+  source: {
+    compartmentId: "ocid1.tenancy.example",
+    region: "home",
+    instanceId: "production-instance",
+    bootVolumeId: "production-boot",
+    rootVolumeId: "production-root",
+  },
+};
+function fundingConfig(): ReplacementConfig {
+  return {
+    ...config,
+    action: "provision",
+    trial: {
+      spendingCapUsd: 300,
+      expiresAtUtc: new Date(fundingNow + 3600000).toISOString(),
+    },
+  };
+}
+function verifiedSubscription(): JsonRecord {
+  return {
+    id: "subscription-id",
+    "compartment-id": fundingController.tenancyId,
+    "lifecycle-state": "ACTIVE",
+    "subscription-tier": "FREE_AND_TRIAL",
+    "payment-model": "FREE_TRIAL",
+    "end-date": new Date(fundingNow + 30 * 24 * 3600000).toISOString(),
+    promotion: [{ status: "ACTIVE", amount: 300, "currency-unit": "USD" }],
+  };
+}
+function fundingRunner(
+  list: unknown = undefined,
+  get: JsonRecord = verifiedSubscription(),
+  calls: string[] = [],
+): CommandRunner {
+  return (command, args) => {
+    assert(command === "oci");
+    const line = args.join(" ");
+    calls.push(line);
+    let data: unknown;
+    if (line.includes("organizations subscription list")) {
+      data = list === undefined ? { items: [{ id: "subscription-id" }] } : list;
+    } else if (line.includes("organizations subscription get")) {
+      data = get;
+    } else throw Error("Unexpected provider operation: " + line);
+    return Promise.resolve({
+      code: 0,
+      stdout: JSON.stringify({ data }),
+      stderr: "",
+    });
+  };
+}
+async function fundingRefuses(list: unknown, get: JsonRecord): Promise<void> {
+  let refused = false;
+  try {
+    await proveTrialFunding(
+      fundingController,
+      fundingConfig(),
+      fundingRunner(list, get),
+    );
+  } catch {
+    refused = true;
+  }
+  assert(refused);
 }
 Deno.test("production footprint blocks a second replacement", () => {
   const result = assessReplacementCapacity(owned().inventory);
@@ -515,4 +610,385 @@ Deno.test({
       await Deno.remove(directory, { recursive: true });
     }
   },
+});
+
+Deno.test("trial coexistence accepts exactly 400 GB 4 OCPU 24 GB while normal still refuses", () => {
+  const trial = assessReplacementCapacity(
+    running(),
+    undefined,
+    productionBinding(),
+  );
+  assert(
+    trial.ready && trial.peak.liveVolumeGb === 400 &&
+      trial.peak.ocpus === 4 && trial.peak.memoryGb === 24,
+  );
+  const normal = assessReplacementCapacity(running());
+  assert(
+    !normal.ready && normal.peak.liveVolumeGb === 400 &&
+      normal.peak.ocpus === 4 && normal.peak.memoryGb === 24,
+  );
+});
+
+Deno.test("trial fails closed on absent stopped or wrong-shaped production source", () => {
+  const absent = assessReplacementCapacity(
+    empty(),
+    undefined,
+    productionBinding(),
+  );
+  assert(!absent.ready);
+  const stopped = running();
+  stopped.instances[0]["lifecycle-state"] = "STOPPED";
+  assert(
+    !assessReplacementCapacity(stopped, undefined, productionBinding()).ready,
+  );
+  const shape = running();
+  shape.instances[0].shape = "VM.Standard.E4.Flex";
+  assert(
+    !assessReplacementCapacity(shape, undefined, productionBinding()).ready,
+  );
+  const ocpus = running();
+  ocpus.instances[0]["shape-config"] = { ocpus: 4, "memory-in-gbs": 12 };
+  assert(
+    !assessReplacementCapacity(ocpus, undefined, productionBinding()).ready,
+  );
+  const memory = running();
+  memory.instances[0]["shape-config"] = { ocpus: 2, "memory-in-gbs": 24 };
+  assert(
+    !assessReplacementCapacity(memory, undefined, productionBinding()).ready,
+  );
+  const boot = running();
+  boot.bootVolumes[0]["size-in-gbs"] = 60;
+  assert(
+    !assessReplacementCapacity(boot, undefined, productionBinding()).ready,
+  );
+  const root = running();
+  root.rootVolumes[0]["size-in-gbs"] = 200;
+  assert(
+    !assessReplacementCapacity(root, undefined, productionBinding()).ready,
+  );
+});
+
+Deno.test("missing or overlapping production identities are refused", () => {
+  refuses(() =>
+    assessReplacementCapacity(running(), undefined, {
+      ...productionBinding(),
+      instanceId: "",
+    })
+  );
+  refuses(() =>
+    assessReplacementCapacity(running(), undefined, {
+      instanceId: "boot",
+      bootVolumeId: "boot",
+      rootVolumeId: "root",
+    })
+  );
+  const { state } = owned();
+  refuses(() =>
+    assessReplacementCapacity(running(), state, productionBinding())
+  );
+});
+
+Deno.test("foreign zero-size volume still blocks trial coexistence", () => {
+  const inventory = running();
+  inventory.rootVolumes.push({ id: "foreign", "size-in-gbs": 0 });
+  assert(
+    !assessReplacementCapacity(inventory, undefined, productionBinding()).ready,
+  );
+  assert(!assessReplacementCapacity(inventory).ready);
+});
+
+Deno.test("trial caps bind the coexistence and refuse any numeric overage", () => {
+  const production = productionBinding();
+  const second = running();
+  second.instances.push({
+    id: "instance2",
+    shape: "VM.Standard.A1.Flex",
+    "shape-config": { ocpus: 2, "memory-in-gbs": 12 },
+    "lifecycle-state": "RUNNING",
+  });
+  const stateSecond: ReplacementState = {
+    requestId: config.requestId,
+    planSha256: replacementPlanDigest(config),
+    instanceId: "instance2",
+    updatedAtUtc: new Date().toISOString(),
+  };
+  const boundary = assessReplacementCapacity(second, stateSecond, production);
+  assert(
+    boundary.ready && boundary.peak.liveVolumeGb === 400 &&
+      boundary.peak.ocpus === 4 && boundary.peak.memoryGb === 24,
+  );
+  const extraBoot = running();
+  extraBoot.bootVolumes.push({ id: "boot2", "size-in-gbs": 51 });
+  const stateBoot: ReplacementState = {
+    requestId: config.requestId,
+    planSha256: replacementPlanDigest(config),
+    bootVolumeId: "boot2",
+    updatedAtUtc: new Date().toISOString(),
+  };
+  assert(!assessReplacementCapacity(extraBoot, stateBoot, production).ready);
+  const third = running();
+  third.instances.push(
+    {
+      id: "instance2",
+      shape: "VM.Standard.A1.Flex",
+      "shape-config": { ocpus: 2, "memory-in-gbs": 12 },
+      "lifecycle-state": "RUNNING",
+    },
+    {
+      id: "instance3",
+      shape: "VM.Standard.A1.Flex",
+      "shape-config": { ocpus: 2, "memory-in-gbs": 12 },
+      "lifecycle-state": "RUNNING",
+    },
+  );
+  const stateThird: ReplacementState = {
+    requestId: config.requestId,
+    planSha256: replacementPlanDigest(config),
+    instanceId: "instance3",
+    updatedAtUtc: new Date().toISOString(),
+  };
+  assert(!assessReplacementCapacity(third, stateThird, production).ready);
+  assert(
+    !assessReplacementCapacity(
+      { ...running(), publicIps: 3 },
+      undefined,
+      production,
+    ).ready,
+  );
+});
+
+Deno.test("distinct trial operation and approval digest drive approval", () => {
+  const now = Date.parse("2026-09-07T01:00:00Z");
+  const trialFields = {
+    spendingCapUsd: 300,
+    expiresAtUtc: new Date(now + 3600000).toISOString(),
+  };
+  const trial: ReplacementConfig = {
+    ...config,
+    action: "provision",
+    trial: trialFields,
+  };
+  const trialDigest = replacementPlanDigest(trial);
+  assert(trialDigest !== replacementPlanDigest(config));
+  assert(
+    trialDigest !== replacementPlanDigest({
+      ...trial,
+      trial: { ...trialFields, spendingCapUsd: 250 },
+    }),
+  );
+  assert(
+    trialDigest !== replacementPlanDigest({
+      ...trial,
+      trial: {
+        ...trialFields,
+        expiresAtUtc: new Date(now + 7200000).toISOString(),
+      },
+    }),
+  );
+  const approved: ReplacementConfig = {
+    ...trial,
+    approval: {
+      approvedAtUtc: new Date(now).toISOString(),
+      planSha256: trialDigest,
+      exactOperation: TRIAL_OPERATION,
+    },
+  };
+  assertReplacementApproval(approved, trialDigest, now);
+  refuses(() =>
+    assertReplacementApproval(
+      {
+        ...approved,
+        approval: { ...approved.approval!, exactOperation: OPERATION_TEXT },
+      },
+      trialDigest,
+      now,
+    )
+  );
+  refuses(() =>
+    assertReplacementApproval(
+      {
+        ...approved,
+        approval: {
+          ...approved.approval!,
+          planSha256: replacementPlanDigest(config),
+        },
+      },
+      trialDigest,
+      now,
+    )
+  );
+  const normal: ReplacementConfig = {
+    ...config,
+    action: "provision",
+    approval: {
+      approvedAtUtc: new Date(now).toISOString(),
+      planSha256: replacementPlanDigest(config),
+      exactOperation: OPERATION_TEXT,
+    },
+  };
+  assertReplacementApproval(normal, replacementPlanDigest(config), now);
+  refuses(() =>
+    assertReplacementApproval(
+      {
+        ...normal,
+        approval: { ...normal.approval!, exactOperation: TRIAL_OPERATION },
+      },
+      replacementPlanDigest(config),
+      now,
+    )
+  );
+});
+
+Deno.test("trial cap and expiry validation plus the four hour approval bound", () => {
+  const now = Date.parse("2026-09-07T01:00:00Z");
+  const expiry = new Date(now + 3600000).toISOString();
+  validateReplacementConfig({
+    ...config,
+    trial: { spendingCapUsd: 300, expiresAtUtc: expiry },
+  });
+  for (const spendingCapUsd of [0, -1, NaN, Infinity, 300.01]) {
+    refuses(() =>
+      validateReplacementConfig({
+        ...config,
+        trial: { spendingCapUsd, expiresAtUtc: expiry },
+      })
+    );
+  }
+  for (
+    const expiresAtUtc of [
+      "2026-09-07",
+      "2026-09-07T01:00:00",
+      "2026-13-07T01:00:00Z",
+      "later",
+    ]
+  ) {
+    refuses(() =>
+      validateReplacementConfig({
+        ...config,
+        trial: { spendingCapUsd: 300, expiresAtUtc },
+      })
+    );
+  }
+  const trialFields = { spendingCapUsd: 300, expiresAtUtc: expiry };
+  const trial: ReplacementConfig = {
+    ...config,
+    action: "provision",
+    trial: trialFields,
+  };
+  const digest = replacementPlanDigest(trial);
+  const approved: ReplacementConfig = {
+    ...trial,
+    approval: {
+      approvedAtUtc: new Date(now).toISOString(),
+      planSha256: digest,
+      exactOperation: TRIAL_OPERATION,
+    },
+  };
+  assertReplacementApproval(approved, digest, now);
+  const withExpiry = (expiresAtUtc: string) => {
+    const next: ReplacementConfig = {
+      ...trial,
+      trial: { ...trialFields, expiresAtUtc },
+    };
+    const nextDigest = replacementPlanDigest(next);
+    return {
+      config: {
+        ...next,
+        approval: {
+          approvedAtUtc: new Date(now).toISOString(),
+          planSha256: nextDigest,
+          exactOperation: TRIAL_OPERATION,
+        },
+      },
+      digest: nextDigest,
+    };
+  };
+  const past = withExpiry(new Date(now - 1000).toISOString());
+  refuses(() => assertReplacementApproval(past.config, past.digest, now));
+  const over = withExpiry(new Date(now + 4 * 3600000 + 1000).toISOString());
+  refuses(() => assertReplacementApproval(over.config, over.digest, now));
+  const exact = withExpiry(new Date(now + 4 * 3600000).toISOString());
+  assertReplacementApproval(exact.config, exact.digest, now);
+});
+
+Deno.test("proveTrialFunding accepts the verified ACTIVE USD promotion with only two calls", async () => {
+  const calls: string[] = [];
+  const runner = fundingRunner(undefined, verifiedSubscription(), calls);
+  await proveTrialFunding(fundingController, fundingConfig(), runner);
+  assert(calls.length === 2);
+  assert(calls[0].includes("organizations subscription list"));
+  assert(calls[1].includes("organizations subscription get --subscription-id"));
+  assert(!calls[0].includes("promotion"));
+  assert(!calls[1].includes("promotion"));
+});
+
+Deno.test("proveTrialFunding refuses a wrong account or subscription state", async () => {
+  const base = verifiedSubscription();
+  for (
+    const get of [
+      { ...base, id: "another-subscription" },
+      { ...base, "compartment-id": "ocid1.tenancy.other" },
+      { ...base, "lifecycle-state": "INACTIVE" },
+      { ...base, "subscription-tier": "FREE" },
+      { ...base, "payment-model": "PAY_AS_YOU_GO" },
+    ]
+  ) {
+    await fundingRefuses(undefined, get);
+  }
+});
+
+Deno.test("proveTrialFunding refuses a missing or earlier end-date", async () => {
+  const base = verifiedSubscription();
+  const missing = { ...base };
+  delete missing["end-date"];
+  for (
+    const get of [
+      missing,
+      { ...base, "end-date": new Date(fundingNow + 3600000).toISOString() },
+      { ...base, "end-date": new Date(fundingNow + 1000).toISOString() },
+      { ...base, "end-date": "not-a-date" },
+    ]
+  ) {
+    await fundingRefuses(undefined, get);
+  }
+});
+
+Deno.test("proveTrialFunding refuses inactive non-USD too-small or malformed promotions", async () => {
+  const base = verifiedSubscription();
+  for (
+    const get of [
+      {
+        ...base,
+        promotion: [{ status: "EXPIRED", amount: 300, "currency-unit": "USD" }],
+      },
+      {
+        ...base,
+        promotion: [{ status: "ACTIVE", amount: 300, "currency-unit": "EUR" }],
+      },
+      {
+        ...base,
+        promotion: [{ status: "ACTIVE", amount: 299, "currency-unit": "USD" }],
+      },
+      { ...base, promotion: [{ status: "ACTIVE", "currency-unit": "USD" }] },
+      { ...base, promotion: "none" },
+      { ...base, promotion: null },
+    ]
+  ) {
+    await fundingRefuses(undefined, get);
+  }
+});
+
+Deno.test("proveTrialFunding refuses a missing duplicate or malformed subscription collection", async () => {
+  for (
+    const list of [
+      { items: [] },
+      { items: [{ id: "a" }, { id: "b" }] },
+      { items: "one" },
+      { no: "items" },
+      null,
+      [{ id: "subscription-id" }],
+    ]
+  ) {
+    await fundingRefuses(list, verifiedSubscription());
+  }
 });
