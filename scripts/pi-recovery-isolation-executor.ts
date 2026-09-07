@@ -1,5 +1,6 @@
-/** Unwired target-only draft for copied-root configuration and exact-approved
- * writes. This does not establish complete first-boot isolation: copied user
+/** Target-only draft for copied-root inspection and exact-approved writes.
+ * Only inspection is connected; writes remain unwired. This does not establish
+ * complete first-boot isolation: copied user
  * agents, shell startup and desktop autostart still require disposition before
  * any boot. No cloud resource, production service, archive transfer or reboot
  * is performed here. */
@@ -42,6 +43,18 @@ export interface IsolationExecutionApproval {
   inspectionSha256: string;
   exactOperation: typeof OPERATION;
   approvedAtUtc: string;
+}
+export function validateIsolationInspection(
+  inspection: IsolationInspection,
+  plan: RecoveryIsolationPlan,
+): void {
+  const { inspectionSha256, ...body } = inspection;
+  if (
+    inspection.planSha256 !== plan.planSha256 ||
+    !/^[0-9a-f]{64}$/.test(inspectionSha256) ||
+    hash(body) !== inspectionSha256 ||
+    new TextEncoder().encode(JSON.stringify(inspection)).length > 48 * 1024
+  ) throw Error("Copied-root inspection is not bound to its plan");
 }
 export type IsolationExchange = (event: {
   kind: "copied-root-isolation";

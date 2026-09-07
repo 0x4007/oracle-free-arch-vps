@@ -20,6 +20,7 @@ import {
   type RecoveryIsolationInput,
   recoveryIsolationPlan,
 } from "./pi-recovery-isolation.ts";
+import { executeCopiedRootIsolation } from "./pi-recovery-isolation-executor.ts";
 
 export type StreamDecrypt = (
   ciphertext: ReadableStream<Uint8Array>,
@@ -304,9 +305,23 @@ export async function restoreCatalogOnTarget(
       expected.loaderBootId !== input.loaderBootId ||
       expected.rescueManifestSha256 !== input.rescueManifestSha256
     ) throw Error("Isolation plan differs from the current RAM boot");
+    const plan = recoveryIsolationPlan(machineInput, input.isolation);
     await channel.send({
       kind: "recovery-isolation-plan",
-      plan: recoveryIsolationPlan(machineInput, input.isolation),
+      plan,
+    });
+    // Inspection only. No approval is supplied, so the executor cannot enter
+    // its copied-filesystem write path. It returns only after releasing mounts.
+    const inspected = await executeCopiedRootIsolation(
+      plan,
+      () => Promise.resolve(undefined),
+      () => Promise.reject(Error("Isolation writes are not connected")),
+    );
+    await channel.send({
+      kind: "recovery-isolation-inspection",
+      inspection: inspected.inspection,
+      mountsReleased: true,
+      isolationApplied: false,
     });
   }
   return result;

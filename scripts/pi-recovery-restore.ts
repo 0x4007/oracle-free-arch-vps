@@ -44,6 +44,10 @@ import {
   type RecoveryIsolationPlan,
   validateIsolationPlanDigest,
 } from "./pi-recovery-isolation.ts";
+import {
+  type IsolationInspection,
+  validateIsolationInspection,
+} from "./pi-recovery-isolation-executor.ts";
 
 export const RECOVERY_TARGET_ROOT = "/run/uos-recovery/restore";
 export const RECOVERY_TARGET_PUBLIC_HOME = "/run/uos-recovery/gnupg";
@@ -180,6 +184,10 @@ export interface RecoveryTargetInstallPorts {
 export interface RecoveryRestorePorts {
   process?: RecoveryTargetProcessFactory;
   beforeCheckpoint?: () => Promise<void>;
+  inspected?: (
+    plan: RecoveryIsolationPlan,
+    inspection: IsolationInspection,
+  ) => Promise<void>;
   progress?: (
     value: { role: string; bytes: number; expectedBytes: number },
   ) => Promise<void>;
@@ -190,6 +198,7 @@ export interface RecoveryRestoreResult {
   checkpoints: RecoveryCheckpoint[];
   stderr: string;
   isolationPlan?: RecoveryIsolationPlan;
+  isolationInspection?: IsolationInspection;
 }
 
 const sha256 = (bytes: Uint8Array): string =>
@@ -796,6 +805,7 @@ export async function restoreDirectFromBackblaze(
   const checkpoints: RecoveryCheckpoint[] = [];
   const archiveProgress = new Map<string, number>();
   let isolationPlan: RecoveryIsolationPlan | undefined;
+  let isolationInspection: IsolationInspection | undefined;
   try {
     return await processDeadline(
       process,
@@ -806,6 +816,18 @@ export async function restoreDirectFromBackblaze(
             throw Error("Recovery control record budget exhausted");
           }
           const value = await channel.receive() as Record<string, unknown>;
+          if (value?.kind === "recovery-isolation-inspection") {
+            if (
+              !isolationPlan || isolationInspection ||
+              value.mountsReleased !== true || value.isolationApplied !== false
+            ) throw Error("Unexpected copied-root inspection");
+            const inspection = value.inspection as IsolationInspection;
+            validateIsolationInspection(inspection, isolationPlan);
+            await ports.beforeCheckpoint?.();
+            await ports.inspected?.(isolationPlan, inspection);
+            isolationInspection = inspection;
+            continue;
+          }
           if (value?.kind === "recovery-isolation-plan") {
             const plan = value.plan as RecoveryIsolationPlan;
             validateIsolationPlanDigest(plan);
@@ -890,6 +912,8 @@ export async function restoreDirectFromBackblaze(
             result.generation !== binding.generation ||
             result.indexSha256 !== binding.indexSha256 ||
             result.machineBootRestoreProved !== false ||
+            (isolationPlan !== undefined &&
+              isolationInspection === undefined) ||
             checkpoints.at(-1)?.journal.completedStages.length !== STAGES.length
           ) {
             throw Error(
@@ -907,6 +931,7 @@ export async function restoreDirectFromBackblaze(
             result,
             checkpoints,
             isolationPlan,
+            isolationInspection,
             stderr: "text" in diagnostic ? diagnostic.text : "",
           };
         }
@@ -929,6 +954,7 @@ export interface RecoveryRestorationState {
   restoreIntent?: { intendedAtUtc: string };
   filesystems?: MachineRestoreResult;
   isolationPlan?: RecoveryIsolationPlan;
+  isolationInspection?: IsolationInspection;
 }
 
 export interface RecoveryRestorationPorts {
@@ -1013,6 +1039,7 @@ export async function continueReplacementRestoration(
         ? "COPIED_ROOT_ISOLATION_PLANNED"
         : "FILESYSTEMS_REBUILT",
       isolationPlan: state.isolationPlan,
+      isolationInspection: state.isolationInspection,
       isolationApplied: false,
       bootAccepted: false,
       applicationAccepted: false,
@@ -1120,6 +1147,11 @@ export async function continueReplacementRestoration(
       RECOVERY_TARGET_CHECKPOINT,
       {
         beforeCheckpoint: ports.beforeMutation,
+        inspected: async (isolationPlan, isolationInspection) => {
+          state.isolationPlan = isolationPlan;
+          state.isolationInspection = isolationInspection;
+          await save();
+        },
         progress: (value) =>
           ports.report({
             status: "ARCHIVE_EXTRACTION_PROGRESS",
@@ -1132,6 +1164,7 @@ export async function continueReplacementRestoration(
     );
     state.filesystems = restored.result;
     state.isolationPlan = restored.isolationPlan;
+    state.isolationInspection = restored.isolationInspection;
     await save();
   } finally {
     await tunnel.close();
@@ -1141,6 +1174,7 @@ export async function continueReplacementRestoration(
       ? "COPIED_ROOT_ISOLATION_PLANNED"
       : "FILESYSTEMS_REBUILT",
     isolationPlan: state.isolationPlan,
+    isolationInspection: state.isolationInspection,
     isolationApplied: false,
     bootAccepted: false,
     applicationAccepted: false,
