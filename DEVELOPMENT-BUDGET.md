@@ -2,6 +2,29 @@
 
 Owner authorization: 2026-09-07.
 
+## Standing execution authority clarified at 22:13 UTC
+
+The owner explicitly authorizes all work needed to develop, test and complete
+this backup/recovery system within the shared USD 300 Oracle trial budget.
+This includes temporary recovery targets, their disk preparation and restored
+boots, required test configuration, and cleanup of task-owned resources.
+Do not repeatedly request permission for these already-authorized operations
+or treat an agent-chosen one-hour approval freshness window as withdrawal of
+the owner's standing instruction. Keep a dated record of this instruction and
+bind each operation to freshly reconciled exact resources and a bounded cost
+and lifetime. Do not invent a new owner message or silently broaden the task.
+
+The owner explicitly prohibits turning off the production Arch VPS and bulk
+transfers through the home connection, including both Mac and Pi. Preserve
+production and required-service continuity. The Pi remains the control/key
+holder, never an archive relay. Backup payloads stay cloud-to-cloud.
+
+This clarification supersedes the repeated per-operation approval requests
+described below for in-scope recovery development. It does not authorize account
+upgrades, spending beyond covered trial funding, destruction of production data
+or the last known-good recovery unit, or unrelated work. Normal operation must
+still settle to the verified Always Free footprint.
+
 Oracle provided a USD 300 trial promotion to develop and test this backup and
 recovery system. The owner authorizes responsible use of the full USD 300 during
 active development. Temporary additional VPS instances, disks, services and
@@ -26,8 +49,9 @@ balance, and reported usage can lag. Never assume the credit renews. Never upgra
 to Pay As You Go or incur charges beyond available authorized trial funding.
 
 This authorization supersedes earlier blanket refusals of trial-funded parallel
-development and restore drills. It does not remove exact resource and destructive
-approval gates, authorize production downtime, permit deletion of good backups,
+development and restore drills. The standing execution authority above covers
+in-scope test operations; exact resource reconciliation remains mandatory.
+It does not authorize production downtime, permit deletion of the last good backup,
 allow private decryption keys on the source VPS, or authorize backup payload
 transfers through the home network. Keep production online; transfer archives
 directly between cloud hosts and Backblaze. The Pi holds the operational recovery

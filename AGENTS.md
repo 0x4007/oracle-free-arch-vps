@@ -47,7 +47,17 @@
 
 ## Explicit approval gates
 
-Obtain current, exact approval before:
+Owner clarification at 2026-09-07 22:13 UTC grants standing authority for all
+in-scope recovery development/testing and task-owned cleanup within the shared
+USD 300 trial budget. Read DEVELOPMENT-BUDGET.md. For covered operations below,
+apply that authority to freshly reconciled exact targets; do not ask repeatedly
+or interpret an agent-selected freshness timeout as revocation. Production Arch
+VPS and required services must stay online. No bulk payload may traverse Mac,
+Pi or the home network. Unrelated work, account upgrades, uncovered spending,
+production data destruction and loss of the last good backup remain excluded.
+
+For operations not covered by that standing authority, obtain current, exact
+approval before:
 
 - Creating or deleting an instance, volume, image, backup, public IP, or DNS
   record.
