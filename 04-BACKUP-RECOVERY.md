@@ -5,6 +5,14 @@
 The staging boot volume and Arch root volume are one machine. A backup of only
 one volume is not a complete recovery point.
 
+Routine weekly backups are online group captures: the instance stays `RUNNING`
+and is never stopped, rebooted, or frozen, and no required service is stopped.
+Only the procedures marked as offline below (the historical build golden pair,
+or a separately approved disaster-recovery or drill capture) stop the instance
+first. The current online operation and acceptance contract is
+`ONLINE-BACKUP-CONTRACT.md` with the owner-controlled charter
+`/Users/nv/repos/0x4007/oracle-free-arch-vps/PROJECT-VISION.md`.
+
 ## Backup-slot plan
 
 Oracle's Always Free page stated a combined maximum of five boot-volume and
@@ -25,7 +33,12 @@ the fifth slot unused unless the owner explicitly accepts a volume-only backup
 for a change that affects only that volume. Such an object is not a complete
 machine recovery point.
 
-## Create the golden pair
+## Create the golden pair (offline build or disaster-recovery capture)
+
+This stopped procedure applies to the historical build golden pair and to a
+separately approved disaster-recovery point. Routine online weekly pairs do not
+use it: they are captured by the online scheduler while the instance stays
+`RUNNING`, so no outage approval or `SOFTSTOP` applies.
 
 1. Reconcile all backup objects and confirm a pair can be created without
    exceeding the current limit.
@@ -67,6 +80,12 @@ machine recovery point.
 11. Start the same instance and complete live acceptance.
 
 ## Rotation
+
+Routine rotation runs automatically and online through the scheduler; it never
+stops the instance and it captures the pair as one OCI volume-group backup (see
+`ONLINE-BACKUP-CONTRACT.md`). The manual procedure below is the historical
+offline alternative, still valid for a separately approved rotation or recovery
+point that requires the instance stopped.
 
 1. Reconcile all existing objects and verify that at least two slots are free.
 2. If two accepted pairs already consume four slots, choose one complete pair as

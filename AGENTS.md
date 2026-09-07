@@ -2,6 +2,14 @@
 
 ## Role and ownership
 
+- The owner-controlled charter is the canonical acceptance authority:
+  `/Users/nv/repos/0x4007/oracle-free-arch-vps/PROJECT-VISION.md`. It requires
+  routine backups to run online without stopping or interrupting production.
+  The current online operation and acceptance contract is
+  `ONLINE-BACKUP-CONTRACT.md` in this repository. Routine online group captures
+  never stop, reboot, or freeze the instance or any required service. Stopping
+  the instance is reserved for separately approved disaster recovery, restore,
+  or one-time build work.
 - Use one primary orchestrator and one live infrastructure writer.
 - Read-only research and audit agents may run in parallel.
 - Do not allow two agents to create, resize, attach, detach, stop, start, or
@@ -69,7 +77,11 @@ Name the exact resource and OCID in each destructive approval request.
 ## Backup invariants
 
 - Give each pair one shared UTC suffix.
-- Create both pair members while the instance is stopped when practical.
+- Routine backups are online group captures: the instance stays `RUNNING` and
+  is never stopped, rebooted, or frozen, and no required service is stopped.
+  Both pair members are created by one online OCI volume-group backup. Only a
+  separately approved disaster-recovery, restore, or historical build capture
+  stops the instance first.
 - Wait for both objects to become `AVAILABLE` before starting cleanup.
 - Verify names, types, source OCIDs, source sizes, timestamps, and region.
 - Create and validate the new pair before deleting the old pair.
@@ -85,7 +97,10 @@ Name the exact resource and OCID in each destructive approval request.
   boot chain, services, listeners, backups, and recovery artifacts.
 - Do not substitute a source diff, unit file, mock, or health endpoint for live
   behavior.
-- A clean backup must be followed by a real start and SSH acceptance.
+- A stopped build capture or restore must be followed by a real start and SSH
+  acceptance. A routine online group capture must instead prove unchanged
+  source boot and service continuity while the instance stayed `RUNNING`
+  through capture and acceptance.
 - Report each resource as created, attached, stopped, backed up, deleted, or
   accepted. Do not merge these states into one claim.
 - If any required evidence is missing or contradictory, continue or report the
@@ -93,9 +108,10 @@ Name the exact resource and OCID in each destructive approval request.
 
 ## Operational invariants
 
-- Use an approved OCI `SOFTSTOP` as the normal mechanism for a planned stop.
-  Quiesce stateful applications first, then verify the instance reaches
-  `STOPPED`.
+- Use an approved OCI `SOFTSTOP` as the mechanism for a separately approved
+  planned outage only: disaster recovery, a restore drill, or the historical
+  build cutover. Quiesce stateful applications first, then verify the instance
+  reaches `STOPPED`. Routine online backups never stop the instance.
 - Never automatically invoke immediate `STOP`, `RESET`, or
   `SENDDIAGNOSTICINTERRUPT`. On a `SOFTSTOP` timeout or error, reread OCI state
   and fail closed. Immediate `STOP` remains a separately approved fallback only

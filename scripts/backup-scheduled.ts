@@ -5,6 +5,7 @@ import {
   duePeriod,
   periodAt,
   periodDate,
+  validateSchedule,
 } from "./backup-schedule.ts";
 import {
   ONLINE_RETRY_POLICY,
@@ -14,6 +15,21 @@ import { readPrivateJson, redactOcid, writePrivateJson } from "./oci.ts";
 
 export type ScheduledClaimStatus = "started" | "complete" | "failed";
 
+/** The approved schedule authority a claim was planned under. */
+export interface ApprovedSchedule {
+  approvedAtUtc: string;
+  timeZone: string;
+  weekday: number; // Sunday = 0
+  hour: number;
+  minute: number;
+  acceptanceWindow?: {
+    approvedAtUtc: string;
+    startsAtUtc: string;
+    expiresAtUtc: string;
+    exactOperation: "one online scheduler acceptance capture";
+  };
+}
+
 export interface WindowClaim {
   /** Kept as windowId for compatibility with existing private claim readers. */
   windowId: string;
@@ -22,6 +38,8 @@ export interface WindowClaim {
   previousCycleSuffix?: string;
   status: ScheduledClaimStatus;
   updatedAtUtc: string;
+  /** Approved schedule authority the claim was planned under. */
+  approvedSchedule?: ApprovedSchedule;
 }
 
 export interface ScheduledCycleState {
@@ -55,6 +73,95 @@ function parseTimestamp(value: string | undefined): number | undefined {
   if (!value) return undefined;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+const TIME_ZONE_PATTERN = /^[A-Za-z_]+(?:\/[A-Za-z_+-]+)*$/;
+
+/** Canonical approved schedule binding stored on a claim. */
+export function approvedScheduleOf(
+  schedule: BackupSchedule,
+): ApprovedSchedule {
+  return {
+    approvedAtUtc: schedule.approvedAtUtc,
+    timeZone: schedule.timeZone,
+    weekday: schedule.weekday,
+    hour: schedule.hour,
+    minute: schedule.minute,
+    ...(schedule.acceptanceWindow
+      ? { acceptanceWindow: structuredClone(schedule.acceptanceWindow) }
+      : {}),
+  };
+}
+
+function sameApprovedSchedule(
+  a: ApprovedSchedule,
+  b: ApprovedSchedule,
+): boolean {
+  if (
+    a.approvedAtUtc !== b.approvedAtUtc ||
+    a.timeZone !== b.timeZone ||
+    a.weekday !== b.weekday ||
+    a.hour !== b.hour ||
+    a.minute !== b.minute
+  ) return false;
+  const aw = a.acceptanceWindow;
+  const bw = b.acceptanceWindow;
+  if ((aw === undefined) !== (bw === undefined)) return false;
+  return aw === undefined || (
+    aw.approvedAtUtc === bw!.approvedAtUtc &&
+    aw.startsAtUtc === bw!.startsAtUtc &&
+    aw.expiresAtUtc === bw!.expiresAtUtc &&
+    aw.exactOperation === bw!.exactOperation
+  );
+}
+
+function validateApprovedSchedule(value: ApprovedSchedule): void {
+  if (
+    !parseTimestamp(value.approvedAtUtc) ||
+    !TIME_ZONE_PATTERN.test(value.timeZone) ||
+    !Number.isInteger(value.weekday) || value.weekday < 0 ||
+    value.weekday > 6 ||
+    !Number.isInteger(value.hour) || value.hour < 0 || value.hour > 23 ||
+    !Number.isInteger(value.minute) || value.minute < 0 || value.minute > 59
+  ) throw new Error("Scheduled claim has an invalid approved schedule binding");
+  if (value.acceptanceWindow !== undefined) {
+    const window = value.acceptanceWindow;
+    const approved = parseTimestamp(window.approvedAtUtc);
+    const starts = parseTimestamp(window.startsAtUtc);
+    const expires = parseTimestamp(window.expiresAtUtc);
+    if (
+      window.exactOperation !== "one online scheduler acceptance capture" ||
+      approved === undefined || starts === undefined || expires === undefined ||
+      approved > starts || expires <= starts ||
+      expires - approved > 4 * 3_600_000
+    ) throw new Error("Scheduled claim has an invalid acceptance binding");
+  }
+}
+
+/** Fail closed when a pending capture is no longer authorized by the latest
+ * approved schedule: a revoked, malformed or future approval, a changed
+ * weekly or one-time authority, or a closed one-time acceptance window.
+ */
+export function assertCaptureStillAuthorized(
+  latest: BackupSchedule,
+  claim: WindowClaim,
+  now: Date,
+): void {
+  validateSchedule(latest, now);
+  if (!claim.approvedSchedule) {
+    throw new Error("Scheduled claim has no approved schedule binding");
+  }
+  if (
+    !sameApprovedSchedule(claim.approvedSchedule, approvedScheduleOf(latest))
+  ) {
+    throw new Error("Approved schedule changed while the capture was pending");
+  }
+  if (
+    isAcceptanceWindowId(claim.windowId) &&
+    currentWindow(latest, now) !== claim.windowId
+  ) {
+    throw new Error("One-time scheduler acceptance window closed");
+  }
 }
 
 function captureTimestamp(
@@ -119,6 +226,9 @@ function validateClaim(claim: WindowClaim): void {
   if (claim.periodId !== undefined && claim.periodId === "") {
     throw new Error("Scheduled claim has no period identity");
   }
+  if (claim.approvedSchedule !== undefined) {
+    validateApprovedSchedule(claim.approvedSchedule);
+  }
 }
 
 function claimFor(
@@ -127,6 +237,7 @@ function claimFor(
   now: Date,
   state: ScheduledRuntimeState | undefined,
   existing: WindowClaim | undefined,
+  schedule: BackupSchedule,
 ): WindowClaim {
   return {
     ...(existing ?? {}),
@@ -135,6 +246,8 @@ function claimFor(
     previousCycleSuffix: state?.cycle?.phase === "complete"
       ? state.cycle.suffix
       : existing?.previousCycleSuffix,
+    approvedSchedule: existing?.approvedSchedule ??
+      approvedScheduleOf(schedule),
     status: "started",
     updatedAtUtc: now.toISOString(),
   };
@@ -201,13 +314,14 @@ export function planScheduledClaim(
         now,
         state,
         existing,
+        schedule,
       ),
     };
   }
 
   return {
     action: "run",
-    claim: claimFor(triggerId, due, now, state, undefined),
+    claim: claimFor(triggerId, due, now, state, undefined, schedule),
   };
 }
 
@@ -263,14 +377,13 @@ export async function runScheduledBackup(): Promise<void> {
           const latest = await readPrivateJson<BackupSchedule>(
             ".private/backup-schedule.json",
           );
-          // Weekly claims remain due after the grace period. Only the bounded
-          // acceptance trigger must still be active when OCI creation starts.
-          if (
-            isAcceptanceWindowId(claim!.windowId) &&
-            currentWindow(latest, new Date()) !== claim!.windowId
-          ) {
-            throw new Error("One-time scheduler acceptance window closed");
-          }
+          // Every capture re-reads the latest approval immediately before
+          // creation. A revoked, malformed, future or changed approval, a
+          // changed weekly or one-time authority, or a closed one-time
+          // acceptance window cannot authorize a stale capture. Weekly claims
+          // stay due after the grace period; only the bounded acceptance
+          // trigger must also still be active when OCI creation starts.
+          assertCaptureStillAuthorized(latest, claim!, new Date());
         },
       };
     });
