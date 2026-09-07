@@ -151,3 +151,19 @@ The RAM-rescue bootstrap, approved disk clearing, Pi checkpoint persistence for
 stream restoration, clone isolation, and real boot/application acceptance remain
 unfinished. The provisioner must not be represented as the complete recovery
 entry point or invoked against the occupied production tenancy.
+
+The corrected read-only Pi plan completed at 2026-09-07T01:11:45.623Z:
+`REPLACEMENT_CAPACITY_BLOCKED`, current 200 GB/2 OCPU/12 GB and projected
+400 GB/4 OCPU/24 GB, three backup members, one public IP and 1,453,785,088
+Object Storage bytes. It ran from temporary candidate code under `safepi` with
+an additional runner that refused mutation commands. The temporary code was
+removed. The plan remains private, action `plan`, with no mutation approval.
+The plan is capacity evidence only; its placeholder cloud-init is not a prepared
+rescue bootstrap and must not be approved as one.
+
+Source 2f841ad passed 26 focused tests, 279 default tests (139 permission-gated
+checks skipped), type, format, lint and whitespace checks. Local Codex review
+against d112157 completed with no actionable findings; it did not run live
+provisioning or recovery. Private receipts: `pi-replacement-plan.json`,
+`pi-replacement-focused-tests.txt`, and `pi-replacement-review-round1.txt` under
+`.private` or `.private/reports` as appropriate.
