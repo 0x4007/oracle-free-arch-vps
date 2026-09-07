@@ -116,6 +116,8 @@ export function replacementPlanDigest(config: ReplacementConfig): string {
     memoryGb: 12,
     bootGb: 50,
     rootGb: 150,
+    consistentVolumeNaming: true,
+    rootDevice: "/dev/oracleoci/oraclevdb",
   })).digest("hex");
 }
 export function validateReplacementConfig(config: ReplacementConfig): void {
@@ -435,6 +437,8 @@ export async function runReplacement(
           instance.shape !== "VM.Standard.A1.Flex" || shape.ocpus !== 2 ||
           shape["memory-in-gbs"] !== 12 ||
           instance["image-id"] !== config.platformImageId ||
+          (instance["launch-options"] as JsonRecord | undefined)
+              ?.["is-consistent-volume-naming-enabled"] !== true ||
           instance["compartment-id"] !== config.compartmentId ||
           instance["availability-domain"] !== config.availabilityDomain ||
           state.instanceId && state.instanceId !== instance.id
@@ -492,7 +496,8 @@ export async function runReplacement(
           rootsAttached[0]["lifecycle-state"] !== "ATTACHED" ||
           rootsAttached[0]["volume-id"] !== state.rootVolumeId ||
           rootsAttached[0]["instance-id"] !== state.instanceId ||
-          rootsAttached[0]["attachment-type"] !== "paravirtualized"
+          rootsAttached[0]["attachment-type"] !== "paravirtualized" ||
+          rootsAttached[0].device !== "/dev/oracleoci/oraclevdb"
         ) {
           throw Error("Replacement root attachment is not proved");
         }
@@ -747,6 +752,8 @@ export async function runReplacement(
           "VM.Standard.A1.Flex",
           "--shape-config",
           JSON.stringify({ ocpus: 2, memoryInGBs: 12 }),
+          "--launch-options",
+          JSON.stringify({ isConsistentVolumeNamingEnabled: true }),
           "--source-details",
           JSON.stringify({
             sourceType: "image",
@@ -757,6 +764,7 @@ export async function runReplacement(
           JSON.stringify([{
             type: "paravirtualized",
             volumeId: state.rootVolumeId,
+            device: "/dev/oracleoci/oraclevdb",
           }]),
           "--assign-public-ip",
           "false",

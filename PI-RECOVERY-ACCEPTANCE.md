@@ -242,3 +242,77 @@ is 15,443 bytes with SHA256
 `9e19d12689505978c8ac8b42abd52eff6f176cedac0171fdcc07135faded20ea`;
 it remains unapproved and unprovisioned. No real boot or backup archive was
 performed in these tests.
+
+## Provider-bound disk preparation candidate, 2026-09-07
+
+The next implementation connects the Ubuntu loader's device identities to the
+RAM disk-preparation boundary. Oracle documents `/dev/oracleoci/oraclevda` as
+the boot device for compatible platform images. The provisioner now explicitly
+requests consistent volume naming and `/dev/oracleoci/oraclevdb` for the root
+attachment, includes these choices in the approval digest, and verifies them
+on the returned instance and attachment. Old provisioning digests must not be
+reused for this changed launch contract. No replacement has been provisioned.
+
+`scripts/pi-recovery-disk-identity.ts` takes fresh authenticated provider reads
+and a host-key-verified loader SSH runner. It verifies the exact boot and root
+attachments, resource sizes, request tag and consistent naming, observes Ubuntu
+24.04 AArch64, resolves the Oracle paths, proves the platform root belongs to
+the boot disk, and records full SCSI hardware serials plus verified by-id aliases.
+It rereads the boot ID and provider attachments before returning a hashed
+receipt. A RAM binding must retain that receipt and use a different boot ID.
+It does not establish SSH trust or attest the new RAM artifact by itself.
+
+`scripts/pi-recovery-disk-preparation.ts` requires a separately approved digest
+that binds the source exclusions, replacement instance/volume IDs, RAM boot,
+serials, paths, capacities and initial disk/signature snapshot. Read-only guards
+require exactly two physical disks, RAM root/private scratch, matching IMDS,
+no swap, no target mounts (including major/minor mount aliases), no read-only or
+mapped children, no kernel device holders and no alternate mount namespaces.
+Before each clear it requires a controller exchange contract for fresh OCI and
+writer checks plus durable Pi acknowledgement, then rereads the target state.
+Each disk must become pristine before the next one is touched. An interrupted
+preparation requires a new observed plan and exact approval, not an automatic
+repeat. Its result explicitly leaves restore and boot acceptance false.
+
+The new modules are not yet wired into a complete Pi executable session. The
+caller must supply the authenticated OCI reads, verified SSH transport and
+actual durable preparation exchange under the controller lock; a mock callback
+is not live controller evidence. No live disk was cleared, partitioned or
+formatted. Remaining issues #16, #17 and #18 and the 200 GB coexistence blocker
+continue to apply. The original machine-restorer's pristine-target checks are
+preserved.
+
+Primary-source contracts checked:
+- https://docs.oracle.com/en-us/iaas/Content/Block/References/consistentdevicepaths.htm
+- https://raw.githubusercontent.com/oracle/oci-python-sdk/master/src/oci/core/models/launch_attach_volume_details.py
+
+Focused tests cover provider/guest identity mismatch, reversed Linux disk order,
+swapped aliases, changed attachments, changed boot IDs, source-resource refusal,
+mounted/held/extra/read-only disks, changed serials, expired approval, failed Pi
+acknowledgements, changed state during acknowledgement, incomplete clearing and
+refusal to silently resume. These are synthetic command-runner checks plus
+actual shell syntax parsing, not proof of OCI device naming or real disk writes.
+
+The first local review found a P1 defect in this candidate: both `lsblk` calls
+omitted `--tree`, so real partition nodes would be flat even though the initial
+test fixtures were nested. Correction f9e068bf072fee4b7f21adb8458f887531f04a2c
+requests trees explicitly, refuses top-level partition records, and makes the
+fixtures return flat data when the option is absent. A read-only Pi probe at
+2026-09-07T02:30:20.927Z confirmed two top-level partitions without `--tree` and
+two nested partitions with it. No disk was modified by that probe.
+
+The corrected source passed type, format, lint and whitespace checks, 42 focused
+tests, and 313 default tests (144 permission-gated checks skipped). All 17 new
+disk-module tests passed on Pi under `safepi` at 2026-09-07T02:31:03.111Z.
+These Pi tests still use synthetic provider/command runners; the read-only
+`lsblk` probe is separate actual tool-behavior evidence. Local Codex review
+round two against 87ae6165d3575567333184fa6e362f9bd7931203 exited successfully
+with no further actionable findings. No new unresolved review finding requires
+a backlog issue; existing issues #12 and #16–#18 remain open.
+
+Private receipts: `pi-disk-focused-tests.txt`, `pi-disk-default-tests.txt`,
+`pi-disk-review-round1.txt`, `pi-disk-review-round2.txt`,
+`reports/pi-disk-tests.json`, and `reports/pi-lsblk-tree-contract.json` under
+`.private`. Alpine's published v3.24 AArch64 `util-linux-misc` file listing
+includes `/sbin/blockdev`, which the preparation stage needs; the existing RAM
+bootstrap already requests that package.
