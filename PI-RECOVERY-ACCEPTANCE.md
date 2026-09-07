@@ -97,3 +97,57 @@ and proved. A platform-image boot disk is not pristine: only exact-approved
 replacement-disk preparation after proving RAM execution can make it eligible
 for the existing pristine-target checks. Never weaken those checks merely to
 make an occupied boot disk pass. All earlier full live-drill constraints remain.
+
+## Pi provisioning controller, 2026-09-07
+
+`scripts/pi-machine-recovery.ts` adds the Pi-owned Oracle provisioning stage.
+It reads the existing controller configuration and a private recovery plan at
+`.private/pi-machine-recovery.json`. The plan binds the request UUID, selected
+generation, tenancy, home region, compartment, availability domain, subnet,
+existing reserved IP, platform image and exact public cloud-init bytes.
+`replacementPlanDigest` produces the approval digest. The `plan` action writes
+current and projected resource totals without cloud mutations. A plan result
+does not prove that bootstrap, restore or boot will work.
+
+The `provision` action requires a current exact approval for that digest. It
+rechecks account eligibility, resource totals, ownership, image compatibility,
+subnet scope, approval and competing writers before each mutation. It creates
+one 150 GB balanced root and one 50 GB platform boot with a 2 OCPU/12 GB A1
+instance. It never deletes existing resources or moves an assigned production
+address. It counts both regional reserved and availability-domain ephemeral IPs.
+The existing reserved address is assigned only to the proved replacement VNIC,
+using an ETag condition against concurrent address changes.
+
+The private journal is `.private/pi-machine-recovery-state.json`. A durable
+intent precedes each CREATE. Resume reconciles the request tag, resource
+specification and recorded IDs. An inconclusive CREATE is refused rather than
+repeated; a missing recorded resource is not silently recreated. Run the same
+request again after provider provisioning completes. Control-plane acceptance
+requires the running instance, both attachments, primary VNIC and assigned IP.
+`REPLACEMENT_CONTROL_PLANE_PROVED` still explicitly reports restore and boot
+acceptance as false. No SSH bootstrap or disk preparation is implied.
+
+The stream-restore executable also now reads the actual flat scoped B2 settings
+format already used on the Pi; it previously expected an absent nested `b2`
+object. Scoped credentials remain private and no real backup payload was fetched
+to check this wiring.
+
+Focused tests exercise production-capacity refusal, post-loss totals, orphaned
+resources, malformed inventory, approval expiry and changes, lost CREATE
+responses, and repeated control-plane resumes without duplicate creation or IP
+assignment. A credential-free runner rejects unexpected provider operations.
+The first read-only Pi plan hit its four-minute timeout; the controller now
+reuses the volume evidence already read during eligibility verification instead
+of repeating that inventory. The failed process exited and its temporary code
+directory was removed. It performed no cloud mutation.
+
+Provider contracts checked against Oracle documentation:
+
+- [Image and shape compatibility](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image-shape-compatibility-entry/list.html).
+- [Boot volume image identity](https://raw.githubusercontent.com/oracle/oci-python-sdk/master/src/oci/core/models/boot_volume.py).
+- [Instance launch](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/launchinginstance.htm).
+
+The RAM-rescue bootstrap, approved disk clearing, Pi checkpoint persistence for
+stream restoration, clone isolation, and real boot/application acceptance remain
+unfinished. The provisioner must not be represented as the complete recovery
+entry point or invoked against the occupied production tenancy.

@@ -13,6 +13,7 @@ import { RetryableObservationError } from "./online-backup-contract.ts";
 import {
   type BackupInventoryConfig,
   backupSnapshot,
+  type FreeResourceSurfaceEvidence,
   readBackupInventory,
 } from "./oci-backup-inventory.ts";
 import {
@@ -41,6 +42,7 @@ export interface BackupControllerEvidence {
     objectStorageWithinLimit: boolean;
     objectStorageBytes?: number;
     objectStorageHeadroomBytes?: number;
+    freeResourceSurface?: FreeResourceSurfaceEvidence;
     /** Optional until the primary's live group SKU/accounting audit passes. */
     groupAccountingProved?: boolean;
   }>;

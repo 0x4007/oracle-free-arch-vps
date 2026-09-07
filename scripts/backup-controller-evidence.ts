@@ -176,6 +176,7 @@ export function backupControllerEvidence(
       }, boundedObjectStorageRunner);
       const surfaces = await readFreeResourceSurfaceEvidence(config, runner);
       return {
+        freeResourceSurface: surfaces,
         accountAndLimitsProved:
           subscription["subscription-tier"] === "FREE_AND_TRIAL" &&
           subscription["payment-model"] === "FREE_TRIAL" &&
@@ -219,7 +220,7 @@ export function backupControllerEvidence(
               p.name.split("/").at(-1)!,
             ) ||
             /(?:^|\s|\/)oci(?:\s|$)/.test(p.args) ||
-            /(?:backup-runtime|backup-scheduled|backup-recovery|oci-restore|weekly-backup|backblaze-file-backup)\.ts/
+            /(?:backup-runtime|backup-scheduled|backup-recovery|oci-restore|pi-machine-recovery|weekly-backup|backblaze-file-backup)\.ts/
               .test(p.args) ||
             /(?:scp|sftp|rsync).*weekly-backup-controller/.test(p.args)
           )

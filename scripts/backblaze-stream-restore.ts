@@ -245,11 +245,11 @@ if (import.meta.main) {
       Parameters<typeof restoreCatalogOnTarget>[0]
     >(".private/backblaze-machine-restore.json");
     const settings = await readPrivateJson<
-      { b2: import("./backblaze-storage.ts").B2Settings }
+      import("./backblaze-storage.ts").B2Settings
     >(".private/b2-file-backup.json");
     console.log(
       JSON.stringify(
-        await restoreCatalogOnTarget(input, new B2Store(settings.b2)),
+        await restoreCatalogOnTarget(input, new B2Store(settings)),
       ),
     );
   } catch {
