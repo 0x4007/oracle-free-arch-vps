@@ -225,7 +225,10 @@ Deno.test("application acceptance requires live Docker and Xvnc evidence", async
   );
   assert(script.includes("systemctl is-active --quiet docker.service"));
   assert(script.includes("pgrep -x Xvnc"));
-  assert(script.includes("docker inspect --format"));
+  // The restored root keeps the codex identity without docker-group access, so
+  // container inspection must use the already granted non-interactive sudo.
+  assert(script.includes("sudo -n docker inspect --format"));
+  assert(!script.includes('test "$(docker inspect'));
   assert(script.includes("http://127.0.0.1:8080/guacamole/"));
   assert(!script.includes("codex-remote-daemon.service"));
   assert(acceptance.activeProcesses[0] === "Xvnc");

@@ -1,9 +1,9 @@
-/** Target-only draft for copied-root inspection and exact-approved writes.
- * Only inspection is connected; writes remain unwired. This does not establish
- * complete first-boot isolation: copied user
- * agents, shell startup and desktop autostart still require disposition before
- * any boot. No cloud resource, production service, archive transfer or reboot
- * is performed here. */
+/** Target-only stage for copied-root inspection and exact-approved writes.
+ * Inspection and the exactly approved isolation writes are wired; this module
+ * does not itself reboot or prove complete live isolation. Copied user agents,
+ * shell startup and desktop autostart still require disposition before any
+ * boot. No cloud resource, production service, archive transfer or reboot is
+ * performed here. */
 import { createHash } from "node:crypto";
 import { type CommandRunner, defaultRunner } from "./oci.ts";
 import { assertAcceptedRescueBoot } from "./pi-recovery-rescue.ts";
