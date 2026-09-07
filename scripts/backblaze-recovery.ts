@@ -447,6 +447,47 @@ async function fetchChunk(
   return bytes;
 }
 
+/** Stream one exact-version archive on the remote recovery host without a
+ * scratch file. Each chunk is verified before delivery; archive completion is
+ * verified before delivering the final chunk. Backpressure permits at most one
+ * fetch at a time. Cancellation does not retry or request a subsequent chunk.
+ * Callers must also check decrypt/extract exit status before accepting a restore.
+ */
+export function streamRecoveryArchive(
+  indexInput: RecoveryIndex,
+  role: IndexArchiveRecord["role"],
+  store: Pick<B2Store, "get">,
+): ReadableStream<Uint8Array> {
+  const index = validateRecoveryIndex(indexInput);
+  const archive = index.archives.find((entry) => entry.role === role);
+  if (!archive) fail("stream:role");
+  let position = 0;
+  let total = 0;
+  let cancelled = false;
+  const hash = createHash("sha256");
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const bytes = await fetchChunk(store, archive.chunks[position]);
+      if (cancelled) return;
+      hash.update(bytes);
+      total += bytes.byteLength;
+      position++;
+      const complete = position === archive.chunks.length;
+      if (
+        complete &&
+        (total !== archive.bytes || hash.digest("hex") !== archive.sha256)
+      ) {
+        fail("stream:archive");
+      }
+      controller.enqueue(bytes);
+      if (complete) controller.close();
+    },
+    cancel() {
+      cancelled = true;
+    },
+  }, { highWaterMark: 0 });
+}
+
 /**
  * Write every byte with a visible progress loop: short writes continue, and
  * every returned count must be a safe integer strictly greater than zero and

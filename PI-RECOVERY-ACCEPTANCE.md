@@ -69,3 +69,31 @@ have not been performed.
 
 The prior schedule-approval finding is tracked in GitHub issue #12. It is not a
 reason to extend the completed backup review loop or to claim that defect fixed.
+
+## Streaming reconstruction candidate, 2026-09-07
+
+PR #13 merged the portable target correction at
+7eebac7 (source correction 3a56ca9). All 19 deployment-manifest hashes were
+verified on the Pi; the historical kit was not overwritten.
+
+The next candidate adds a lazy, exact-version ciphertext stream with chunk and
+archive hash checks, a streaming adapter for the existing Pi-backed GPG decryptor,
+and an extraction pipeline that requires the accepted plaintext hash, GPG
+integrity result and successful GNU tar exit. The machine restorer accepts that
+extractor without local archive paths. `backblaze-stream-restore.ts` binds the
+directly fetched recovery metadata to the accepted catalog and checks the target's OCI instance metadata before any archive request. It writes no private keys.
+
+A small synthetic archive was generated and extracted on the VPS in a unique
+/tmp directory; GNU tar success, plaintext mismatch rejection and decrypt failure
+rejection passed (one integration test, repeated with metadata-hash rejection, 54 ms). The directory was removed. No
+B2 request, real backup payload download, disk format or production restart was
+part of this test. The GPG callback's real agent tunnel and a complete machine
+restore were not exercised by this synthetic check.
+
+The proposed no-third-disk bootstrap is an AArch64 RAM-rescue system, followed by
+bounded B2/GPG/tar streams into the final 50/150 GB target. Its actual Oracle boot,
+networking, target preparation and Pi checkpoint persistence remain to be built
+and proved. A platform-image boot disk is not pristine: only exact-approved
+replacement-disk preparation after proving RAM execution can make it eligible
+for the existing pristine-target checks. Never weaken those checks merely to
+make an occupied boot disk pass. All earlier full live-drill constraints remain.
