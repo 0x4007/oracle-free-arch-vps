@@ -68,13 +68,22 @@ import {
 import type { PreparationApproval } from "./pi-recovery-disk-preparation.ts";
 import type { B2Settings } from "./backblaze-storage.ts";
 import { validateCatalogEntry } from "./backblaze-file-backup.ts";
+import {
+  type ConsoleConnectionApproval,
+  consoleConnectionPlan,
+  type ConsoleConnectionState,
+  stepConsoleConnection,
+} from "./pi-recovery-console-connection.ts";
 
 const CONFIG = ".private/pi-machine-recovery.json";
 const STATE = ".private/pi-recovery-session.json";
 const REPORT = ".private/reports/pi-recovery-session.json";
 type RebootApproval = Parameters<typeof approvedRescueBootScript>[1];
 interface SessionConfig extends ReplacementConfig {
+  /** Existing RSA public key; no private key or new credential is generated. */
+  consolePublicKey?: string;
   sessionApprovals?: {
+    consoleConnection?: ConsoleConnectionApproval;
     loaderConsole?: ConsoleCaptureApproval;
     ramConsole?: ConsoleCaptureApproval;
     rescueReboot?: RebootApproval;
@@ -95,6 +104,7 @@ export interface RecoverySession {
   rebootIntent?: { planSha256: string; intendedAtUtc: string };
   ramConsole?: ConsoleCaptureState;
   ramAccepted?: { bootId: string; acceptedAtUtc: string };
+  consoleConnection?: ConsoleConnectionState;
 }
 export interface SessionPorts {
   now: () => number;
@@ -546,13 +556,94 @@ export async function runRecoverySession(
             )).state;
           } catch (error) {
             if (error instanceof ConsoleConnectionRequiredError) {
+              const current = await readPrivateJson<SessionConfig>(CONFIG);
+              if (!current.consolePublicKey) {
+                await writePrivateJson(REPORT, {
+                  status: "CONSOLE_PUBLIC_KEY_REQUIRED",
+                  requestId: request.requestId,
+                  instanceId: request.instanceId,
+                  requiredKeyType: "existing RSA public key",
+                  setupAccepted: false,
+                });
+                throw error;
+              }
+              const publicKey = current.consolePublicKey;
+              const connectionPlan = consoleConnectionPlan(
+                request.requestId,
+                request.instanceId,
+                config.compartmentId,
+                publicKey,
+              );
+              state.consoleConnection ??= {
+                planSha256: connectionPlan.planSha256,
+              };
+              await persist(state);
+              const connectionStatus = await stepConsoleConnection(
+                connectionPlan,
+                publicKey,
+                state.consoleConnection,
+                {
+                  json,
+                  now: () => Date.now(),
+                  persist: async (value) => {
+                    state.consoleConnection = value;
+                    await persist(state);
+                  },
+                  approval: async () => (await approvals())?.consoleConnection,
+                  beforeMutation: async () => {
+                    await beforeMutation();
+                    const fresh = await readPrivateJson<SessionConfig>(CONFIG);
+                    if (
+                      consoleConnectionPlan(
+                        request.requestId,
+                        request.instanceId,
+                        config.compartmentId,
+                        fresh.consolePublicKey!,
+                      ).planSha256 !== connectionPlan.planSha256
+                    ) {
+                      throw Error("Console public-key authority changed");
+                    }
+                    const instance = dataObject(
+                      await json([
+                        "compute",
+                        "instance",
+                        "get",
+                        "--instance-id",
+                        request.instanceId,
+                      ]),
+                    );
+                    if (
+                      instance.id !== request.instanceId ||
+                      instance["lifecycle-state"] !== "RUNNING" ||
+                      instance["compartment-id"] !== config.compartmentId ||
+                      (instance["freeform-tags"] as
+                          | Record<string, unknown>
+                          | undefined)?.uosRecoveryRequest !==
+                        request.requestId ||
+                      request.instanceId === controller.source.instanceId
+                    ) {
+                      throw Error(
+                        "Console connection target is not the running replacement",
+                      );
+                    }
+                  },
+                },
+              );
               await writePrivateJson(REPORT, {
-                status: "CONSOLE_CONNECTION_REQUIRED",
-                requestId: plan.expected.requestId,
-                instanceId: plan.expected.instanceId,
-                captureIntentRecorded: captureState.attempts.length > 0,
-                setupAccepted: false,
+                status: connectionStatus,
+                plan: connectionPlan,
+                setupAccepted: connectionStatus === "CONSOLE_CONNECTION_ACTIVE",
+                restoreAccepted: false,
+                applicationAccepted: false,
               });
+              if (connectionStatus === "CONSOLE_CONNECTION_ACTIVE") {
+                return (await stepConsoleCapture(
+                  plan,
+                  approval!,
+                  captureState,
+                  ports,
+                )).state;
+              }
             }
             throw error;
           }
