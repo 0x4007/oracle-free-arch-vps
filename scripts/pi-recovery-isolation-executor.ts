@@ -36,6 +36,8 @@ export interface IsolationInspection {
   grubSha256: string;
   masks: string[];
   files: FileState[];
+  startup: FileState[];
+  startupIsolationVerified: false;
   inspectionSha256: string;
 }
 export interface IsolationExecutionApproval {
@@ -51,6 +53,8 @@ export function validateIsolationInspection(
   const { inspectionSha256, ...body } = inspection;
   if (
     inspection.planSha256 !== plan.planSha256 ||
+    inspection.startupIsolationVerified !== false ||
+    !Array.isArray(inspection.startup) || inspection.startup.length > 128 ||
     !/^[0-9a-f]{64}$/.test(inspectionSha256) ||
     hash(body) !== inspectionSha256 ||
     new TextEncoder().encode(JSON.stringify(inspection)).length > 48 * 1024
@@ -271,6 +275,74 @@ async function diskPartitions(
   return { rootDevice: found.root, stagingDevice: found.boot };
 }
 
+/** Retain hashes and link targets only, never copied startup file contents.
+ * This is a bounded inventory for disposition, not an execution-policy proof.
+ * Do not follow directory links into arbitrary copied or host filesystems. */
+async function inspectCopiedStartup(): Promise<FileState[]> {
+  const paths = new Set([
+    "etc/profile",
+    "etc/bash.bashrc",
+    "etc/bash.bash_logout",
+    "etc/ssh/sshrc",
+    "etc/pam.d/sshd",
+    "etc/pam.d/system-login",
+    "home/codex/.profile",
+    "home/codex/.bash_profile",
+    "home/codex/.bash_login",
+    "home/codex/.bashrc",
+    "home/codex/.bash_logout",
+    "home/codex/.zshenv",
+    "home/codex/.zprofile",
+    "home/codex/.zshrc",
+    "home/codex/.zlogin",
+    "home/codex/.ssh/rc",
+    "home/codex/.xinitrc",
+    "home/codex/.xsession",
+  ]);
+  let entries = 0;
+  const visit = async (relative: string, depth: number): Promise<void> => {
+    if (depth > 6) {
+      throw Error("Copied startup directory depth exceeds its bound");
+    }
+    const path = await below(ROOT, relative);
+    const info = await Deno.lstat(path).catch((error) => {
+      if (error instanceof Deno.errors.NotFound) return null;
+      throw error;
+    });
+    if (!info) {
+      paths.add(relative);
+      return;
+    }
+    if (!info.isDirectory || info.isSymlink) {
+      paths.add(relative);
+      return;
+    }
+    for await (const entry of Deno.readDir(path)) {
+      if (++entries > 128) {
+        throw Error("Copied startup inventory exceeds its bound");
+      }
+      await visit(relative + "/" + entry.name, depth + 1);
+    }
+  };
+  for (
+    const directory of [
+      "etc/profile.d",
+      "etc/zsh",
+      "etc/systemd/system",
+      "etc/systemd/user",
+      "home/codex/.config/systemd/user",
+      "etc/xdg/autostart",
+      "home/codex/.config/autostart",
+    ]
+  ) await visit(directory, 0);
+  if (paths.size > 128) {
+    throw Error("Copied startup inventory exceeds its bound");
+  }
+  const result: FileState[] = [];
+  for (const path of [...paths].sort()) result.push(await snapshotFile(path));
+  return result;
+}
+
 /** The caller first mounts only the bound copies read-only at ROOT and STAGE.
  * This inspection neither remounts them nor accepts uninspected write targets. */
 export async function inspectCopiedRootIsolation(
@@ -328,7 +400,19 @@ export async function inspectCopiedRootIsolation(
     !grub.includes("root=UUID=" + plan.rootUuid) ||
     !grub.includes("Oracle Linux (fallback)")
   ) throw Error("Copied boot chain needs separate repair before isolation");
-  const osPath = await regular(ROOT, "etc/os-release");
+  const releasePath = await below(ROOT, "etc/os-release");
+  const releaseInfo = await Deno.lstat(releasePath);
+  let releaseRelative = "etc/os-release";
+  if (releaseInfo.isSymlink) {
+    const target = await Deno.readLink(releasePath);
+    if (!["../usr/lib/os-release", "/usr/lib/os-release"].includes(target)) {
+      throw Error(
+        "Copied os-release link is not the standard local release file",
+      );
+    }
+    releaseRelative = "usr/lib/os-release";
+  }
+  const osPath = await regular(ROOT, releaseRelative);
   if (
     (await Deno.stat(osPath)).size > 65536 ||
     !/^ID=(?:arch|"arch")$/m.test(await Deno.readTextFile(osPath))
@@ -382,6 +466,8 @@ export async function inspectCopiedRootIsolation(
     grubSha256: await fileHash(grubPath),
     masks: [...masks].sort(),
     files,
+    startup: await inspectCopiedStartup(),
+    startupIsolationVerified: false as const,
   };
   const result = { ...body, inspectionSha256: hash(body) };
   if (new TextEncoder().encode(JSON.stringify(result)).length > 48 * 1024) {
