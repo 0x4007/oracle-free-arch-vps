@@ -34,6 +34,7 @@ import {
   type ConsoleCapturePlan,
   consoleCapturePlan,
   type ConsoleCaptureState,
+  ConsoleConnectionRequiredError,
   recoveryConsolePorts,
   stepConsoleCapture,
 } from "./pi-recovery-console.ts";
@@ -518,12 +519,25 @@ export async function runRecoverySession(
             runner,
           );
           // Existing captures can be read after approval expiry; CREATE rechecks.
-          return (await stepConsoleCapture(
-            plan,
-            approval!,
-            captureState,
-            ports,
-          )).state;
+          try {
+            return (await stepConsoleCapture(
+              plan,
+              approval!,
+              captureState,
+              ports,
+            )).state;
+          } catch (error) {
+            if (error instanceof ConsoleConnectionRequiredError) {
+              await writePrivateJson(REPORT, {
+                status: "CONSOLE_CONNECTION_REQUIRED",
+                requestId: plan.expected.requestId,
+                instanceId: plan.expected.instanceId,
+                captureIntentRecorded: captureState.attempts.length > 0,
+                setupAccepted: false,
+              });
+            }
+            throw error;
+          }
         },
       },
     );

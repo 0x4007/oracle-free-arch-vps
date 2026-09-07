@@ -89,6 +89,39 @@ export function consoleCapturePlan(
   };
   return { ...body, planSha256: hash(body) };
 }
+export class ConsoleConnectionRequiredError extends Error {
+  constructor() {
+    super(
+      "An active instance console connection is required before history capture",
+    );
+  }
+}
+async function requireConsoleConnection(
+  plan: ConsoleCapturePlan,
+  ports: ConsoleCapturePorts,
+) {
+  const connections = dataArray(
+    await ports.json([
+      "compute",
+      "instance-console-connection",
+      "list",
+      "--compartment-id",
+      plan.compartmentId,
+      "--instance-id",
+      plan.expected.instanceId,
+      "--all",
+    ]),
+  );
+  if (
+    !connections.some((connection) =>
+      connection["instance-id"] === plan.expected.instanceId &&
+      connection["lifecycle-state"] === "ACTIVE" &&
+      typeof connection.id === "string" &&
+      /^ocid1\.instanceconsoleconnection\.[a-zA-Z0-9.]+$/.test(connection.id)
+    )
+  ) throw new ConsoleConnectionRequiredError();
+}
+
 function assertApproval(
   plan: ConsoleCapturePlan,
   approval: ConsoleCaptureApproval,
@@ -195,6 +228,7 @@ export async function stepConsoleCapture(
     }
     assertApproval(plan, approval, ports.now());
     await ports.beforeMutation();
+    await requireConsoleConnection(plan, ports);
     // Check for a pre-existing tagged capture before creating a new intent.
     const next = state.attempts.length + 1;
     const existing = dataArray(
@@ -226,6 +260,7 @@ export async function stepConsoleCapture(
     if (newlyIntended) {
       await ports.beforeMutation();
       assertApproval(plan, approval, ports.now());
+      await requireConsoleConnection(plan, ports);
       const created = dataObject(
         await ports.json([
           "compute",

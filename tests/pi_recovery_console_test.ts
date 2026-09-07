@@ -43,6 +43,7 @@ function fixture() {
   const f = {
     now: time + 1000,
     creates: 0,
+    connection: true,
     saves: 0,
     before: 0,
     lost: false,
@@ -67,7 +68,16 @@ function fixture() {
     text: () => Promise.resolve(f.noMarker ? "booting" : marker),
     json: (args) => {
       let data: unknown;
-      if (args[2] === "list") data = f.records;
+      if (args[1] === "instance-console-connection") {
+        assert(args[2] === "list" && args.includes(plan.expected.instanceId));
+        data = f.connection
+          ? [{
+            id: "ocid1.instanceconsoleconnection.example",
+            "instance-id": plan.expected.instanceId,
+            "lifecycle-state": "ACTIVE",
+          }]
+          : [];
+      } else if (args[2] === "list") data = f.records;
       else if (args[2] === "capture") {
         assert(
           f.saved.attempts.at(-1)?.historyId === undefined &&
@@ -225,4 +235,19 @@ Deno.test("console plans reject invalid boot transitions before capture", () => 
     }
     assert(refused);
   }
+});
+
+Deno.test("missing console connection refuses before capture intent or CREATE", async () => {
+  const { f, ports, state } = fixture();
+  f.connection = false;
+  await rejects(
+    stepConsoleCapture(plan, approval, state(), ports),
+    "active instance console connection",
+  );
+  assert(f.creates === 0 && f.saves === 0 && f.saved.attempts.length === 0);
+  f.connection = true;
+  assert(
+    (await stepConsoleCapture(plan, approval, state(), ports)).status ===
+      "RECOVERY_HOST_KEY_VERIFIED",
+  );
 });
