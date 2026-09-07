@@ -316,3 +316,88 @@ Private receipts: `pi-disk-focused-tests.txt`, `pi-disk-default-tests.txt`,
 `.private`. Alpine's published v3.24 AArch64 `util-linux-misc` file listing
 includes `/sbin/blockdev`, which the preparation stage needs; the existing RAM
 bootstrap already requests that package.
+
+## Pi session integration candidate, 2026-09-07
+
+Source candidate `52f4170` adds `deno task backup:replace`, a Pi entry point that
+runs replacement provisioning and then joins console capture, pinned non-root
+SSH, loader disk identity, staged rescue receipt, durable reboot intent and
+new RAM boot acceptance under the existing controller lock. The ordinary
+`backup:recover` service retains its source-recovery purpose. Provisioning and
+each console/reboot mutation require their own exact approvals; no approval is
+created by the controller. The existing private replacement configuration holds
+optional `sessionApprovals.loaderConsole`, `ramConsole` and `rescueReboot`.
+Their plans are written to `.private/reports/pi-recovery-session.json` for review.
+
+The parent persists `.private/pi-recovery-session.json` before sending a reboot.
+After an uncertain SSH response it observes the next boot instead of repeating
+the reboot. The boot is accepted only when console and SSH boot IDs agree,
+the loader boot differs, RAM checks pass, and the rescue manifest matches the
+approved bootstrap. This is software identity evidence, not hardware attestation.
+The manifest binds the request, public SSH key, overlay contents and pinned
+Alpine release. A changed bootstrap is refused before provisioning and again
+under the provisioner's lock before cloud mutation.
+
+Oracle console history establishes each boot's public Ed25519 key. Dedicated
+private known-host files leave the controller's global SSH configuration alone.
+Captures have durable intent, exact resource tags, a three-capture limit and
+lost-response reconciliation. The OCI/SSH control runner bounds stdout and
+stderr to 1 MiB each. Checkpoint shutdown no longer waits for a permanently
+stalled writer; the stream executable disposes its own pipe descriptors.
+
+Current acceptance stops at `RAM_RESCUE_ACCEPTED`, with restoration and
+application acceptance explicitly false. Disk preparation, runtime and scoped
+credential installation, the Pi GPG extra-socket tunnel, direct archive restore,
+clone isolation and restored boot/application acceptance still need to be joined
+to this parent. This candidate does not close issues #17 or #18 by itself and
+is not end-to-end recovery proof. No live cloud, disk, package, reboot, service,
+backup-payload or production mutation was performed for these checks.
+
+The local candidate passed 62 focused tests, 333 default tests (148 skipped),
+type checking, formatting, lint and whitespace checks. Focused tests use fake
+provider/SSH ports; actual local subprocess checks verify bounded output and
+shell parsing. Review, corrected Pi test evidence and deployment evidence follow
+below when available. The 200 GB free-storage coexistence blocker and unproved
+post-trial eligibility mapping remain unresolved.
+
+Review round one found a P1 overlay-permission defect and a P2 resume-approval
+defect. Correction `af92bf3` makes the task-owned public overlay directories
+traversable while preserving file modes and private assembly/scratch paths.
+A real shell/stat regression checks this under umask 077. Completed reserved-IP
+assignment now reconciles read-only after provisioning approval expires; an
+unassigned address still requires fresh authority before UPDATE. The provider
+fixture verifies both cases and no duplicate creation or assignment.
+
+The corrected source passed 75 focused local tests, 333 default tests (149
+permission-gated tests skipped), and type/format/lint checks. All 58 selected
+provisioning/session/bootstrap/transport tests passed on Pi under `safepi` at
+2026-09-07T03:40:27.571Z, in an owned temporary directory that was removed afterward.
+Those Pi checks used fake provider/SSH ports plus real local shell, filesystem
+and bounded subprocess operations; they did not invoke a live recovery.
+Private evidence is in `reports/pi-session-tests.json`,
+`pi-session-focused-tests.txt`, `pi-session-default-tests.txt` and
+`pi-session-review-round1.txt` under `.private`.
+
+Review round two found Oracle's documented console-connection prerequisite:
+https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/displayingconsole-capturing.htm .
+Correction `b0df24c` requires an ACTIVE instance console connection for the exact
+replacement before saving capture intent, and checks again before CREATE. An
+absent prerequisite writes `CONSOLE_CONNECTION_REQUIRED` to the private session
+report. The Pi does not yet create that connection automatically. This remaining
+P1 setup integration is retained in the existing host-trust issue
+https://github.com/0x4007/oracle-free-arch-vps/issues/18 with provider evidence,
+affected revision and acceptance criteria. It is a live-recovery blocker, not
+an excuse to record a failed or unattempted capture as successful.
+
+The final correction passed 76 focused local tests, 334 default tests (149
+permission-gated tests skipped), and type/format/lint checks. The third local
+review is the last permitted round for this candidate; any remaining
+substantiated findings are backlogged before GitHub delivery.
+
+Review round three against `f1ddfcc206c069970b188969c4bb65de68ac2d78` exited zero
+with no further actionable defects on source `b0df24c`. No fourth review was run.
+The corrected 59-test Pi selection passed at 2026-09-07T03:46:14.462Z under
+`safepi`; its exact source bundle digest is retained in the private receipt.
+Issue #16's pending-write regression passes locally and on Pi. Issues #17 and
+#18 remain open for their full integrated/live acceptance; #18 also retains the
+P1 console-connection setup gap. Review receipt: `pi-session-review-round3.txt`.
