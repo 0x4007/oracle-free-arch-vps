@@ -16,6 +16,11 @@ import {
   CheckpointChannel,
   remoteCheckpoint,
 } from "./pi-recovery-checkpoint.ts";
+import {
+  type RecoveryIsolationInput,
+  recoveryIsolationPlan,
+} from "./pi-recovery-isolation.ts";
+import { executeCopiedRootIsolation } from "./pi-recovery-isolation-executor.ts";
 
 export type StreamDecrypt = (
   ciphertext: ReadableStream<Uint8Array>,
@@ -31,6 +36,7 @@ export async function extractStreamedArchive(
   mountPath: string,
   store: Pick<B2Store, "get">,
   decrypt: StreamDecrypt,
+  progress?: (bytes: number) => Promise<void>,
 ): Promise<void> {
   const index = validateRecoveryIndex(indexInput);
   const selected = index.archives.find((entry) => entry.role === archive.role);
@@ -43,6 +49,9 @@ export async function extractStreamedArchive(
     throw new Error("Stream restore archive binding failed");
   }
   const args = [...restoreTarArgs("-", mountPath)];
+  await progress?.(0);
+  let lastProgressAt = Date.now();
+  let reportedBytes = 0;
   const child = new Deno.Command("tar", {
     args,
     stdin: "piped",
@@ -68,6 +77,11 @@ export async function extractStreamedArchive(
             }
             hash.update(bytes);
             await writer.write(bytes);
+            if (progress && Date.now() - lastProgressAt >= 30_000) {
+              await progress(total);
+              reportedBytes = total;
+              lastProgressAt = Date.now();
+            }
             return bytes.byteLength;
           },
         },
@@ -100,6 +114,7 @@ export async function extractStreamedArchive(
   ) {
     throw new Error("Stream archive pipeline did not complete successfully");
   }
+  if (total > reportedBytes) await progress?.(total);
 }
 
 /** Only the small recovery metadata is buffered; filesystem archives never are. */
@@ -191,6 +206,7 @@ export async function restoreCatalogOnTarget(
     rescueManifestSha256: string;
     target: import("./backblaze-machine-restore.ts").MachineRestoreTarget;
     publicHome: string;
+    isolation?: RecoveryIsolationInput;
   },
   store: Pick<B2Store, "get">,
   channel: CheckpointChannel,
@@ -230,7 +246,7 @@ export async function restoreCatalogOnTarget(
     loaderBootId: input.loaderBootId,
     manifestSha256: input.rescueManifestSha256,
   });
-  const checkpoint = remoteCheckpoint(channel, {
+  const binding = {
     requestId: input.requestId,
     instanceId: input.target.targetId,
     bootId: runtime.bootId,
@@ -240,7 +256,8 @@ export async function restoreCatalogOnTarget(
     rootDiskPath: input.target.rootDiskPath,
     bootDiskSerial: input.target.bootDiskSerial,
     rootDiskSerial: input.target.rootDiskSerial,
-  });
+  };
+  const checkpoint = remoteCheckpoint(channel, binding);
   const decrypt = makeStreamDecryptArchive(input.publicHome);
   const metadata = await readStreamedMetadata(catalog, store, decrypt);
   const archives = catalog.receipt.archives.filter((a) => a.role !== "recovery")
@@ -252,26 +269,71 @@ export async function restoreCatalogOnTarget(
       ciphertextSha256: a.ciphertextSha256,
       verifierChecked: true as const,
     }));
-  return await restoreMachine(
-    {
-      index: catalog.index,
-      indexSha256: machineRestoreIndexSha256(catalog.index),
-      metadata,
-      archives,
-      target: input.target,
-    },
+  const machineInput = {
+    index: catalog.index,
+    indexSha256: machineRestoreIndexSha256(catalog.index),
+    metadata,
+    archives,
+    target: input.target,
+  };
+  const result = await restoreMachine(
+    machineInput,
     undefined,
     (archive, mount) =>
-      extractStreamedArchive(catalog.index, archive, mount, store, decrypt),
+      extractStreamedArchive(
+        catalog.index,
+        archive,
+        mount,
+        store,
+        decrypt,
+        (bytes) =>
+          channel.send({
+            kind: "recovery-archive-progress",
+            binding,
+            role: archive.role,
+            bytes,
+            expectedBytes: archive.bytes,
+          }),
+      ),
     checkpoint,
   );
+  if (input.isolation) {
+    const expected = input.isolation.preparation;
+    if (
+      expected.bootId !== runtime.bootId ||
+      expected.requestId !== input.requestId ||
+      expected.loaderBootId !== input.loaderBootId ||
+      expected.rescueManifestSha256 !== input.rescueManifestSha256
+    ) throw Error("Isolation plan differs from the current RAM boot");
+    const plan = recoveryIsolationPlan(machineInput, input.isolation);
+    await channel.send({
+      kind: "recovery-isolation-plan",
+      plan,
+    });
+    // Inspection only. No approval is supplied, so the executor cannot enter
+    // its copied-filesystem write path. It returns only after releasing mounts.
+    const inspected = await executeCopiedRootIsolation(
+      plan,
+      () => Promise.resolve(undefined),
+      () => Promise.reject(Error("Isolation writes are not connected")),
+    );
+    await channel.send({
+      kind: "recovery-isolation-inspection",
+      inspection: inspected.inspection,
+      mountsReleased: true,
+      isolationApplied: false,
+    });
+  }
+  return result;
 }
 
 if (import.meta.main) {
   const channel = new CheckpointChannel(
     Deno.stdin.readable,
     Deno.stdout.writable,
-    30_000,
+    // The Pi rechecks OCI ownership before acknowledging a durable stage.
+    // Bound that control-plane round trip separately from archive progress.
+    10 * 60 * 1000,
     () => {
       for (const file of [Deno.stdin, Deno.stdout]) {
         try {

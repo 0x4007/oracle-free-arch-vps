@@ -39,6 +39,7 @@ import {
   stepConsoleCapture,
 } from "./pi-recovery-console.ts";
 import {
+  assertRetainedProviderBinding,
   captureLoaderDiskIdentity,
   type LoaderDiskIdentity,
   type LoaderIdentityRequest,
@@ -57,16 +58,45 @@ import {
   type RecoverySshTarget,
   retainRecoveryHost,
 } from "./pi-recovery-ssh.ts";
+import {
+  buildRecoveryTargetBundle,
+  continueReplacementRestoration,
+  type RecoveryRestorationState,
+  type RecoveryTargetControlInput,
+  type RecoveryTargetInstallApproval,
+} from "./pi-recovery-restore.ts";
+import type { IsolationExecutionApproval } from "./pi-recovery-isolation-executor.ts";
+import {
+  checkRestoredApplications,
+  type RestoredBootApproval,
+} from "./pi-recovery-acceptance.ts";
+import type { PreparationApproval } from "./pi-recovery-disk-preparation.ts";
+import type { B2Settings } from "./backblaze-storage.ts";
+import { validateCatalogEntry } from "./backblaze-file-backup.ts";
+import {
+  type ConsoleConnectionApproval,
+  consoleConnectionPlan,
+  type ConsoleConnectionState,
+  stepConsoleConnection,
+} from "./pi-recovery-console-connection.ts";
 
 const CONFIG = ".private/pi-machine-recovery.json";
 const STATE = ".private/pi-recovery-session.json";
 const REPORT = ".private/reports/pi-recovery-session.json";
 type RebootApproval = Parameters<typeof approvedRescueBootScript>[1];
 interface SessionConfig extends ReplacementConfig {
+  /** Existing RSA public key; no private key or new credential is generated. */
+  consolePublicKey?: string;
   sessionApprovals?: {
+    consoleConnection?: ConsoleConnectionApproval;
     loaderConsole?: ConsoleCaptureApproval;
     ramConsole?: ConsoleCaptureApproval;
     rescueReboot?: RebootApproval;
+    restoreInstallation?: RecoveryTargetInstallApproval;
+    diskPreparation?: PreparationApproval;
+    isolation?: IsolationExecutionApproval;
+    restoredBoot?: RestoredBootApproval;
+    restoredConsole?: ConsoleCaptureApproval;
   };
 }
 export interface RecoverySession {
@@ -82,6 +112,8 @@ export interface RecoverySession {
   rebootIntent?: { planSha256: string; intendedAtUtc: string };
   ramConsole?: ConsoleCaptureState;
   ramAccepted?: { bootId: string; acceptedAtUtc: string };
+  consoleConnection?: ConsoleConnectionState;
+  restoredConsole?: ConsoleCaptureState;
 }
 export interface SessionPorts {
   now: () => number;
@@ -439,7 +471,231 @@ export async function runRecoverySession(
       ) throw Error("Recovery approval configuration changed");
       return current.sessionApprovals;
     };
-    const status = await stepRecoverySession(
+    const targetForHost = async (
+      host: import("./pi-recovery-ssh.ts").VerifiedRecoveryHost,
+    ) => {
+      const address = dataObject(
+        await json([
+          "network",
+          "public-ip",
+          "get",
+          "--public-ip-id",
+          config.reservedPublicIpId,
+        ]),
+      );
+      if (
+        address["private-ip-id"] !== replacement.privateIpId ||
+        address["lifecycle-state"] !== "ASSIGNED" ||
+        typeof address["ip-address"] !== "string"
+      ) throw Error("Replacement public address changed");
+      const privateIp = dataObject(
+        await json([
+          "network",
+          "private-ip",
+          "get",
+          "--private-ip-id",
+          replacement.privateIpId!,
+        ]),
+      );
+      const attachments = dataArray(
+        await json([
+          "compute",
+          "vnic-attachment",
+          "list",
+          "--compartment-id",
+          config.compartmentId,
+          "--instance-id",
+          request.instanceId,
+          "--all",
+        ]),
+      );
+      if (
+        !attachments.some((a) =>
+          a["lifecycle-state"] === "ATTACHED" &&
+          a["instance-id"] === request.instanceId &&
+          a["vnic-id"] === privateIp["vnic-id"]
+        )
+      ) throw Error("Public address is not attached to the replacement");
+      return await retainRecoveryHost(host, address["ip-address"]);
+    };
+    const acceptRestored = async (
+      restoration: RecoveryRestorationState,
+    ): Promise<boolean> => {
+      if (
+        restoration.schemaVersion !== 1 ||
+        restoration.binding.requestId !== request.requestId ||
+        restoration.binding.instanceId !== request.instanceId ||
+        restoration.binding.generation !== config.generation ||
+        !state.ramAccepted ||
+        restoration.binding.bootId !== state.ramAccepted.bootId ||
+        !restoration.isolationPlan ||
+        !/^[0-9a-f]{64}$/.test(
+          restoration.isolationPlan.restoredManifestSha256,
+        ) ||
+        !restoration.restoredBootPlan ||
+        restoration.restoredBootPlan.binding.requestId !==
+          restoration.binding.requestId ||
+        restoration.restoredBootPlan.binding.instanceId !==
+          restoration.binding.instanceId ||
+        restoration.restoredBootPlan.binding.bootId !==
+          restoration.binding.bootId ||
+        restoration.restoredBootPlan.binding.generation !==
+          restoration.binding.generation
+      ) throw Error("Restored recovery journal binding differs");
+      const { planSha256: restoredPlanSha256, ...restoredPlanBody } =
+        restoration.restoredBootPlan;
+      if (hash(restoredPlanBody) !== restoredPlanSha256) {
+        throw Error("Restored boot plan digest differs");
+      }
+      if (
+        !restoration.restoredBootIntent ||
+        restoration.restoredBootIntent.planSha256 !== restoredPlanSha256 ||
+        restoration.restoredBootPlan.isolationPlanSha256 !==
+          restoration.isolationPlan.planSha256
+      ) throw Error("Restored recovery journal intent differs");
+      if (restoration.applicationAcceptance) {
+        const cached = restoration.applicationAcceptance;
+        if (
+          cached.status !== "RESTORED_APPLICATIONS_ACCEPTED" ||
+          cached.host.requestId !== request.requestId ||
+          cached.host.instanceId !== request.instanceId ||
+          cached.host.phase !== "restored" ||
+          cached.manifestSha256 !==
+            restoration.isolationPlan.restoredManifestSha256 ||
+          cached.host.manifestSha256 !== cached.manifestSha256
+        ) throw Error("Cached restored acceptance binding differs");
+      }
+      if (restoration.applicationAcceptance) {
+        await writePrivateJson(REPORT, {
+          status: "RESTORED_APPLICATIONS_ACCEPTED",
+          isolationApplied: true,
+          bootAccepted: true,
+          applicationAccepted: true,
+          acceptance: restoration.applicationAcceptance,
+        });
+        return true;
+      }
+      if (
+        !restoration.restoredBootIntent || !restoration.restoredBootPlan ||
+        restoration.restoredBootIntent.planSha256 !==
+          restoration.restoredBootPlan.planSha256
+      ) throw Error("Restored boot intent is not bound to its plan");
+      const plan = consoleCapturePlan({
+        requestId: request.requestId,
+        instanceId: request.instanceId,
+        phase: "restored",
+        notBeforeUtc: restoration.restoredBootIntent.intendedAtUtc,
+        previousBootId: restoration.restoredBootPlan.binding.bootId,
+        manifestSha256: restoration.isolationPlan.restoredManifestSha256,
+      }, config.compartmentId);
+      const approval = (await approvals())?.restoredConsole;
+      if (!approval) {
+        await writePrivateJson(REPORT, {
+          status: "RESTORED_CONSOLE_APPROVAL_REQUIRED",
+          plan,
+          isolationApplied: true,
+          bootAccepted: false,
+          applicationAccepted: false,
+        });
+        return false;
+      }
+      let captureState = state.restoredConsole;
+      if (!captureState) {
+        captureState = { planSha256: plan.planSha256, attempts: [] };
+        state.restoredConsole = captureState;
+        await persist(state);
+      }
+      if (captureState.planSha256 !== plan.planSha256) {
+        throw Error("Restored console journal differs from the boot intent");
+      }
+      const capturePorts = recoveryConsolePorts(
+        controller,
+        plan,
+        async (value) => {
+          state.restoredConsole = value;
+          await persist(state);
+        },
+        async () => {
+          const current = (await approvals())?.restoredConsole;
+          if (!current) {
+            throw Error("Exact restored console approval is absent");
+          }
+          return current;
+        },
+        runner,
+      );
+      let captured;
+      try {
+        captured = await stepConsoleCapture(
+          plan,
+          approval,
+          captureState,
+          capturePorts,
+        );
+      } catch (error) {
+        if (error instanceof ConsoleConnectionRequiredError) {
+          await writePrivateJson(REPORT, {
+            status: "CONSOLE_CONNECTION_REQUIRED",
+            phase: "restored",
+            plan,
+            setupAccepted: false,
+            bootAccepted: false,
+            applicationAccepted: false,
+          });
+          return false;
+        }
+        throw error;
+      }
+      state.restoredConsole = captured.state;
+      await persist(state);
+      if (!captured.host) {
+        await writePrivateJson(REPORT, {
+          status: captured.status,
+          phase: "restored",
+          bootAccepted: false,
+          applicationAccepted: false,
+        });
+        return false;
+      }
+      const restoredTarget = await targetForHost(captured.host);
+      const acceptance = await checkRestoredApplications(
+        restoredTarget,
+        restoration.isolationPlan.restoredManifestSha256,
+      );
+      restoration.restoredHost = captured.host;
+      restoration.applicationAcceptance = acceptance;
+      await writePrivateJson(
+        ".private/pi-recovery-restoration.json",
+        restoration,
+      );
+      await writePrivateJson(REPORT, {
+        status: "RESTORED_APPLICATIONS_ACCEPTED",
+        isolationApplied: true,
+        bootAccepted: true,
+        applicationAccepted: true,
+        acceptance,
+      });
+      console.log(JSON.stringify({
+        status: "RESTORED_APPLICATIONS_ACCEPTED",
+        restoreAccepted: true,
+        applicationAccepted: true,
+      }));
+      return true;
+    };
+    let restoration: RecoveryRestorationState | undefined;
+    try {
+      restoration = await readPrivateJson<RecoveryRestorationState>(
+        ".private/pi-recovery-restoration.json",
+      );
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    }
+    if (restoration?.restoredBootIntent) {
+      await acceptRestored(restoration);
+      return;
+    }
+    let acceptedTarget: RecoverySshTarget | undefined;
+    let status = await stepRecoverySession(
       state,
       request,
       config.compartmentId,
@@ -452,49 +708,8 @@ export async function runRecoverySession(
         rebootApproval: async () => (await approvals())?.rescueReboot,
         ssh: recoverySshRunner,
         target: async (capture) => {
-          const address = dataObject(
-            await json([
-              "network",
-              "public-ip",
-              "get",
-              "--public-ip-id",
-              config.reservedPublicIpId,
-            ]),
-          );
-          if (
-            address["private-ip-id"] !== replacement.privateIpId ||
-            address["lifecycle-state"] !== "ASSIGNED" ||
-            typeof address["ip-address"] !== "string"
-          ) throw Error("Replacement public address changed");
-          const privateIp = dataObject(
-            await json([
-              "network",
-              "private-ip",
-              "get",
-              "--private-ip-id",
-              replacement.privateIpId!,
-            ]),
-          );
-          const attachments = dataArray(
-            await json([
-              "compute",
-              "vnic-attachment",
-              "list",
-              "--compartment-id",
-              config.compartmentId,
-              "--instance-id",
-              request.instanceId,
-              "--all",
-            ]),
-          );
-          if (
-            !attachments.some((a) =>
-              a["lifecycle-state"] === "ATTACHED" &&
-              a["instance-id"] === request.instanceId &&
-              a["vnic-id"] === privateIp["vnic-id"]
-            )
-          ) throw Error("Public address is not attached to the replacement");
-          return retainRecoveryHost(capture.host!, address["ip-address"]);
+          acceptedTarget = await targetForHost(capture.host!);
+          return acceptedTarget;
         },
         capture: async (plan, captureState, phase) => {
           const key = phase === "loader" ? "loaderConsole" : "ramConsole";
@@ -528,19 +743,207 @@ export async function runRecoverySession(
             )).state;
           } catch (error) {
             if (error instanceof ConsoleConnectionRequiredError) {
+              const current = await readPrivateJson<SessionConfig>(CONFIG);
+              if (!current.consolePublicKey) {
+                await writePrivateJson(REPORT, {
+                  status: "CONSOLE_PUBLIC_KEY_REQUIRED",
+                  requestId: request.requestId,
+                  instanceId: request.instanceId,
+                  requiredKeyType: "existing RSA public key",
+                  setupAccepted: false,
+                });
+                throw error;
+              }
+              const publicKey = current.consolePublicKey;
+              const connectionPlan = consoleConnectionPlan(
+                request.requestId,
+                request.instanceId,
+                config.compartmentId,
+                publicKey,
+              );
+              state.consoleConnection ??= {
+                planSha256: connectionPlan.planSha256,
+              };
+              await persist(state);
+              const connectionStatus = await stepConsoleConnection(
+                connectionPlan,
+                publicKey,
+                state.consoleConnection,
+                {
+                  json,
+                  now: () => Date.now(),
+                  persist: async (value) => {
+                    state.consoleConnection = value;
+                    await persist(state);
+                  },
+                  approval: async () => (await approvals())?.consoleConnection,
+                  beforeMutation: async () => {
+                    await beforeMutation();
+                    const fresh = await readPrivateJson<SessionConfig>(CONFIG);
+                    if (
+                      consoleConnectionPlan(
+                        request.requestId,
+                        request.instanceId,
+                        config.compartmentId,
+                        fresh.consolePublicKey!,
+                      ).planSha256 !== connectionPlan.planSha256
+                    ) {
+                      throw Error("Console public-key authority changed");
+                    }
+                    const instance = dataObject(
+                      await json([
+                        "compute",
+                        "instance",
+                        "get",
+                        "--instance-id",
+                        request.instanceId,
+                      ]),
+                    );
+                    if (
+                      instance.id !== request.instanceId ||
+                      instance["lifecycle-state"] !== "RUNNING" ||
+                      instance["compartment-id"] !== config.compartmentId ||
+                      (instance["freeform-tags"] as
+                          | Record<string, unknown>
+                          | undefined)?.uosRecoveryRequest !==
+                        request.requestId ||
+                      request.instanceId === controller.source.instanceId
+                    ) {
+                      throw Error(
+                        "Console connection target is not the running replacement",
+                      );
+                    }
+                  },
+                },
+              );
               await writePrivateJson(REPORT, {
-                status: "CONSOLE_CONNECTION_REQUIRED",
-                requestId: plan.expected.requestId,
-                instanceId: plan.expected.instanceId,
-                captureIntentRecorded: captureState.attempts.length > 0,
-                setupAccepted: false,
+                status: connectionStatus,
+                plan: connectionPlan,
+                setupAccepted: connectionStatus === "CONSOLE_CONNECTION_ACTIVE",
+                restoreAccepted: false,
+                applicationAccepted: false,
               });
+              if (connectionStatus === "CONSOLE_CONNECTION_ACTIVE") {
+                return (await stepConsoleCapture(
+                  plan,
+                  approval!,
+                  captureState,
+                  ports,
+                )).state;
+              }
             }
             throw error;
           }
         },
       },
     );
+    if (status === "RAM_RESCUE_ACCEPTED") {
+      if (!acceptedTarget || !state.loaderIdentity || !state.ramAccepted) {
+        throw Error("Accepted RAM target is unavailable for restoration");
+      }
+      const inputPath = ".private/backblaze-machine-restore.json";
+      let input: RecoveryTargetControlInput | undefined;
+      try {
+        input = await readPrivateJson<RecoveryTargetControlInput>(inputPath);
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      }
+      if (!input) {
+        status = "RESTORE_CONFIGURATION_REQUIRED";
+        await writePrivateJson(REPORT, {
+          status,
+          restoreAccepted: false,
+          applicationAccepted: false,
+        });
+      } else {
+        if (
+          validateCatalogEntry(input.catalog).index.generation !==
+            config.generation
+        ) {
+          throw Error(
+            "Restoration generation differs from the replacement plan",
+          );
+        }
+        const inputDigest = hash(input);
+        const preparation = preparationBindingFromLoader(
+          state.loaderIdentity,
+          state.ramAccepted.bootId,
+          state.manifestSha256,
+        );
+        const connection = await recoverySshRunner(acceptedTarget)("bash", [
+          "-ec",
+          "printf '%s\\n' \"$SSH_CONNECTION\"",
+        ]);
+        const connectionFields = connection.stdout.trim().split(/\s+/);
+        if (connection.code !== 0 || connectionFields.length !== 4) {
+          throw Error(
+            "Pi SSH peer address is unavailable for copied-root isolation",
+          );
+        }
+        const release = await readPrivateJson<{ sourceRevision: string }>(
+          ".private/reports/pi-session-deployment.json",
+        );
+        const bundle = await buildRecoveryTargetBundle({
+          sourceRoot: Deno.cwd(),
+          sourceRevision: release.sourceRevision,
+          input: {
+            ...input,
+            isolation: {
+              preparation,
+              controllerIpv4: connectionFields[0],
+              sshPublicKey: publicInput.sshPublicKey,
+            },
+          },
+          b2: await readPrivateJson<B2Settings>(".private/b2-file-backup.json"),
+          recipientBytes: await Deno.readFile(
+            ".private/file-backup/recipient.asc",
+          ),
+        });
+        const restorationPath = ".private/pi-recovery-restoration.json";
+        let retained: RecoveryRestorationState | undefined;
+        try {
+          retained = await readPrivateJson<RecoveryRestorationState>(
+            restorationPath,
+          );
+        } catch (error) {
+          if (!(error instanceof Deno.errors.NotFound)) throw error;
+        }
+        status = await continueReplacementRestoration(
+          acceptedTarget,
+          preparation,
+          bundle,
+          retained,
+          {
+            beforeMutation: async () => {
+              await beforeMutation();
+              if (hash(await readPrivateJson(inputPath)) !== inputDigest) {
+                throw Error("Restoration input or approval changed");
+              }
+              assertRetainedProviderBinding(
+                state.loaderIdentity!,
+                await provider(),
+              );
+            },
+            persist: (value) => writePrivateJson(restorationPath, value),
+            report: (value) => writePrivateJson(REPORT, value),
+            installationApproval: async () =>
+              (await approvals())?.restoreInstallation,
+            preparationApproval: async () =>
+              (await approvals())?.diskPreparation,
+            isolationApproval: async () => (await approvals())?.isolation,
+            restoredBootApproval: async () => (await approvals())?.restoredBoot,
+            isolationEvent: (value) =>
+              writePrivateJson(REPORT, {
+                status: "COPIED_ROOT_ISOLATION_PROGRESS",
+                event: value,
+                isolationApplied: false,
+                bootAccepted: false,
+                applicationAccepted: false,
+              }),
+          },
+        );
+      }
+    }
     console.log(
       JSON.stringify({
         status,

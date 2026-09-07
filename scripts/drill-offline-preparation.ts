@@ -16,24 +16,33 @@ export interface DrillGuestBundle {
 export async function drillGuestBundle(
   plan: DrillPlan,
 ): Promise<DrillGuestBundle> {
-  controllerCidr(plan.controllerIpv4);
-  const planSha256 = await drillPlanDigest(plan);
+  return {
+    planSha256: await drillPlanDigest(plan),
+    ...copiedRootIsolationFiles(plan.controllerIpv4),
+  };
+}
+
+/** Shared copied-root rules. Resource and approval bindings belong to each
+ * caller; the RAM replacement must not fabricate the historical helper plan. */
+export function copiedRootIsolationFiles(
+  controllerIpv4: string,
+): Pick<DrillGuestBundle, "files" | "masks"> {
+  controllerCidr(controllerIpv4);
   const firewallDependency =
     `[Unit]\nRequires=arch-drill-firewall.service\nAfter=arch-drill-firewall.service\n`;
   return {
-    planSha256,
     files: {
       "etc/arch-drill.nft": `table inet arch_drill {
   chain input {
     type filter hook input priority -300; policy drop;
     iifname "lo" accept
-    ip saddr ${plan.controllerIpv4} tcp dport 22 ct state { new, established } accept
+    ip saddr ${controllerIpv4} tcp dport 22 ct state { new, established } accept
     ip saddr 169.254.169.254 udp sport 67 udp dport 68 accept
   }
   chain output {
     type filter hook output priority -150; policy drop;
     oifname "lo" accept
-    ip daddr ${plan.controllerIpv4} tcp sport 22 ct state established accept
+    ip daddr ${controllerIpv4} tcp sport 22 ct state established accept
     ip daddr { 169.254.169.254, 255.255.255.255 } udp sport 68 udp dport 67 accept
   }
   chain forward {
@@ -54,8 +63,8 @@ RemainAfterExit=yes
 `,
       "etc/systemd/system/arch-drill.target": `[Unit]
 Description=Isolated Arch restore acceptance
-Requires=basic.target arch-drill-firewall.service systemd-networkd.service systemd-user-sessions.service systemd-logind.service sshd.service
-After=basic.target arch-drill-firewall.service systemd-networkd.service systemd-user-sessions.service systemd-logind.service sshd.service
+Requires=basic.target arch-drill-firewall.service systemd-networkd.service systemd-user-sessions.service systemd-logind.service sshd.service docker.service
+After=basic.target arch-drill-firewall.service systemd-networkd.service systemd-user-sessions.service systemd-logind.service sshd.service docker.service
 AllowIsolate=yes
 `,
       "etc/systemd/system/systemd-networkd.service.d/arch-drill.conf":
