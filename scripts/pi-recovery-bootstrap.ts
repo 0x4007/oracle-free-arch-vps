@@ -300,6 +300,9 @@ done
 for rescue_service in mount-ro killprocs; do
   ln -s /etc/init.d/"$rescue_service" "$rescue_dir/overlay/etc/runlevels/shutdown/$rescue_service"
 done
+# Overlay directories contain public configuration; retain normal traversal
+# even though the assembly workspace and private scratch use umask 077.
+find "$rescue_dir/overlay" -type d -exec chmod 0755 {} +
 tar --numeric-owner --owner=0 --group=0 -czf "$rescue_dir/append/uos-rescue.apkovl.tar.gz" -C "$rescue_dir/overlay" .
 (cd "$rescue_dir/append" && printf 'uos-rescue.apkovl.tar.gz\\n' | cpio --quiet -o --format=newc | gzip -n > "$rescue_dir/overlay.cpio.gz")
 cat "$rescue_dir/artifacts/boot/initramfs-virt" "$rescue_dir/overlay.cpio.gz" > "$rescue_dir/initramfs-rescue"

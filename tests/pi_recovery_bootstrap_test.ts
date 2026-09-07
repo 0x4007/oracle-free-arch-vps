@@ -423,3 +423,57 @@ Deno.test("accepted rescue requires a new boot and the exact regular manifest", 
     "manifest differs",
   );
 });
+
+Deno.test({
+  name:
+    "assembled public overlay directories remain traversable under private umask",
+  ignore: !allowedRun || !allowedRead ||
+    (await Deno.permissions.query({ name: "write" })).state !== "granted",
+  fn: async () => {
+    const directory = await Deno.makeTempDir();
+    try {
+      const script = rescueAssemblerScript(input);
+      const start = script.indexOf('mkdir -p "$rescue_dir/overlay/etc/apk"');
+      const stop = script.indexOf('mkdir -p "$rescue_dir/overlay/lib"');
+      const permissions = script.split("\n").find((line) =>
+        line.startsWith('find "$rescue_dir/overlay"')
+      );
+      assert(start > 0 && stop > start && permissions);
+      const child = new Deno.Command("bash", {
+        args: [
+          "-ec",
+          'umask 077; rescue_dir="$1"; ' + script.slice(start, stop) + "\n" +
+          permissions,
+          "overlay-test",
+          directory,
+        ],
+        stdout: "piped",
+        stderr: "piped",
+      });
+      const result = await child.output();
+      assert(result.success);
+      for (
+        const path of [
+          "overlay",
+          "overlay/etc",
+          "overlay/etc/uos-rescue",
+          "overlay/etc/ssh",
+        ]
+      ) {
+        assert(
+          ((await Deno.stat(directory + "/" + path)).mode! & 0o777) === 0o755,
+        );
+      }
+      assert(
+        ((await Deno.stat(directory + "/overlay/etc/uos-rescue/manifest.json"))
+          .mode! & 0o777) === 0o644,
+      );
+      assert(
+        ((await Deno.stat(directory + "/overlay/etc/sudoers.d/uos-rescue"))
+          .mode! & 0o777) === 0o600,
+      );
+    } finally {
+      await Deno.remove(directory, { recursive: true });
+    }
+  },
+});

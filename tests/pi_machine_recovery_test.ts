@@ -494,6 +494,22 @@ Deno.test({
       await run();
       await run();
       assert(assignments === 1 && creates === 1 && Number(launches) === 1);
+      approved.approval.approvedAtUtc = new Date(Date.now() - 3600001)
+        .toISOString();
+      await Deno.writeTextFile(
+        ".private/pi-machine-recovery.json",
+        JSON.stringify(approved),
+      );
+      await run(); // Read-only reconciliation must not renew creation authority.
+      assert(assignments === 1 && creates === 1 && Number(launches) === 1);
+      assignedIp = null;
+      let expired = false;
+      try {
+        await run();
+      } catch (error) {
+        expired = String(error).includes("exact replacement approval");
+      }
+      assert(expired && assignments === 1);
     } finally {
       Deno.chdir(previous);
       await Deno.remove(directory, { recursive: true });

@@ -792,15 +792,31 @@ export async function runReplacement(
     }
     await save();
     if (state.privateIpId) {
-      await preMutation();
-      const reservedResponse = await call([
+      let reservedResponse = await call([
         "network",
         "public-ip",
         "get",
         "--public-ip-id",
         config.reservedPublicIpId,
       ]);
-      const reserved = dataObject(reservedResponse);
+      let reserved = dataObject(reservedResponse);
+      if (reserved.lifetime !== "RESERVED") {
+        throw Error("Replacement address is not reserved");
+      }
+      if (reserved["private-ip-id"] === null) {
+        await preMutation();
+        reservedResponse = await call([
+          "network",
+          "public-ip",
+          "get",
+          "--public-ip-id",
+          config.reservedPublicIpId,
+        ]);
+        reserved = dataObject(reservedResponse);
+        if (reserved.lifetime !== "RESERVED") {
+          throw Error("Replacement address changed");
+        }
+      }
       if (reserved["private-ip-id"] === null) {
         // A lost response is reconciled by rereading this same reserved IP on
         // resume. This never allocates an address or detaches another owner.
