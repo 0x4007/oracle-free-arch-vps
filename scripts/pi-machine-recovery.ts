@@ -345,6 +345,7 @@ async function inventory(
 export async function runReplacement(
   runner: CommandRunner = defaultRunner,
   fetchDocument?: () => Promise<string>,
+  validateBootstrap?: (config: ReplacementConfig) => Promise<unknown>,
 ): Promise<void> {
   const controller = await readPrivateJson<BackupInventoryConfig>(
     ".private/backup-controller.json",
@@ -579,6 +580,7 @@ export async function runReplacement(
         .assertNoOtherController();
       const currentConfig = await readPrivateJson<ReplacementConfig>(CONFIG);
       assertReplacementApproval(currentConfig, digest);
+      await validateBootstrap?.(currentConfig);
       const image = dataObject(
         await call([
           "compute",

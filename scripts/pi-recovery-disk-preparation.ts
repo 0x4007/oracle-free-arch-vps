@@ -3,7 +3,7 @@
  * and durably acknowledge every intent before this target can write a disk.
  */
 import { createHash } from "node:crypto";
-import { assertRamRescueRuntime } from "./pi-recovery-rescue.ts";
+import { assertAcceptedRescueBoot } from "./pi-recovery-rescue.ts";
 import { type CommandRunner, defaultRunner } from "./oci.ts";
 
 export interface PreparationDisk {
@@ -16,6 +16,8 @@ export interface DiskPreparationBinding {
   requestId: string;
   instanceId: string;
   bootId: string;
+  loaderBootId: string;
+  rescueManifestSha256: string;
   sourceInstanceId: string;
   sourceBootVolumeId: string;
   sourceRootVolumeId: string;
@@ -129,9 +131,13 @@ export async function inspectPreparationDisks(
   runner: CommandRunner = defaultRunner,
 ): Promise<PreparationSnapshot> {
   assertBinding(binding);
-  const runtime = await assertRamRescueRuntime(
+  const runtime = await assertAcceptedRescueBoot(
     { targetId: binding.instanceId, workDirectory: "/run/uos-recovery" },
-    binding.requestId,
+    {
+      requestId: binding.requestId,
+      loaderBootId: binding.loaderBootId,
+      manifestSha256: binding.rescueManifestSha256,
+    },
     runner,
   );
   if (runtime.bootId !== binding.bootId) {

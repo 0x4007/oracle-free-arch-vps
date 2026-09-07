@@ -94,6 +94,46 @@ export async function assertRamRescueRuntime(
   return { bootId, requestId, ramRuntimeProved: true };
 }
 
+/** Software evidence joined to the approved staged reboot and console host
+ * receipt. This is not hardware attestation of a kernel or initramfs.
+ */
+export async function assertAcceptedRescueBoot(
+  target: Pick<MachineRestoreTarget, "targetId" | "workDirectory">,
+  expected: { requestId: string; loaderBootId: string; manifestSha256: string },
+  runner: CommandRunner = defaultRunner,
+) {
+  if (
+    !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(
+      expected.loaderBootId,
+    ) || !/^[0-9a-f]{64}$/.test(expected.manifestSha256)
+  ) throw Error("Approved rescue boot binding is incomplete");
+  const runtime = await assertRamRescueRuntime(
+    target,
+    expected.requestId,
+    runner,
+  );
+  if (runtime.bootId === expected.loaderBootId) {
+    throw Error("The loader has not entered a new RAM boot");
+  }
+  if (
+    await read(runner, "stat", [
+      "--format=%F:%a",
+      "/etc/uos-rescue/manifest.json",
+    ]) !== "regular file:644"
+  ) throw Error("Rescue manifest is not the expected regular file");
+  const result = await read(runner, "sha256sum", [
+    "/etc/uos-rescue/manifest.json",
+  ]);
+  if (result !== `${expected.manifestSha256}  /etc/uos-rescue/manifest.json`) {
+    throw Error("RAM rescue manifest differs from the approved bootstrap");
+  }
+  return {
+    ...runtime,
+    loaderBootId: expected.loaderBootId,
+    manifestSha256: expected.manifestSha256,
+  };
+}
+
 import { createHash } from "node:crypto";
 import {
   RESCUE_DIRECTORY,

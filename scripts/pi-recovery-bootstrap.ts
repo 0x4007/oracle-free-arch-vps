@@ -4,6 +4,7 @@
  */
 import { createHash } from "node:crypto";
 import { shellQuote } from "./backup-guest.ts";
+import { hostKeyConsoleCommand } from "./pi-recovery-ssh.ts";
 
 export const RESCUE_DIRECTORY = "/run/uos-recovery-bootstrap";
 export const ALPINE_RELEASE = {
@@ -102,7 +103,7 @@ export function rescueKernelCommandLine(): string {
  */
 export function rescueOverlayFiles(input: PublicRescueBootstrap): RescueFile[] {
   validate(input);
-  return [
+  const files: RescueFile[] = [
     {
       path: "etc/apk/world",
       mode: "0644",
@@ -209,13 +210,32 @@ start() {
   chmod 600 /home/codex/.ssh/authorized_keys || return 1
   chown codex:codex /home/codex /home/codex/.ssh /home/codex/.ssh/authorized_keys /run/uos-recovery /run/uos-recovery/gnupg || return 1
   ssh-keygen -A || return 1
-  printf 'UOS_RAM_RESCUE_HOST_KEY ${input.requestId} ' >/dev/console
-  ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub >/dev/console || return 1
+  ${hostKeyConsoleCommand(input.requestId, "ram")} || return 1
   return 0
 }
 `,
     },
   ];
+  const manifest = {
+    schemaVersion: 1,
+    requestId: input.requestId,
+    alpine: ALPINE_RELEASE,
+    commandLine: rescueKernelCommandLine(),
+    overlayFilesSha256: createHash("sha256").update(JSON.stringify(files))
+      .digest("hex"),
+  };
+  files.push({
+    path: "etc/uos-rescue/manifest.json",
+    mode: "0644",
+    content: JSON.stringify(manifest) + "\n",
+  });
+  return files;
+}
+export function rescueManifestSha256(input: PublicRescueBootstrap): string {
+  const manifest = rescueOverlayFiles(input).find((file) =>
+    file.path === "etc/uos-rescue/manifest.json"
+  )!;
+  return createHash("sha256").update(manifest.content).digest("hex");
 }
 function base64(text: string): string {
   return btoa(String.fromCharCode(...new TextEncoder().encode(text)));
@@ -248,6 +268,7 @@ curl --fail --silent --show-error --max-time 10 -H 'Authorization: Bearer Oracle
 jq -e --arg request ${
     shellQuote(input.requestId)
   } '.freeformTags.uosRecoveryRequest == $request and (.id | startswith("ocid1.instance."))' "$rescue_dir/instance.json" >/dev/null
+${hostKeyConsoleCommand(input.requestId, "loader")}
 curl --fail --silent --show-error --proto '=https' --max-time 300 --max-filesize 1073741824 ${
     shellQuote(ALPINE_RELEASE.archiveUrl)
   } -o "$rescue_dir/netboot.tar.gz"

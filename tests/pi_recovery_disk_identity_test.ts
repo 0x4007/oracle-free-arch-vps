@@ -164,7 +164,11 @@ Deno.test("loader binds OCI consistent paths to full serials despite reversed Li
     receipt.root.serial === "root-full-hardware-serial" &&
       f.state.providerReads === 2,
   );
-  const binding = preparationBindingFromLoader(receipt, ramBootId);
+  const binding = preparationBindingFromLoader(
+    receipt,
+    ramBootId,
+    "ab".repeat(32),
+  );
   assert(
     binding.bootId === ramBootId &&
       binding.sourceInstanceId === request.sourceInstanceId &&
@@ -257,7 +261,7 @@ Deno.test("receipt substitution and unchanged loader boot cannot authorize RAM d
   ) {
     let refused = false;
     try {
-      preparationBindingFromLoader(value, boot);
+      preparationBindingFromLoader(value, boot, "ab".repeat(32));
     } catch {
       refused = true;
     }

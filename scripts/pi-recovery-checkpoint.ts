@@ -130,6 +130,7 @@ export class CheckpointChannel {
     input: ReadableStream<Uint8Array>,
     output: WritableStream<Uint8Array>,
     readonly timeoutMs = 30_000,
+    readonly disposeTransport: () => void = () => {},
   ) {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       throw Error("Invalid checkpoint timeout");
@@ -190,12 +191,19 @@ export class CheckpointChannel {
       }
     })());
   }
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    if (this.#closed) return Promise.resolve();
     this.#closed = true;
-    await Promise.allSettled([this.#reader.cancel(), this.#writer.abort()]);
-    this.#reader.releaseLock();
-    this.#writer.releaseLock();
+    // Abort waits for an in-flight sink write. Initiate cancellation without
+    // holding the deadline open; the owner closes its descriptors or SSH child.
+    void Promise.allSettled([this.#reader.cancel(), this.#writer.abort()]);
+    try {
+      this.disposeTransport();
+    } finally {
+      this.#reader.releaseLock();
+      this.#writer.releaseLock();
+    }
+    return Promise.resolve();
   }
 }
 

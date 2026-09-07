@@ -187,6 +187,8 @@ export async function restoreCatalogOnTarget(
   input: {
     catalog: unknown;
     requestId: string;
+    loaderBootId: string;
+    rescueManifestSha256: string;
     target: import("./backblaze-machine-restore.ts").MachineRestoreTarget;
     publicHome: string;
   },
@@ -222,8 +224,12 @@ export async function restoreCatalogOnTarget(
   ) {
     throw new Error("Oracle target instance identity is not proved");
   }
-  const { assertRamRescueRuntime } = await import("./pi-recovery-rescue.ts");
-  const runtime = await assertRamRescueRuntime(input.target, input.requestId);
+  const { assertAcceptedRescueBoot } = await import("./pi-recovery-rescue.ts");
+  const runtime = await assertAcceptedRescueBoot(input.target, {
+    requestId: input.requestId,
+    loaderBootId: input.loaderBootId,
+    manifestSha256: input.rescueManifestSha256,
+  });
   const checkpoint = remoteCheckpoint(channel, {
     requestId: input.requestId,
     instanceId: input.target.targetId,
@@ -265,6 +271,16 @@ if (import.meta.main) {
   const channel = new CheckpointChannel(
     Deno.stdin.readable,
     Deno.stdout.writable,
+    30_000,
+    () => {
+      for (const file of [Deno.stdin, Deno.stdout]) {
+        try {
+          file.close();
+        } catch (error) {
+          if (!(error instanceof Deno.errors.BadResource)) throw error;
+        }
+      }
+    },
   );
   try {
     const { readPrivateJson } = await import("./oci.ts");
