@@ -371,6 +371,14 @@ Deno.test({
         } else if (line.includes("compute instance launch")) {
           launches++;
           assert(eligibilityReads >= 4);
+          assert(
+            JSON.parse(args[args.indexOf("--launch-options") + 1])
+              .isConsistentVolumeNamingEnabled === true,
+          );
+          assert(
+            JSON.parse(args[args.indexOf("--launch-volume-attachments") + 1])[0]
+              .device === "/dev/oracleoci/oraclevdb",
+          );
           data = { id: "ocid1.instance.example" };
         } else if (line.includes("compute instance list")) {
           data = launches
@@ -379,6 +387,7 @@ Deno.test({
               shape: "VM.Standard.A1.Flex",
               "shape-config": { ocpus: 2, "memory-in-gbs": 12 },
               "image-id": config.platformImageId,
+              "launch-options": { "is-consistent-volume-naming-enabled": true },
               "compartment-id": config.compartmentId,
               "availability-domain": config.availabilityDomain,
               "freeform-tags": { uosRecoveryRequest: config.requestId },
@@ -407,6 +416,7 @@ Deno.test({
             "instance-id": "ocid1.instance.example",
             "lifecycle-state": "ATTACHED",
             "attachment-type": "paravirtualized",
+            device: "/dev/oracleoci/oraclevdb",
           }];
         } else if (line.includes("compute vnic-attachment list")) {
           data = [{

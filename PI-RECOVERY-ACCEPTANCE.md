@@ -242,3 +242,53 @@ is 15,443 bytes with SHA256
 `9e19d12689505978c8ac8b42abd52eff6f176cedac0171fdcc07135faded20ea`;
 it remains unapproved and unprovisioned. No real boot or backup archive was
 performed in these tests.
+
+## Provider-bound disk preparation candidate, 2026-09-07
+
+The next implementation connects the Ubuntu loader's device identities to the
+RAM disk-preparation boundary. Oracle documents `/dev/oracleoci/oraclevda` as
+the boot device for compatible platform images. The provisioner now explicitly
+requests consistent volume naming and `/dev/oracleoci/oraclevdb` for the root
+attachment, includes these choices in the approval digest, and verifies them
+on the returned instance and attachment. Old provisioning digests must not be
+reused for this changed launch contract. No replacement has been provisioned.
+
+`scripts/pi-recovery-disk-identity.ts` takes fresh authenticated provider reads
+and a host-key-verified loader SSH runner. It verifies the exact boot and root
+attachments, resource sizes, request tag and consistent naming, observes Ubuntu
+24.04 AArch64, resolves the Oracle paths, proves the platform root belongs to
+the boot disk, and records full SCSI hardware serials plus verified by-id aliases.
+It rereads the boot ID and provider attachments before returning a hashed
+receipt. A RAM binding must retain that receipt and use a different boot ID.
+It does not establish SSH trust or attest the new RAM artifact by itself.
+
+`scripts/pi-recovery-disk-preparation.ts` requires a separately approved digest
+that binds the source exclusions, replacement instance/volume IDs, RAM boot,
+serials, paths, capacities and initial disk/signature snapshot. Read-only guards
+require exactly two physical disks, RAM root/private scratch, matching IMDS,
+no swap, no target mounts (including major/minor mount aliases), no read-only or
+mapped children, no kernel device holders and no alternate mount namespaces.
+Before each clear it requires a controller exchange contract for fresh OCI and
+writer checks plus durable Pi acknowledgement, then rereads the target state.
+Each disk must become pristine before the next one is touched. An interrupted
+preparation requires a new observed plan and exact approval, not an automatic
+repeat. Its result explicitly leaves restore and boot acceptance false.
+
+The new modules are not yet wired into a complete Pi executable session. The
+caller must supply the authenticated OCI reads, verified SSH transport and
+actual durable preparation exchange under the controller lock; a mock callback
+is not live controller evidence. No live disk was cleared, partitioned or
+formatted. Remaining issues #16, #17 and #18 and the 200 GB coexistence blocker
+continue to apply. The original machine-restorer's pristine-target checks are
+preserved.
+
+Primary-source contracts checked:
+- https://docs.oracle.com/en-us/iaas/Content/Block/References/consistentdevicepaths.htm
+- https://raw.githubusercontent.com/oracle/oci-python-sdk/master/src/oci/core/models/launch_attach_volume_details.py
+
+Focused tests cover provider/guest identity mismatch, reversed Linux disk order,
+swapped aliases, changed attachments, changed boot IDs, source-resource refusal,
+mounted/held/extra/read-only disks, changed serials, expired approval, failed Pi
+acknowledgements, changed state during acknowledgement, incomplete clearing and
+refusal to silently resume. These are synthetic command-runner checks plus
+actual shell syntax parsing, not proof of OCI device naming or real disk writes.
