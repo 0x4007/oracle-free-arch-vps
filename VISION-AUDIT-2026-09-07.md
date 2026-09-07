@@ -4,6 +4,49 @@ The owner-controlled charter remains unchanged at
 `/Users/nv/repos/0x4007/oracle-free-arch-vps/PROJECT-VISION.md`.
 This report records evidence and disposition; it does not change requirements.
 
+## Current continuation — 20:46 UTC
+
+Earlier entries below are dated history, not the current authority or inventory.
+The owner now permits temporary development within one shared USD 300 Oracle
+trial budget; PR #26 records this in `DEVELOPMENT-BUDGET.md` and `AGENTS.md`.
+Normal operation must still remain Always Free. The former blanket rejection of
+trial-funded coexistence is superseded, not the exact resource approval gates.
+
+DeepSeek implementation `c2ccc0921365e04d971781cb0c00b86d74dc569b` adds an explicit
+trial-only capacity path for the trusted running production footprint plus one
+2 OCPU / 12 GB, 50/150 GB replacement. It binds trial cap and expiry into exact
+approval and checks the current Oracle subscription before provisioning writes.
+The original free-only source-loss path remains separate. Primary verification
+passed compile, formatting, whitespace checks and 31 focused provisioner/session
+tests. The actual funding function passed two live read-only Oracle calls via Pi
+at 20:42:54.537 UTC for a proposed USD 5, four-hour window. This is not remaining
+credit, resource provisioning, or restored-boot proof.
+
+Local exact-commit review exited zero with one P2 finding: completed trial
+reconciliation still demands a provisioning approval less than one hour old.
+It fails closed even while the trial window remains valid. The bounded review
+policy requires tracking rather than another correction round for P2 alone:
+[issue #28](https://github.com/0x4007/oracle-free-arch-vps/issues/28).
+
+At 20:44 UTC, Pi still had installed recovery revision `1ba69ae`, with replacement
+runtime acceptance false. Its backup service was idle after a successful exit;
+the catch-up timer activation remained unchanged. Source boot, Docker, Caddy and
+VNC invocation identities matched the pre-development observations. No source
+stop/restart, cloud test resource, or home-network archive transfer occurred.
+
+The latest accepted B2 capture completed at 19:51 UTC and cleanup at 19:52 UTC;
+three accepted generations now exist. Its 20:07 timer replay preserved the same
+completed job without creating a duplicate. The Pi operational kit was installed
+at 19:59 UTC with 326 verified files, approximately 6 MB; the independent Mac
+spare was preserved. This kit transfer did not contain system backup archives.
+
+Still unproved: exact approved trial target provisioning, the current Pi-led
+restored boot/SSH/mounts/applications/desktop and clone isolation, separate online
+Oracle-group boot proof, and the fourth naturally accumulated weekly B2 point.
+Post-trial provider representation and lasting billing evidence also remain
+distinct from current trial eligibility. Issues #17, #18 and #22 remain open.
+No complete-vision or clean unattended replacement claim is made.
+
 ## Fresh audit baseline
 
 Origin was fetched on September 7 before the fresh DeepSeek audit. Default branch
