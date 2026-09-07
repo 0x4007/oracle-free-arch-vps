@@ -485,6 +485,10 @@ Deno.test({
               .isConsistentVolumeNamingEnabled === true,
           );
           assert(
+            JSON.parse(args[args.indexOf("--launch-options") + 1])
+              .networkType === "PARAVIRTUALIZED",
+          );
+          assert(
             JSON.parse(args[args.indexOf("--launch-volume-attachments") + 1])[0]
               .device === "/dev/oracleoci/oraclevdb",
           );
