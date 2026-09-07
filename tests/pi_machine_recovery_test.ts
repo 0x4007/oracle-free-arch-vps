@@ -264,6 +264,7 @@ Deno.test({
       await Deno.chmod(".private/backup-controller.json", 0o600);
       await Deno.chmod(".private/pi-machine-recovery.json", 0o600);
       let root: JsonRecord | undefined;
+      let compatibleLoader = false;
       let loseResponse = true;
       let foreign = false;
       let creates = 0;
@@ -302,7 +303,12 @@ Deno.test({
           data = "namespace";
         } else if (line.includes("os bucket list")) data = [];
         else if (line.includes("compute image get")) {
-          data = { "compartment-id": null, "lifecycle-state": "AVAILABLE" };
+          data = {
+            "compartment-id": null,
+            "lifecycle-state": "AVAILABLE",
+            "operating-system": "Canonical Ubuntu",
+            "operating-system-version": compatibleLoader ? "24.04" : "22.04",
+          };
         } else if (
           line.includes("compute image-shape-compatibility-entry get")
         ) {
@@ -431,6 +437,16 @@ Deno.test({
       };
       const run = () => runReplacement(runner, () => Promise.resolve(terms));
       let failure = "";
+      try {
+        await run();
+      } catch (error) {
+        failure = String(error);
+      }
+      assert(
+        failure.includes("Ubuntu 24.04") && Number(creates) === 0 &&
+          Number(launches) === 0,
+      );
+      compatibleLoader = true;
       try {
         await run();
       } catch (error) {

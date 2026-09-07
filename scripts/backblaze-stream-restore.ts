@@ -12,6 +12,10 @@ import {
 } from "./backblaze-index.ts";
 import { streamRecoveryArchive } from "./backblaze-recovery.ts";
 import type { B2Store } from "./backblaze-storage.ts";
+import {
+  CheckpointChannel,
+  remoteCheckpoint,
+} from "./pi-recovery-checkpoint.ts";
 
 export type StreamDecrypt = (
   ciphertext: ReadableStream<Uint8Array>,
@@ -182,10 +186,12 @@ export async function readStreamedMetadata(
 export async function restoreCatalogOnTarget(
   input: {
     catalog: unknown;
+    requestId: string;
     target: import("./backblaze-machine-restore.ts").MachineRestoreTarget;
     publicHome: string;
   },
   store: Pick<B2Store, "get">,
+  channel: CheckpointChannel,
 ) {
   const { validateCatalogEntry, makeStreamDecryptArchive } = await import(
     "./backblaze-file-backup.ts"
@@ -209,9 +215,26 @@ export async function restoreCatalogOnTarget(
     redirect: "error",
     signal: AbortSignal.timeout(5000),
   });
-  if (!response.ok || (await response.json()).id !== input.target.targetId) {
+  const instance = response.ok ? await response.json() : null;
+  if (
+    instance?.id !== input.target.targetId ||
+    instance?.freeformTags?.uosRecoveryRequest !== input.requestId
+  ) {
     throw new Error("Oracle target instance identity is not proved");
   }
+  const { assertRamRescueRuntime } = await import("./pi-recovery-rescue.ts");
+  const runtime = await assertRamRescueRuntime(input.target, input.requestId);
+  const checkpoint = remoteCheckpoint(channel, {
+    requestId: input.requestId,
+    instanceId: input.target.targetId,
+    bootId: runtime.bootId,
+    generation: catalog.index.generation,
+    indexSha256: machineRestoreIndexSha256(catalog.index),
+    bootDiskPath: input.target.bootDiskPath,
+    rootDiskPath: input.target.rootDiskPath,
+    bootDiskSerial: input.target.bootDiskSerial,
+    rootDiskSerial: input.target.rootDiskSerial,
+  });
   const decrypt = makeStreamDecryptArchive(input.publicHome);
   const metadata = await readStreamedMetadata(catalog, store, decrypt);
   const archives = catalog.receipt.archives.filter((a) => a.role !== "recovery")
@@ -234,10 +257,15 @@ export async function restoreCatalogOnTarget(
     undefined,
     (archive, mount) =>
       extractStreamedArchive(catalog.index, archive, mount, store, decrypt),
+    checkpoint,
   );
 }
 
 if (import.meta.main) {
+  const channel = new CheckpointChannel(
+    Deno.stdin.readable,
+    Deno.stdout.writable,
+  );
   try {
     const { readPrivateJson } = await import("./oci.ts");
     const { B2Store } = await import("./backblaze-storage.ts");
@@ -247,15 +275,20 @@ if (import.meta.main) {
     const settings = await readPrivateJson<
       import("./backblaze-storage.ts").B2Settings
     >(".private/b2-file-backup.json");
-    console.log(
-      JSON.stringify(
-        await restoreCatalogOnTarget(input, new B2Store(settings)),
+    await channel.send({
+      kind: "recovery-restore-result",
+      result: await restoreCatalogOnTarget(
+        input,
+        new B2Store(settings),
+        channel,
       ),
-    );
+    });
   } catch {
     console.error(
       "Remote stream restore failed; preserve its journal and do not boot the target",
     );
     Deno.exitCode = 1;
+  } finally {
+    await channel.close();
   }
 }

@@ -555,3 +555,80 @@ Deno.test("restore accepts a new explicitly bound target and rejects stale appro
     assert(calls === 0);
   }
 });
+
+Deno.test({
+  name: "failed initial Pi checkpoint prevents all disk mutations",
+  ignore:
+    (await Deno.permissions.query({ name: "read" })).state !== "granted" ||
+    (await Deno.permissions.query({ name: "write" })).state !== "granted",
+  fn: async () => {
+    const index = makeIndex();
+    const workDirectory = await Deno.realPath(await Deno.makeTempDir());
+    await Deno.chmod(workDirectory, 0o700);
+    let checkpoints = 0;
+    const commands: string[] = [];
+    try {
+      await rejects(
+        restoreMachine({
+          index,
+          indexSha256: machineRestoreIndexSha256(index),
+          metadata: metadata(index),
+          target: { ...TARGET, workDirectory },
+          archives: index.archives.filter((a) => a.role !== "recovery").map((
+            a,
+          ) => ({
+            role: a.role as Exclude<typeof a.role, "recovery">,
+            bytes: 4,
+            sha256: "ab".repeat(32),
+            ciphertextBytes: a.bytes,
+            ciphertextSha256: a.sha256,
+            verifierChecked: true,
+          })),
+        }, (command, args) => {
+          commands.push(command);
+          let stdout = "";
+          if (command === "lsblk") {
+            stdout = JSON.stringify({
+              blockdevices: [
+                {
+                  path: "/dev/vda",
+                  type: "disk",
+                  size: TARGET.bootDiskBytes,
+                  serial: TARGET.bootDiskSerial,
+                },
+                {
+                  path: "/dev/vdb",
+                  type: "disk",
+                  size: TARGET.rootDiskBytes,
+                  serial: TARGET.rootDiskSerial,
+                },
+              ],
+            });
+          } else if (command === "readlink") {
+            stdout = args.at(-1) === TARGET.bootDiskPath
+              ? "/dev/vda"
+              : "/dev/vdb";
+          } else if (command === "findmnt") {
+            stdout = JSON.stringify({ filesystems: [] });
+          } else if (command !== "wipefs" || args[0] !== "--noheadings") {
+            throw Error(
+              "Unexpected disk mutation before durable Pi checkpoint",
+            );
+          }
+          return Promise.resolve({ code: 0, stdout, stderr: "" });
+        }, () => {
+          throw Error("Archive extraction must not start");
+        }, (journal) => {
+          checkpoints++;
+          assert(journal.completedStages.join() === "preflight-verified");
+          throw Error("Pi persistence failed");
+        }),
+        "Pi persistence failed",
+      );
+      assert(checkpoints === 1);
+      assert(commands.length === 6);
+    } finally {
+      await Deno.remove(workDirectory, { recursive: true });
+    }
+  },
+});

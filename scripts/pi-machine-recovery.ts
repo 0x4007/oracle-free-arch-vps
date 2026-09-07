@@ -585,8 +585,10 @@ export async function runReplacement(
       );
       if (
         image["compartment-id"] !== null ||
-        image["lifecycle-state"] !== "AVAILABLE"
-      ) throw Error("A current Oracle platform image is required");
+        image["lifecycle-state"] !== "AVAILABLE" ||
+        image["operating-system"] !== "Canonical Ubuntu" ||
+        image["operating-system-version"] !== "24.04"
+      ) throw Error("A current Oracle Ubuntu 24.04 platform image is required");
       const compatible = dataObject(
         await call([
           "compute",
