@@ -20,17 +20,30 @@
 
 ## Account and cost safety
 
+- Owner authorization dated 2026-09-07: use the shared USD 300 Oracle trial
+  credit responsibly for active backup-system development and testing, including
+  temporary concurrent instances, disks, and services. Read
+  [DEVELOPMENT-BUDGET.md](DEVELOPMENT-BUDGET.md) before planning cloud spending.
+  This is a cumulative budget, not a per-agent allowance. Verify remaining
+  coverage and expiry, bound each test's cost and lifetime, and clean up its
+  temporary resources. Normal operation must return to one Always Free VPS and
+  its complete online two-volume recovery backup, with safe rotation headroom.
 - Never upgrade the account to Pay As You Go.
 - Confirm the signed-in account still says Free Tier or Always Free before
-  provisioning.
+  provisioning; trial-funded development also requires verified active trial
+  coverage as described in DEVELOPMENT-BUDGET.md.
 - Verify current Oracle limits from official documentation. Do not rely only on
   the values copied into this kit.
 - Use only the tenancy home region for resources that must remain Always Free.
-- Do not enable retention locks, cross-region copies, higher volume performance,
-  paid load balancers, or other paid features.
+- Do not enable retention locks. Normal operation must not use cross-region
+  copies, higher volume performance, paid load balancers, or other paid features.
+  Temporary trial-funded development resources are permitted only within
+  DEVELOPMENT-BUDGET.md and the explicit approval gates below.
 - Before creating a resource, calculate the resulting OCPU, RAM, live-volume,
   backup-count, public-IP, and Object Storage totals.
-- Stop if the operation would exceed the current free allowance.
+- Stop if normal operation would exceed the current free allowance. Temporary
+  development may exceed that allowance within the authorized trial budget;
+  stop if available trial funding or its expiry cannot cover the operation.
 
 ## Explicit approval gates
 
