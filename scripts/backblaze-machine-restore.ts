@@ -3,10 +3,10 @@
  * from one accepted v1 Backblaze generation onto the one explicitly approved
  * empty aarch64 drill target.
  *
- * The B2 download/decryption and archive verification stages are deliberately
- * outside this module.  The caller supplies the six fully decrypted,
- * verifier-checked `.tar.zst` files plus the matching recovery metadata and
- * index.  This module then performs the target-only destructive work in
+ * The caller supplies verified archive identities plus the matching recovery
+ * metadata and index. Archives can be local `.tar.zst` files or a verified
+ * streaming extractor, so a RAM-rescue target needs no archive scratch disk.
+ * This module then performs the target-only destructive work in
  * bounded, journaled stages.  It never opens a source block device, talks to
  * B2, reads credentials, configures NVRAM, masks clone services, or claims a
  * boot drill.  A successful result is `FILESYSTEMS_REBUILT` only.
@@ -83,11 +83,11 @@ export interface MachineRestoreTarget {
   };
 }
 
-/** One fully decrypted and independently verifier-checked filesystem archive. */
+/** One filesystem archive's identities from the accepted verifier receipt. */
 export interface DecryptedRestoreArchive {
   role: RestoreArchiveRole;
-  /** Absolute path to the `.tar.zst` plaintext, never a `.gpg` ciphertext. */
-  path: string;
+  /** Local `.tar.zst` path; omitted when a verified stream extractor is supplied. */
+  path?: string;
   bytes: number;
   sha256: string;
   /** Ciphertext size/hash bound to the selected RecoveryIndex archive. */
@@ -737,8 +737,10 @@ function archiveMap(
     }
     const role = archive.role as RestoreArchiveRole;
     if (out.has(role)) fail("archives:shape");
-    assertAbsolutePath(archive.path, "archives:path");
-    if (!archive.path.endsWith(".tar.zst")) fail("archives:format");
+    if (archive.path !== undefined) {
+      assertAbsolutePath(archive.path, "archives:path");
+      if (!archive.path.endsWith(".tar.zst")) fail("archives:format");
+    }
     const expected = indexByRole.get(role);
     const metadataArchive = metadataByRole.get(role);
     if (!expected || !metadataArchive) fail("archives:binding");
@@ -1398,7 +1400,7 @@ export function restoreTarArgs(
   archivePath: string,
   mountPath: string,
 ): readonly string[] {
-  assertAbsolutePath(archivePath, "archive:path");
+  if (archivePath !== "-") assertAbsolutePath(archivePath, "archive:path");
   assertAbsolutePath(mountPath, "archive:mount");
   return tarExtractionArgs(archivePath, mountPath);
 }
@@ -1601,12 +1603,15 @@ async function extractArchives(
   target: MachineRestoreTarget,
   archives: Map<RestoreArchiveRole, DecryptedRestoreArchive>,
   mounts: Record<RestoreArchiveRole, string>,
+  streamArchive?: MachineArchiveExtractor,
 ): Promise<void> {
   for (const role of EXPECTED_ARCHIVE_ROLES) {
     const archive = archives.get(role)!;
-    const result = await readFileSha256(archive.path);
-    if (result.bytes !== archive.bytes || result.sha256 !== archive.sha256) {
-      fail(`archive:${role}:hash`);
+    if (!streamArchive) {
+      const result = await readFileSha256(archive.path!);
+      if (result.bytes !== archive.bytes || result.sha256 !== archive.sha256) {
+        fail(`archive:${role}:hash`);
+      }
     }
     const current = await guardBeforeWrite(
       runner,
@@ -1615,12 +1620,14 @@ async function extractArchives(
       `extract:${role}`,
     );
     await assertMountedFilesystems(current, metadata, target.workDirectory);
-    await checked(
-      runner,
-      "tar",
-      tarExtractionArgs(archive.path, mounts[role]),
-      `extract:${role}`,
-    );
+    if (streamArchive) {
+      await streamArchive(archive, mounts[role]);
+    } else {await checked(
+        runner,
+        "tar",
+        tarExtractionArgs(archive.path!, mounts[role]),
+        `extract:${role}`,
+      );}
   }
   // These volatile trees are excluded from capture, including their parent
   // directories. Recreate mount points before the restored system boots.
@@ -1751,9 +1758,16 @@ function assertMachineMetadataInput(metadata: MachineRecoveryMetadata): void {
  * journal-free non-empty target, or a journal whose disk state does not match
  * its last completed stage, fails before the next write.
  */
+/** The extractor must verify ciphertext, plaintext and pipeline completion. */
+export type MachineArchiveExtractor = (
+  archive: DecryptedRestoreArchive,
+  mountPath: string,
+) => Promise<void>;
+
 export async function restoreMachine(
   input: MachineRestoreInput,
   runner: CommandRunner = defaultRunner,
+  streamArchive?: MachineArchiveExtractor,
 ): Promise<MachineRestoreResult> {
   assertTargetShape(input.target);
   assertMachineMetadataInput(input.metadata);
@@ -1766,6 +1780,11 @@ export async function restoreMachine(
     fail("metadata:generation");
   }
   const archives = archiveMap(index, input.metadata, input.archives);
+  if (
+    !streamArchive && [...archives.values()].some((archive) => !archive.path)
+  ) {
+    fail("archives:extractor-required");
+  }
   const layout = buildRestoreLayout(index, input.metadata, input.target);
   await assertWorkDirectory(input.target.workDirectory);
   const journalPath = `${input.target.workDirectory}/${JOURNAL_NAME}`;
@@ -1957,6 +1976,7 @@ export async function restoreMachine(
       input.target,
       archives,
       mounts,
+      streamArchive,
     );
     await checked(runner, "sync", [], "extract:sync");
     await markStage(journalPath, journal, "archives-extracted");

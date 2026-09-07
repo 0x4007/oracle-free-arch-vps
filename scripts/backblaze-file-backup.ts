@@ -2936,7 +2936,7 @@ function assertVerifierStatusIdentity(
  * bytes even though the producer exited successfully. */
 export async function pumpGpgStdout(
   stdout: ReadableStream<Uint8Array>,
-  destination: Deno.FsFile,
+  destination: Pick<Deno.FsFile, "write">,
 ): Promise<number> {
   let total = 0;
   for await (const chunk of stdout) {
@@ -2959,7 +2959,30 @@ export async function pumpGpgStdout(
  * No private key exists on the source and the default agent socket is never
  * touched. */
 export function makeDecryptArchive(publicHome: string): DecryptArchive {
+  const decrypt = makeStreamDecryptArchive(publicHome);
   return async (ciphertextPath, destination) => {
+    const file = await Deno.open(ciphertextPath, { read: true });
+    try {
+      return await decrypt(file.readable, destination);
+    } finally {
+      try {
+        file.close();
+      } catch {
+        // pipeTo closes the read handle. Cleanup must not replace the
+        // original decryption result with a double-close error.
+      }
+    }
+  };
+}
+
+/** Stream ciphertext on the remote target using the existing Pi agent tunnel.
+ * Only bounded GPG protocol traffic reaches the Pi, never archive contents.
+ */
+export function makeStreamDecryptArchive(publicHome: string) {
+  return async (
+    ciphertext: ReadableStream<Uint8Array>,
+    destination: Pick<Deno.FsFile, "write">,
+  ): Promise<{ integrityChecked: true }> => {
     const socketResult = await new Deno.Command("sudo", {
       args: [
         "-n",
@@ -3004,7 +3027,6 @@ export function makeDecryptArchive(publicHome: string): DecryptArchive {
     } catch (error) {
       if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
-    const ciphertext = await Deno.open(ciphertextPath, { read: true });
     const child = new Deno.Command("sudo", {
       args: [
         "-n",
@@ -3042,18 +3064,11 @@ export function makeDecryptArchive(publicHome: string): DecryptArchive {
     // drains, bounded stderr collection and the exit status are never
     // awaited one-by-one, so a stalled leg cannot deadlock another.
     const settled = await Promise.allSettled([
-      ciphertext.readable.pipeTo(child.stdin),
+      ciphertext.pipeTo(child.stdin),
       pumpGpgStdout(child.stdout, destination),
       diagnostics,
       child.status,
     ]);
-    try {
-      ciphertext.close();
-    } catch (error) {
-      // `readable.pipeTo` auto-closes the ciphertext handle on completion;
-      // cleanup must never mask a successful integrity result.
-      if (!(error instanceof Deno.errors.BadResource)) throw error;
-    }
     const failed = settled.find((entry) => entry.status === "rejected");
     if (failed !== undefined) {
       const reason = (failed as PromiseRejectedResult).reason;

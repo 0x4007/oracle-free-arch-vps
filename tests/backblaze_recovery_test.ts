@@ -34,6 +34,7 @@ import {
 import {
   type ReconstructedGeneration,
   reconstructGeneration,
+  streamRecoveryArchive,
 } from "../scripts/backblaze-recovery.ts";
 
 function assert(condition: unknown, message?: string): asserts condition {
@@ -1390,3 +1391,50 @@ runtimeTest(
     }
   },
 );
+
+Deno.test("remote archive stream is lazy, version-bound and stops fetching on cancellation", async () => {
+  const f = makeIndexFixture({ multiChunkRoot: true });
+  const archive = f.index.archives.find((a) => a.role === "root")!;
+  let requests = 0;
+  const stream = streamRecoveryArchive(f.index, "root", {
+    get(object) {
+      const chunk = archive.chunks[requests];
+      assert(object.fileId === chunk.fileId && object.fileName === chunk.name);
+      return Promise.resolve(f.chunkBytes.get("root")![requests++]);
+    },
+  });
+  await Promise.resolve();
+  assert(requests === 0);
+  const reader = stream.getReader();
+  const first = await reader.read();
+  assertBytes(first.value!, f.chunkBytes.get("root")![0]);
+  assert(Number(requests) === 1);
+  await reader.cancel();
+  assert(Number(requests) === 1);
+});
+
+Deno.test("remote archive stream verifies chunks and aggregate before completion", async () => {
+  const f = makeIndexFixture();
+  for (const corruption of ["none", "chunk", "archive"]) {
+    const index = cloneIndex(f.index);
+    if (corruption === "archive") index.archives[0].sha256 = "00".repeat(32);
+    let requests = 0;
+    const stream = streamRecoveryArchive(index, "root", {
+      get() {
+        requests++;
+        const bytes = f.chunkBytes.get("root")![0].slice();
+        if (corruption === "chunk") bytes[0] ^= 1;
+        return Promise.resolve(bytes);
+      },
+    });
+    const received = new Response(stream).arrayBuffer();
+    if (corruption === "none") {
+      assertBytes(new Uint8Array(await received), f.chunkBytes.get("root")![0]);
+    } else {assert(
+        (await rejectWith(received)).message.includes(
+          corruption === "chunk" ? "get:sha256" : "stream:archive",
+        ),
+      );}
+    assert(requests === 1);
+  }
+});
