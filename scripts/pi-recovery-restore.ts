@@ -39,6 +39,11 @@ import {
   type RecoverySshTarget,
 } from "./pi-recovery-ssh.ts";
 import { type CommandRunner, readPrivateJson } from "./oci.ts";
+import {
+  type RecoveryIsolationInput,
+  type RecoveryIsolationPlan,
+  validateIsolationPlanDigest,
+} from "./pi-recovery-isolation.ts";
 
 export const RECOVERY_TARGET_ROOT = "/run/uos-recovery/restore";
 export const RECOVERY_TARGET_PUBLIC_HOME = "/run/uos-recovery/gnupg";
@@ -81,6 +86,7 @@ export interface RecoveryTargetControlInput {
   rescueManifestSha256: string;
   target: MachineRestoreTarget;
   publicHome: typeof RECOVERY_TARGET_PUBLIC_HOME;
+  isolation?: RecoveryIsolationInput;
 }
 
 export interface RecoveryTargetSourceBundleOptions {
@@ -183,6 +189,7 @@ export interface RecoveryRestoreResult {
   result: MachineRestoreResult;
   checkpoints: RecoveryCheckpoint[];
   stderr: string;
+  isolationPlan?: RecoveryIsolationPlan;
 }
 
 const sha256 = (bytes: Uint8Array): string =>
@@ -788,6 +795,7 @@ export async function restoreDirectFromBackblaze(
   );
   const checkpoints: RecoveryCheckpoint[] = [];
   const archiveProgress = new Map<string, number>();
+  let isolationPlan: RecoveryIsolationPlan | undefined;
   try {
     return await processDeadline(
       process,
@@ -798,6 +806,30 @@ export async function restoreDirectFromBackblaze(
             throw Error("Recovery control record budget exhausted");
           }
           const value = await channel.receive() as Record<string, unknown>;
+          if (value?.kind === "recovery-isolation-plan") {
+            const plan = value.plan as RecoveryIsolationPlan;
+            validateIsolationPlanDigest(plan);
+            if (
+              isolationPlan ||
+              checkpoints.at(-1)?.journal.completedStages.length !==
+                STAGES.length ||
+              plan.generation !== binding.generation ||
+              plan.indexSha256 !== binding.indexSha256 ||
+              plan.binding.requestId !== binding.requestId ||
+              plan.binding.instanceId !== binding.instanceId ||
+              plan.binding.bootId !== binding.bootId ||
+              plan.binding.boot.path !== binding.bootDiskPath ||
+              plan.binding.root.path !== binding.rootDiskPath ||
+              plan.binding.boot.serial !== binding.bootDiskSerial ||
+              plan.binding.root.serial !== binding.rootDiskSerial
+            ) {
+              throw Error(
+                "Isolation plan is not bound to the completed filesystem checkpoint",
+              );
+            }
+            isolationPlan = plan;
+            continue;
+          }
           if (value?.kind === "recovery-archive-progress") {
             const recordBinding = value.binding as
               | CheckpointBinding
@@ -874,6 +906,7 @@ export async function restoreDirectFromBackblaze(
           return {
             result,
             checkpoints,
+            isolationPlan,
             stderr: "text" in diagnostic ? diagnostic.text : "",
           };
         }
@@ -895,6 +928,7 @@ export interface RecoveryRestorationState {
   prepared?: { planSha256: string; snapshotSha256: string };
   restoreIntent?: { intendedAtUtc: string };
   filesystems?: MachineRestoreResult;
+  isolationPlan?: RecoveryIsolationPlan;
 }
 
 export interface RecoveryRestorationPorts {
@@ -975,7 +1009,11 @@ export async function continueReplacementRestoration(
   await save();
   if (state.filesystems) {
     await ports.report({
-      status: "FILESYSTEMS_REBUILT",
+      status: state.isolationPlan
+        ? "COPIED_ROOT_ISOLATION_PLANNED"
+        : "FILESYSTEMS_REBUILT",
+      isolationPlan: state.isolationPlan,
+      isolationApplied: false,
       bootAccepted: false,
       applicationAccepted: false,
     });
@@ -1093,12 +1131,17 @@ export async function continueReplacementRestoration(
       },
     );
     state.filesystems = restored.result;
+    state.isolationPlan = restored.isolationPlan;
     await save();
   } finally {
     await tunnel.close();
   }
   await ports.report({
-    status: "FILESYSTEMS_REBUILT",
+    status: state.isolationPlan
+      ? "COPIED_ROOT_ISOLATION_PLANNED"
+      : "FILESYSTEMS_REBUILT",
+    isolationPlan: state.isolationPlan,
+    isolationApplied: false,
     bootAccepted: false,
     applicationAccepted: false,
   });

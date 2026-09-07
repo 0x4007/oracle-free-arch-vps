@@ -678,13 +678,35 @@ export async function runRecoverySession(
           );
         }
         const inputDigest = hash(input);
+        const preparation = preparationBindingFromLoader(
+          state.loaderIdentity,
+          state.ramAccepted.bootId,
+          state.manifestSha256,
+        );
+        const connection = await recoverySshRunner(acceptedTarget)("bash", [
+          "-ec",
+          "printf '%s\\n' \"$SSH_CONNECTION\"",
+        ]);
+        const connectionFields = connection.stdout.trim().split(/\s+/);
+        if (connection.code !== 0 || connectionFields.length !== 4) {
+          throw Error(
+            "Pi SSH peer address is unavailable for copied-root isolation",
+          );
+        }
         const release = await readPrivateJson<{ sourceRevision: string }>(
           ".private/reports/pi-session-deployment.json",
         );
         const bundle = await buildRecoveryTargetBundle({
           sourceRoot: Deno.cwd(),
           sourceRevision: release.sourceRevision,
-          input,
+          input: {
+            ...input,
+            isolation: {
+              preparation,
+              controllerIpv4: connectionFields[0],
+              sshPublicKey: publicInput.sshPublicKey,
+            },
+          },
           b2: await readPrivateJson<B2Settings>(".private/b2-file-backup.json"),
           recipientBytes: await Deno.readFile(
             ".private/file-backup/recipient.asc",
@@ -701,11 +723,7 @@ export async function runRecoverySession(
         }
         status = await continueReplacementRestoration(
           acceptedTarget,
-          preparationBindingFromLoader(
-            state.loaderIdentity,
-            state.ramAccepted.bootId,
-            state.manifestSha256,
-          ),
+          preparation,
           bundle,
           retained,
           {

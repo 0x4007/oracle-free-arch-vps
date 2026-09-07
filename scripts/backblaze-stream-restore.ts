@@ -16,6 +16,10 @@ import {
   CheckpointChannel,
   remoteCheckpoint,
 } from "./pi-recovery-checkpoint.ts";
+import {
+  type RecoveryIsolationInput,
+  recoveryIsolationPlan,
+} from "./pi-recovery-isolation.ts";
 
 export type StreamDecrypt = (
   ciphertext: ReadableStream<Uint8Array>,
@@ -201,6 +205,7 @@ export async function restoreCatalogOnTarget(
     rescueManifestSha256: string;
     target: import("./backblaze-machine-restore.ts").MachineRestoreTarget;
     publicHome: string;
+    isolation?: RecoveryIsolationInput;
   },
   store: Pick<B2Store, "get">,
   channel: CheckpointChannel,
@@ -263,14 +268,15 @@ export async function restoreCatalogOnTarget(
       ciphertextSha256: a.ciphertextSha256,
       verifierChecked: true as const,
     }));
-  return await restoreMachine(
-    {
-      index: catalog.index,
-      indexSha256: machineRestoreIndexSha256(catalog.index),
-      metadata,
-      archives,
-      target: input.target,
-    },
+  const machineInput = {
+    index: catalog.index,
+    indexSha256: machineRestoreIndexSha256(catalog.index),
+    metadata,
+    archives,
+    target: input.target,
+  };
+  const result = await restoreMachine(
+    machineInput,
     undefined,
     (archive, mount) =>
       extractStreamedArchive(
@@ -290,6 +296,20 @@ export async function restoreCatalogOnTarget(
       ),
     checkpoint,
   );
+  if (input.isolation) {
+    const expected = input.isolation.preparation;
+    if (
+      expected.bootId !== runtime.bootId ||
+      expected.requestId !== input.requestId ||
+      expected.loaderBootId !== input.loaderBootId ||
+      expected.rescueManifestSha256 !== input.rescueManifestSha256
+    ) throw Error("Isolation plan differs from the current RAM boot");
+    await channel.send({
+      kind: "recovery-isolation-plan",
+      plan: recoveryIsolationPlan(machineInput, input.isolation),
+    });
+  }
+  return result;
 }
 
 if (import.meta.main) {
