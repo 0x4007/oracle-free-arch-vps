@@ -957,8 +957,6 @@ export async function runReplacement(
           config.requestId + "-root",
           "--freeform-tags",
           tags,
-          "--opc-retry-token",
-          config.requestId.slice(9),
         ]),
       );
       state.rootVolumeId = stringField(root, "id");
@@ -1026,8 +1024,6 @@ export async function runReplacement(
               ),
             ),
           }),
-          "--opc-retry-token",
-          config.requestId.slice(9),
         ]),
       );
       state.instanceId = stringField(created, "id");
