@@ -156,6 +156,7 @@ export async function inspectPreparationDisks(
   const tree = JSON.parse(
     await run(runner, "lsblk", [
       "--json",
+      "--tree",
       "--bytes",
       "--output",
       "PATH,TYPE,SIZE,RO,SERIAL,UUID,FSTYPE,MAJ:MIN,MOUNTPOINTS",
@@ -163,6 +164,13 @@ export async function inspectPreparationDisks(
   );
   if (!Array.isArray(tree.blockdevices)) {
     throw Error("Block inventory is unavailable");
+  }
+  if (
+    tree.blockdevices.some((node: BlockNode) =>
+      !["disk", "loop"].includes(node.type)
+    )
+  ) {
+    throw Error("Preparation inventory lacks partition trees");
   }
   const all = flatten(tree.blockdevices);
   const physical = all.filter((node) => node.type === "disk");

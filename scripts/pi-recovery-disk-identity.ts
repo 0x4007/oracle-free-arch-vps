@@ -158,6 +158,7 @@ export async function captureLoaderDiskIdentity(
   const tree = JSON.parse(
     await read(runner, "lsblk", [
       "--json",
+      "--tree",
       "--bytes",
       "--output",
       "PATH,TYPE,SIZE,MAJ:MIN,MOUNTPOINTS",
@@ -165,6 +166,13 @@ export async function captureLoaderDiskIdentity(
   );
   if (!Array.isArray(tree.blockdevices)) {
     throw Error("Loader block evidence is absent");
+  }
+  if (
+    tree.blockdevices.some((node: Node) =>
+      !["disk", "loop"].includes(node.type)
+    )
+  ) {
+    throw Error("Loader inventory lacks partition trees");
   }
   const disks = flat(tree.blockdevices).filter((node) => node.type === "disk");
   if (disks.length !== 2) {

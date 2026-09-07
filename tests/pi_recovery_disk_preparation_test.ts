@@ -44,6 +44,7 @@ function fixture() {
   const state = {
     cleared: { boot: false, root: false },
     extraDisk: false,
+    flatOutput: false,
     mounted: false,
     mountedById: false,
     held: false,
@@ -119,6 +120,12 @@ function fixture() {
           ? [...nodes(), { path: "/dev/sdc", type: "disk", size: 1 }]
           : nodes(),
       };
+      if (state.flatOutput || !args.includes("--tree")) {
+        const data = value as { blockdevices: Record<string, unknown>[] };
+        data.blockdevices = data.blockdevices.flatMap((
+          { children, ...disk },
+        ) => [disk, ...((children ?? []) as Record<string, unknown>[])]);
+      }
     } else if (command === "readlink") {
       value = args.at(-1) === binding.boot.path ? "/dev/sda" : "/dev/sdb";
     } else if (command === "udevadm" && args[0] === "info") {
@@ -247,6 +254,13 @@ Deno.test("preparation rejects expired or altered approval before commands", asy
       "exact disk-clearing",
     );
   }
+});
+Deno.test("flat lsblk output cannot bypass partition mount and holder checks", async () => {
+  const f = fixture();
+  f.state.flatOutput = true;
+  f.state.mounted = true;
+  await rejects(inspectPreparationDisks(binding, f.runner), "partition trees");
+  assert(f.state.mutations.length === 0);
 });
 Deno.test("each disk clear requires acknowledged intent and verified pristine result", async () => {
   const f = await prepared();

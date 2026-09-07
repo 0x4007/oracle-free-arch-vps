@@ -62,6 +62,7 @@ function fixture() {
   };
   const state = {
     providerReads: 0,
+    flatOutput: false,
     swapPaths: false,
     rootOnWrongDisk: false,
     collide: false,
@@ -114,6 +115,12 @@ function fixture() {
           }],
         }],
       };
+      if (state.flatOutput || !args.includes("--tree")) {
+        const data = value as { blockdevices: Record<string, unknown>[] };
+        data.blockdevices = data.blockdevices.flatMap((
+          { children, ...disk },
+        ) => [disk, ...((children ?? []) as Record<string, unknown>[])]);
+      }
     } else if (command === "findmnt") {
       value = {
         filesystems: [{ "maj:min": state.rootOnWrongDisk ? "8:0" : "8:17" }],
@@ -226,6 +233,14 @@ Deno.test("attachment changes or reboot during collection invalidate the receipt
       "changed during observation",
     );
   }
+});
+Deno.test("flat lsblk output cannot silently discard loader partitions", async () => {
+  const f = fixture();
+  f.state.flatOutput = true;
+  await rejects(
+    captureLoaderDiskIdentity(request, f.readProvider, f.runner),
+    "partition trees",
+  );
 });
 Deno.test("receipt substitution and unchanged loader boot cannot authorize RAM disk preparation", async () => {
   const f = fixture();
