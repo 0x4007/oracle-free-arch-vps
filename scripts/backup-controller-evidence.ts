@@ -220,7 +220,7 @@ export function backupControllerEvidence(
               p.name.split("/").at(-1)!,
             ) ||
             /(?:^|\s|\/)oci(?:\s|$)/.test(p.args) ||
-            /(?:backup-runtime|backup-scheduled|backup-recovery|oci-restore|pi-machine-recovery|weekly-backup|backblaze-file-backup)\.ts/
+            /(?:backup-runtime|backup-scheduled|backup-recovery|oci-restore|pi-machine-recovery|pi-recovery-session|weekly-backup|backblaze-file-backup)\.ts/
               .test(p.args) ||
             /(?:scp|sftp|rsync).*weekly-backup-controller/.test(p.args)
           )

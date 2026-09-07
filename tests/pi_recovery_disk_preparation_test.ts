@@ -23,6 +23,8 @@ const binding: DiskPreparationBinding = {
   requestId: "recovery-681c4067-aec2-45d5-9afb-77ee530e3a97",
   instanceId: "ocid1.instance.example.replacement",
   bootId: "681c4067-aec2-45d5-9afb-77ee530e3a97",
+  loaderBootId: "781c4067-aec2-45d5-9afb-77ee530e3a97",
+  rescueManifestSha256: "ab".repeat(32),
   sourceInstanceId: "ocid1.instance.example.production",
   sourceBootVolumeId: "ocid1.bootvolume.example.production",
   sourceRootVolumeId: "ocid1.volume.example.production",
@@ -90,7 +92,11 @@ function fixture() {
     const line = [command, ...args].join(" ");
     let value: unknown;
     if (line === "uname -m") value = "aarch64";
-    else if (line === "stat --format=%F:%a /run/uos-recovery") {
+    else if (line === "stat --format=%F:%a /etc/uos-rescue/manifest.json") {
+      value = "regular file:644";
+    } else if (command === "sha256sum") {
+      value = binding.rescueManifestSha256 + "  /etc/uos-rescue/manifest.json";
+    } else if (line === "stat --format=%F:%a /run/uos-recovery") {
       value = "directory:700";
     } else if (line === "cat /proc/cmdline") value = "ip=dhcp";
     else if (line === "cat /proc/swaps") {

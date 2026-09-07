@@ -255,6 +255,37 @@ Deno.test("missing acknowledgement cancels outstanding read and stops restore", 
   assert(fixture.cancelled());
   await rejects(fixture.channel.receive(), "closed");
 });
+Deno.test("permanently stalled output cannot block the checkpoint deadline", async () => {
+  let disposed = 0;
+  const input = new ReadableStream<Uint8Array>();
+  const output = new WritableStream<Uint8Array>({
+    write: () => new Promise<void>(() => {}),
+  });
+  const channel = new CheckpointChannel(input, output, 10, () => {
+    disposed++;
+  });
+  let guard: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await rejects(
+      Promise.race([
+        channel.send({ kind: "blocked-write" }),
+        new Promise<never>((_, reject) => {
+          guard = setTimeout(
+            () => reject(Error("deadline did not return")),
+            500,
+          );
+        }),
+      ]),
+      "timed out",
+    );
+    assert(disposed === 1);
+    assert(!input.locked && !output.locked);
+    await rejects(channel.send({ kind: "retry" }), "closed");
+  } finally {
+    clearTimeout(guard);
+    await channel.close();
+  }
+});
 Deno.test("oversized control input and malformed JSON poison the channel", async () => {
   for (
     const [bytes, fragment] of [

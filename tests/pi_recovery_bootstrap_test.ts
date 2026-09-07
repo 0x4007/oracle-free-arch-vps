@@ -2,10 +2,12 @@ import {
   buildRescueCloudInit,
   rescueAssemblerScript,
   rescueKernelCommandLine,
+  rescueManifestSha256,
   rescueOverlayFiles,
 } from "../scripts/pi-recovery-bootstrap.ts";
 import {
   approvedRescueBootScript,
+  assertAcceptedRescueBoot,
   assertRamRescueRuntime,
   type RescueBootBinding,
   rescueBootPlan,
@@ -341,4 +343,137 @@ Deno.test("wrong scratch path refuses before commands", async () => {
       ),
     "binding",
   );
+});
+
+Deno.test("rescue manifest binds request and authorized public bootstrap key", () => {
+  const original = rescueManifestSha256(input);
+  assert(original === rescueManifestSha256(input));
+  assert(
+    original !==
+      rescueManifestSha256({
+        ...input,
+        requestId: "recovery-781c4067-aec2-45d5-9afb-77ee530e3a97",
+      }),
+  );
+  const other = bytes.slice();
+  other[20]++;
+  assert(
+    original !==
+      rescueManifestSha256({
+        ...input,
+        sshPublicKey: "ssh-ed25519 " + btoa(String.fromCharCode(...other)),
+      }),
+  );
+  const manifest = rescueOverlayFiles(input).find((f) =>
+    f.path === "etc/uos-rescue/manifest.json"
+  )!;
+  assert(
+    manifest.mode === "0644" &&
+      JSON.parse(manifest.content).requestId === requestId,
+  );
+});
+Deno.test("accepted rescue requires a new boot and the exact regular manifest", async () => {
+  const expected = {
+    requestId,
+    loaderBootId: "881c4067-aec2-45d5-9afb-77ee530e3a97",
+    manifestSha256: rescueManifestSha256(input),
+  };
+  const facts = {
+    "stat --format=%F:%a /etc/uos-rescue/manifest.json": "regular file:644",
+    "sha256sum /etc/uos-rescue/manifest.json":
+      `${expected.manifestSha256}  /etc/uos-rescue/manifest.json`,
+  };
+  await assertAcceptedRescueBoot(target, expected, runtime(facts));
+  await rejects(
+    () =>
+      assertAcceptedRescueBoot(
+        target,
+        expected,
+        runtime({
+          ...facts,
+          "cat /proc/sys/kernel/random/boot_id": expected.loaderBootId,
+        }),
+      ),
+    "new RAM boot",
+  );
+  for (
+    const kind of ["symbolic link:777", "regular file:666", "directory:644"]
+  ) {
+    await rejects(() =>
+      assertAcceptedRescueBoot(
+        target,
+        expected,
+        runtime({
+          ...facts,
+          "stat --format=%F:%a /etc/uos-rescue/manifest.json": kind,
+        }),
+      ), "regular file");
+  }
+  await rejects(
+    () =>
+      assertAcceptedRescueBoot(
+        target,
+        expected,
+        runtime({
+          ...facts,
+          "sha256sum /etc/uos-rescue/manifest.json": "a".repeat(64) +
+            "  /etc/uos-rescue/manifest.json",
+        }),
+      ),
+    "manifest differs",
+  );
+});
+
+Deno.test({
+  name:
+    "assembled public overlay directories remain traversable under private umask",
+  ignore: !allowedRun || !allowedRead ||
+    (await Deno.permissions.query({ name: "write" })).state !== "granted",
+  fn: async () => {
+    const directory = await Deno.makeTempDir();
+    try {
+      const script = rescueAssemblerScript(input);
+      const start = script.indexOf('mkdir -p "$rescue_dir/overlay/etc/apk"');
+      const stop = script.indexOf('mkdir -p "$rescue_dir/overlay/lib"');
+      const permissions = script.split("\n").find((line) =>
+        line.startsWith('find "$rescue_dir/overlay"')
+      );
+      assert(start > 0 && stop > start && permissions);
+      const child = new Deno.Command("bash", {
+        args: [
+          "-ec",
+          'umask 077; rescue_dir="$1"; ' + script.slice(start, stop) + "\n" +
+          permissions,
+          "overlay-test",
+          directory,
+        ],
+        stdout: "piped",
+        stderr: "piped",
+      });
+      const result = await child.output();
+      assert(result.success);
+      for (
+        const path of [
+          "overlay",
+          "overlay/etc",
+          "overlay/etc/uos-rescue",
+          "overlay/etc/ssh",
+        ]
+      ) {
+        assert(
+          ((await Deno.stat(directory + "/" + path)).mode! & 0o777) === 0o755,
+        );
+      }
+      assert(
+        ((await Deno.stat(directory + "/overlay/etc/uos-rescue/manifest.json"))
+          .mode! & 0o777) === 0o644,
+      );
+      assert(
+        ((await Deno.stat(directory + "/overlay/etc/sudoers.d/uos-rescue"))
+          .mode! & 0o777) === 0o600,
+      );
+    } finally {
+      await Deno.remove(directory, { recursive: true });
+    }
+  },
 });

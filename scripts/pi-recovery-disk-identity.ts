@@ -269,10 +269,12 @@ export async function captureLoaderDiskIdentity(
 export function preparationBindingFromLoader(
   receipt: LoaderDiskIdentity,
   ramBootId: string,
+  rescueManifestSha256: string,
 ): DiskPreparationBinding {
   const { identitySha256, ...body } = receipt;
   if (
     hash(body) !== identitySha256 || ramBootId === receipt.loaderBootId ||
+    !/^[0-9a-f]{64}$/.test(rescueManifestSha256) ||
     !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(ramBootId)
   ) throw Error("Loader receipt changed or RAM boot is not new");
   const { bootVolumeId: _boot, rootVolumeId: _root, ...request } =
@@ -280,6 +282,8 @@ export function preparationBindingFromLoader(
   return {
     ...request,
     bootId: ramBootId,
+    loaderBootId: receipt.loaderBootId,
+    rescueManifestSha256,
     boot: structuredClone(receipt.boot),
     root: structuredClone(receipt.root),
   };
