@@ -38,7 +38,7 @@ const EXPECTED_ARCHIVE_ROLES: readonly RestoreArchiveRole[] = [
   "oracle-root",
   "oracle-oled",
 ];
-const STAGES = [
+export const STAGES = [
   "preflight-verified",
   "partition-tables-written",
   "filesystems-created",
@@ -257,7 +257,7 @@ export interface MachineMountEntry {
   fstype?: string;
 }
 
-interface RestoreJournal {
+export interface RestoreJournal {
   schemaVersion: 2;
   targetId: string;
   architecture: "aarch64";
@@ -1292,12 +1292,14 @@ async function markStage(
   path: string,
   journal: RestoreJournal,
   stage: RestoreStage,
+  checkpoint?: RestoreCheckpoint,
 ): Promise<void> {
   const expectedIndex = journal.completedStages.length;
   if (STAGES[expectedIndex] !== stage) fail("journal:transition");
   journal.completedStages.push(stage);
   journal.updatedAtUtc = new Date().toISOString();
   await saveJournal(path, journal);
+  await checkpoint?.(structuredClone(journal));
 }
 
 function expectedMounts(
@@ -1764,10 +1766,14 @@ export type MachineArchiveExtractor = (
   mountPath: string,
 ) => Promise<void>;
 
+/** Await durable off-target storage before proceeding to the next stage. */
+export type RestoreCheckpoint = (journal: RestoreJournal) => Promise<void>;
+
 export async function restoreMachine(
   input: MachineRestoreInput,
   runner: CommandRunner = defaultRunner,
   streamArchive?: MachineArchiveExtractor,
+  checkpoint?: RestoreCheckpoint,
 ): Promise<MachineRestoreResult> {
   assertTargetShape(input.target);
   assertMachineMetadataInput(input.metadata);
@@ -1806,6 +1812,7 @@ export async function restoreMachine(
     journal = newJournal({ ...input, index }, archives, layout, indexSha256);
     await saveJournal(journalPath, journal);
   }
+  await checkpoint?.(structuredClone(journal));
 
   if (!journalHas(journal, "partition-tables-written")) {
     const bootDumpPath = `${input.target.workDirectory}/sfdisk-boot.txt`;
@@ -1845,7 +1852,12 @@ export async function restoreMachine(
       "partition:verify",
     );
     assertPartitionShape(afterPartitions, false);
-    await markStage(journalPath, journal, "partition-tables-written");
+    await markStage(
+      journalPath,
+      journal,
+      "partition-tables-written",
+      checkpoint,
+    );
   }
 
   if (!journalHas(journal, "filesystems-created")) {
@@ -1859,7 +1871,7 @@ export async function restoreMachine(
         layout.filesystems.find((fs) => fs.role === role)!,
       );
     }
-    await markStage(journalPath, journal, "filesystems-created");
+    await markStage(journalPath, journal, "filesystems-created", checkpoint);
   }
 
   if (!journalHas(journal, "lvm-restored")) {
@@ -1914,7 +1926,7 @@ export async function restoreMachine(
       "lvm:verify",
     );
     assertPartitionShape(afterLvm, true);
-    await markStage(journalPath, journal, "lvm-restored");
+    await markStage(journalPath, journal, "lvm-restored", checkpoint);
   }
 
   if (!journalHas(journal, "mounted")) {
@@ -1966,7 +1978,7 @@ export async function restoreMachine(
       mounts["oracle-oled"],
       "mount:oracle-oled",
     );
-    await markStage(journalPath, journal, "mounted");
+    await markStage(journalPath, journal, "mounted", checkpoint);
   }
 
   if (!journalHas(journal, "archives-extracted")) {
@@ -1979,7 +1991,7 @@ export async function restoreMachine(
       streamArchive,
     );
     await checked(runner, "sync", [], "extract:sync");
-    await markStage(journalPath, journal, "archives-extracted");
+    await markStage(journalPath, journal, "archives-extracted", checkpoint);
   }
 
   if (!journalHas(journal, "swap-recreated")) {
@@ -1991,7 +2003,7 @@ export async function restoreMachine(
       layout.swap,
     );
     await checked(runner, "sync", [], "swap:sync");
-    await markStage(journalPath, journal, "swap-recreated");
+    await markStage(journalPath, journal, "swap-recreated", checkpoint);
   }
 
   if (!journalHas(journal, "filesystem-rebuilt")) {
@@ -2003,7 +2015,7 @@ export async function restoreMachine(
       true,
     );
     if (released.mountedSources.length > 0) fail("mount:release");
-    await markStage(journalPath, journal, "filesystem-rebuilt");
+    await markStage(journalPath, journal, "filesystem-rebuilt", checkpoint);
   }
   return {
     status: "FILESYSTEMS_REBUILT",

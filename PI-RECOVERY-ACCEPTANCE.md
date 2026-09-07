@@ -167,3 +167,78 @@ against d112157 completed with no actionable findings; it did not run live
 provisioning or recovery. Private receipts: `pi-replacement-plan.json`,
 `pi-replacement-focused-tests.txt`, and `pi-replacement-review-round1.txt` under
 `.private` or `.private/reports` as appropriate.
+
+## RAM bootstrap and Pi checkpoint candidate, 2026-09-07
+
+The next source candidate generates public cloud-init for a current Oracle
+Ubuntu 24.04 AArch64 platform image. Image compatibility is checked before each
+provisioning mutation. The replacement stages the pinned Alpine 3.24.1 netboot
+archive directly into tmpfs and checks its published SHA256 and release
+signature. The public release key is retained in
+`config/alpine-release-public.asc` and must be included in Pi deployment.
+The Pi and Mac fetch no netboot binary or backup archive.
+
+The generated overlay prepares non-root public-key SSH, explicit OpenRC
+network/udev services, and a RAM scratch directory. Its account service validates
+and reuses an existing account and never recursively changes ownership under
+restore mounts. Staging does not load kexec, reboot, or prepare disks. A separate
+reboot-script builder binds current exact approval to the replacement instance,
+volume IDs, original boot ID, and staged kernel/initramfs hashes, then rechecks
+those facts before a graceful kexec request. A disconnect is not boot proof.
+
+`backblaze-stream-restore.ts` now checks request-tagged OCI identity, AArch64,
+RAM root and scratch, private non-symlink scratch, absence of swap/disk-root
+arguments and the rescue request marker before requesting metadata from B2.
+Every machine-restorer journal stage, including the initial preflight, is sent
+as a bounded control record and requires a matching Pi acknowledgement before
+later disk work. The acknowledgement helper writes the checkpoint durably on
+Pi before returning it. Request, instance, RAM boot, generation, index digest,
+stable disk paths/serials, immutable journal fields and ordered stages are bound.
+Exact replay is accepted; missing acknowledgement, altered identity/hash,
+regression, skipped stage, oversized input and failed persistence stop the path.
+
+These are implementation and synthetic/file-persistence checks. They do not
+prove artifact assembly, Alpine boot/package installation, kexec handoff,
+OCI-console-to-SSH host-key trust, mounted disk safety in a real guest, GPG
+forwarding or a real archive restore. The Pi session controller still must join
+the checkpoint receiver to its SSH child under the controller lock, reconcile
+RAM-loss journals against actual disks, and complete approved disk clearing,
+clone isolation, reboot and application/desktop acceptance. RAM checks alone
+are not attestation that the approved staged artifact booted. None of these
+remaining steps may be represented as implemented or accepted by this candidate.
+
+A private candidate cloud-init is prepared from the existing Pi outgoing public
+SSH key at `.private/pi-rescue-bootstrap-candidate.json`. It is not approved
+and does not replace the private provisioner's placeholder configuration.
+The live 200 GB storage/coexistence blocker still applies; production and
+existing backups remain untouched.
+
+Source candidate 1413dc38ca7780623af9a91f40e819a255249c68 passed type,
+format, lint and whitespace checks, 42 focused tests (one GNU-tar integration
+check skipped on Mac), and 297 default tests (143 permission-gated checks
+skipped). Eight checkpoint tests then passed on the Pi under `safepi`, including
+an actual private-file fsync/rename roundtrip, at 2026-09-07T02:07:51.718Z.
+The first isolated Pi test package omitted three unchanged source dependencies;
+that temporary test failed type checking and was removed. The corrected test
+package included the dependencies and passed. The installed Pi controller
+already had those dependency files; it was not the source of that test failure.
+
+Local Codex review against 262674d2ce859e967109c9664f31a866284921c4 exited
+successfully after one round. Its substantiated P2 timeout finding is backlogged:
+[issue #16](https://github.com/0x4007/oracle-free-arch-vps/issues/16). A blocked
+output write can keep abort cleanup pending past the deadline; the passing
+missing-ack test covers a pending read only. Do not claim bounded failure for
+all SSH stalls. Per the bounded review rule, no P2-only correction round was
+started. Remaining audit/integration findings are retained in
+[issue #17](https://github.com/0x4007/oracle-free-arch-vps/issues/17) for approved
+rescue boot evidence and
+[issue #18](https://github.com/0x4007/oracle-free-arch-vps/issues/18) for
+OCI-console-based SSH host trust. None is fixed by backlogging.
+
+Private evidence is retained in `pi-rescue-focused-tests.txt`,
+`pi-rescue-default-tests.txt`, `pi-rescue-review-round1.txt`, and
+`reports/pi-checkpoint-tests.json` under `.private`. The prepared cloud-init
+is 15,443 bytes with SHA256
+`9e19d12689505978c8ac8b42abd52eff6f176cedac0171fdcc07135faded20ea`;
+it remains unapproved and unprovisioned. No real boot or backup archive was
+performed in these tests.
