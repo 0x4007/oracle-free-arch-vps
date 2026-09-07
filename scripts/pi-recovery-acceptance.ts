@@ -320,7 +320,7 @@ systemctl is-active --quiet arch-drill-firewall.service
 systemctl is-active --quiet docker.service
 pgrep -x Xvnc >/dev/null
 for container in guacamole-trial-guacamole-1 guacamole-trial-guacd-1; do
-  test "$(docker inspect --format '{{.State.Running}}' "$container")" = true
+  test "$(sudo -n docker inspect --format '{{.State.Running}}' "$container")" = true
 done
 page="$(curl --fail --silent --show-error --max-time 15 http://127.0.0.1:8080/guacamole/)"
 case "$page" in *guacamole*) ;; *) exit 1 ;; esac

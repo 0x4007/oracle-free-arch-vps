@@ -126,3 +126,39 @@ regressions. It independently reran the 349-test default suite with 149 skipped.
 This was the second review round for this correction set; no additional
 correction round was needed. Git delivery and guarded installation follow;
 the new B2 timer's activation remains a distinct operational boundary.
+
+## Owner-approved activation and recovery follow-up
+
+The owner approved timer activation and completion work at 18:58 UTC. Guarded
+unit installation and daemon-reload activated the B2 catch-up timer at
+18:59:54 UTC. No production service was stopped or restarted. The timer started
+one request for the overdue September 6 period, with an immutable six-hour
+deadline. Its source worker was still capturing with current heartbeats at
+19:18 UTC. The existing two accepted catalog entries remain preserved; this
+running request is not yet an accepted third point.
+
+A fresh read-only Oracle account/official-limits check passed. Tenancy-wide
+Object Storage was 1,453,785,088 bytes, with 18,546,214,912 bytes of headroom.
+The current Free Tier representation is verified; future post-trial mapping
+and actual billing acceptance remain distinct obligations.
+
+The Mac recovery kit's 31 historical tooling hashes were verified, and a
+separate 64-file package of `37e8ca7` was added and hash-checked. No credential
+was copied and no historical package was replaced. The new package carries
+explicitly false replacement-boot and Oracle-group-boot proof fields. Secure
+independent-copy custody still requires confirmation.
+
+DeepSeek's bounded recovery follow-up passed 74 focused chain tests (12
+permission-gated tests skipped). The first read-only task was stopped after
+repeated speculative permission probes and an out-of-scope web search. A
+settled evidence-only handback rejected those candidates and established no
+functional defect from that audit; this is not exhaustive acceptance.
+
+Primary live inspection then found a concrete omitted prerequisite in the
+restored-application check: `codex` cannot access the Docker socket directly.
+The existing `sudo -n docker` read-only path works. DeepSeek changed only the
+container-inspection command to use that existing authority, updated its
+regression assertion, and corrected a stale isolation-module header. All six
+focused tests passed independently. The exact corrected inspection loop passed
+against both running Guacamole containers at 19:19 UTC. No user/group/sudoers
+change was made, and this source-host check is not restored-machine acceptance.
