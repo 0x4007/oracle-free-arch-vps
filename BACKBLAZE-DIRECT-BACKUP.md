@@ -84,14 +84,18 @@ before decryption, with a 5 GiB reserve and 512 MiB margin. Its request deadline
 bounds polling; temporary retention inventory failures preserve progress for
 retry.
 
-The controller schedules Sundays at 00:05 America/New_York, with a six-hour
-catch-up window. A shared lock serializes it with the Oracle backup cycle. It
-accepts a generation only after complete archive verification and terminal
-source-process evidence. Retention keeps the newest four accepted generations
-and removes older exact object versions only after recording and rechecking a
-deletion plan. Interrupted deletions resume from a fresh inventory. The watchdog
-records separate Oracle and Backblaze assessments and sends one combined status
-transition through the existing Mac alert queue.
+The controller schedules Sundays at 00:05 America/New_York. Each period's
+catch-up window runs from its Sunday 00:05 to the next Sunday 00:05, so a
+delayed or missed trigger coalesces into one fresh request for the latest
+Sunday period instead of being lost; a per-job request keeps its immutable
+six-hour source deadline from the request instant. A shared lock serializes
+it with the Oracle backup cycle. It accepts a generation only after complete
+archive verification and terminal source-process evidence. Retention keeps
+the newest four accepted generations and removes older exact object versions
+only after recording and rechecking a deletion plan. Interrupted deletions
+resume from a fresh inventory. The watchdog records separate Oracle and
+Backblaze assessments and sends one combined status transition through the
+existing Mac alert queue.
 
 The installed controller completed the second generation at 04:53 UTC, with two
 accepted points in its catalog. Its temporary capture, reconstructed, and
@@ -100,10 +104,16 @@ three result records outside the scratch directory; the deployed cleanup
 correction now accepts those exact producer filenames, and real Linux fixtures
 verify cleanup and foreign-file preservation.
 
-The weekly timer is enabled and active. Its next trigger is Sunday, September
-13, 2026 at 00:05 New York time. Four retained points accumulate through
-successful runs; two accepted points currently exist. The Pi image mirror is
-absent, with 3.19 GiB reclaimed.
+The weekly timer is enabled and active, verified September 7, 2026 at 18:12
+UTC; its next preferred trigger is Sunday, September 13, 2026 at 00:05 New
+York time, and no 15-minute Backblaze timer was deployed yet. The source
+configuration adds 15-minute checks on boot/startup and while the unit is
+inactive and a seven-hour service timeout to cover worker/verifier polling,
+intended to retry an unattended miss or a previously blocked next-period
+launch without waiting a full week; activation of these settings remains
+pending. Four retained points accumulate through successful runs; two
+accepted points currently exist. The Pi image mirror is absent, with 3.19 GiB
+reclaimed.
 
 The Oracle controller now uses online group capture. Its real scheduler
 acceptance completed on September 6 without source interruption. Existing

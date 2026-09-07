@@ -3,6 +3,9 @@ Description=Weekly Backblaze file backup after the Oracle backup starts
 
 [Timer]
 OnCalendar=Sun *-*-* 00:05:00 America/New_York
+OnBootSec=15min
+OnStartupSec=15min
+OnUnitInactiveSec=15min
 Persistent=true
 AccuracySec=1min
 RandomizedDelaySec=0

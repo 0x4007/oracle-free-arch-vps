@@ -7,8 +7,11 @@ import {
   periodAt,
 } from "../scripts/backup-schedule.ts";
 import {
+  approvedScheduleOf,
+  assertCaptureStillAuthorized,
   planScheduledClaim,
   type ScheduledRuntimeState,
+  type WindowClaim,
 } from "../scripts/backup-scheduled.ts";
 const schedule: BackupSchedule = {
   approvedAtUtc: "2026-09-05T01:51:00Z",
@@ -342,4 +345,228 @@ Deno.test("satisfied period repairs a stale claim only after a different cycle c
   });
   assert(unchanged.action === "skip");
   assert(unchanged.completedClaim === undefined);
+});
+
+function startedClaim(
+  schedule: BackupSchedule,
+  windowId: string,
+): WindowClaim {
+  const now = new Date("2026-09-06T08:00:00Z");
+  return {
+    windowId,
+    periodId: duePeriod(schedule, now),
+    status: "started",
+    updatedAtUtc: now.toISOString(),
+    approvedSchedule: approvedScheduleOf(schedule),
+  };
+}
+
+Deno.test("a pending capture fails closed on revoked, malformed or future approval", () => {
+  const claim = startedClaim(schedule, "2026-09-06@America/New_York");
+  const now = new Date("2026-09-08T12:00:00Z");
+  assertCaptureStillAuthorized(schedule, claim, now);
+  // Only an alert-grace change does not change the schedule authority.
+  assertCaptureStillAuthorized({ ...schedule, windowMinutes: 240 }, claim, now);
+  for (
+    const revoked of [
+      { ...schedule, approvedAtUtc: "" },
+      { ...schedule, approvedAtUtc: "a-timestamp-that-is-not" },
+      { ...schedule, approvedAtUtc: "2099-01-01T00:00:00Z" },
+    ]
+  ) {
+    let refused = false;
+    try {
+      assertCaptureStillAuthorized(revoked, claim, now);
+    } catch {
+      refused = true;
+    }
+    assert(refused);
+  }
+});
+
+Deno.test("a pending capture is refused when the approved schedule authority changes", () => {
+  const claim = startedClaim(schedule, "2026-09-06@America/New_York");
+  const now = new Date("2026-09-08T12:00:00Z");
+  for (
+    const changed of [
+      { ...schedule, approvedAtUtc: "2026-09-06T00:00:00Z" },
+      { ...schedule, weekday: 1 },
+      { ...schedule, hour: 2 },
+      { ...schedule, timeZone: "UTC" },
+    ]
+  ) {
+    let refused = false;
+    try {
+      assertCaptureStillAuthorized(changed, claim, now);
+    } catch {
+      refused = true;
+    }
+    assert(refused);
+  }
+});
+
+Deno.test("valid late catch-up and next-period crossing remain authorized", () => {
+  const claim = startedClaim(schedule, "2026-09-06@America/New_York");
+  // A delayed weekly trigger after the grace period is still authorized.
+  assertCaptureStillAuthorized(
+    schedule,
+    claim,
+    new Date("2026-09-08T12:00:00Z"),
+  );
+  // An unfinished claim crossing into a later preferred week is still authorized.
+  assertCaptureStillAuthorized(
+    schedule,
+    claim,
+    new Date("2026-09-20T12:00:00Z"),
+  );
+  const resumed = planScheduledClaim(
+    schedule,
+    new Date("2026-09-20T12:00:00Z"),
+    { cycle: { phase: "backing-up", suffix: "20260906T080000Z" } },
+    { ...claim, status: "failed" },
+  );
+  assert(resumed.action === "run");
+  if (resumed.action === "run") {
+    // The original binding survives reuse across periods.
+    assert(resumed.claim.windowId === claim.windowId);
+    assert(resumed.claim.periodId === claim.periodId);
+    assert(
+      resumed.claim.approvedSchedule?.approvedAtUtc ===
+        schedule.approvedAtUtc,
+    );
+  }
+});
+
+Deno.test("a pending capture rejects a closed or changed one-time acceptance window", () => {
+  const accepted: BackupSchedule = {
+    ...schedule,
+    acceptanceWindow: {
+      approvedAtUtc: "2026-09-06T22:00:00Z",
+      startsAtUtc: "2026-09-06T22:05:00Z",
+      expiresAtUtc: "2026-09-07T01:00:00Z",
+      exactOperation: "one online scheduler acceptance capture",
+    },
+  };
+  const claim = startedClaim(accepted, "acceptance@2026-09-06T22:05:00.000Z");
+  assertCaptureStillAuthorized(
+    accepted,
+    claim,
+    new Date("2026-09-06T22:10:00Z"),
+  );
+  let refused = false;
+  try {
+    assertCaptureStillAuthorized(
+      accepted,
+      claim,
+      new Date("2026-09-07T02:00:00Z"),
+    );
+  } catch {
+    refused = true;
+  }
+  assert(refused);
+  // The window was replaced by a different exact acceptance window.
+  const replaced: BackupSchedule = {
+    ...schedule,
+    acceptanceWindow: {
+      approvedAtUtc: "2026-09-06T23:00:00Z",
+      startsAtUtc: "2026-09-06T23:05:00Z",
+      expiresAtUtc: "2026-09-07T02:00:00Z",
+      exactOperation: "one online scheduler acceptance capture",
+    },
+  };
+  refused = false;
+  try {
+    assertCaptureStillAuthorized(
+      replaced,
+      claim,
+      new Date("2026-09-06T23:10:00Z"),
+    );
+  } catch {
+    refused = true;
+  }
+  assert(refused);
+  // The acceptance window was removed from the schedule.
+  refused = false;
+  try {
+    assertCaptureStillAuthorized(
+      schedule,
+      claim,
+      new Date("2026-09-06T22:10:00Z"),
+    );
+  } catch {
+    refused = true;
+  }
+  assert(refused);
+});
+
+Deno.test("a claim without an approved schedule binding cannot authorize a capture", () => {
+  const legacy = {
+    windowId: "2026-09-06@America/New_York",
+    status: "started" as const,
+    updatedAtUtc: "2026-09-06T08:00:00Z",
+  };
+  let refused = false;
+  try {
+    assertCaptureStillAuthorized(
+      schedule,
+      legacy,
+      new Date("2026-09-06T09:00:00Z"),
+    );
+  } catch {
+    refused = true;
+  }
+  assert(refused);
+});
+
+Deno.test("a fresh plan binds the approved schedule authority into its claim", () => {
+  const accepted: BackupSchedule = {
+    ...schedule,
+    acceptanceWindow: {
+      approvedAtUtc: "2026-09-06T22:00:00Z",
+      startsAtUtc: "2026-09-06T22:05:00Z",
+      expiresAtUtc: "2026-09-07T01:00:00Z",
+      exactOperation: "one online scheduler acceptance capture",
+    },
+  };
+  for (
+    const [planned, when] of [
+      [schedule, "2026-09-06T08:00:00Z"],
+      [accepted, "2026-09-06T22:10:00Z"],
+    ] as const
+  ) {
+    const decision = planScheduledClaim(
+      planned,
+      new Date(when),
+      undefined,
+      undefined,
+    );
+    assert(decision.action === "run");
+    if (decision.action === "run") {
+      assert(
+        JSON.stringify(decision.claim.approvedSchedule) ===
+          JSON.stringify(approvedScheduleOf(planned)),
+      );
+    }
+  }
+});
+
+Deno.test("a malformed claim schedule binding fails closed", () => {
+  const malformed = {
+    windowId: "2026-09-06@America/New_York",
+    status: "started" as const,
+    updatedAtUtc: "2026-09-06T08:00:00Z",
+    approvedSchedule: { ...approvedScheduleOf(schedule), hour: 25 },
+  };
+  let refused = false;
+  try {
+    planScheduledClaim(
+      schedule,
+      new Date("2026-09-06T09:00:00Z"),
+      undefined,
+      malformed,
+    );
+  } catch {
+    refused = true;
+  }
+  assert(refused);
 });

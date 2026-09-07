@@ -874,17 +874,40 @@ Deno.test("period: Sunday window and DST boundaries", () => {
   const start = weekWindow(new Date(WINDOW_START));
   assert(start.periodKey === "2026-09-06");
   assert(start.startAtUtc === "2026-09-06T04:05:00.000Z");
-  assert(start.endAtUtc === "2026-09-06T10:05:00.000Z");
+  assert(start.endAtUtc === "2026-09-13T04:05:00.000Z");
   assert(withinCatchUp(new Date(WINDOW_START)));
+  // The catch-up window ends exactly where the next period begins.
   assert(withinCatchUp(new Date(Date.parse(start.endAtUtc) - 1)));
-  assert(!withinCatchUp(new Date(Date.parse(start.endAtUtc))));
-  assert(!withinCatchUp(new Date("2026-09-05T23:00:00.000Z")));
+  assert(withinCatchUp(new Date(Date.parse(start.endAtUtc))));
+  // Just before this Sunday's 00:05 the latest Sunday window is the prior
+  // week's; its catch-up stays open until exactly the new 00:05.
+  const justBefore = weekWindow(new Date("2026-09-06T04:04:59.000Z"));
+  assert(justBefore.periodKey === "2026-08-30");
+  assert(justBefore.startAtUtc === "2026-08-30T04:05:00.000Z");
+  assert(justBefore.endAtUtc === "2026-09-06T04:05:00.000Z");
+  assert(withinCatchUp(new Date("2026-09-06T04:04:59.000Z")));
+  // Days missed coalesce: a Saturday run still targets the latest Sunday.
+  const saturday = weekWindow(new Date("2026-09-05T23:00:00.000Z"));
+  assert(saturday.periodKey === "2026-08-30");
+  assert(withinCatchUp(new Date("2026-09-05T23:00:00.000Z")));
   const spring = weekWindow(new Date("2026-03-08T05:05:00.000Z"));
   assert(spring.periodKey === "2026-03-08");
   assert(spring.startAtUtc === "2026-03-08T05:05:00.000Z");
+  assert(spring.endAtUtc === "2026-03-15T04:05:00.000Z");
+  assert(
+    Date.parse(spring.endAtUtc) - Date.parse(spring.startAtUtc) ===
+      167 * 3_600_000,
+    "the spring-forward week is 167 hours",
+  );
   const fall = weekWindow(new Date("2026-11-01T04:05:00.000Z"));
   assert(fall.periodKey === "2026-11-01");
   assert(fall.startAtUtc === "2026-11-01T04:05:00.000Z");
+  assert(fall.endAtUtc === "2026-11-08T05:05:00.000Z");
+  assert(
+    Date.parse(fall.endAtUtc) - Date.parse(fall.startAtUtc) ===
+      169 * 3_600_000,
+    "the fall-back week is 169 hours",
+  );
   assert(
     weekWindow(new Date("2026-09-06T09:59:59.000Z")).periodKey === "2026-09-06",
   );
@@ -1592,12 +1615,65 @@ Deno.test("watchdog: source heartbeat never falls back to Pi polling time", () =
 // Orchestration
 // ---------------------------------------------------------------------------
 
-Deno.test("orchestration: outside the catch-up window creates no job", async () => {
-  const h = harness({ now: new Date("2026-09-05T23:00:00.000Z") });
+Deno.test("orchestration: days missed coalesce into one job for the latest Sunday period", async () => {
+  // Sep 6 and Sep 13 (both Sundays) were missed; a later run still creates
+  // exactly one job for the latest Sunday period.
+  const h = harness({
+    now: new Date("2026-09-15T12:00:00.000Z"),
+    seedPrivate: (map) => {
+      map.set(".private/backup-runtime.json", ORACLE_STATE_FIXTURE);
+      map.set(
+        ".private/backup-scheduled-window.json",
+        SCHEDULED_CLAIM_FIXTURE,
+      );
+    },
+  });
+  const created = await stepBackupController(undefined, h.deps, h.deps.now());
+  assert(created.job!.phase === "REQUESTED", `phase=${created.job!.phase}`);
+  assert(
+    created.job!.envelope.request.periodKey === "2026-09-13",
+    `period=${created.job!.envelope.request.periodKey}`,
+  );
+  const again = await stepBackupController(created, h.deps, h.deps.now());
+  assert(
+    again.job!.envelope.request.jobId ===
+      created.job!.envelope.request.jobId,
+    "one coalesced job per latest Sunday period",
+  );
+});
+
+Deno.test("orchestration: a Monday launch carries the prior Sunday period with a fresh six-hour deadline", async () => {
+  const monday = Date.parse("2026-09-07T14:00:00.000Z");
+  const h = harness({
+    now: new Date(monday),
+    seedPrivate: (map) => {
+      map.set(".private/backup-runtime.json", ORACLE_STATE_FIXTURE);
+      map.set(
+        ".private/backup-scheduled-window.json",
+        SCHEDULED_CLAIM_FIXTURE,
+      );
+    },
+  });
   const report = await runBackblazeCycle(h.deps, 4);
-  assert(report.status.startsWith("B2_SKIPPED"));
-  assert(!report.healthy);
-  assert(!h.privateMap.has(CONTROLLER_STATE_PATH));
+  const persisted = h.privateMap.get(CONTROLLER_STATE_PATH) as ControllerState;
+  const job = persisted.job!;
+  assert(
+    job.envelope.request.periodKey === "2026-09-06",
+    `period=${job.envelope.request.periodKey}`,
+  );
+  assert(Date.parse(job.envelope.request.requestedAtUtc) === monday);
+  assert(
+    Date.parse(job.envelope.request.deadlineAtUtc) -
+        Date.parse(job.envelope.request.requestedAtUtc) ===
+      6 * 3_600_000,
+    "the per-job request deadline stays six hours from the request",
+  );
+  assert(h.launches.length === 1, `launches=${h.launches.length}`);
+  assert(
+    h.launches[0].remainingSec === 6 * 3_600,
+    `remainingSec=${h.launches[0].remainingSec}`,
+  );
+  assert(!report.status.startsWith("B2_BACKUP_FAILED"), report.status);
 });
 
 Deno.test("orchestration: Oracle runtime is required before new work", async () => {
@@ -3804,12 +3880,23 @@ Deno.test("orchestration: prior period closes allow a fresh next Sunday job", as
       map.set(".private/backup-scheduled-window.json", SCHEDULED_CLAIM_FIXTURE);
     },
   });
-  const unchanged = await stepBackupController(
-    closed,
-    blocked.deps,
-    blocked.deps.now(),
+  // Regression: a next-due period behind an active/orphaned gate must
+  // report blocked, never return the old COMPLETE as a healthy current
+  // week.
+  let blockedError: string | undefined;
+  try {
+    await stepBackupController(closed, blocked.deps, blocked.deps.now());
+  } catch (error) {
+    blockedError = error instanceof Error ? error.message : String(error);
+  }
+  assert(
+    blockedError !== undefined,
+    "an active gate must block the next-period replacement",
   );
-  assert(unchanged.job!.phase === "COMPLETE");
+  assert(
+    blockedError!.includes("gate is active"),
+    `blocked detail=${blockedError}`,
+  );
   assert(
     blocked.launches.length === 0,
     "an active gate must block replacement",
@@ -3946,6 +4033,93 @@ Deno.test("cycle: a closed previous-week job must not cut the fresh next-Sunday 
       `phase=${phase} report=${report.status}`,
     );
   }
+});
+
+Deno.test("cycle: a blocked next-period launch preserves the closed predecessor and the next run retries the same period", async () => {
+  // Regression: job creation for the next due period can fail (Oracle
+  // authority or scheduled claim blocked) while the durable state is still
+  // the closed previous-period COMPLETE with no new job. The cycle must
+  // report an unhealthy retryable skip and never failJob over the prior
+  // terminal evidence; the next invocation must create the same due-period
+  // job.
+  const nextSunday = WINDOW_START + 7 * 86_400_000;
+  const fixture = generationFixture(20, WINDOW_START);
+  const closed = validateControllerState({
+    schemaVersion: 1,
+    catalog: [catalogEntry(fixture, WINDOW_START + 1000)],
+    job: stateWithJob(fixture, "COMPLETE").job,
+  });
+  const blockedRuns: {
+    name: string;
+    seedPrivate: NonNullable<HarnessOptions["seedPrivate"]>;
+  }[] = [
+    { name: "absent Oracle state", seedPrivate: () => {} },
+    {
+      name: "started scheduled claim",
+      seedPrivate: (map) => {
+        map.set(".private/backup-runtime.json", ORACLE_STATE_FIXTURE);
+        map.set(".private/backup-scheduled-window.json", {
+          windowId: "2026-09-13@America/New_York",
+          status: "started",
+          updatedAtUtc: "2026-09-05T03:00:00.000Z",
+        });
+      },
+    },
+  ];
+  for (const blockedCase of blockedRuns) {
+    const h = harness({
+      now: new Date(nextSunday + 1000),
+      seedPrivate: blockedCase.seedPrivate,
+    });
+    await h.deps.private.write(CONTROLLER_STATE_PATH, closed);
+    const report = await runBackblazeCycle(h.deps, 4);
+    assert(
+      report.status.startsWith("B2_SKIPPED"),
+      `${blockedCase.name} report=${report.status}`,
+    );
+    assert(!report.healthy, blockedCase.name);
+    const preserved = h.privateMap.get(
+      CONTROLLER_STATE_PATH,
+    ) as ControllerState;
+    assert(
+      preserved.job!.envelope.request.jobId === fixture.jobId,
+      blockedCase.name,
+    );
+    assert(
+      preserved.job!.phase === "COMPLETE",
+      `${blockedCase.name} phase=${preserved.job!.phase}`,
+    );
+    assert(preserved.job!.failure === undefined, blockedCase.name);
+    assert(h.launches.length === 0, blockedCase.name);
+  }
+  // A later invocation with authority again creates the same due period.
+  const allowed = harness({
+    now: new Date(nextSunday + 60_000),
+    seedPrivate: (map) => {
+      map.set(".private/backup-runtime.json", ORACLE_STATE_FIXTURE);
+      map.set(
+        ".private/backup-scheduled-window.json",
+        SCHEDULED_CLAIM_FIXTURE,
+      );
+    },
+  });
+  await allowed.deps.private.write(CONTROLLER_STATE_PATH, closed);
+  const nextReport = await runBackblazeCycle(allowed.deps, 4);
+  const next = allowed.privateMap.get(CONTROLLER_STATE_PATH) as ControllerState;
+  assert(
+    next.job!.envelope.request.periodKey === "2026-09-13",
+    `period=${next.job!.envelope.request.periodKey}`,
+  );
+  assert(next.job!.envelope.request.jobId !== fixture.jobId);
+  assert(
+    !["COMPLETE", "FAILED"].includes(next.job!.phase),
+    `phase=${next.job!.phase}`,
+  );
+  assert(
+    allowed.launches.length === 1,
+    `launches=${allowed.launches.length}`,
+  );
+  assert(!nextReport.status.startsWith("B2_BACKUP_FAILED"), nextReport.status);
 });
 
 Deno.test("retention: resume revalidates plan IDs and trims a zero-remaining plan", () => {

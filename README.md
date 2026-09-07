@@ -71,6 +71,18 @@ The recommended steady state uses two of the five backup slots:
 During rotation, the old and new pairs briefly use four slots. Delete the old
 pair only after the new pair is `AVAILABLE` and live acceptance passes.
 
+## Authoritative direction
+
+The owner-controlled charter is the canonical acceptance authority:
+
+`/Users/nv/repos/0x4007/oracle-free-arch-vps/PROJECT-VISION.md`
+
+It requires routine backups to run online while the VPS stays up and usable.
+The current online operation and acceptance contract is `ONLINE-BACKUP-CONTRACT.md`
+in this repository. Routine online group captures never stop, reboot, or freeze
+the instance or any required service. Stopping the instance is limited to
+separately approved disaster recovery, restore, or one-time build work.
+
 ## Start here
 
 1. Read `AGENTS.md` and accept its safety rules.
@@ -78,7 +90,8 @@ pair only after the new pair is `AVAILABLE` and live acceptance passes.
 3. Complete `02-VARIABLES-AND-PREFLIGHT.md` with fresh account data.
 4. Record every required approval in `templates/APPROVAL-LEDGER.md` before
    executing `03-BUILD-RUNBOOK.md`.
-5. Create the paired backups in `04-BACKUP-RECOVERY.md`.
+5. Create the build's golden paired backups in `04-BACKUP-RECOVERY.md`; routine
+   online weekly pairs follow `ONLINE-BACKUP-CONTRACT.md` instead.
 6. Pass every item in `05-ACCEPTANCE.md`.
 7. Use `06-TROUBLESHOOTING.md` for evidence-first recovery from failures.
 8. Configure the restore and weekly audit tools in

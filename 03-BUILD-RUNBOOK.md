@@ -3,6 +3,12 @@
 This runbook is a phase-gated procedure. Do not continue to the next phase until
 the current phase has evidence and every required approval.
 
+> Scope: this runbook covers the one-time machine build, including the stopped
+> golden-pair capture at the end. Routine online backups are not part of a
+> build: they never stop the instance, and they follow `ONLINE-BACKUP-CONTRACT.md`
+> under the owner-controlled charter
+> `/Users/nv/repos/0x4007/oracle-free-arch-vps/PROJECT-VISION.md`.
+
 ## Phase 0: Verify current policy and account state
 
 1. Read the current Oracle Always Free resource page in `SOURCES.md`.
@@ -143,7 +149,10 @@ cross-architecture emulation.
    - Exit nonzero on any mismatch.
 6. Run the synchronization once and record both source and destination hashes.
 
-## Phase 6: First Arch boot
+## Phase 6: First Arch boot (one-time build cutover)
+
+This phase stops the guest once, for the boot cutover only. It is not a routine
+backup and it is not part of normal online operation.
 
 1. Keep an OCI Console or serial-console recovery path available.
 2. Record the SSH host key before the boot change.
@@ -174,9 +183,11 @@ cross-architecture emulation.
 
 ## Phase 8: Golden backups and cleanup
 
-Follow `04-BACKUP-RECOVERY.md`. Do not delete any safety point until the new
-pair is `AVAILABLE`, the instance has restarted, and every acceptance check has
-passed.
+Follow `04-BACKUP-RECOVERY.md` for the stopped golden-pair capture after this
+build cutover. Do not delete any safety point until the new pair is `AVAILABLE`,
+the instance has completed the cutover restart, and every acceptance check has
+passed. Later weekly pairs are captured online while the instance stays
+`RUNNING`; they use no stop or restart.
 
 ## Phase 9: Final handoff
 

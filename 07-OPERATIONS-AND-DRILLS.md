@@ -22,9 +22,14 @@ instance, and an unassigned reserved IP. The approval must be less than one hour
 old and repeat the exact backup, source-volume, compartment, availability-domain,
 subnet, and reserved-IP targets from the restore configuration.
 
-## Shutdown lifecycle state machine
+## Shutdown lifecycle (separately approved outages only)
 
-Use this sequence for every backup outage:
+Use this sequence for every separately approved outage: a restore drill,
+disaster recovery, or the historical build cutover. Routine online backups do
+not use this sequence. They never stop, reboot, or freeze the instance or any
+required service; they are defined in `ONLINE-BACKUP-CONTRACT.md` under the
+owner-controlled charter
+`/Users/nv/repos/0x4007/oracle-free-arch-vps/PROJECT-VISION.md`.
 
 ```text
 quiesce applications
