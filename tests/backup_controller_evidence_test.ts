@@ -113,6 +113,7 @@ Deno.test("online controller permits ordinary SSH but refuses infrastructure wri
     const writer of [
       "30 1 oci oci bv backup create",
       "31 1 deno deno run scripts/backup-runtime.ts",
+      "33 1 deno deno run scripts/pi-machine-recovery.ts",
       "32 1 rsync rsync files pi:/home/pi/ops/weekly-backup-controller",
     ]
   ) {
