@@ -45,26 +45,35 @@ export function assertReplacementApproval(
     throw Error("Replacement plan changed");
   }
   const approval = config.approval;
-  const age = now - Date.parse(approval?.approvedAtUtc ?? "");
+  const approvedAt = Date.parse(approval?.approvedAtUtc ?? "");
+  const age = now - approvedAt;
   if (
     !approval || approval.exactOperation !==
       (config.trial !== undefined ? TRIAL_OPERATION : OPERATION) ||
     approval.planSha256 !== digest ||
-    !Number.isFinite(age) || age < 0 || age > 3600000
+    !Number.isFinite(approvedAt) || age < 0
   ) {
     throw Error("Current exact replacement approval is required");
   }
   if (config.trial !== undefined) {
-    const approvedAt = Date.parse(approval.approvedAtUtc);
+    // The owner's standing trial authorization is durable: an exact plan,
+    // future bound lifetime and current verified subscription (rechecked
+    // before every mutation) continue to authorize a trial replacement after
+    // more than one hour. Only malformed, future, expired or lifetime-exceeding
+    // trial authority fails closed.
     const expires = Date.parse(config.trial.expiresAtUtc);
     if (
-      !Number.isFinite(approvedAt) || !Number.isFinite(expires) ||
-      expires <= now || expires - approvedAt > 4 * 3600000
+      !Number.isFinite(expires) || expires <= now ||
+      expires - approvedAt > 4 * 3600000
     ) {
       throw Error(
         "Trial replacement is authorized only while its expiry is future and within four hours of approval",
       );
     }
+  } else if (age > 3600000) {
+    // Ordinary free-only replacement never uses trial authority and still
+    // requires a fresh exact approval.
+    throw Error("Current exact replacement approval is required");
   }
 }
 
