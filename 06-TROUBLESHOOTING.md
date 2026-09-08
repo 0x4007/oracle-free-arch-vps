@@ -123,6 +123,46 @@ report, local file, source configuration, or a different machine. Repeat only
 safe read-only checks. If a check needs an outage or mutation, obtain the exact
 approval and record it in the approval ledger.
 
+## Scheduled backup requires claim reconciliation
+
+When the scheduler reports `SCHEDULE_CLAIM_RECONCILIATION_REQUIRED`, a stale
+one-time acceptance claim has expired while the runtime recorded no OCI create
+intent and no group backup ID. The terminal claim is
+`.private/backup-scheduled-window.json` with status `reconciliation-required`.
+The scheduler keeps skipping with that distinct reason and never allocates a
+capture identity until the claim is removed. Reconcile read-only, in order:
+
+1. Read `.private/backup-scheduled-window.json` and confirm status
+   `reconciliation-required`, the recorded `reconciliation.requiredAtUtc` and
+   `reconciliation.expiredAtUtc`, and that the claim names only its own window
+   and period. Do not edit the claim.
+2. Read `.private/backup-runtime.json` and confirm its `cycle` journal has no
+   `volumeGroupBackupIntent: true` and no `volumeGroupBackupId`. If either is
+   present, STOP: an OCI operation may have started. Keep the scheduler block,
+   reconcile the exact recorded group backup identity first, and never remove
+   the claim or suggest its removal.
+3. From the same runtime journal, record the exact `cycle.suffix` and
+   `policy.volumeGroupId` (and confirm they are present and well-formed). Run
+   the read-only inventory entry point (`deno task backup:inventory`, or a
+   `backup:run` preflight) and confirm no new `FULL` volume-group backup for
+   that exact group has the runtime suffix/display identity; the claim's civil
+   period (for example `2026-09-06@America/New_York`) is not a backup suffix.
+   If the runtime suffix or group identity is missing, malformed, or cannot be
+   matched to the inventory, STOP and reconcile before removing the claim. Do
+   not use any OCI write for this check.
+4. Only after steps 1-3 pass, move the claim aside into the private archive
+   (for example `mv .private/backup-scheduled-window.json
+   .private/cycles/scheduled-claim-<windowId>.expired.json`), removing only
+   that stale claim file. Do not delete or rewrite `.private/backup-runtime.json`,
+   the schedule approval, or any backup object.
+5. The next scheduled invocation plans a fresh claim under the latest approved
+   schedule. That plan still requires the normal schedule, standing-approval
+   and source-binding checks; this reconciliation approves no capture.
+
+If `ACCEPTANCE_WINDOW_EXPIRED` is reported instead, the runtime recorded an
+intent or a group ID: fail closed and reconcile the exact recorded OCI
+operation before doing anything else.
+
 ## Repository synchronization returns partial failure
 
 - Keep the nonzero result and complete failure list.

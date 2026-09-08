@@ -1,5 +1,45 @@
 # Pi-orchestrated replacement recovery
 
+## Current verified state, 2026-09-08 07:39 UTC
+
+The latest verified live deployment and Pi runtime are at source revision
+`8dcf3edc0e47f7aa68097759d23819a728732df7`. The canonical branch contains
+follow-up scheduler reconciliation corrections in this change set; they are
+source-reviewed but are not represented as live Pi evidence until a separate
+deployment receipt exists. The production VPS remained `RUNNING` throughout
+the latest work; its boot identity and required service continuity were
+unchanged by the backup operations.
+
+The accepted online Oracle volume-group capture with suffix
+`20260908T061252Z` completed at 06:26:57 UTC. A controller-bound inventory at
+07:39:56 UTC proved one instance, 2 OCPUs, 12 GB RAM, 200 GB live volumes,
+three member backups, one volume-group backup, one public IP, exact source
+attachments and source-group membership, complete free-surface and object
+storage accounting, and two free backup-member slots under the verified
+five-member limit. The private receipt is
+`.private/reports/controller-bound-inventory-20260908.json`.
+
+The installed scheduled path also passed a live overlap check at 07:30 UTC:
+two concurrent ordinary `deno task backup:scheduled` invocations both exited
+successfully while the period was already satisfied. The observer recorded
+three kernel `WRITE*` waiter rows, both timers remained enabled and active, and
+no capture, stop, reboot or required-service restart occurred. The private
+receipt is `.private/reports/issue35-overlap-acceptance-20260908.json`; this
+closes the live-evidence gap tracked by issue #35 while retaining the source
+regression tests.
+
+The Pi and Mac recovery kits contain the same two receipts and
+`RECOVERY-KIT-STATUS-2026-09-08.md`. This transfer contained only small
+control/status data; no archive payload, private key or storage credential was
+sent through the home network.
+
+The full vision remains intentionally explicit: Oracle-group restore/boot is
+still unproved, the fourth Backblaze generation must accumulate naturally,
+post-trial provider eligibility is unverified, and the normal state remains one
+Always Free production VPS plus its accepted online recovery unit and safe
+rotation headroom. These are evidence boundaries, not cleanup or deployment
+pending states.
+
 ## Current verified recovery state, 2026-09-08
 
 On 2026-09-08, independent generation `generation-a0f12b6f-6c4b-436a-b547-58090e39ae71`
@@ -354,8 +394,10 @@ bootstrap already requests that package.
 Source candidate `52f4170` adds `deno task backup:replace`, a Pi entry point that
 runs replacement provisioning and then joins console capture, pinned non-root
 SSH, loader disk identity, staged rescue receipt, durable reboot intent and
-new RAM boot acceptance under the existing controller lock. The ordinary
-`backup:recover` service retains its source-recovery purpose. Provisioning and
+new RAM boot acceptance under the existing controller lock. The read-only
+`deno task backup:recover` diagnostic retains its legacy source-recovery
+purpose; the former `weekly-backup-recovery.service` wrapper has been removed.
+Provisioning and
 each console/reboot mutation require their own exact approvals; no approval is
 created by the controller. The existing private replacement configuration holds
 optional `sessionApprovals.loaderConsole`, `ramConsole` and `rescueReboot`.
