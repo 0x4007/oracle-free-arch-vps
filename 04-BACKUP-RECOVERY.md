@@ -132,6 +132,16 @@ drill boots a replacement from the capture and passes the full acceptance
 checklist, the online group's restore and boot status is `METADATA_PROVED`, not
 `RESTORE_DRILL_PROVED`.
 
+The isolated volume-group restore drill's plan gate is a source-only contract in
+`scripts/oci-group-restore-drill.ts`. It validates the exact bound plan, the
+reviewed one-hour approval over the plan digest, the live group-capture member
+metadata, the distinct restored targets and the durable journal, then builds the
+deterministic OCI CLI requests and the journal-guarded cleanup order. It never
+issues a provider call and never claims live recovery: its states are
+`PLAN_VALID`, `METADATA_PROVED` and the `RUN_READY` run guard, each with
+`restoreDrillProved` false. Live execution belongs to the primary-owned runner
+and the guest acceptance checklist below.
+
 1. Confirm both backup names share the intended suffix.
 2. Restore the staging backup as a boot volume in the tenancy home region.
 3. Restore the root backup as a block volume in the same availability domain.

@@ -59,6 +59,12 @@ Deno.test("drill preparation requires a fresh online capture and accepted runnin
   };
   assert(acceptedDrillPair(state, now).bootId === "new-boot");
   assert(acceptedDrillPair(state, now).volumeGroupBackupId === "new-capture");
+  assert(
+    acceptedDrillPair({
+      ...state,
+      policy: { ...policy, retainPreviousPair: false },
+    }, now).rootId === "new-root",
+  );
   rejects(() =>
     acceptedDrillPair({
       ...state,
