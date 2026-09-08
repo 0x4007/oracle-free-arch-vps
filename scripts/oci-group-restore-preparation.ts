@@ -308,14 +308,19 @@ export function validateGroupRestoreHelperIdentity(
 }
 
 /** Read-only proof that the SSH host is the helper's exact one public IP, on a
- * management network that is neither the production network nor the isolated
- * drill network, so the preparation channel can never reach production. */
+ * management subnet whose VCN is resolved from the subnet resource (OCI VNIC
+ * responses expose `subnet-id`, not a reliable `vcn-id`) and is neither the
+ * production network nor the isolated drill network. */
 export function validateGroupRestoreHelperNetwork(
   config: GroupRestorePreparationConfig,
   plan: GroupRestorePlan,
   vnic: JsonRecord,
+  subnet: JsonRecord,
   expectedVnicId?: string,
 ): void {
+  const subnetId = stringField(vnic, "subnet-id");
+  const subnetVcnId = stringField(subnet, "vcn-id");
+  const vnicVcnId = vnic["vcn-id"];
   if (expectedVnicId !== undefined && vnic.id !== expectedVnicId) {
     throw new Error(
       "Preparation helper VNIC identity differs from its attachment",
@@ -326,10 +331,14 @@ export function validateGroupRestoreHelperNetwork(
     vnic["compartment-id"] !== plan.source.compartmentId ||
     vnic["availability-domain"] !== plan.availabilityDomain ||
     vnic["public-ip"] !== config.ssh.host ||
-    stringField(vnic, "subnet-id") === plan.productionSubnetId ||
-    stringField(vnic, "vcn-id") === plan.productionVcnId ||
-    stringField(vnic, "subnet-id") === plan.isolatedSubnetId ||
-    stringField(vnic, "vcn-id") === plan.isolatedVcnId
+    subnet.id !== subnetId ||
+    subnet["lifecycle-state"] !== "AVAILABLE" ||
+    subnet["compartment-id"] !== plan.source.compartmentId ||
+    subnetId === plan.productionSubnetId ||
+    subnetVcnId === plan.productionVcnId ||
+    subnetId === plan.isolatedSubnetId ||
+    subnetVcnId === plan.isolatedVcnId ||
+    (vnicVcnId !== undefined && vnicVcnId !== subnetVcnId)
   ) {
     throw new Error(
       "Preparation SSH host is not bound to the reviewed helper management network",
@@ -338,9 +347,9 @@ export function validateGroupRestoreHelperNetwork(
 }
 
 /** Exact attachment proof: both restored volumes are attached to the reviewed
- * helper as paravirtualized data disks with the OCI device identity rules for
- * copied whole disks (the boot copy may use automatic device discovery), and
- * their identity fields match the reviewed copied-volume configuration. */
+ * helper as paravirtualized data disks through the data-volume attachment API
+ * with the OCI device identity rules for copied whole disks, and their
+ * identity fields match the reviewed copied-volume configuration. */
 export function validateGroupRestorePreparationEvidence(
   config: GroupRestorePreparationConfig,
   plan: GroupRestorePlan,
@@ -356,7 +365,7 @@ export function validateGroupRestorePreparationEvidence(
   const rootAttachment = evidence.rootAttachment;
   if (
     bootAttachment["instance-id"] !== config.helper.instanceId ||
-    bootAttachment["boot-volume-id"] !== evidence.bootVolumeId ||
+    bootAttachment["volume-id"] !== evidence.bootVolumeId ||
     bootAttachment["lifecycle-state"] !== "ATTACHED" ||
     bootAttachment["attachment-type"] !== "paravirtualized" ||
     rootAttachment["instance-id"] !== config.helper.instanceId ||
@@ -371,8 +380,7 @@ export function validateGroupRestorePreparationEvidence(
   const bootDevice = evidence.bootAttachment.device;
   const rootDevice = evidence.rootAttachment.device;
   if (
-    !(bootDevice === null || (typeof bootDevice === "string" &&
-      ROOT_DEVICE_PATTERN.test(bootDevice))) ||
+    typeof bootDevice !== "string" || !ROOT_DEVICE_PATTERN.test(bootDevice) ||
     typeof rootDevice !== "string" || !ROOT_DEVICE_PATTERN.test(rootDevice) ||
     bootDevice === rootDevice
   ) {
@@ -427,7 +435,7 @@ export async function groupRestorePreparationCommand(
     ).join(""),
   );
   const script =
-    `import base64,hashlib,json,os,pathlib,stat,subprocess,urllib.request
+    `import base64,hashlib,json,os,pathlib,re,stat,subprocess,urllib.request
 p=json.loads(base64.b64decode('${payload}'))
 e=p['evidence']; b=p['bundle']
 assert p['preparationPlanSha256']==b['planSha256'], 'Preparation plan binding changed'
@@ -436,16 +444,12 @@ with urllib.request.urlopen(request,timeout=10) as response: identity=json.load(
 assert identity['id']==e['helper']['id'] and identity['id']!=p['plan']['source']['instanceId'], 'Wrong helper instance'
 def run(*args): return subprocess.check_output(args,text=True).strip()
 def disk(attachment,uuid,fstype,size):
- # OCI forbids an explicit consistent device path for boot volumes attached
- # as data. Resolve only that case from the unique copied filesystem UUID.
  args=['lsblk','--json','--tree','--paths','--bytes','--output','PATH,TYPE,UUID,FSTYPE,SIZE,MOUNTPOINTS']
- if attachment['device'] is not None: args.append(os.path.realpath(attachment['device']))
- else: assert attachment==e['bootAttachment'], 'Only the boot copy may use automatic device discovery'
+ assert isinstance(attachment.get('device'),str) and re.fullmatch(r'/dev/oracleoci/oraclevd[b-z]',attachment['device']), 'Copied attachment device is not an OCI data-volume path'
+ args.append(os.path.realpath(attachment['device']))
  tree=json.loads(run(*args))['blockdevices']
  def has_mounts(item):
   return any(item.get('mountpoints') or []) or any(has_mounts(child) for child in item.get('children',[]))
- if attachment['device'] is None:
-  tree=[item for item in tree if item['type']=='disk' and not has_mounts(item) and any(child.get('uuid')==uuid and child.get('fstype')==fstype for child in item.get('children',[]))]
  assert len(tree)==1 and tree[0]['type']=='disk' and int(tree[0]['size'])==size, 'Unexpected disk size or type'
  assert stat.S_ISBLK(os.stat(tree[0]['path']).st_mode), 'Attachment is not a block device'
  def unmounted(item):
@@ -605,51 +609,46 @@ export function groupRestorePreparationAdapter(
     }
   };
 
+  const isTerminalAttachment = (row: JsonRecord): boolean =>
+    row["lifecycle-state"] === "DETACHED" ||
+    row["lifecycle-state"] === "TERMINATED";
+
   const listAttachments = async (
-    kind: "boot" | "root",
+    _kind: "boot" | "root",
   ): Promise<JsonRecord[]> =>
     dataArray(
       await call(
-        kind === "boot"
-          ? [
-            "compute",
-            "boot-volume-attachment",
-            "list",
-            "--compartment-id",
-            plan.source.compartmentId,
-            "--instance-id",
-            config.helper.instanceId,
-            "--all",
-          ]
-          : [
-            "compute",
-            "volume-attachment",
-            "list",
-            "--compartment-id",
-            plan.source.compartmentId,
-            "--instance-id",
-            config.helper.instanceId,
-            "--all",
-          ],
+        [
+          "compute",
+          "volume-attachment",
+          "list",
+          "--compartment-id",
+          plan.source.compartmentId,
+          "--instance-id",
+          config.helper.instanceId,
+          "--all",
+        ],
       ),
     );
 
-  const attachmentVolumeId = (row: JsonRecord, kind: "boot" | "root"): string =>
-    stringField(row, kind === "boot" ? "boot-volume-id" : "volume-id");
+  const attachmentVolumeId = (row: JsonRecord): string =>
+    stringField(row, "volume-id");
 
   const ensureAttached = async (
     kind: "boot" | "root",
     volumeId: string,
     onAttachAttempt: () => void,
   ): Promise<string> => {
-    const rows = await listAttachments(kind);
+    const rows = (await listAttachments(kind)).filter((row) =>
+      !isTerminalAttachment(row)
+    );
     // The helper must never hold a production source volume attachment: the
     // guarded command and the device resolution may only ever see the exact
     // restored copies.
     if (
       rows.some((row) =>
         [plan.source.bootVolumeId, plan.source.rootVolumeId].includes(
-          attachmentVolumeId(row, kind),
+          attachmentVolumeId(row),
         )
       )
     ) {
@@ -657,10 +656,7 @@ export function groupRestorePreparationAdapter(
         "Preparation helper holds a production source volume attachment",
       );
     }
-    const matching = rows.filter((row) =>
-      attachmentVolumeId(row, kind) === volumeId &&
-      row["lifecycle-state"] !== "TERMINATED"
-    );
+    const matching = rows.filter((row) => attachmentVolumeId(row) === volumeId);
     // A target attachment that predates this invocation is not adapter-owned.
     // Never adopt or detach it: an operator must reconcile that state first.
     if (matching.length !== 0) {
@@ -676,11 +672,11 @@ export function groupRestorePreparationAdapter(
       kind === "boot"
         ? [
           "compute",
-          "boot-volume-attachment",
+          "volume-attachment",
           "attach",
           "--instance-id",
           config.helper.instanceId,
-          "--boot-volume-id",
+          "--volume-id",
           volumeId,
           "--type",
           "paravirtualized",
@@ -700,13 +696,18 @@ export function groupRestorePreparationAdapter(
     const started = now();
     while (now() - started < GROUP_RESTORE_DETACH_POLL_BUDGET_MS) {
       const current = (await listAttachments(kind)).filter((row) =>
-        attachmentVolumeId(row, kind) === volumeId &&
-        row["lifecycle-state"] !== "TERMINATED"
+        attachmentVolumeId(row) === volumeId && !isTerminalAttachment(row)
       );
       if (
         current.length === 1 && current[0]!["lifecycle-state"] === "ATTACHED"
       ) {
         return stringField(current[0], "id");
+      }
+      if (
+        current.length === 1 && current[0]!["lifecycle-state"] === "ATTACHING"
+      ) {
+        await sleep(GROUP_RESTORE_DETACH_POLL_INTERVAL_MS);
+        continue;
       }
       if (current.length !== 0) {
         throw new Error(
@@ -725,27 +726,20 @@ export function groupRestorePreparationAdapter(
     attachmentId: string,
   ): Promise<void> => {
     await call(
-      kind === "boot"
-        ? [
-          "compute",
-          "boot-volume-attachment",
-          "detach",
-          "--boot-volume-attachment-id",
-          attachmentId,
-        ]
-        : [
-          "compute",
-          "volume-attachment",
-          "detach",
-          "--volume-attachment-id",
-          attachmentId,
-        ],
+      [
+        "compute",
+        "volume-attachment",
+        "detach",
+        "--volume-attachment-id",
+        attachmentId,
+        "--force",
+      ],
     );
     const started = now();
     while (now() - started < GROUP_RESTORE_DETACH_POLL_BUDGET_MS) {
       const live = (await listAttachments(kind)).filter((row) =>
         String(row.id) === attachmentId &&
-        row["lifecycle-state"] !== "TERMINATED"
+        !isTerminalAttachment(row)
       );
       if (live.length === 0) return;
       await sleep(GROUP_RESTORE_DETACH_POLL_INTERVAL_MS);
@@ -760,8 +754,7 @@ export function groupRestorePreparationAdapter(
     volumeId: string,
   ): Promise<void> => {
     const matching = (await listAttachments(kind)).filter((row) =>
-      attachmentVolumeId(row, kind) === volumeId &&
-      row["lifecycle-state"] !== "TERMINATED"
+      attachmentVolumeId(row) === volumeId && !isTerminalAttachment(row)
     );
     if (matching.length === 0) return;
     if (matching.length !== 1) {
@@ -819,7 +812,22 @@ export function groupRestorePreparationAdapter(
           helperVnicId,
         ]),
       );
-      validateGroupRestoreHelperNetwork(config, plan, vnic, helperVnicId);
+      const helperSubnet = dataObject(
+        await call([
+          "network",
+          "subnet",
+          "get",
+          "--subnet-id",
+          stringField(vnic, "subnet-id"),
+        ]),
+      );
+      validateGroupRestoreHelperNetwork(
+        config,
+        plan,
+        vnic,
+        helperSubnet,
+        helperVnicId,
+      );
       let bootAttachmentId: string | undefined;
       let rootAttachmentId: string | undefined;
       let bootAttachAttempted = false;
@@ -844,9 +852,9 @@ export function groupRestorePreparationAdapter(
         const bootAttachment = dataObject(
           await call([
             "compute",
-            "boot-volume-attachment",
+            "volume-attachment",
             "get",
-            "--boot-volume-attachment-id",
+            "--volume-attachment-id",
             bootAttachmentId,
           ]),
         );

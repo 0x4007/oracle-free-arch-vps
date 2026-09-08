@@ -2339,27 +2339,39 @@ function helperVnic(): JsonRecord {
     "availability-domain": plan.availabilityDomain,
     "public-ip": PREP_SSH_HOST,
     "subnet-id": "helper-subnet",
+  };
+}
+
+function helperSubnet(): JsonRecord {
+  return {
+    id: "helper-subnet",
+    "lifecycle-state": "AVAILABLE",
+    "compartment-id": plan.source.compartmentId,
     "vcn-id": "helper-vcn",
   };
 }
 
-function bootAttachmentRecord(): JsonRecord {
+function bootAttachmentRecord(
+  lifecycleState: "ATTACHING" | "ATTACHED" | "DETACHED" = "ATTACHED",
+): JsonRecord {
   return {
     id: "boot-attachment",
     "instance-id": "helper-instance",
-    "boot-volume-id": "target-boot-volume",
-    "lifecycle-state": "ATTACHED",
+    "volume-id": "target-boot-volume",
+    "lifecycle-state": lifecycleState,
     "attachment-type": "paravirtualized",
-    device: null,
+    device: "/dev/oracleoci/oraclevdc",
   };
 }
 
-function rootAttachmentRecord(): JsonRecord {
+function rootAttachmentRecord(
+  lifecycleState: "ATTACHING" | "ATTACHED" | "DETACHED" = "ATTACHED",
+): JsonRecord {
   return {
     id: "root-attachment",
     "instance-id": "helper-instance",
     "volume-id": "target-root-volume",
-    "lifecycle-state": "ATTACHED",
+    "lifecycle-state": lifecycleState,
     "attachment-type": "paravirtualized",
     device: "/dev/oracleoci/oraclevdb",
   };
@@ -2373,7 +2385,10 @@ function preparationOciFixture(
   helper: JsonRecord = helperRecord(),
   vnic: JsonRecord = helperVnic(),
   held: { boot?: JsonRecord[]; root?: JsonRecord[] } = {},
-  options: { failDetach?: "boot" | "root" } = {},
+  options: {
+    failDetach?: "boot" | "root";
+    initiallyAttaching?: "boot" | "root";
+  } = {},
 ): {
   runner: GroupRestoreRunner;
   events: string[];
@@ -2382,6 +2397,8 @@ function preparationOciFixture(
   const events: string[] = [];
   let bootAttached = false;
   let rootAttached = false;
+  let bootAttachmentPolls = 0;
+  let rootAttachmentPolls = 0;
   const network = goodIsolationNetwork();
   const targets = goodTargetObservation();
   const run: CommandRunner = (_command, args) => {
@@ -2389,9 +2406,12 @@ function preparationOciFixture(
     events.push(joined);
     const object = (data: unknown) => JSON.stringify({ data });
     if (joined.includes("network subnet get")) {
+      const subnet = joined.includes("helper-subnet")
+        ? helperSubnet()
+        : network.subnet;
       return Promise.resolve({
         code: 0,
-        stdout: object(network.subnet),
+        stdout: object(subnet),
         stderr: "",
       });
     }
@@ -2461,73 +2481,63 @@ function preparationOciFixture(
         stderr: "",
       });
     }
-    if (joined.includes("boot-volume-attachment attach")) {
-      bootAttached = true;
-      return Promise.resolve({
-        code: 0,
-        stdout: object(bootAttachmentRecord()),
-        stderr: "",
-      });
-    }
     if (joined.includes("volume-attachment attach")) {
-      rootAttached = true;
+      if (joined.includes("target-boot-volume")) {
+        bootAttached = true;
+        bootAttachmentPolls = 0;
+      } else {
+        rootAttached = true;
+        rootAttachmentPolls = 0;
+      }
       return Promise.resolve({
         code: 0,
-        stdout: object(rootAttachmentRecord()),
+        stdout: object(
+          joined.includes("target-boot-volume")
+            ? bootAttachmentRecord()
+            : rootAttachmentRecord(),
+        ),
         stderr: "",
       });
-    }
-    if (joined.includes("boot-volume-attachment detach")) {
-      if (options.failDetach === "boot") {
-        return Promise.resolve({
-          code: 1,
-          stdout: "",
-          stderr: "boot detach failed",
-        });
-      }
-      bootAttached = false;
-      return Promise.resolve({ code: 0, stdout: object({}), stderr: "" });
     }
     if (joined.includes("volume-attachment detach")) {
-      if (options.failDetach === "root") {
+      const boot = joined.includes("boot-attachment");
+      const kind = boot ? "boot" : "root";
+      if (options.failDetach === kind) {
         return Promise.resolve({
           code: 1,
           stdout: "",
-          stderr: "root detach failed",
+          stderr: `${kind} detach failed`,
         });
       }
-      rootAttached = false;
+      if (boot) bootAttached = false;
+      else rootAttached = false;
       return Promise.resolve({ code: 0, stdout: object({}), stderr: "" });
     }
-    if (joined.includes("boot-volume-attachment get")) {
-      return Promise.resolve({
-        code: 0,
-        stdout: object(bootAttachmentRecord()),
-        stderr: "",
-      });
-    }
     if (joined.includes("volume-attachment get")) {
+      const boot = joined.includes("boot-attachment");
       return Promise.resolve({
         code: 0,
-        stdout: object(rootAttachmentRecord()),
-        stderr: "",
-      });
-    }
-    if (joined.includes("boot-volume-attachment list")) {
-      return Promise.resolve({
-        code: 0,
-        stdout: object([
-          ...(bootAttached ? [bootAttachmentRecord()] : []),
-          ...(held.boot ?? []),
-        ]),
+        stdout: object(boot ? bootAttachmentRecord() : rootAttachmentRecord()),
         stderr: "",
       });
     }
     if (joined.includes("volume-attachment list")) {
+      const bootState = bootAttached
+        ? options.initiallyAttaching === "boot" && bootAttachmentPolls++ === 0
+          ? bootAttachmentRecord("ATTACHING")
+          : bootAttachmentRecord()
+        : undefined;
+      const rootState = rootAttached
+        ? options.initiallyAttaching === "root" && rootAttachmentPolls++ === 0
+          ? rootAttachmentRecord("ATTACHING")
+          : rootAttachmentRecord()
+        : undefined;
       return Promise.resolve({
         code: 0,
         stdout: object([
-          ...(rootAttached ? [rootAttachmentRecord()] : []),
+          ...(bootState ? [bootState] : []),
+          ...(rootState ? [rootState] : []),
+          ...(held.boot ?? []),
           ...(held.root ?? []),
         ]),
         stderr: "",
@@ -2632,7 +2642,7 @@ Deno.test("real preparation adapter binds the exact targets to the reviewed help
   );
   assert(
     flat.some((line) =>
-      line.includes("boot-volume-attachment attach") &&
+      line.includes("volume-attachment attach") &&
       line.includes("target-boot-volume")
     ),
   );
@@ -2646,11 +2656,17 @@ Deno.test("real preparation adapter binds the exact targets to the reviewed help
     line.includes("volume-attachment detach")
   );
   const bootDetach = flat.findIndex((line) =>
-    line.includes("boot-volume-attachment detach")
+    line.includes("volume-attachment detach") &&
+    line.includes("boot-attachment")
   );
   assert(
     rootDetach > 0 && bootDetach > rootDetach,
     "root must detach before boot",
+  );
+  assert(
+    flat[rootDetach]!.includes("--force") &&
+      flat[bootDetach]!.includes("--force"),
+    "owned detaches must suppress the OCI confirmation prompt",
   );
   for (const line of fixture.events) {
     for (
@@ -2670,6 +2686,63 @@ Deno.test("real preparation adapter binds the exact targets to the reviewed help
   assert(
     fixture.ready() === false,
     "both copies must be detached after preparation",
+  );
+});
+
+Deno.test("real preparation adapter waits for asynchronous data-volume attachment", async () => {
+  const config = await prepConfigWithDigest();
+  const fixture = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    {},
+    { initiallyAttaching: "boot" },
+  );
+  let sleeps = 0;
+  const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    ssh: (_command, _args) =>
+      preparationMarkerJson(config).then((stdout) =>
+        Promise.resolve({ code: 0, stdout, stderr: "" })
+      ),
+    sleep: () => {
+      sleeps += 1;
+      return Promise.resolve();
+    },
+  });
+  await adapter.prepareCopiedVolumes({
+    bootVolumeId: "target-boot-volume",
+    rootVolumeId: "target-root-volume",
+  });
+  assert(sleeps > 0, "ATTACHING must be polled before accepting the copy");
+});
+
+Deno.test("real preparation adapter ignores terminal DETACHED history and owns only new attachments", async () => {
+  const config = await prepConfigWithDigest();
+  const fixture = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    {
+      boot: [bootAttachmentRecord("DETACHED")],
+      root: [rootAttachmentRecord("DETACHED")],
+    },
+  );
+  const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    ssh: (_command, _args) =>
+      preparationMarkerJson(config).then((stdout) =>
+        Promise.resolve({ code: 0, stdout, stderr: "" })
+      ),
+  });
+  await adapter.prepareCopiedVolumes({
+    bootVolumeId: "target-boot-volume",
+    rootVolumeId: "target-root-volume",
+  });
+  assert(
+    fixture.events.filter((line) => line.includes("volume-attachment attach"))
+      .length === 2,
+    "terminal historical rows must not be adopted instead of attaching copies",
+  );
+  assert(
+    fixture.ready() === false,
+    "owned copies must be detached at completion",
   );
 });
 
@@ -2847,7 +2920,7 @@ Deno.test("real preparation adapter refuses a helper that already holds a source
     boot: [{
       id: "source-attachment",
       "instance-id": "helper-instance",
-      "boot-volume-id": plan.source.bootVolumeId,
+      "volume-id": plan.source.bootVolumeId,
       "lifecycle-state": "ATTACHED",
       "attachment-type": "paravirtualized",
       device: "/dev/oracleoci/oraclevdz",
@@ -2939,7 +3012,8 @@ Deno.test("real preparation adapter attempts both detaches when the root detach 
     line.includes("volume-attachment detach")
   );
   const bootDetach = fixture.events.findIndex((line) =>
-    line.includes("boot-volume-attachment detach")
+    line.includes("volume-attachment detach") &&
+    line.includes("boot-attachment")
   );
   assert(rootDetach >= 0, "the failed root detach must be attempted");
   assert(
