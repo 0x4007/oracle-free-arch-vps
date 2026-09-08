@@ -35,6 +35,14 @@ import {
 } from "../scripts/oci-group-restore-drill.ts";
 import type { DrillNetworkEvidence } from "../scripts/isolated-drill.ts";
 import type { CommandRunner, JsonRecord } from "../scripts/oci.ts";
+import { drillGuestFilesDigest } from "../scripts/drill-offline-preparation.ts";
+import {
+  groupRestorePreparationAdapter,
+  groupRestorePreparationBundle,
+  type GroupRestorePreparationConfig,
+  validateGroupRestorePreparationConfig,
+  validateGroupRestorePreparationTargets,
+} from "../scripts/oci-group-restore-preparation.ts";
 
 function assert(value: unknown, message = "Assertion failed"): asserts value {
   if (!value) throw new Error(message);
@@ -2279,5 +2287,797 @@ Deno.test("cleanup fails closed when a retried exact delete is still live and pr
   assert(
     lastWrite.filter((entry) => entry.intent === "delete").length === 1,
     "the durable delete intent must not be duplicated or widened",
+  );
+});
+
+const PREP_SSH_HOST = "203.0.113.10";
+
+function preparationConfig(): GroupRestorePreparationConfig {
+  return {
+    planSha256: PLAN_SHA,
+    helper: {
+      instanceId: "helper-instance",
+      displayName: "arch-drill-helper-" + plan.suffix,
+      imageId: "helper-image",
+    },
+    ssh: {
+      host: PREP_SSH_HOST,
+      port: 22,
+      user: "opc",
+      identityFile: ".private/prep/helper-key",
+      knownHostsFile: ".private/prep/helper-known-hosts",
+      connectTimeoutSeconds: 10,
+    },
+    copied: {
+      rootUuid: ROOT_UUID,
+      stagingUuid: STAGING_UUID,
+      rootPartitionStartSector: 1050624,
+      kernelSha256: SHA256,
+      initramfsSha256: SHA256,
+      grubSha256: SHA256,
+    },
+    offlineFilesSha256: "pending",
+  };
+}
+
+function helperRecord(): JsonRecord {
+  return {
+    id: "helper-instance",
+    "lifecycle-state": "RUNNING",
+    "compartment-id": plan.source.compartmentId,
+    "availability-domain": plan.availabilityDomain,
+    "display-name": "arch-drill-helper-" + plan.suffix,
+    "image-id": "helper-image",
+  };
+}
+
+function helperVnic(): JsonRecord {
+  return {
+    id: "helper-vnic",
+    "lifecycle-state": "AVAILABLE",
+    "compartment-id": plan.source.compartmentId,
+    "availability-domain": plan.availabilityDomain,
+    "public-ip": PREP_SSH_HOST,
+    "subnet-id": "helper-subnet",
+    "vcn-id": "helper-vcn",
+  };
+}
+
+function bootAttachmentRecord(): JsonRecord {
+  return {
+    id: "boot-attachment",
+    "instance-id": "helper-instance",
+    "boot-volume-id": "target-boot-volume",
+    "lifecycle-state": "ATTACHED",
+    "attachment-type": "paravirtualized",
+    device: null,
+  };
+}
+
+function rootAttachmentRecord(): JsonRecord {
+  return {
+    id: "root-attachment",
+    "instance-id": "helper-instance",
+    "volume-id": "target-root-volume",
+    "lifecycle-state": "ATTACHED",
+    "attachment-type": "paravirtualized",
+    device: "/dev/oracleoci/oraclevdb",
+  };
+}
+
+/** Stateful OCI fixture for the real preparation adapter: attachment list
+ * responses follow the attach/detach calls, and every call is recorded in
+ * `events` in order. `held` adds pre-existing attachment rows (e.g. a source
+ * volume) to the list responses. */
+function preparationOciFixture(
+  helper: JsonRecord = helperRecord(),
+  vnic: JsonRecord = helperVnic(),
+  held: { boot?: JsonRecord[]; root?: JsonRecord[] } = {},
+  options: { failDetach?: "boot" | "root" } = {},
+): {
+  runner: GroupRestoreRunner;
+  events: string[];
+  ready: () => boolean;
+} {
+  const events: string[] = [];
+  let bootAttached = false;
+  let rootAttached = false;
+  const network = goodIsolationNetwork();
+  const targets = goodTargetObservation();
+  const run: CommandRunner = (_command, args) => {
+    const joined = args.join(" ");
+    events.push(joined);
+    const object = (data: unknown) => JSON.stringify({ data });
+    if (joined.includes("network subnet get")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: object(network.subnet),
+        stderr: "",
+      });
+    }
+    if (joined.includes("network route-table get")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: object(network.routeTable),
+        stderr: "",
+      });
+    }
+    if (joined.includes("network vcn get")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: object(network.vcn),
+        stderr: "",
+      });
+    }
+    if (joined.includes("network security-list get")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: object(network.securityLists[0]),
+        stderr: "",
+      });
+    }
+    if (joined.includes("network internet-gateway get")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: object(network.internetGateway),
+        stderr: "",
+      });
+    }
+    if (joined.includes("network dhcp-options get")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: object(network.dhcpOptions),
+        stderr: "",
+      });
+    }
+    if (joined.includes("network vnic get")) {
+      return Promise.resolve({ code: 0, stdout: object(vnic), stderr: "" });
+    }
+    if (joined.includes("compute instance get")) {
+      return Promise.resolve({ code: 0, stdout: object(helper), stderr: "" });
+    }
+    if (joined.includes("vnic-attachment list")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: object([{
+          "vnic-id": "helper-vnic",
+          "instance-id": "helper-instance",
+          "lifecycle-state": "ATTACHED",
+        }]),
+        stderr: "",
+      });
+    }
+    if (joined.includes("bv boot-volume get")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: object(targets.bootVolume),
+        stderr: "",
+      });
+    }
+    if (joined.includes("bv volume get")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: object(targets.rootVolume),
+        stderr: "",
+      });
+    }
+    if (joined.includes("boot-volume-attachment attach")) {
+      bootAttached = true;
+      return Promise.resolve({
+        code: 0,
+        stdout: object(bootAttachmentRecord()),
+        stderr: "",
+      });
+    }
+    if (joined.includes("volume-attachment attach")) {
+      rootAttached = true;
+      return Promise.resolve({
+        code: 0,
+        stdout: object(rootAttachmentRecord()),
+        stderr: "",
+      });
+    }
+    if (joined.includes("boot-volume-attachment detach")) {
+      if (options.failDetach === "boot") {
+        return Promise.resolve({
+          code: 1,
+          stdout: "",
+          stderr: "boot detach failed",
+        });
+      }
+      bootAttached = false;
+      return Promise.resolve({ code: 0, stdout: object({}), stderr: "" });
+    }
+    if (joined.includes("volume-attachment detach")) {
+      if (options.failDetach === "root") {
+        return Promise.resolve({
+          code: 1,
+          stdout: "",
+          stderr: "root detach failed",
+        });
+      }
+      rootAttached = false;
+      return Promise.resolve({ code: 0, stdout: object({}), stderr: "" });
+    }
+    if (joined.includes("boot-volume-attachment get")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: object(bootAttachmentRecord()),
+        stderr: "",
+      });
+    }
+    if (joined.includes("volume-attachment get")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: object(rootAttachmentRecord()),
+        stderr: "",
+      });
+    }
+    if (joined.includes("boot-volume-attachment list")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: object([
+          ...(bootAttached ? [bootAttachmentRecord()] : []),
+          ...(held.boot ?? []),
+        ]),
+        stderr: "",
+      });
+    }
+    if (joined.includes("volume-attachment list")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: object([
+          ...(rootAttached ? [rootAttachmentRecord()] : []),
+          ...(held.root ?? []),
+        ]),
+        stderr: "",
+      });
+    }
+    return Promise.resolve({ code: 0, stdout: object([]), stderr: "" });
+  };
+  return {
+    runner: { ...runner, run },
+    events,
+    ready: () => bootAttached && rootAttached,
+  };
+}
+
+const PREP_BUNDLE = await groupRestorePreparationBundle(plan);
+
+function boundPreparationConfig(): GroupRestorePreparationConfig {
+  const config = preparationConfig();
+  config.offlineFilesSha256 = "pending";
+  return config;
+}
+
+async function prepConfigWithDigest(): Promise<GroupRestorePreparationConfig> {
+  const config = boundPreparationConfig();
+  config.offlineFilesSha256 = await drillGuestFilesDigest(PREP_BUNDLE);
+  return config;
+}
+
+function preparationMarkerJson(
+  config: GroupRestorePreparationConfig,
+): Promise<string> {
+  return Promise.resolve(JSON.stringify({
+    status: "OFFLINE_FILES_PREPARED",
+    planSha256: PREP_BUNDLE.planSha256,
+    bootVolumeId: "target-boot-volume",
+    rootVolumeId: "target-root-volume",
+    helperInstanceId: config.helper.instanceId,
+    firstBootProved: false,
+  }));
+}
+
+Deno.test("real preparation adapter binds the exact targets to the reviewed helper and prepares before launch", async () => {
+  const config = await prepConfigWithDigest();
+  const fixture = preparationOciFixture();
+  const sshCalls: string[][] = [];
+  const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    ssh: (_command, args) => {
+      sshCalls.push(args);
+      return preparationMarkerJson(config).then((stdout) =>
+        Promise.resolve({ code: 0, stdout, stderr: "" })
+      );
+    },
+  });
+  await adapter.prepareCopiedVolumes({
+    bootVolumeId: "target-boot-volume",
+    rootVolumeId: "target-root-volume",
+  });
+  assert(
+    sshCalls.length === 1,
+    "the guarded preparation must run exactly once",
+  );
+  const ssh = sshCalls[0]!;
+  assert(
+    ssh[0] === "-o",
+    "the ssh runner must receive the ssh command and options",
+  );
+  for (
+    const option of [
+      "BatchMode=yes",
+      "StrictHostKeyChecking=yes",
+      "IdentitiesOnly=yes",
+      `UserKnownHostsFile=${config.ssh.knownHostsFile}`,
+      "ConnectTimeout=10",
+      "-p",
+      "22",
+      "-i",
+      config.ssh.identityFile,
+      `${config.ssh.user}@${config.ssh.host}`,
+    ]
+  ) {
+    assert(ssh.includes(option), `pinned prep ssh option missing: ${option}`);
+  }
+  const command = ssh[ssh.length - 1]!;
+  assert(
+    command.startsWith("sudo -n python3 -c '"),
+    "the guarded command must run over sudo",
+  );
+  assert(
+    command.includes("OFFLINE_FILES_PREPARED"),
+    "the guarded marker must be requested",
+  );
+  assert(
+    command.includes("arch-drill.target"),
+    "the drill default target must be installed",
+  );
+  assert(
+    command.includes("mask"),
+    "duplicate-job masking must be in the guarded command",
+  );
+  const flat = fixture.events.map((line) =>
+    line.replace(/^.*? (compute|network|bv) /, "")
+  );
+  assert(
+    flat.some((line) =>
+      line.includes("boot-volume-attachment attach") &&
+      line.includes("target-boot-volume")
+    ),
+  );
+  assert(
+    flat.some((line) =>
+      line.includes("volume-attachment attach") &&
+      line.includes("target-root-volume")
+    ),
+  );
+  const rootDetach = flat.findIndex((line) =>
+    line.includes("volume-attachment detach")
+  );
+  const bootDetach = flat.findIndex((line) =>
+    line.includes("boot-volume-attachment detach")
+  );
+  assert(
+    rootDetach > 0 && bootDetach > rootDetach,
+    "root must detach before boot",
+  );
+  for (const line of fixture.events) {
+    for (
+      const source of [
+        "source-boot",
+        "source-root",
+        "source-instance",
+        "source-capture",
+      ]
+    ) {
+      assert(
+        !line.includes(source),
+        `preparation cannot touch the source: ${line}`,
+      );
+    }
+  }
+  assert(
+    fixture.ready() === false,
+    "both copies must be detached after preparation",
+  );
+});
+
+Deno.test("real preparation adapter fails closed on a missing or mismatching configuration before any call", async () => {
+  const invalid = boundPreparationConfig();
+  // The config digest is not yet bound: refused before any OCI or SSH call.
+  const fixture = preparationOciFixture();
+  let sshCalls = 0;
+  const adapter = groupRestorePreparationAdapter(
+    invalid,
+    plan,
+    fixture.runner,
+    {
+      ssh: () => {
+        sshCalls += 1;
+        return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+      },
+    },
+  );
+  await rejects(async () => {
+    try {
+      await adapter.prepareCopiedVolumes({
+        bootVolumeId: "target-boot-volume",
+        rootVolumeId: "target-root-volume",
+      });
+    } catch (error) {
+      assert(
+        String(error).includes("isolation files differ"),
+        "the mismatching reviewed digest must be named",
+      );
+      throw error;
+    }
+  });
+  assert(
+    fixture.events.length === 0,
+    "no OCI call may run for an unbound configuration",
+  );
+  assert(sshCalls === 0, "no preparation may run for an unbound configuration");
+  const sourceHelper = await prepConfigWithDigest();
+  sourceHelper.helper.instanceId = plan.source.instanceId;
+  await rejects(() =>
+    validateGroupRestorePreparationConfig(sourceHelper, plan, PREP_BUNDLE)
+  );
+  const wrongPlan = await prepConfigWithDigest();
+  wrongPlan.planSha256 = "cd".repeat(32);
+  await rejects(() =>
+    validateGroupRestorePreparationConfig(wrongPlan, plan, PREP_BUNDLE)
+  );
+  await rejects(() =>
+    validateGroupRestorePreparationTargets(plan, {
+      bootVolumeId: plan.source.bootVolumeId,
+      rootVolumeId: "target-root-volume",
+    })
+  );
+  await rejects(() =>
+    validateGroupRestorePreparationTargets(plan, {
+      bootVolumeId: "target-boot-volume",
+      rootVolumeId: plan.source.rootVolumeId,
+    })
+  );
+});
+
+Deno.test("real preparation adapter refuses a helper outside the reviewed identity and management network", async () => {
+  const mismatches: Array<() => Promise<void>> = [];
+  for (
+    const mutate of [
+      (helper: JsonRecord) => {
+        helper["lifecycle-state"] = "STOPPED";
+      },
+      (helper: JsonRecord) => {
+        helper["display-name"] = "other-helper";
+      },
+      (helper: JsonRecord) => {
+        helper["image-id"] = "other-image";
+      },
+      (helper: JsonRecord) => {
+        helper["compartment-id"] = "other-compartment";
+      },
+      (helper: JsonRecord) => {
+        helper["availability-domain"] = "other-AD";
+      },
+    ]
+  ) {
+    mismatches.push(async () => {
+      const helper = helperRecord();
+      mutate(helper);
+      const fixture = preparationOciFixture(helper);
+      const sshCalls: string[][] = [];
+      const adapter = groupRestorePreparationAdapter(
+        await prepConfigWithDigest(),
+        plan,
+        fixture.runner,
+        {
+          ssh: (_command, args) => {
+            sshCalls.push(args);
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          },
+        },
+      );
+      await rejects(() =>
+        adapter.prepareCopiedVolumes({
+          bootVolumeId: "target-boot-volume",
+          rootVolumeId: "target-root-volume",
+        })
+      );
+      assert(
+        sshCalls.length === 0,
+        "no preparation may run for a mismatched helper",
+      );
+    });
+  }
+  for (const run of mismatches) await run();
+  // The live adapter must refuse a production-network helper before any attach.
+  const onProduction = preparationOciFixture(helperRecord(), {
+    ...helperVnic(),
+    "subnet-id": plan.productionSubnetId,
+  });
+  const adapter = groupRestorePreparationAdapter(
+    await prepConfigWithDigest(),
+    plan,
+    onProduction.runner,
+    { ssh: () => Promise.resolve({ code: 0, stdout: "", stderr: "" }) },
+  );
+  await rejects(() =>
+    adapter.prepareCopiedVolumes({
+      bootVolumeId: "target-boot-volume",
+      rootVolumeId: "target-root-volume",
+    })
+  );
+  assert(
+    onProduction.events.every((line) => !line.includes(" attach ")),
+    "no attach may run on a production-network helper",
+  );
+  for (
+    const mutate of [
+      (vnic: JsonRecord) => {
+        vnic.id = "other-vnic";
+      },
+      (vnic: JsonRecord) => {
+        vnic["lifecycle-state"] = "TERMINATED";
+      },
+      (vnic: JsonRecord) => {
+        vnic["compartment-id"] = "other-compartment";
+      },
+      (vnic: JsonRecord) => {
+        vnic["availability-domain"] = "other-AD";
+      },
+    ]
+  ) {
+    const vnic = helperVnic();
+    mutate(vnic);
+    const mismatch = preparationOciFixture(helperRecord(), vnic);
+    const mismatchAdapter = groupRestorePreparationAdapter(
+      await prepConfigWithDigest(),
+      plan,
+      mismatch.runner,
+      { ssh: () => Promise.resolve({ code: 0, stdout: "", stderr: "" }) },
+    );
+    await rejects(() =>
+      mismatchAdapter.prepareCopiedVolumes({
+        bootVolumeId: "target-boot-volume",
+        rootVolumeId: "target-root-volume",
+      })
+    );
+    assert(
+      mismatch.events.every((line) => !line.includes(" attach ")),
+      "no attach may run for an invalid helper VNIC",
+    );
+  }
+});
+
+Deno.test("real preparation adapter refuses a helper that already holds a source volume attachment", async () => {
+  const config = await prepConfigWithDigest();
+  const held = {
+    boot: [{
+      id: "source-attachment",
+      "instance-id": "helper-instance",
+      "boot-volume-id": plan.source.bootVolumeId,
+      "lifecycle-state": "ATTACHED",
+      "attachment-type": "paravirtualized",
+      device: "/dev/oracleoci/oraclevdz",
+    }],
+  };
+  const fixture = preparationOciFixture(helperRecord(), helperVnic(), held);
+  let sshCalls = 0;
+  const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    ssh: () => {
+      sshCalls += 1;
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    },
+  });
+  await rejects(async () => {
+    try {
+      await adapter.prepareCopiedVolumes({
+        bootVolumeId: "target-boot-volume",
+        rootVolumeId: "target-root-volume",
+      });
+    } catch (error) {
+      assert(
+        String(error).includes("holds a production source volume attachment"),
+        "a helper holding source volumes must refuse preparation",
+      );
+      throw error;
+    }
+  });
+  assert(
+    sshCalls === 0,
+    "no preparation may run while source volumes are attached",
+  );
+  assert(
+    fixture.events.every((line) => !line.includes(" attach ")),
+    "no attach may run while source volumes are attached",
+  );
+  assert(
+    fixture.events.every((line) => !line.includes(" detach ")),
+    "no source attachment may ever be detached by this adapter",
+  );
+});
+
+Deno.test("real preparation adapter refuses pre-existing target attachments without detaching them", async () => {
+  const config = await prepConfigWithDigest();
+  const held = {
+    boot: [bootAttachmentRecord()],
+    root: [rootAttachmentRecord()],
+  };
+  const fixture = preparationOciFixture(helperRecord(), helperVnic(), held);
+  const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    ssh: () => Promise.resolve({ code: 0, stdout: "", stderr: "" }),
+  });
+  await rejects(() =>
+    adapter.prepareCopiedVolumes({
+      bootVolumeId: "target-boot-volume",
+      rootVolumeId: "target-root-volume",
+    })
+  );
+  assert(
+    fixture.events.every((line) => !line.includes(" attach ")),
+    "a pre-existing target must not be reattached",
+  );
+  assert(
+    fixture.events.every((line) => !line.includes(" detach ")),
+    "a pre-existing target must never be detached by this adapter",
+  );
+});
+
+Deno.test("real preparation adapter attempts both detaches when the root detach fails", async () => {
+  const config = await prepConfigWithDigest();
+  const fixture = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    {},
+    { failDetach: "root" },
+  );
+  const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    ssh: (_command, _args) =>
+      preparationMarkerJson(config).then((stdout) =>
+        Promise.resolve({ code: 0, stdout, stderr: "" })
+      ),
+  });
+  await rejects(() =>
+    adapter.prepareCopiedVolumes({
+      bootVolumeId: "target-boot-volume",
+      rootVolumeId: "target-root-volume",
+    })
+  );
+  const rootDetach = fixture.events.findIndex((line) =>
+    line.includes("volume-attachment detach")
+  );
+  const bootDetach = fixture.events.findIndex((line) =>
+    line.includes("boot-volume-attachment detach")
+  );
+  assert(rootDetach >= 0, "the failed root detach must be attempted");
+  assert(
+    bootDetach > rootDetach,
+    "boot detach must still run after root failure",
+  );
+});
+
+Deno.test("real preparation adapter fails closed when the guarded command fails or the marker is unbound", async () => {
+  const failure = preparationOciFixture();
+  const failedAdapter = groupRestorePreparationAdapter(
+    await prepConfigWithDigest(),
+    plan,
+    failure.runner,
+    {
+      ssh: () =>
+        Promise.resolve({
+          code: 1,
+          stdout: "",
+          stderr: "interactive authentication failed",
+        }),
+    },
+  );
+  await rejects(async () => {
+    try {
+      await failedAdapter.prepareCopiedVolumes({
+        bootVolumeId: "target-boot-volume",
+        rootVolumeId: "target-root-volume",
+      });
+    } catch (error) {
+      assert(
+        String(error).includes("failed on the helper"),
+        "the preparation failure must propagate as a refusal",
+      );
+      throw error;
+    }
+  });
+  assert(
+    failure.events.some((line) => line.includes("volume-attachment detach")),
+    "the copies must be detached after a failed preparation",
+  );
+  assert(
+    failure.ready() === false,
+    "no copy may stay attached after a refusal",
+  );
+  const unbound = preparationOciFixture();
+  const config = await prepConfigWithDigest();
+  const unboundAdapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    unbound.runner,
+    {
+      ssh: (_command, _args) => {
+        const stdout = JSON.stringify({
+          status: "OFFLINE_FILES_PREPARED",
+          planSha256: PREP_BUNDLE.planSha256,
+          bootVolumeId: "other-boot-volume",
+          rootVolumeId: "target-root-volume",
+          helperInstanceId: config.helper.instanceId,
+          firstBootProved: false,
+        });
+        return Promise.resolve({ code: 0, stdout, stderr: "" });
+      },
+    },
+  );
+  await rejects(async () => {
+    try {
+      await unboundAdapter.prepareCopiedVolumes({
+        bootVolumeId: "target-boot-volume",
+        rootVolumeId: "target-root-volume",
+      });
+    } catch (error) {
+      assert(
+        String(error).includes("marker is missing, malformed or unbound"),
+        "an unbound marker must refuse the launch",
+      );
+      throw error;
+    }
+  });
+});
+
+Deno.test("real preparation adapter refusals hold the pre-boot gate before any instance create", async () => {
+  const fixture = preparationOciFixture();
+  const config = await prepConfigWithDigest();
+  const failing = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    ssh: () =>
+      Promise.resolve({ code: 1, stdout: "", stderr: "preparation not ready" }),
+  });
+  const ports = ociGroupRestorePorts(plan, fixture.runner, {
+    preBootIsolation: failing,
+  });
+  await rejects(() => ports.verifyPreBootIsolation(isolationTargets));
+  assert(
+    fixture.events.every((line) => !line.includes("compute instance launch")),
+    "no clone launch may be issued after a preparation refusal",
+  );
+  assert(
+    fixture.events.every((line) => !line.includes("source-instance")),
+    "the source instance may never be referenced",
+  );
+});
+
+Deno.test("real gate runs the read-only proofs before the preparation adapter and launches only after it", async () => {
+  const fixture = preparationOciFixture();
+  const config = await prepConfigWithDigest();
+  const sshCalls: string[][] = [];
+  const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    ssh: (_command, args) => {
+      sshCalls.push(args);
+      return preparationMarkerJson(config).then((stdout) =>
+        Promise.resolve({ code: 0, stdout, stderr: "" })
+      );
+    },
+  });
+  const ports = ociGroupRestorePorts(plan, fixture.runner, {
+    preBootIsolation: adapter,
+  });
+  await ports.verifyPreBootIsolation(isolationTargets);
+  assert(sshCalls.length === 1, "the guarded preparation must run once");
+  const events = fixture.events;
+  const first = events[0]!;
+  assert(
+    first.includes("network subnet get"),
+    "the routed-network proof must run first",
+  );
+  const lastProof = events.findIndex((line) => line.includes("bv volume get"));
+  const helperRead = events.findIndex((line) =>
+    line.includes("compute instance get")
+  );
+  const rootDetach = events.findIndex((line) =>
+    line.includes("volume-attachment detach")
+  );
+  assert(
+    helperRead > lastProof,
+    "helper identity proof must run after the reviewed read-only proofs",
+  );
+  assert(
+    rootDetach > helperRead,
+    "preparation must finish its attaches before detach",
   );
 });
