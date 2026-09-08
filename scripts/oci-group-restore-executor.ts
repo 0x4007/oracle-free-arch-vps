@@ -12,6 +12,7 @@
  */
 import {
   assertTimestampUtc,
+  BOOT_MEMBER_SIZE_GB,
   buildGroupRestoreLaunchRequest,
   buildRestoredBootVolumeRequest,
   buildRestoredRootVolumeRequest,
@@ -36,6 +37,7 @@ import {
   type GroupRestoreTargetResources,
   journalGroupRestoreIntent,
   reconcileGroupRestoreResource,
+  ROOT_MEMBER_SIZE_GB,
   validateGroupRestoreApproval,
   validateGroupRestoreEvidence,
   validateGroupRestoreJournal,
@@ -43,6 +45,10 @@ import {
   validateGroupRestorePlan,
   validateGroupRestoreTargets,
 } from "./oci-group-restore-drill.ts";
+import {
+  type DrillNetworkEvidence,
+  verifyDrillRoutedNetwork,
+} from "./isolated-drill.ts";
 import { dataArray, dataObject, type JsonRecord, redactOcid } from "./oci.ts";
 
 export interface GroupRestoreExecutionInput {
@@ -154,10 +160,13 @@ export interface GroupRestoreExecutionPorts {
    * volume-group accounting). Called before the first create and after all
    * deletes; a throw fails the operation closed. */
   verifyProduction(): Promise<void>;
-  /** Prove and, where required, prepare all isolation controls before the
-   * restored instance is launched. The hook receives the exact restored
-   * volume IDs so an implementation can mask duplicate jobs on those copies.
-   * A missing or failed hook must prevent the first clone boot. */
+  /** Prove and prepare all isolation controls before the restored instance is
+   * launched. The implementation re-reads the reviewed isolated network and
+   * the exact restored volume identities through the injected runner, then
+   * requires the caller-supplied copied-volume preparation/masking hook:
+   * read-only network checks never mask duplicate jobs on the copies. The
+   * hook receives the exact restored volume IDs. A missing or failed hook
+   * must prevent the first clone boot. */
   verifyPreBootIsolation(
     targets: Pick<GroupRestoreTargetResources, "bootVolumeId" | "rootVolumeId">,
   ): Promise<void>;
@@ -924,7 +933,32 @@ async function executeGroupRestoreDeletes(
       );
       await persistJournal?.(journal);
       if (!deleteEntryCompleted(journal, request)) {
-        throw new Error("Unresolved delete intent cannot be retried");
+        // The exact recorded resource is still live after reconciliation:
+        // retry the identical reviewed delete request exactly once in this
+        // invocation (same plan-bound identity and argv, bounded by
+        // ports.delete), then reconcile and persist again. No wider
+        // identity, no create retry and no journal-order change is
+        // introduced here; the durable intent stays the single journaled one.
+        const retryArgv = buildGroupRestoreDeleteRequest(
+          plan,
+          step,
+          identity,
+          runner,
+        );
+        const after = await ports.delete(step, identity, retryArgv);
+        journal = reconcileGroupRestoreResource(
+          journal,
+          request,
+          "delete",
+          after,
+          nowUtc,
+        );
+        await persistJournal?.(journal);
+        if (!deleteEntryCompleted(journal, request)) {
+          throw new Error(
+            "Exact delete intent is still live after one bounded retry; a later bounded retry must retry the same exact delete",
+          );
+        }
       }
       continue;
     }
@@ -1422,6 +1456,261 @@ export function verifyGroupRestoreProduction(
   }
 }
 
+/** The exact restored targets the pre-boot isolation gate receives. */
+export type GroupRestorePreBootIsolationTargets = Pick<
+  GroupRestoreTargetResources,
+  "bootVolumeId" | "rootVolumeId"
+>;
+
+/** Caller-supplied copied-volume preparation for the pre-boot isolation gate.
+ * The OCI adapter's read-only network and target-identity proofs never mask
+ * duplicate jobs on the restored copies: only this required hook performs
+ * that preparation/masking, and the gate stays fail-closed while it is absent
+ * or throws. A Pi or helper recovery owner may satisfy it later; the
+ * executable wrapper never substitutes a readiness flag for the hook. */
+export interface GroupRestorePreBootIsolationAdapter {
+  /** Prepare/mask the exact restored copies before the first clone boot. */
+  prepareCopiedVolumes(
+    targets: GroupRestorePreBootIsolationTargets,
+  ): Promise<void>;
+}
+
+/** Read-only OCI observations of the exact restored target volumes. */
+export interface GroupRestoreIsolationTargetObservation {
+  bootVolume: JsonRecord;
+  rootVolume: JsonRecord;
+}
+
+/** Pure fail-closed proof that the observed restored volumes are exactly the
+ * non-production targets passed to the pre-boot gate: the exact journaled
+ * identities, in the reviewed compartment, AVAILABLE, at the reviewed member
+ * sizes, and never an alias of the source, group, backup, production or
+ * isolated plan identities. */
+export function verifyGroupRestoreIsolationTargets(
+  plan: GroupRestorePlan,
+  targets: GroupRestorePreBootIsolationTargets,
+  observed: GroupRestoreIsolationTargetObservation,
+): void {
+  validateGroupRestorePlan(plan);
+  const forbidden = [
+    plan.source.instanceId,
+    plan.source.bootVolumeId,
+    plan.source.rootVolumeId,
+    plan.volumeGroupId,
+    plan.volumeGroupBackupId,
+    plan.bootMemberBackupId,
+    plan.rootMemberBackupId,
+    plan.productionSubnetId,
+    plan.productionVcnId,
+    plan.productionReservedIpId,
+    plan.isolatedSubnetId,
+    plan.isolatedVcnId,
+  ];
+  if (
+    !targets.bootVolumeId || !targets.rootVolumeId ||
+    targets.bootVolumeId === targets.rootVolumeId
+  ) {
+    throw new Error("Pre-boot isolation targets are not two distinct volumes");
+  }
+  if (
+    forbidden.includes(targets.bootVolumeId) ||
+    forbidden.includes(targets.rootVolumeId)
+  ) {
+    throw new Error(
+      "Pre-boot isolation targets reference a protected identity",
+    );
+  }
+  if (
+    observed.bootVolume.id !== targets.bootVolumeId ||
+    observed.rootVolume.id !== targets.rootVolumeId
+  ) {
+    throw new Error("Restored target volumes differ from the gate targets");
+  }
+  if (
+    observed.bootVolume["compartment-id"] !== plan.source.compartmentId ||
+    observed.rootVolume["compartment-id"] !== plan.source.compartmentId
+  ) {
+    throw new Error(
+      "Restored target volumes are outside the reviewed compartment",
+    );
+  }
+  if (
+    observed.bootVolume["lifecycle-state"] !== "AVAILABLE" ||
+    observed.rootVolume["lifecycle-state"] !== "AVAILABLE"
+  ) {
+    throw new Error("Restored target volumes are not AVAILABLE");
+  }
+  if (
+    observed.bootVolume["size-in-gbs"] !== BOOT_MEMBER_SIZE_GB ||
+    observed.rootVolume["size-in-gbs"] !== ROOT_MEMBER_SIZE_GB
+  ) {
+    throw new Error(
+      "Restored target volumes differ from the reviewed member sizes",
+    );
+  }
+}
+
+/** Fail-closed pure proof with a strictly limited scope: it proves only the
+ * reviewed routed-network evidence (isolated VCN, subnet, exactly one
+ * security list, route table, internet gateway and DHCP options as read
+ * back live) and the exact non-production restored-volume identities bound
+ * to the gate. It is not a full first-boot isolation proof: full isolation
+ * also requires the copied-volume preparation hook and guest-side
+ * metadata/link-local suppression, which this function does not prove. The
+ * routed-network check is the single reused proof (never duplicated with
+ * contradictory rules), and the caller-supplied preparation adapter must
+ * still run before the gate admits the clone launch. */
+export function verifyGroupRestorePreBootIsolation(
+  plan: GroupRestorePlan,
+  network: DrillNetworkEvidence,
+  targets: GroupRestorePreBootIsolationTargets,
+  observed: GroupRestoreIsolationTargetObservation,
+): void {
+  verifyDrillRoutedNetwork(plan, network);
+  verifyGroupRestoreIsolationTargets(plan, targets, observed);
+}
+
+/** OCI adapter for the pre-boot isolation gate: deterministic read-only
+ * probes through the injected runner (`network subnet/vcn/security-list/
+ * route-table/internet-gateway/dhcp-options get`, then `bv boot-volume get`
+ * and `bv volume get` on the exact target ids), followed by the required
+ * caller-supplied copied-volume preparation hook. No mutation command ever
+ * appears; a missing adapter or any failed proof throws before the instance
+ * create can be resumed. */
+export function groupRestorePreBootIsolationVerifier(
+  plan: GroupRestorePlan,
+  runner: GroupRestoreRunner,
+  call: (argv: string[]) => Promise<JsonRecord>,
+  adapter: GroupRestorePreBootIsolationAdapter | undefined,
+): GroupRestoreExecutionPorts["verifyPreBootIsolation"] {
+  const read = (args: string[]) => call(groupRestoreCliArgs(runner, args));
+  return async (targets) => {
+    if (!adapter) {
+      throw new Error(
+        "Pre-boot isolation gate is not configured: a copied-volume preparation adapter is required; clone launch is refused",
+      );
+    }
+    const subnet = dataObject(
+      await read([
+        "network",
+        "subnet",
+        "get",
+        "--subnet-id",
+        plan.isolatedSubnetId,
+      ]),
+    );
+    const securityListIds = subnet["security-list-ids"];
+    if (
+      !Array.isArray(securityListIds) || securityListIds.length !== 1 ||
+      typeof securityListIds[0] !== "string"
+    ) {
+      throw new Error(
+        "Isolated subnet does not bind exactly one reviewed security list",
+      );
+    }
+    const routeTableId = subnet["route-table-id"];
+    const dhcpOptionsId = subnet["dhcp-options-id"];
+    if (
+      typeof routeTableId !== "string" || routeTableId === "" ||
+      typeof dhcpOptionsId !== "string" || dhcpOptionsId === ""
+    ) {
+      throw new Error(
+        "Isolated subnet misses its reviewed route table or DHCP options",
+      );
+    }
+    const routeTable = dataObject(
+      await read([
+        "network",
+        "route-table",
+        "get",
+        "--route-table-id",
+        routeTableId,
+      ]),
+    );
+    const routeRules = routeTable["route-rules"];
+    if (!Array.isArray(routeRules) || routeRules.length !== 1) {
+      throw new Error(
+        "Isolated route table does not bind exactly one reviewed route",
+      );
+    }
+    const gatewayId = routeRules[0]!["network-entity-id"];
+    if (typeof gatewayId !== "string" || gatewayId === "") {
+      throw new Error("Isolated route does not bind an internet gateway");
+    }
+    const vcn = dataObject(
+      await read([
+        "network",
+        "vcn",
+        "get",
+        "--vcn-id",
+        plan.isolatedVcnId,
+      ]),
+    );
+    const securityList = dataObject(
+      await read([
+        "network",
+        "security-list",
+        "get",
+        "--security-list-id",
+        String(securityListIds[0]),
+      ]),
+    );
+    const internetGateway = dataObject(
+      await read([
+        "network",
+        "internet-gateway",
+        "get",
+        "--ig-id",
+        gatewayId,
+      ]),
+    );
+    const dhcpOptions = dataObject(
+      await read([
+        "network",
+        "dhcp-options",
+        "get",
+        "--dhcp-options-id",
+        dhcpOptionsId,
+      ]),
+    );
+    const bootVolume = dataObject(
+      await read([
+        "bv",
+        "boot-volume",
+        "get",
+        "--boot-volume-id",
+        targets.bootVolumeId,
+      ]),
+    );
+    const rootVolume = dataObject(
+      await read([
+        "bv",
+        "volume",
+        "get",
+        "--volume-id",
+        targets.rootVolumeId,
+      ]),
+    );
+    verifyGroupRestorePreBootIsolation(
+      plan,
+      {
+        vcn,
+        subnet,
+        securityLists: [securityList],
+        routeTable,
+        internetGateway,
+        dhcpOptions,
+      },
+      targets,
+      { bootVolume, rootVolume },
+    );
+    // The read-only proofs never mask duplicate jobs on the copies: this
+    // caller-supplied hook is the only thing allowed to prepare them, and it
+    // runs after the proofs and before any instance create can be resumed.
+    await adapter.prepareCopiedVolumes(targets);
+  };
+}
+
 /** Short bounded budget for one delete poll, derived from the lifetime window
  * and capped so no hard-coded long cost window exists. */
 export const DELETE_POLL_INTERVAL_MS = 10_000;
@@ -1451,18 +1740,20 @@ export interface GroupRestorePortsOptions {
   lifetime?: GroupRestoreLifetime;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
-  /** Caller-owned pre-boot isolation implementation. It must verify the
-   * isolated network and prepare the copied volumes before the first launch.
-   * The default deliberately fails closed. */
-  verifyPreBootIsolation?: (
-    targets: Pick<GroupRestoreTargetResources, "bootVolumeId" | "rootVolumeId">,
-  ) => Promise<void>;
+  /** Caller-supplied copied-volume preparation/masking adapter for the exact
+   * restored targets. The read-only network and target-identity proofs never
+   * mask duplicate jobs; the pre-boot isolation gate fails closed while this
+   * typed adapter is absent or throws, so an unprepared or duplicate-job
+   * guest can never boot beside production. */
+  preBootIsolation?: GroupRestorePreBootIsolationAdapter;
 }
 
 /** OCI adapter used by the Pi. It performs no calls until a state-machine
  * function invokes one of its methods. Every call carries the provider-wide
  * no-retry and bounded timeout discipline plus `--output json`; the live
- * production verifier is implemented here and uses only read-only probes. */
+ * production verifier and the pre-boot isolation gate (read-only network and
+ * target proofs plus the required caller-supplied copied-volume preparation)
+ * are implemented here and use only read-only probes. */
 export function ociGroupRestorePorts(
   plan: GroupRestorePlan,
   runner: GroupRestoreRunner,
@@ -1575,13 +1866,11 @@ export function ociGroupRestorePorts(
         observation as unknown as GroupRestoreProductionObservation,
       );
     },
-    verifyPreBootIsolation: async (targets) => {
-      if (!options.verifyPreBootIsolation) {
-        throw new Error(
-          "Pre-boot isolation gate is not configured; clone launch is refused",
-        );
-      }
-      await options.verifyPreBootIsolation(targets);
-    },
+    verifyPreBootIsolation: groupRestorePreBootIsolationVerifier(
+      plan,
+      runner,
+      call,
+      options.preBootIsolation,
+    ),
   };
 }

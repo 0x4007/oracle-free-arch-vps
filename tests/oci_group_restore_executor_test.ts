@@ -9,10 +9,13 @@ import {
   groupRestoreDeletePollBudgetMs,
   type GroupRestoreExecutionInput,
   type GroupRestoreExecutionPorts,
+  type GroupRestoreIsolationTargetObservation,
   type GroupRestoreProductionObservation,
   groupRestoreProductionProbes,
   ociGroupRestorePorts,
   validateGroupRestoreAcceptance,
+  verifyGroupRestoreIsolationTargets,
+  verifyGroupRestorePreBootIsolation,
   verifyGroupRestoreProduction,
 } from "../scripts/oci-group-restore-executor.ts";
 import {
@@ -30,7 +33,8 @@ import {
   journalGroupRestoreIntent,
   reconcileGroupRestoreResource,
 } from "../scripts/oci-group-restore-drill.ts";
-import type { CommandRunner } from "../scripts/oci.ts";
+import type { DrillNetworkEvidence } from "../scripts/isolated-drill.ts";
+import type { CommandRunner, JsonRecord } from "../scripts/oci.ts";
 
 function assert(value: unknown, message = "Assertion failed"): asserts value {
   if (!value) throw new Error(message);
@@ -1651,4 +1655,629 @@ Deno.test("production verifier never weakens the online invariant", async () => 
   for (const bad of cases) {
     await rejects(() => verifyGroupRestoreProduction(plan, bad));
   }
+});
+
+function goodIsolationNetwork(): DrillNetworkEvidence {
+  const vcnId = plan.isolatedVcnId;
+  return {
+    vcn: { id: vcnId, "compartment-id": plan.source.compartmentId },
+    subnet: {
+      id: plan.isolatedSubnetId,
+      "vcn-id": vcnId,
+      "compartment-id": plan.source.compartmentId,
+      "prohibit-public-ip-on-vnic": false,
+      "lifecycle-state": "AVAILABLE",
+      "cidr-block": "10.77.0.0/28",
+      "security-list-ids": ["isolated-security-list"],
+      "route-table-id": "isolated-route-table",
+      "dhcp-options-id": "isolated-dhcp",
+    },
+    securityLists: [{
+      id: "isolated-security-list",
+      "vcn-id": vcnId,
+      "compartment-id": plan.source.compartmentId,
+      "ingress-security-rules": [{
+        protocol: "6",
+        source: "74.72.113.64/32",
+        "source-type": "CIDR_BLOCK",
+        "is-stateless": false,
+        "tcp-options": { "destination-port-range": { min: 22, max: 22 } },
+      }],
+      "egress-security-rules": [],
+    }],
+    routeTable: {
+      id: "isolated-route-table",
+      "vcn-id": vcnId,
+      "compartment-id": plan.source.compartmentId,
+      "route-rules": [{
+        destination: "0.0.0.0/0",
+        "destination-type": "CIDR_BLOCK",
+        "network-entity-id": "isolated-igw",
+      }],
+    },
+    internetGateway: {
+      id: "isolated-igw",
+      "vcn-id": vcnId,
+      "compartment-id": plan.source.compartmentId,
+      "is-enabled": true,
+    },
+    dhcpOptions: {
+      id: "isolated-dhcp",
+      "vcn-id": vcnId,
+      "compartment-id": plan.source.compartmentId,
+      options: [{
+        type: "DomainNameServer",
+        "server-type": "CustomDnsServer",
+        "custom-dns-servers": ["192.0.2.1"],
+      }],
+    },
+  };
+}
+
+function goodTargetObservation(): GroupRestoreIsolationTargetObservation {
+  return {
+    bootVolume: {
+      id: "target-boot-volume",
+      "compartment-id": plan.source.compartmentId,
+      "lifecycle-state": "AVAILABLE",
+      "size-in-gbs": 50,
+    },
+    rootVolume: {
+      id: "target-root-volume",
+      "compartment-id": plan.source.compartmentId,
+      "lifecycle-state": "AVAILABLE",
+      "size-in-gbs": 150,
+    },
+  };
+}
+
+const isolationTargets = {
+  bootVolumeId: "target-boot-volume",
+  rootVolumeId: "target-root-volume",
+};
+
+Deno.test("pre-boot isolation proof accepts the reviewed isolated network and exact targets", () => {
+  verifyGroupRestorePreBootIsolation(
+    plan,
+    goodIsolationNetwork(),
+    isolationTargets,
+    goodTargetObservation(),
+  );
+});
+
+Deno.test("pre-boot isolation proof refuses production, permissive and contradictory network evidence", async () => {
+  const good = goodIsolationNetwork();
+  const ingress = good.securityLists[0]!["ingress-security-rules"] as unknown[];
+  const cases: (() => DrillNetworkEvidence)[] = [
+    () => ({
+      ...good,
+      subnet: { ...good.subnet, id: plan.productionSubnetId },
+    }),
+    () => ({
+      ...good,
+      subnet: { ...good.subnet, "vcn-id": plan.productionVcnId },
+    }),
+    // A network that is not the reviewed isolated network is never proof.
+    () => ({
+      ...good,
+      subnet: { ...good.subnet, id: "other-isolated-subnet" },
+    }),
+    () => ({
+      ...good,
+      vcn: { ...good.vcn, id: "other-isolated-vcn" },
+      subnet: { ...good.subnet, "vcn-id": "other-isolated-vcn" },
+    }),
+    () => ({
+      ...good,
+      subnet: { ...good.subnet, "lifecycle-state": "PROVISIONING" },
+    }),
+    () => ({
+      ...good,
+      subnet: { ...good.subnet, "compartment-id": "other-compartment" },
+    }),
+    () => ({
+      ...good,
+      subnet: { ...good.subnet, "cidr-block": "10.99.0.0/28" },
+    }),
+    () => ({
+      ...good,
+      subnet: { ...good.subnet, "ipv6-cidr-block": "2001:db8::/64" },
+    }),
+    () => ({
+      ...good,
+      subnet: { ...good.subnet, "ipv6-cidr-blocks": ["2001:db8::/64"] },
+    }),
+    // A second list is additive-permissive even if its own rules were fine.
+    () => ({
+      ...good,
+      securityLists: [
+        good.securityLists[0]!,
+        { ...good.securityLists[0]!, id: "isolated-security-list-2" },
+      ],
+    }),
+    () => ({
+      ...good,
+      subnet: {
+        ...good.subnet,
+        "security-list-ids": [
+          "isolated-security-list",
+          "isolated-security-list-2",
+        ],
+      },
+    }),
+    // Permissive ingress: a wider source, an extra rule or a wider port.
+    () => ({
+      ...good,
+      securityLists: [{
+        ...good.securityLists[0]!,
+        "ingress-security-rules": [{
+          ...(ingress[0] as JsonRecord),
+          source: "0.0.0.0/0",
+        }],
+      }],
+    }),
+    () => ({
+      ...good,
+      securityLists: [{
+        ...good.securityLists[0]!,
+        "ingress-security-rules": [
+          ingress[0],
+          {
+            protocol: "6",
+            source: "74.72.113.65/32",
+            "source-type": "CIDR_BLOCK",
+          },
+        ],
+      }],
+    }),
+    () => ({
+      ...good,
+      securityLists: [{
+        ...good.securityLists[0]!,
+        "ingress-security-rules": [{
+          ...(ingress[0] as JsonRecord),
+          "tcp-options": { "destination-port-range": { min: 22, max: 23 } },
+        }],
+      }],
+    }),
+    // Egress must stay empty.
+    () => ({
+      ...good,
+      securityLists: [{
+        ...good.securityLists[0]!,
+        "egress-security-rules": [{
+          protocol: "6",
+          destination: "0.0.0.0/0",
+          "destination-type": "CIDR_BLOCK",
+        }],
+      }],
+    }),
+    // The route must be the reviewed isolated route to the reviewed gateway.
+    () => ({
+      ...good,
+      routeTable: {
+        ...good.routeTable,
+        "route-rules": [{
+          destination: "0.0.0.0/0",
+          "destination-type": "CIDR_BLOCK",
+          "network-entity-id": "another-igw",
+        }],
+      },
+    }),
+    () => ({
+      ...good,
+      routeTable: { ...good.routeTable, "route-rules": [] },
+    }),
+    // DHCP must not advertise the recursive resolver or any other resolver.
+    () => ({
+      ...good,
+      dhcpOptions: {
+        ...good.dhcpOptions,
+        options: [{
+          type: "DomainNameServer",
+          "server-type": "CustomDnsServer",
+          "custom-dns-servers": ["169.254.169.254"],
+        }],
+      },
+    }),
+    () => ({
+      ...good,
+      dhcpOptions: {
+        ...good.dhcpOptions,
+        options: [{
+          type: "DomainNameServer",
+          "server-type": "VcnLocalPlusInternet",
+          "custom-dns-servers": [],
+        }],
+      },
+    }),
+    () => ({
+      ...good,
+      internetGateway: { ...good.internetGateway, "is-enabled": false },
+    }),
+    () => ({
+      ...good,
+      vcn: { ...good.vcn, "compartment-id": "other-compartment" },
+    }),
+    () => ({
+      ...good,
+      securityLists: [{
+        ...good.securityLists[0]!,
+        "vcn-id": "other-vcn",
+      }],
+    }),
+  ];
+  for (const make of cases) {
+    await rejects(() =>
+      verifyGroupRestorePreBootIsolation(
+        plan,
+        make(),
+        isolationTargets,
+        goodTargetObservation(),
+      )
+    );
+  }
+});
+
+Deno.test("pre-boot isolation proof refuses target mismatch and protected identities", async () => {
+  const good = goodTargetObservation();
+  const cases: (() => {
+    targets: typeof isolationTargets;
+    observed: GroupRestoreIsolationTargetObservation;
+  })[] = [
+    () => ({
+      targets: isolationTargets,
+      observed: {
+        ...good,
+        bootVolume: { ...good.bootVolume, id: "other-boot" },
+      },
+    }),
+    () => ({
+      targets: isolationTargets,
+      observed: {
+        ...good,
+        rootVolume: { ...good.rootVolume, id: "other-root" },
+      },
+    }),
+    () => ({
+      targets: isolationTargets,
+      observed: {
+        ...good,
+        bootVolume: { ...good.bootVolume, id: "target-root-volume" },
+      },
+    }),
+    () => ({
+      targets: isolationTargets,
+      observed: {
+        ...good,
+        bootVolume: {
+          ...good.bootVolume,
+          "compartment-id": "other-compartment",
+        },
+      },
+    }),
+    () => ({
+      targets: isolationTargets,
+      observed: {
+        ...good,
+        rootVolume: { ...good.rootVolume, "lifecycle-state": "PROVISIONING" },
+      },
+    }),
+    () => ({
+      targets: isolationTargets,
+      observed: {
+        ...good,
+        bootVolume: { ...good.bootVolume, "size-in-gbs": 60 },
+      },
+    }),
+    () => ({
+      targets: { ...isolationTargets, bootVolumeId: plan.source.bootVolumeId },
+      observed: good,
+    }),
+    () => ({
+      targets: { ...isolationTargets, rootVolumeId: plan.isolatedSubnetId },
+      observed: good,
+    }),
+    () => ({
+      targets: { ...isolationTargets, bootVolumeId: "target-root-volume" },
+      observed: good,
+    }),
+  ];
+  for (const make of cases) {
+    const { targets, observed } = make();
+    await rejects(() =>
+      verifyGroupRestoreIsolationTargets(plan, targets, observed)
+    );
+  }
+});
+
+Deno.test("pre-boot isolation adapter reads only read-only evidence and runs the preparation hook", async () => {
+  const network = goodIsolationNetwork();
+  const targets = goodTargetObservation();
+  const responses = {
+    "network subnet get": { data: network.subnet },
+    "network vcn get": { data: network.vcn },
+    "network security-list get": { data: network.securityLists[0] },
+    "network route-table get": { data: network.routeTable },
+    "network internet-gateway get": { data: network.internetGateway },
+    "network dhcp-options get": { data: network.dhcpOptions },
+    "bv boot-volume get": { data: targets.bootVolume },
+    "bv volume get": { data: targets.rootVolume },
+  };
+  const captured = capturingRunner(responses);
+  const prepared: Array<typeof isolationTargets> = [];
+  const ports = ociGroupRestorePorts(plan, captured.runner, {
+    preBootIsolation: {
+      prepareCopiedVolumes: (exact) => {
+        prepared.push(exact);
+        return Promise.resolve();
+      },
+    },
+  });
+  await ports.verifyPreBootIsolation(isolationTargets);
+  assertEquals(prepared, [isolationTargets]);
+  const flat = captured.calls.map((argv) => argv.join(" "));
+  for (
+    const expected of [
+      "network subnet get --subnet-id isolated-subnet",
+      "network vcn get --vcn-id isolated-vcn",
+      "network security-list get --security-list-id isolated-security-list",
+      "network route-table get --route-table-id isolated-route-table",
+      "network internet-gateway get --ig-id isolated-igw",
+      "network dhcp-options get --dhcp-options-id isolated-dhcp",
+      "bv boot-volume get --boot-volume-id target-boot-volume",
+      "bv volume get --volume-id target-root-volume",
+    ]
+  ) {
+    assert(
+      flat.some((line) => line.includes(expected)),
+      `adapter must read the exact reviewed resource: ${expected}`,
+    );
+  }
+  for (const argv of captured.calls) {
+    for (
+      const mutating of [
+        "create",
+        "delete",
+        "update",
+        "terminate",
+        "attach",
+        "detach",
+      ]
+    ) {
+      assert(!argv.includes(mutating), `unexpected mutation verb: ${mutating}`);
+    }
+  }
+  const subnetCall = flat.find((line) => line.includes("network subnet get"))!;
+  for (const flag of ["--no-retry", "--connection-timeout", "--read-timeout"]) {
+    assert(
+      subnetCall.indexOf(flag) < subnetCall.indexOf("network"),
+      `${flag} must precede the isolation subcommand`,
+    );
+  }
+  assert(subnetCall.endsWith("--output json"));
+});
+
+Deno.test("pre-boot isolation adapter fails closed when the preparation hook throws", async () => {
+  const network = goodIsolationNetwork();
+  const targets = goodTargetObservation();
+  const ports = ociGroupRestorePorts(
+    plan,
+    capturingRunner({
+      "network subnet get": { data: network.subnet },
+      "network vcn get": { data: network.vcn },
+      "network security-list get": { data: network.securityLists[0] },
+      "network route-table get": { data: network.routeTable },
+      "network internet-gateway get": { data: network.internetGateway },
+      "network dhcp-options get": { data: network.dhcpOptions },
+      "bv boot-volume get": { data: targets.bootVolume },
+      "bv volume get": { data: targets.rootVolume },
+    }).runner,
+    {
+      preBootIsolation: {
+        prepareCopiedVolumes: () =>
+          Promise.reject(new Error("duplicate-job masking failed")),
+      },
+    },
+  );
+  await rejects(async () => {
+    try {
+      await ports.verifyPreBootIsolation(isolationTargets);
+    } catch (error) {
+      assert(
+        String(error).includes("duplicate-job masking failed"),
+        "the preparation hook failure must propagate",
+      );
+      throw error;
+    }
+  });
+});
+
+Deno.test("pre-boot isolation adapter refuses a subnet without exactly one security list", async () => {
+  const network = goodIsolationNetwork();
+  const ports = ociGroupRestorePorts(
+    plan,
+    capturingRunner({
+      "network subnet get": {
+        data: { ...network.subnet, "security-list-ids": [] },
+      },
+    }).runner,
+    {
+      preBootIsolation: {
+        prepareCopiedVolumes: () => Promise.reject(new Error("must not run")),
+      },
+    },
+  );
+  await rejects(async () => {
+    try {
+      await ports.verifyPreBootIsolation(isolationTargets);
+    } catch (error) {
+      assert(
+        String(error).includes("exactly one reviewed security list"),
+        "the ambiguous security list must fail closed in the adapter",
+      );
+      throw error;
+    }
+  });
+});
+
+function unresolvedDeleteIntent(
+  kind: "boot-volume" | "root-volume" | "instance",
+): GroupRestoreJournal {
+  const request = requestFor(kind);
+  return [{
+    request,
+    intent: "delete" as const,
+    createdAtUtc: "2026-09-08T16:00:00.000Z",
+    identity: {
+      id: `target-${kind}`,
+      name: request.requestName,
+    },
+  }];
+}
+
+Deno.test("cleanup retries a durable unresolved exact delete once and reconciles it", async () => {
+  const { result, ports } = await created();
+  const accepted = await acceptGroupRestoreExecution(
+    result,
+    plan,
+    now,
+    receipt(),
+  );
+  const instanceRequest = requestFor("instance");
+  const journal: GroupRestoreJournal = [
+    ...accepted.journal,
+    ...unresolvedDeleteIntent("instance"),
+  ];
+  const writes: GroupRestoreJournal[] = [];
+  const cleaned = await cleanupGroupRestoreExecution(
+    { ...accepted, journal },
+    plan,
+    approval,
+    evidence,
+    runner,
+    ports,
+    now,
+    (next) => {
+      writes.push(structuredClone(next));
+      return Promise.resolve();
+    },
+  );
+  assert(cleaned.state === "CLEANED");
+  assert(cleaned.deadlineExceeded === false);
+  // The retry resumed the single durable intent: exactly one delete entry per
+  // resource, never a fresh second intent, and every one is reconciled.
+  assert(ports.deleteArgv.length === 3);
+  assertEquals(
+    ports.deleteArgv[0],
+    buildGroupRestoreDeleteRequest(
+      plan,
+      groupRestoreCleanupOrderFor("instance"),
+      {
+        id: "target-instance",
+        name: instanceRequest.requestName,
+      },
+      runner,
+    ),
+  );
+  for (const kind of ["instance", "root-volume", "boot-volume"] as const) {
+    const deletes = cleaned.journal.filter((entry) =>
+      entry.request.kind === kind && entry.intent === "delete"
+    );
+    assert(
+      deletes.length === 1,
+      `the durable delete intent for ${kind} must be retried, not duplicated`,
+    );
+    assert(
+      deletes[0]!.completedAtUtc !== undefined,
+      `the retried delete for ${kind} must be reconciled completed`,
+    );
+  }
+  assert(
+    writes.at(-1)!.at(-1)!.request.kind === "boot-volume",
+    "journal ordering must stay in the reviewed reverse-dependency order",
+  );
+  assert(ports.resources.length === 0);
+});
+
+Deno.test("cleanup fails closed when a retried exact delete is still live and preserves the durable intent", async () => {
+  const { result, ports } = await created();
+  const accepted = await acceptGroupRestoreExecution(
+    result,
+    plan,
+    now,
+    receipt(),
+  );
+  const instanceRequest = requestFor("instance");
+  const journal: GroupRestoreJournal = [
+    ...accepted.journal,
+    ...unresolvedDeleteIntent("instance"),
+  ];
+  // The provider cannot confirm absence: the exact recorded resource stays
+  // live after the bounded delete call.
+  const retryArgv: string[][] = [];
+  const retryIdentities: Array<{ id: string; name: string }> = [];
+  ports.delete = (step, identity, argv) => {
+    retryArgv.push(argv);
+    retryIdentities.push(identity);
+    return ports.observe(requestFor(step.kind));
+  };
+  const writes: GroupRestoreJournal[] = [];
+  await rejects(async () => {
+    try {
+      await cleanupGroupRestoreExecution(
+        { ...accepted, journal },
+        plan,
+        approval,
+        evidence,
+        runner,
+        ports,
+        now,
+        (next) => {
+          writes.push(structuredClone(next));
+          return Promise.resolve();
+        },
+      );
+    } catch (error) {
+      assert(
+        String(error).includes("still live after one bounded retry"),
+        "a still-live retried delete must fail closed and name the later bounded retry",
+      );
+      throw error;
+    }
+  });
+  assert(retryArgv.length === 1);
+  assertEquals(
+    retryArgv[0],
+    buildGroupRestoreDeleteRequest(
+      plan,
+      groupRestoreCleanupOrderFor("instance"),
+      {
+        id: "target-instance",
+        name: instanceRequest.requestName,
+      },
+      runner,
+    ),
+  );
+  assertEquals(
+    retryIdentities,
+    [{ id: "target-instance", name: instanceRequest.requestName }],
+  );
+  assert(
+    ports.deleteArgv.length === 0,
+    "no further resource may be touched after the fail-closed retry",
+  );
+  // The durable intent survives unchanged: one unresolved delete for the exact
+  // recorded identity, and the create/delete journal is never widened.
+  const lastWrite = writes.at(-1)!;
+  const deleteEntries = lastWrite.filter((entry) =>
+    entry.request.kind === "instance" && entry.intent === "delete"
+  );
+  assert(deleteEntries.length === 1);
+  assert(deleteEntries[0]!.identity?.id === "target-instance");
+  assert(deleteEntries[0]!.completedAtUtc === undefined);
+  assert(
+    lastWrite.filter((entry) => entry.intent === "delete").length === 1,
+    "the durable delete intent must not be duplicated or widened",
+  );
 });

@@ -500,6 +500,38 @@ Deno.test("run create refuses before any read or provider call without a configu
   );
 });
 
+Deno.test("run create refuses at the pre-boot gate before any instance create", async () => {
+  const { store, deps, ports } = harness();
+  ports.isolationFailure = true;
+  await rejects(async () => {
+    try {
+      await runGroupRestoreCycle(config("create"), deps);
+    } catch (error) {
+      assert(
+        String(error).includes("pre-boot isolation is not proved"),
+        "the pre-boot isolation gate refusal must propagate",
+      );
+      throw error;
+    }
+  });
+  const journal = persisted(
+    GROUP_RESTORE_STATE_FILES.journal,
+    store,
+  ) as GroupRestoreJournal;
+  assert(
+    journal.length === 2,
+    "only the two restored volumes may be journaled before the gate",
+  );
+  assert(
+    journal.every((entry) => entry.request.kind !== "instance"),
+    "the instance create must be refused before the pre-boot gate",
+  );
+  assert(
+    store.files.get(statePath(GROUP_RESTORE_STATE_FILES.result)) === undefined,
+    "no durable result may exist while the clone launch is refused",
+  );
+});
+
 Deno.test("run accept and cleanup still run without the pre-boot isolation verifier", async () => {
   const { deps, store } = harness();
   await runGroupRestoreCycle(config("create"), deps);

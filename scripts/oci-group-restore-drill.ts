@@ -10,9 +10,15 @@
  * restoreDrillProved always false. The injected runner surface
  * (GroupRestoreRunner) is the only live-capable interface: the primary
  * supplies the OCI CLI path, profile, region and a CommandRunner; this module
- * still only builds deterministic argv and guards. Full first-boot isolation,
- * capacity checks and the live guest acceptance checklist belong to the
- * existing drill adapters and the acceptance runbook.
+ * still only builds deterministic argv and guards. The pre-run guard
+ * (`guardGroupRestoreRun`) returns only the deterministic boot-volume and
+ * root-volume create steps: this module holds no pre-boot isolation proof, so
+ * it never emits or authorizes an instance-launch step. Callers that need the
+ * gated isolated clone launch must use the executor's
+ * `executeGroupRestoreCreates`, which verifies pre-boot isolation and the
+ * durable lifetime before that create. Full first-boot isolation, capacity
+ * checks and the live guest acceptance checklist belong to the existing drill
+ * adapters and the acceptance runbook.
  */
 import { type CommandRunner, type JsonRecord, stringField } from "./oci.ts";
 import { validateBackupPair } from "./oci-restore.ts";
@@ -145,6 +151,15 @@ const RESOURCE_KINDS: GroupRestoreResourceKind[] = [
   "boot-volume",
   "root-volume",
   "instance",
+];
+/** The only create steps the pre-run guard may emit: the deterministic
+ * boot-volume and root-volume restores. The instance launch is never returned
+ * by this guard because it has no pre-boot isolation proof; the gated launch
+ * lives in the executor's executeGroupRestoreCreates, after isolation is
+ * verified. */
+const GUARD_CREATE_KINDS: readonly GroupRestoreResourceKind[] = [
+  "boot-volume",
+  "root-volume",
 ];
 const DISPLAY_PREFIX: Record<GroupRestoreResourceKind, string> = {
   "boot-volume": "arch-oracle-drill-boot",
@@ -862,7 +877,10 @@ export interface GroupRestoreRunStep {
 
 /** Fail-closed pre-run guard result. RUN_READY binds plan, approval, capture
  * metadata, targets and journal consistency; it never claims live restore
- * proof (`restoreDrillProved` stays false). */
+ * proof (`restoreDrillProved` stays false). The returned steps contain only
+ * the deterministic boot-volume and root-volume creates and never an instance
+ * launch: pre-boot isolation proof is owned by the executor's
+ * executeGroupRestoreCreates, which gates the launch after it is verified. */
 export interface GroupRestoreRunGuard {
   state: "RUN_READY";
   suffix: string;
@@ -917,7 +935,12 @@ export function validateGroupRestoreJournal(
 /** Pure pre-run guard: refuse stale or ambiguous intents, an expired
  * approval, mismatched group/member metadata, wrong target identity or any
  * unbound runner value before a single mutation. The returned steps are the
- * exact deterministic argv for the injected CommandRunner. */
+ * exact deterministic argv for the injected CommandRunner and contain only the
+ * boot-volume and root-volume creates: this module holds no pre-boot
+ * isolation proof, so it can never emit or authorize an instance-launch step.
+ * The gated isolated clone launch belongs to the executor's
+ * executeGroupRestoreCreates, which verifies pre-boot isolation and the
+ * durable lifetime immediately before that create. */
 export async function guardGroupRestoreRun(
   input: GroupRestoreRunInput,
   runner: GroupRestoreRunner,
@@ -932,20 +955,26 @@ export async function guardGroupRestoreRun(
     validateGroupRestoreLifetime(input.lifetime, plan, now);
   }
   const steps: GroupRestoreRunStep[] = [];
-  for (const kind of RESOURCE_KINDS) {
+  for (const kind of GUARD_CREATE_KINDS) {
     const request = exactResourceRequest(plan, kind);
-    const argv = kind === "boot-volume"
-      ? groupRestoreCliArgs(runner, buildRestoredBootVolumeRequest(plan))
-      : kind === "root-volume"
-      ? groupRestoreCliArgs(runner, buildRestoredRootVolumeRequest(plan))
-      : groupRestoreCliArgs(
+    let argv: string[];
+    if (kind === "boot-volume") {
+      argv = groupRestoreCliArgs(
         runner,
-        buildGroupRestoreLaunchRequest(
-          plan,
-          targets.bootVolumeId,
-          targets.rootVolumeId,
-        ),
+        buildRestoredBootVolumeRequest(plan),
       );
+    } else if (kind === "root-volume") {
+      argv = groupRestoreCliArgs(
+        runner,
+        buildRestoredRootVolumeRequest(plan),
+      );
+    } else {
+      // Fail closed: an unanticipated kind must never turn into a
+      // differently-kind create step, let alone an unisolated launch.
+      throw new Error(
+        "Guard refuses to emit an unisolated create step for this resource",
+      );
+    }
     steps.push({
       kind,
       request,
