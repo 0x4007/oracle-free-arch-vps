@@ -678,9 +678,14 @@ export async function executeCopiedRootIsolation(
 > {
   await runtime(plan, runner);
   const devices = await diskPartitions(plan, runner, true);
+  // Every mount namespace must be our own except the kernel's private
+  // kdevtmpfs namespace: it must prove exactly one kdevtmpfs Kthread:1 in its
+  // status and one devtmpfs-root-row mountinfo, and still equal the observed
+  // namespace link when re-read after that evidence. No generic kernel thread
+  // and no name alone is trusted; any evidence failure is fail-closed.
   await command(runner, "bash", [
     "-ec",
-    'own=$(readlink /proc/self/ns/mnt); for ns in /proc/[0-9]*/ns/mnt; do observed=$(readlink "$ns") || continue; test "$observed" = "$own"; done',
+    'own=$(readlink /proc/self/ns/mnt); for ns in /proc/[0-9]*/ns/mnt; do observed=$(readlink "$ns") || continue; if test "$observed" = "$own"; then continue; fi; proc=${ns%/ns/mnt}; awk \'BEGIN{n=0;k=0} $1=="Name:" && $2=="kdevtmpfs" {n++} $1=="Kthread:" && $2=="1" {k++} END{exit !(n==1 && k==1)}\' "$proc/status"; awk \'NR==1{sep=0; for(i=1;i<=NF;i++) if($i=="-"){sep++; at=i}} NR>1{bad=1} END{ok=!bad&&NR==1&&sep==1&&$1~/^[0-9]+$/&&$2~/^[0-9]+$/&&$3~/^0:[0-9]+$/&&$4=="/"&&$5=="/"&&$(at+1)=="devtmpfs"&&$(at+2)=="devtmpfs"&&$(at+3)!=""; exit !ok}\' "$proc/mountinfo"; test "$(readlink "$ns")" = "$observed"; done',
   ]);
   await Deno.mkdir(BASE, { mode: 0o700 }).catch((error) => {
     if (!(error instanceof Deno.errors.AlreadyExists)) throw error;

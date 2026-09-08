@@ -123,8 +123,13 @@ function flatten(nodes: BlockNode[]): BlockNode[] {
   return output;
 }
 
-/** Read-only. Only a RAM guest with exactly the two serial-bound whole disks
- * and no mounts, writable holders or alternate mount namespaces can pass.
+/** Read-only. Only a RAM guest with exactly the two serial-bound whole disks,
+ * no mounts, writable holders or alternate mount namespaces can pass. The one
+ * narrow exception is the kernel's private kdevtmpfs mount namespace: an
+ * alternate namespace must prove from its own process status and one-row
+ * mountinfo that it is exactly that kdevtmpfs kernel thread's devtmpfs-root
+ * namespace, and must still equal the observed namespace link when re-read
+ * after that evidence. No generic kernel thread and no name alone is trusted.
  */
 export async function inspectPreparationDisks(
   binding: DiskPreparationBinding,
@@ -248,7 +253,7 @@ export async function inspectPreparationDisks(
     }
     await run(runner, "bash", [
       "-ec",
-      'for device in "$@"; do name=${device##*/}; test -d "/sys/class/block/$name/holders"; for holder in /sys/class/block/"$name"/holders/*; do test ! -e "$holder"; done; done; own=$(readlink /proc/self/ns/mnt); for ns in /proc/[0-9]*/ns/mnt; do observed=$(readlink "$ns") || continue; test "$observed" = "$own"; done',
+      'for device in "$@"; do name=${device##*/}; test -d "/sys/class/block/$name/holders"; for holder in /sys/class/block/"$name"/holders/*; do test ! -e "$holder"; done; done; own=$(readlink /proc/self/ns/mnt); for ns in /proc/[0-9]*/ns/mnt; do observed=$(readlink "$ns") || continue; if test "$observed" = "$own"; then continue; fi; proc=${ns%/ns/mnt}; awk \'BEGIN{n=0;k=0} $1=="Name:" && $2=="kdevtmpfs" {n++} $1=="Kthread:" && $2=="1" {k++} END{exit !(n==1 && k==1)}\' "$proc/status"; awk \'NR==1{sep=0; for(i=1;i<=NF;i++) if($i=="-"){sep++; at=i}} NR>1{bad=1} END{ok=!bad&&NR==1&&sep==1&&$1~/^[0-9]+$/&&$2~/^[0-9]+$/&&$3~/^0:[0-9]+$/&&$4=="/"&&$5=="/"&&$(at+1)=="devtmpfs"&&$(at+2)=="devtmpfs"&&$(at+3)!=""; exit !ok}\' "$proc/mountinfo"; test "$(readlink "$ns")" = "$observed"; done',
       "preparation-read-only",
       ...nodes.map((node) => node.path),
     ]);
