@@ -249,10 +249,10 @@ Deno.test("controller guard accepts only fixture-backed named writer proof", asy
   const originalRealPath = Deno.realPath;
   let seen = "";
   try {
-    Deno.realPath = async (input: string | URL) => {
+    Deno.realPath = (input: string | URL) => {
       seen = String(input);
       assert(input === ".private");
-      return "/fixture/.private";
+      return Promise.resolve("/fixture/.private");
     };
     await evidence({ locks: [holderRow(), waiterRow()] })
       .assertNoOtherController();
@@ -340,10 +340,10 @@ function startupEvidence(
 async function insideStartupFixture(run: () => Promise<void>) {
   const originalRealPath = Deno.realPath;
   let seen = "";
-  Deno.realPath = async (input: string | URL) => {
+  Deno.realPath = (input: string | URL) => {
     seen = String(input);
     assert(input === ".private");
-    return "/fixture/.private";
+    return Promise.resolve("/fixture/.private");
   };
   try {
     await run();

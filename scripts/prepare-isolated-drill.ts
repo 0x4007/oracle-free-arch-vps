@@ -41,7 +41,7 @@ export function acceptedDrillPair(state: AcceptedRuntime, now = new Date()) {
     (cycle.mode === "online"
       ? !cycle.captureIdentity
       : !state.guest?.restored) ||
-    !policy.retainPreviousPair || cycle.suffix === policy.acceptedPair.suffix ||
+    cycle.suffix === policy.acceptedPair.suffix ||
     JSON.stringify(cycle.source) !== JSON.stringify(policy.source) ||
     !Number.isFinite(Date.parse(cycle.createdAtUtc)) ||
     !Number.isFinite(Date.parse(cycle.sourceAcceptedAtUtc)) ||
