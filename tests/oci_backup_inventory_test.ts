@@ -1,7 +1,11 @@
 import {
+  type BackupInventory,
+  type ControllerInventoryConfig,
+  INVENTORY_CONTROLLER_CONFIG_PATH,
   proveFreeVolumeSettings,
   proveNoBillableCustomImages,
   readFreeResourceSurfaceEvidence,
+  runReadOnlyInventory,
 } from "../scripts/oci-backup-inventory.ts";
 import type { CommandResult } from "../scripts/oci.ts";
 
@@ -190,4 +194,166 @@ Deno.test("provider null replicas and platform image sizes do not imply paid res
       "billable-size-in-gbs": 0,
     }]),
   );
+});
+
+const controllerSource = {
+  instanceId: "instance",
+  bootVolumeId: "boot",
+  rootVolumeId: "root",
+  compartmentId: "tenancy",
+  region: "region",
+};
+
+/** Current controller config shape: runtime action plus binding/evidence, with
+ * the extra policy carried by the controller configuration. */
+const controllerConfig = (action: "cycle" | "preflight") => ({
+  action,
+  ociCliPath: "oci",
+  ociProfile: "TEST",
+  tenancyId: "tenancy",
+  source: controllerSource,
+  volumeGroupId: "volume-group",
+  groupAccountingProved: true,
+  policy: {
+    source: controllerSource,
+    volumeGroupId: "volume-group",
+    standingApproval: {
+      approvedAtUtc: "2026-09-05T01:51:00Z",
+      exactOperation: "weekly paired backup rotation",
+      source: controllerSource,
+    },
+    acceptedPair: {
+      suffix: "20260903T191507Z",
+      bootId: "boot",
+      rootId: "root",
+    },
+    retainPreviousPair: true,
+    allowFifthSlot: true,
+  },
+  guest: {
+    host: "codex@controller",
+    rootUuid: "root-uuid",
+    stagingUuid: "staging-uuid",
+    activityScriptPath:
+      "/home/codex/ops/weekly-backup-controller/backup-guest-activity.ts",
+  },
+});
+
+const cannedInventory: BackupInventory = {
+  observedAtUtc: "2026-09-05T00:00:00.000Z",
+  source: controllerSource,
+  homeRegion: "region",
+  compartments: 1,
+  instance: { id: "instance" },
+  instanceEtag: "etag",
+  bootVolume: { id: "boot" },
+  rootVolume: { id: "root" },
+  bootAttachments: [],
+  rootAttachments: [],
+  bootBackups: [],
+  rootBackups: [],
+  volumeGroups: [],
+  volumeGroupBackups: [],
+  sourceVolumeGroup: { id: "volume-group" },
+  sourceVolumeGroupProved: true,
+  publicIps: [],
+  totals: {
+    instances: 1,
+    ocpus: 2,
+    memoryGb: 12,
+    liveVolumeGb: 200,
+    backups: 0,
+    volumeGroupBackups: 0,
+    volumeGroups: 1,
+    publicIps: 1,
+  },
+  sourceAttachmentsProved: true,
+  groupAccountingProved: true,
+};
+
+Deno.test("inventory entry point loads the current controller config and never the legacy path", async () => {
+  const requested: string[] = [];
+  const written = [] as { path: string; value: BackupInventory }[];
+  const inventory = await runReadOnlyInventory({
+    readConfig: (path: string) => {
+      requested.push(path);
+      if (path !== INVENTORY_CONTROLLER_CONFIG_PATH) {
+        throw new Error(`Reading an unexpected entry-point config: ${path}`);
+      }
+      return Promise.resolve(controllerConfig("preflight"));
+    },
+    inventory: () => Promise.resolve(cannedInventory),
+    writeReport: (path, value) => {
+      written.push({ path, value });
+      return Promise.resolve();
+    },
+  });
+  assert(requested.length === 1);
+  assert(requested[0] === ".private/backup-controller.json");
+  assert(!requested.includes(".private/weekly-backup.json"));
+  assert(written.length === 1);
+  assert(
+    written[0].path === ".private/reports/weekly-controller-inventory.json",
+  );
+  assert(written[0].value === inventory);
+});
+
+Deno.test("cycle and preflight controller configs are accepted by the inventory loader without cloud calls", async () => {
+  for (const action of ["cycle", "preflight"] as const) {
+    let inventoryReads = 0;
+    let reportWrites = 0;
+    let received: ControllerInventoryConfig | undefined;
+    const config = controllerConfig(action);
+    const inventory = await runReadOnlyInventory({
+      readConfig: () => Promise.resolve(config),
+      inventory: (loaded) => {
+        inventoryReads += 1;
+        received = loaded;
+        return Promise.resolve(cannedInventory);
+      },
+      writeReport: () => {
+        reportWrites += 1;
+        return Promise.resolve();
+      },
+    });
+    assert(inventoryReads === 1);
+    assert(reportWrites === 1);
+    assert(received?.action === action);
+    assert(received?.volumeGroupId === "volume-group");
+    assert(received?.groupAccountingProved === true);
+    assert(
+      JSON.stringify(received?.source) === JSON.stringify(config.source),
+    );
+    assert(inventory.sourceVolumeGroupProved);
+    assert(inventory.groupAccountingProved);
+  }
+});
+
+Deno.test("inventory entry point stays fail-closed when the controller config is unreadable", async () => {
+  let inventoryReads = 0;
+  let reportWrites = 0;
+  let thrown: unknown;
+  try {
+    await runReadOnlyInventory({
+      readConfig: () => {
+        throw new Error("Missing or malformed current controller config");
+      },
+      inventory: () => {
+        inventoryReads += 1;
+        return Promise.resolve(cannedInventory);
+      },
+      writeReport: () => {
+        reportWrites += 1;
+        return Promise.resolve();
+      },
+    });
+  } catch (error) {
+    thrown = error;
+  }
+  assert(
+    thrown instanceof Error &&
+      thrown.message.includes("Missing or malformed current controller config"),
+  );
+  assert(inventoryReads === 0);
+  assert(reportWrites === 0);
 });
