@@ -1141,10 +1141,98 @@ Deno.test("run entry-point args fail closed without the exact action", async () 
     ".private/inputs/approval.json",
     "--evidence",
     ".private/inputs/evidence.json",
+    "--preparation",
+    ".private/inputs/preparation.json",
     "--runner",
     ".private/inputs/runner.json",
   ]);
   assert(parsed.config.action === "create");
   assert(parsed.config.inputs.acceptancePath === undefined);
+  assert(
+    parsed.config.inputs.preparationPath === ".private/inputs/preparation.json",
+  );
   assert(parsed.runnerPath === ".private/inputs/runner.json");
+});
+
+Deno.test("run entry-point create fails closed without a bound preparation configuration", async () => {
+  await rejects(() => {
+    try {
+      parseGroupRestoreRunArgs([
+        "--action",
+        "create",
+        "--state-dir",
+        ".private/group-restore",
+        "--plan",
+        ".private/inputs/plan.json",
+        "--approval",
+        ".private/inputs/approval.json",
+        "--evidence",
+        ".private/inputs/evidence.json",
+        "--runner",
+        ".private/inputs/runner.json",
+      ]);
+    } catch (error) {
+      assert(
+        String(error).includes(
+          "A bound --preparation private configuration path is required",
+        ),
+        "create must name the missing preparation configuration",
+      );
+      throw error;
+    }
+  });
+  await rejects(() =>
+    parseGroupRestoreRunArgs([
+      "--action",
+      "create",
+      "--state-dir",
+      ".private/group-restore",
+      "--plan",
+      ".private/inputs/plan.json",
+      "--approval",
+      ".private/inputs/approval.json",
+      "--evidence",
+      ".private/inputs/evidence.json",
+      "--preparation",
+      "/tmp/preparation.json",
+      "--runner",
+      ".private/inputs/runner.json",
+    ])
+  );
+  await rejects(() =>
+    parseGroupRestoreRunArgs([
+      "--action",
+      "create",
+      "--state-dir",
+      ".private/group-restore",
+      "--plan",
+      ".private/inputs/plan.json",
+      "--approval",
+      ".private/inputs/approval.json",
+      "--evidence",
+      ".private/inputs/evidence.json",
+      "--preparation",
+      ".private/../preparation.json",
+      "--runner",
+      ".private/inputs/runner.json",
+    ])
+  );
+  // Non-create actions do not require the preparation configuration.
+  const cleanup = parseGroupRestoreRunArgs([
+    "--action",
+    "cleanup",
+    "--state-dir",
+    ".private/group-restore",
+    "--plan",
+    ".private/inputs/plan.json",
+    "--approval",
+    ".private/inputs/approval.json",
+    "--evidence",
+    ".private/inputs/evidence.json",
+    "--acceptance",
+    ".private/inputs/acceptance.json",
+    "--runner",
+    ".private/inputs/runner.json",
+  ]);
+  assert(cleanup.config.inputs.preparationPath === undefined);
 });
