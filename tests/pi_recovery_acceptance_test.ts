@@ -288,3 +288,46 @@ Deno.test("restored reboot reports an explicit command failure", async () => {
     "command failed",
   );
 });
+
+const RELEASE_SOURCE_URL = new URL(
+  "../scripts/pi-recovery-isolation-executor.ts",
+  import.meta.url,
+);
+const READ_RELEASE_SOURCE = (await Deno.permissions.query({
+  name: "read",
+  path: RELEASE_SOURCE_URL.pathname,
+})).state === "granted";
+Deno.test({
+  name: "copied-root release ID guard admits exact Arch Linux ARM IDs only",
+  ignore: !READ_RELEASE_SOURCE,
+  fn: async () => {
+    // Extract the real inline predicate from the executor source: the regex
+    // literal immediately preceding the Os release .test() call. Never
+    // duplicate an independent regex that could diverge from production.
+    const source = await Deno.readTextFile(RELEASE_SOURCE_URL);
+    const argument = source.indexOf("await Deno.readTextFile(osPath)");
+    const member = source.lastIndexOf(".test(", argument);
+    const open = source.lastIndexOf("!/", member);
+    const close = source.lastIndexOf("/m", member);
+    if (argument < 0 || member < 0 || open < 0 || close <= open + 2) {
+      throw Error("Copied-root release ID guard is absent");
+    }
+    const id = new RegExp(source.slice(open + 2, close), "m");
+    for (const os of [
+      "ID=arch\n",
+      'ID="arch"\n',
+      "ID=archarm\n",
+      'ID="archarm"\n',
+    ]) {
+      assert(id.test(os));
+    }
+    for (const os of [
+      "ID=ubuntu\n",
+      "ID=archarm-extra\n",
+      'NAME="Arch Linux ARM"\n',
+      "ID_LIKE=arch\n",
+    ]) {
+      assert(!id.test(os));
+    }
+  },
+});
