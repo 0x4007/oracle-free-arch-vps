@@ -200,6 +200,21 @@ start() {
   fi
   [ "$(id -u codex):$(id -g codex)" = 1000:1000 ] || return 1
   awk -F: '$1 == "codex" && $6 == "/home/codex" && $7 == "/bin/bash" { found++ } END { exit found != 1 }' /etc/passwd || return 1
+  # GPG socket creation needs the standard per-user runtime directory; the
+  # live replacement proved gpgconf --create-socketdir fails without /run/user.
+  [ "$(findmnt -n -o FSTYPE --target /run)" = tmpfs ] || return 1
+  if [ ! -e /run/user ] && [ ! -L /run/user ]; then
+    install -d -o root -g root -m 0755 /run/user || return 1
+  fi
+  [ ! -L /run/user ] || return 1
+  [ -d /run/user ] || return 1
+  [ "$(stat -c '%u:%g:%a' /run/user)" = 0:0:755 ] || return 1
+  if [ ! -e /run/user/1000 ] && [ ! -L /run/user/1000 ]; then
+    install -d -o codex -g codex -m 0700 /run/user/1000 || return 1
+  fi
+  [ ! -L /run/user/1000 ] || return 1
+  [ -d /run/user/1000 ] || return 1
+  [ "$(stat -c '%u:%g:%a' /run/user/1000)" = 1000:1000:700 ] || return 1
   # Unknown random password hash avoids a locked-account public-key rejection.
   # All SSH password authentication remains disabled.
   rescue_hash=$(head -c 48 /dev/urandom | base64 | openssl passwd -6 -stdin) || return 1
@@ -364,11 +379,6 @@ export async function buildRescueCloudInit(
         "jq",
       ],
       write_files: [
-        {
-          path: "/etc/default/kexec",
-          permissions: "0644",
-          content: "LOAD_KEXEC=false\n",
-        },
         {
           path: "/etc/uos-recovery-bootstrap/alpine-release-public.asc",
           permissions: "0644",

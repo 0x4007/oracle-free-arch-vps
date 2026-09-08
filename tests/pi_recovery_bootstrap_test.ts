@@ -108,6 +108,22 @@ Deno.test("rescue reboot approval binds resource identities, boot identity and s
     }, now)
   );
 });
+Deno.test("reboot script refuses a competing kexec-load unit, never relying on removed LOAD_KEXEC", () => {
+  const now = Date.now();
+  const script = approvedRescueBootScript(binding, {
+    approvedAtUtc: new Date(now).toISOString(),
+    planSha256: rescueBootPlan(binding).planSha256,
+    exactOperation: rescueBootPlan(binding).operation,
+  });
+  assert(
+    script.includes(
+      'test "$(systemctl show --property=LoadState --value kexec-load.service)" = not-found',
+    ),
+  );
+  assert(script.indexOf("kexec-load.service") < script.indexOf("kexec --load"));
+  assert(!script.includes("LOAD_KEXEC"));
+  assert(!script.includes("/etc/default/kexec"));
+});
 Deno.test("bootstrap rejects private keys, malformed public keys and injected identity", () => {
   for (
     const key of [
@@ -157,6 +173,40 @@ Deno.test("rescue account requires RAM and non-root public-key SSH", () => {
     ),
   );
 });
+Deno.test("rescue account prepares the GPG runtime after codex identity checks and before SSH keys", () => {
+  const script =
+    rescueOverlayFiles(input).find((f) =>
+      f.path === "etc/init.d/uos-rescue-account"
+    )!.content;
+  assert(script.includes("findmnt -n -o FSTYPE --target /run"));
+  assert(
+    script.includes("install -d -o root -g root -m 0755 /run/user") &&
+      script.includes("install -d -o codex -g codex -m 0700 /run/user/1000"),
+  );
+  assert(
+    script.includes(
+      "[ \"$(stat -c '%u:%g:%a' /run/user)\" = 0:0:755 ] || return 1",
+    ) &&
+      script.includes(
+        "[ \"$(stat -c '%u:%g:%a' /run/user/1000)\" = 1000:1000:700 ] || return 1",
+      ),
+  );
+  assert(
+    script.includes("[ ! -L /run/user ] || return 1") &&
+      script.includes("[ ! -L /run/user/1000 ] || return 1") &&
+      script.includes("[ -d /run/user ] || return 1") &&
+      script.includes("[ -d /run/user/1000 ] || return 1"),
+  );
+  assert(script.indexOf("--target /run") < script.indexOf("install -d"));
+  assert(
+    script.indexOf("/run/user/1000") >
+      script.indexOf('[ "$(id -u codex):$(id -g codex)" = 1000:1000 ]'),
+  );
+  assert(
+    script.indexOf("/run/user/1000") <
+      script.indexOf("cp /etc/uos-rescue/authorized_keys"),
+  );
+});
 Deno.test("assembler verifies signed archive before unpacking and never reboots or wipes", () => {
   const script = rescueAssemblerScript(input);
   assert(script.indexOf("sha256sum -c") < script.indexOf("tar -xzf"));
@@ -194,6 +244,20 @@ Deno.test({
       config.runcmd.length === 1 &&
         config.runcmd[0][0] === "/usr/local/sbin/uos-prepare-ram-rescue",
     );
+  },
+});
+Deno.test({
+  name:
+    "cloud-init no longer writes /etc/default/kexec or the removed LOAD_KEXEC option",
+  ignore: !allowedRead,
+  fn: async () => {
+    const text = await buildRescueCloudInit(input);
+    assert(!text.includes("LOAD_KEXEC"));
+    const config = JSON.parse(text.slice("#cloud-config\n".length));
+    const paths = (config.write_files ?? []).map((file: { path?: string }) =>
+      file.path
+    );
+    assert(!paths.includes("/etc/default/kexec"));
   },
 });
 const allowedRun =
