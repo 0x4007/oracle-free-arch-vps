@@ -650,24 +650,47 @@ export function backupSnapshot(
   };
 }
 
+/** The read-only inventory entry point loads the single current controller
+ * configuration. The legacy inventory config path is never referenced: the
+ * current controller config carries the source volume-group binding
+ * (`volumeGroupId`) and `groupAccountingProved` evidence. */
+export const INVENTORY_CONTROLLER_CONFIG_PATH =
+  ".private/backup-controller.json";
+const INVENTORY_REPORT_PATH =
+  ".private/reports/weekly-controller-inventory.json";
+
+/** Current controller configuration: inventory fields plus the runtime action
+ * (`preflight` or `cycle`), which no longer rejects a valid read-only run. */
+export type ControllerInventoryConfig = BackupInventoryConfig & {
+  action: string;
+};
+
+/** Pure entry-point ports keep the inventory flow deterministic and injectable. */
+export interface ReadOnlyInventoryPorts {
+  readConfig(path: string): Promise<ControllerInventoryConfig>;
+  inventory(config: ControllerInventoryConfig): Promise<BackupInventory>;
+  writeReport(path: string, value: BackupInventory): Promise<void>;
+}
+
+export async function runReadOnlyInventory(
+  ports: ReadOnlyInventoryPorts,
+): Promise<BackupInventory> {
+  const config = await ports.readConfig(INVENTORY_CONTROLLER_CONFIG_PATH);
+  const inventory = await ports.inventory(config);
+  await ports.writeReport(INVENTORY_REPORT_PATH, inventory);
+  return inventory;
+}
+
 if (import.meta.main) {
   const { readPrivateJson, writePrivateJson, redactOcid } = await import(
     "./oci.ts"
   );
   try {
-    const config = await readPrivateJson<
-      BackupInventoryConfig & { action: string }
-    >(
-      ".private/weekly-backup.json",
-    );
-    if (config.action !== "inventory") {
-      throw new Error("This entry point only permits read-only inventory");
-    }
-    const inventory = await readBackupInventory(config);
-    await writePrivateJson(
-      ".private/reports/weekly-controller-inventory.json",
-      inventory,
-    );
+    const inventory = await runReadOnlyInventory({
+      readConfig: readPrivateJson,
+      inventory: readBackupInventory,
+      writeReport: writePrivateJson,
+    });
     console.log(JSON.stringify(
       {
         status: "INVENTORY_RECORDED",
