@@ -270,3 +270,332 @@ Deno.test("controller guard accepts only fixture-backed named writer proof", asy
     Deno.realPath = originalRealPath;
   }
 });
+
+const startupFixtureOptions = {
+  ociCliPath: "oci",
+  ociProfile: "DEFAULT",
+  tenancyId: "tenancy",
+  source: {
+    instanceId: "instance",
+    bootVolumeId: "boot",
+    rootVolumeId: "root",
+    compartmentId: "tenancy",
+    region: "region",
+  },
+};
+const startupFixtureLockPath = "/fixture/.private/backup-controller.lock";
+const startupHolder = (overrides: Record<string, unknown> = {}) => ({
+  pid: Deno.pid,
+  type: "FLOCK",
+  mode: "WRITE",
+  path: startupFixtureLockPath,
+  blocker: null,
+  inode: 123,
+  "maj:min": "179:2",
+  ...overrides,
+});
+const startupWaiter = (
+  pid: number,
+  overrides: Record<string, unknown> = {},
+) => ({
+  pid,
+  type: "FLOCK",
+  mode: "WRITE*",
+  path: startupFixtureLockPath,
+  blocker: Deno.pid,
+  inode: 123,
+  "maj:min": "179:2",
+  ...overrides,
+});
+type StartupObservation = { processes: string; locks: unknown[] };
+type StartupStats = { ps: number; lslocks: number };
+function startupEvidence(
+  steps: ReadonlyArray<StartupObservation>,
+  stats: StartupStats,
+) {
+  let activeObservation = steps[0]!;
+  let next = 0;
+  return backupControllerEvidence(startupFixtureOptions, (command: string) => {
+    if (command === "ps") {
+      activeObservation = steps[Math.min(next, steps.length - 1)]!;
+      next += 1;
+      stats.ps += 1;
+      return Promise.resolve({
+        code: 0,
+        stdout: activeObservation.processes,
+        stderr: "",
+      });
+    }
+    if (command === "lslocks") {
+      stats.lslocks += 1;
+      return Promise.resolve({
+        code: 0,
+        stdout: JSON.stringify({ locks: activeObservation.locks }),
+        stderr: "",
+      });
+    }
+    throw new Error("Unexpected command");
+  });
+}
+async function insideStartupFixture(run: () => Promise<void>) {
+  const originalRealPath = Deno.realPath;
+  let seen = "";
+  Deno.realPath = async (input: string | URL) => {
+    seen = String(input);
+    assert(input === ".private");
+    return "/fixture/.private";
+  };
+  try {
+    await run();
+    assert(seen === ".private");
+  } finally {
+    Deno.realPath = originalRealPath;
+  }
+}
+const startupWrapperProcesses = (queuedDeno: number) =>
+  [
+    "1 0 init init",
+    `${Deno.pid} 1 deno deno test`,
+    "70001 1 bash /usr/local/bin/safepi -- deno run scripts/backup-scheduled.ts",
+    "70002 1 systemd-run systemd-run --user --scope --collect --working-directory=/tmp" +
+    " -- nice -n10 -- deno run scripts/backup-scheduled.ts",
+    `${queuedDeno} 1 nice nice -n10 -- deno run scripts/backup-scheduled.ts`,
+  ].join("\n");
+const queuedDenoProcesses = (deno: number) =>
+  [
+    "1 0 init init",
+    `${Deno.pid} 1 deno deno test`,
+    `${deno} 1 deno deno run scripts/backup-scheduled.ts`,
+  ].join("\n");
+
+Deno.test("startup wrapper may prove its exact queued Deno within bounded observations", async () => {
+  const queuedDeno = 70003;
+  const stats: StartupStats = { ps: 0, lslocks: 0 };
+  const evidence = startupEvidence([
+    {
+      processes: startupWrapperProcesses(queuedDeno),
+      locks: [startupHolder()],
+    },
+    {
+      processes: queuedDenoProcesses(queuedDeno),
+      locks: [startupHolder(), startupWaiter(queuedDeno)],
+    },
+  ], stats);
+  await insideStartupFixture(async () => {
+    await evidence.assertNoOtherController();
+    assert(stats.ps === 2 && stats.lslocks === 2);
+  });
+});
+
+Deno.test("persistent startup wrapper fails after bounded observations", async () => {
+  const queuedDeno = 70003;
+  const stats: StartupStats = { ps: 0, lslocks: 0 };
+  const evidence = startupEvidence([
+    {
+      processes: startupWrapperProcesses(queuedDeno),
+      locks: [startupHolder()],
+    },
+  ], stats);
+  await insideStartupFixture(async () => {
+    let rejected = false;
+    try {
+      await evidence.assertNoOtherController();
+    } catch {
+      rejected = true;
+    }
+    assert(rejected);
+    assert(stats.ps === 3 && stats.lslocks === 3);
+  });
+});
+
+Deno.test("OCI writer appearing during startup observation fails immediately", async () => {
+  const queuedDeno = 70003;
+  const stats: StartupStats = { ps: 0, lslocks: 0 };
+  const evidence = startupEvidence([
+    {
+      processes: startupWrapperProcesses(queuedDeno),
+      locks: [startupHolder()],
+    },
+    {
+      processes: startupWrapperProcesses(queuedDeno) +
+        "\n90000 1 oci oci bv backup create",
+      locks: [startupHolder()],
+    },
+  ], stats);
+  await insideStartupFixture(async () => {
+    let rejected = false;
+    try {
+      await evidence.assertNoOtherController();
+    } catch {
+      rejected = true;
+    }
+    assert(rejected);
+    assert(stats.ps === 2 && stats.lslocks === 1);
+  });
+});
+
+Deno.test("moved owned lock identity during startup observation rejects", async () => {
+  const queuedDeno = 70003;
+  const stats: StartupStats = { ps: 0, lslocks: 0 };
+  const evidence = startupEvidence([
+    {
+      processes: startupWrapperProcesses(queuedDeno),
+      locks: [startupHolder()],
+    },
+    {
+      processes: startupWrapperProcesses(queuedDeno),
+      locks: [startupHolder({ inode: 124 })],
+    },
+  ], stats);
+  await insideStartupFixture(async () => {
+    let rejected = false;
+    try {
+      await evidence.assertNoOtherController();
+    } catch {
+      rejected = true;
+    }
+    assert(rejected);
+    assert(stats.ps === 2 && stats.lslocks === 2);
+  });
+});
+
+Deno.test("queued Deno on a different lock object never satisfies the startup proof", async () => {
+  const queuedDeno = 70003;
+  const wrongWaiter = {
+    processes: queuedDenoProcesses(queuedDeno),
+    locks: [startupHolder(), startupWaiter(queuedDeno, { inode: 999 })],
+  };
+  const stats: StartupStats = { ps: 0, lslocks: 0 };
+  const evidence = startupEvidence([
+    {
+      processes: startupWrapperProcesses(queuedDeno),
+      locks: [startupHolder()],
+    },
+    wrongWaiter,
+    wrongWaiter,
+  ], stats);
+  await insideStartupFixture(async () => {
+    let rejected = false;
+    try {
+      await evidence.assertNoOtherController();
+    } catch {
+      rejected = true;
+    }
+    assert(rejected);
+    assert(stats.ps === 3 && stats.lslocks === 3);
+  });
+});
+
+Deno.test("already-proved queued waiter succeeds on the first observation", async () => {
+  const queuedDeno = 70011;
+  const stats: StartupStats = { ps: 0, lslocks: 0 };
+  const evidence = startupEvidence([
+    {
+      processes: queuedDenoProcesses(queuedDeno),
+      locks: [startupHolder(), startupWaiter(queuedDeno)],
+    },
+  ], stats);
+  await insideStartupFixture(async () => {
+    await evidence.assertNoOtherController();
+    assert(stats.ps === 1 && stats.lslocks === 1);
+  });
+});
+
+Deno.test("wrapper that becomes an unproved Deno may use remaining observations", async () => {
+  const queuedDeno = 70003;
+  const stats: StartupStats = { ps: 0, lslocks: 0 };
+  const evidence = startupEvidence([
+    {
+      processes: startupWrapperProcesses(queuedDeno),
+      locks: [startupHolder()],
+    },
+    {
+      processes: queuedDenoProcesses(queuedDeno),
+      locks: [startupHolder()],
+    },
+    {
+      processes: queuedDenoProcesses(queuedDeno),
+      locks: [startupHolder(), startupWaiter(queuedDeno)],
+    },
+  ], stats);
+  await insideStartupFixture(async () => {
+    await evidence.assertNoOtherController();
+    assert(stats.ps === 3 && stats.lslocks === 3);
+  });
+});
+
+Deno.test("wrapper then vanished candidates re-prove the same holder", async () => {
+  const queuedDeno = 70003;
+  const noCandidates = [
+    "1 0 init init",
+    `${Deno.pid} 1 deno deno test`,
+  ].join("\n");
+  const stats: StartupStats = { ps: 0, lslocks: 0 };
+  const evidence = startupEvidence([
+    {
+      processes: startupWrapperProcesses(queuedDeno),
+      locks: [startupHolder()],
+    },
+    {
+      processes: noCandidates,
+      locks: [startupHolder()],
+    },
+  ], stats);
+  await insideStartupFixture(async () => {
+    await evidence.assertNoOtherController();
+    assert(stats.ps === 2 && stats.lslocks === 2);
+  });
+});
+
+Deno.test("wrapper then vanished candidates with moved or absent holder rejects", async () => {
+  const queuedDeno = 70003;
+  const noCandidates = [
+    "1 0 init init",
+    `${Deno.pid} 1 deno deno test`,
+  ].join("\n");
+  for (const secondLocks of [[], [startupHolder({ inode: 124 })]]) {
+    const stats: StartupStats = { ps: 0, lslocks: 0 };
+    const evidence = startupEvidence([
+      {
+        processes: startupWrapperProcesses(queuedDeno),
+        locks: [startupHolder()],
+      },
+      {
+        processes: noCandidates,
+        locks: secondLocks,
+      },
+    ], stats);
+    await insideStartupFixture(async () => {
+      let rejected = false;
+      try {
+        await evidence.assertNoOtherController();
+      } catch {
+        rejected = true;
+      }
+      assert(rejected);
+      assert(stats.ps === 2 && stats.lslocks === 2);
+    });
+  }
+});
+
+Deno.test("mixed ordinary unproved process cannot open the startup window", async () => {
+  const queuedDeno = 70003;
+  const stats: StartupStats = { ps: 0, lslocks: 0 };
+  const evidence = startupEvidence([
+    {
+      processes: startupWrapperProcesses(queuedDeno) + "\n" +
+        "70020 1 deno deno run scripts/backup-scheduled.ts",
+      locks: [startupHolder()],
+    },
+  ], stats);
+  await insideStartupFixture(async () => {
+    let rejected = false;
+    try {
+      await evidence.assertNoOtherController();
+    } catch {
+      rejected = true;
+    }
+    assert(rejected);
+    assert(stats.ps === 1 && stats.lslocks === 1);
+  });
+});
