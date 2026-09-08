@@ -570,3 +570,249 @@ Deno.test("a malformed claim schedule binding fails closed", () => {
   }
   assert(refused);
 });
+
+function acceptanceSchedule(): BackupSchedule {
+  return {
+    ...schedule,
+    acceptanceWindow: {
+      approvedAtUtc: "2026-09-06T22:00:00Z",
+      startsAtUtc: "2026-09-06T22:05:00Z",
+      expiresAtUtc: "2026-09-07T01:00:00Z",
+      exactOperation: "one online scheduler acceptance capture",
+    },
+  };
+}
+
+Deno.test("an expired acceptance claim without any capture is terminalized for operator reconciliation", () => {
+  const claim = startedClaim(
+    acceptanceSchedule(),
+    "acceptance@2026-09-06T22:05:00.000Z",
+  );
+  const decision = planScheduledClaim(
+    schedule, // the one-time window is no longer part of the current schedule
+    new Date("2026-09-08T12:00:00Z"),
+    { cycle: { phase: "planned", suffix: "20260908T115959Z" } },
+    claim,
+  );
+  assert(decision.action === "skip");
+  if (decision.action === "skip") {
+    assert(decision.reason === "SCHEDULE_CLAIM_RECONCILIATION_REQUIRED");
+    const terminal = decision.reconciliationClaim;
+    assert(terminal !== undefined);
+    assert(terminal.status === "reconciliation-required");
+    // No new capture identity: the claim keeps its own window and period.
+    assert(terminal.windowId === claim.windowId);
+    assert(terminal.periodId === claim.periodId);
+    assert(terminal.updatedAtUtc === "2026-09-08T12:00:00.000Z");
+    assert(
+      JSON.stringify(terminal.approvedSchedule) ===
+        JSON.stringify(claim.approvedSchedule),
+    );
+    assert(terminal.reconciliation?.captureStarted === false);
+    assert(
+      terminal.reconciliation?.expiredAtUtc === "2026-09-07T01:00:00.000Z",
+    );
+    assert(
+      terminal.reconciliation?.requiredAtUtc === "2026-09-08T12:00:00.000Z",
+    );
+    assert(
+      terminal.reconciliation?.instruction.includes("06-TROUBLESHOOTING.md"),
+    );
+  }
+});
+
+Deno.test("a reconciliation-required claim keeps skipping until the operator removes it", () => {
+  const expired = planScheduledClaim(
+    schedule,
+    new Date("2026-09-08T12:00:00Z"),
+    { cycle: { phase: "planned", suffix: "20260908T115959Z" } },
+    startedClaim(acceptanceSchedule(), "acceptance@2026-09-06T22:05:00.000Z"),
+  );
+  assert(expired.action === "skip");
+  if (expired.action !== "skip" || !expired.reconciliationClaim) {
+    throw new Error("Assertion failed");
+  }
+  const terminal = expired.reconciliationClaim;
+  for (
+    const later of [
+      new Date("2026-09-13T12:00:00Z"),
+      new Date("2026-09-20T12:00:00Z"),
+    ]
+  ) {
+    const again = planScheduledClaim(schedule, later, {
+      cycle: { phase: "planned", suffix: "20260920T115959Z" },
+    }, terminal);
+    assert(again.action === "skip");
+    if (again.action === "skip") {
+      assert(again.reason === "SCHEDULE_CLAIM_RECONCILIATION_REQUIRED");
+      assert(again.completedClaim === undefined);
+      assert(again.reconciliationClaim === undefined);
+    }
+  }
+  // The terminal claim is not resumed even when the runtime journal is complete.
+  const completed = planScheduledClaim(
+    schedule,
+    new Date("2026-09-20T12:00:00Z"),
+    {
+      cycle: {
+        phase: "complete",
+        suffix: "20260920T110000Z",
+        captureIdentity: { captureTimeUtc: "2026-09-20T11:00:00Z" },
+      },
+    },
+    terminal,
+  );
+  assert(completed.action === "skip");
+  if (completed.action === "skip") {
+    assert(completed.reason === "SCHEDULE_CLAIM_RECONCILIATION_REQUIRED");
+  }
+});
+
+Deno.test("an expired acceptance claim with a blocked no-capture journal is terminalized", () => {
+  const claim = startedClaim(
+    acceptanceSchedule(),
+    "acceptance@2026-09-06T22:05:00.000Z",
+  );
+  const decision = planScheduledClaim(
+    schedule,
+    new Date("2026-09-08T12:00:00Z"),
+    {
+      cycle: {
+        phase: "failed",
+        suffix: "20260906T220500Z",
+        retry: {
+          disposition: "blocked",
+          resumePhase: "planned",
+          attempts: 1,
+          firstFailureAtUtc: "2026-09-06T22:05:01Z",
+          nextAttemptAtUtc: "2026-09-06T22:05:01Z",
+          deadlineAtUtc: "2026-09-07T04:05:01Z",
+        },
+      },
+    },
+    claim,
+  );
+  assert(decision.action === "skip");
+  if (decision.action === "skip") {
+    assert(decision.reason === "SCHEDULE_CLAIM_RECONCILIATION_REQUIRED");
+    assert(decision.reconciliationClaim?.status === "reconciliation-required");
+  }
+});
+
+Deno.test("an expired claim with a recorded intent or group ID keeps the strict block", () => {
+  const claim = startedClaim(
+    acceptanceSchedule(),
+    "acceptance@2026-09-06T22:05:00.000Z",
+  );
+  for (
+    const cycle of [
+      {
+        phase: "planned",
+        suffix: "20260908T115959Z",
+        volumeGroupBackupIntent: true,
+      },
+      {
+        phase: "backing-up",
+        suffix: "20260908T115959Z",
+        volumeGroupBackupId: "ocid1.test.volumegroupbackup.unique",
+      },
+    ]
+  ) {
+    const decision = planScheduledClaim(
+      schedule,
+      new Date("2026-09-08T12:00:00Z"),
+      { cycle },
+      claim,
+    );
+    assert(decision.action === "skip");
+    if (decision.action === "skip") {
+      assert(decision.reason === "ACCEPTANCE_WINDOW_EXPIRED");
+      assert(decision.reconciliationClaim === undefined);
+    }
+  }
+});
+
+Deno.test("an unexpired claim that lost its acceptance window keeps the strict block", () => {
+  const decision = planScheduledClaim(
+    schedule, // the one-time window was removed before its recorded expiry
+    new Date("2026-09-06T23:30:00Z"),
+    { cycle: { phase: "planned", suffix: "20260906T232959Z" } },
+    startedClaim(acceptanceSchedule(), "acceptance@2026-09-06T22:05:00.000Z"),
+  );
+  assert(decision.action === "skip");
+  if (decision.action === "skip") {
+    assert(decision.reason === "ACCEPTANCE_WINDOW_EXPIRED");
+    assert(decision.reconciliationClaim === undefined);
+  }
+});
+
+Deno.test("claim-only removal leaves the blocked failed runtime stopped", () => {
+  const blocked: ScheduledRuntimeState = {
+    cycle: {
+      phase: "failed",
+      suffix: "20260906T220500Z",
+      retry: {
+        disposition: "blocked",
+        resumePhase: "planned",
+        attempts: 1,
+        firstFailureAtUtc: "2026-09-06T22:05:01Z",
+        nextAttemptAtUtc: "2026-09-06T22:05:01Z",
+        deadlineAtUtc: "2026-09-07T04:05:01Z",
+      },
+    },
+  };
+  const decision = planScheduledClaim(
+    schedule,
+    new Date("2026-09-08T12:00:00Z"),
+    blocked,
+    undefined,
+  );
+  assert(decision.action === "skip");
+  if (decision.action === "skip") {
+    assert(decision.reason === "BACKUP_RETRY_BLOCKED");
+  }
+});
+
+Deno.test("after claim and failed-runtime archival a fresh plan allocates a new identity", () => {
+  const decision = planScheduledClaim(
+    schedule,
+    new Date("2026-09-20T12:00:00Z"),
+    undefined,
+    undefined,
+  );
+  assert(decision.action === "run");
+  if (decision.action === "run") {
+    assert(decision.claim.windowId === "2026-09-20@America/New_York");
+    assert(decision.claim.periodId === "2026-09-20@America/New_York");
+    assert(decision.claim.status === "started");
+    assert(
+      JSON.stringify(decision.claim.approvedSchedule) ===
+        JSON.stringify(approvedScheduleOf(schedule)),
+    );
+  }
+});
+
+Deno.test("a malformed reconciliation-required claim fails closed", () => {
+  const malformed = {
+    ...startedClaim(schedule, "2026-09-06@America/New_York"),
+    status: "reconciliation-required" as const,
+    reconciliation: {
+      requiredAtUtc: "not-a-timestamp",
+      expiredAtUtc: "2026-09-07T01:00:00Z",
+      captureStarted: false as const,
+      instruction: "verify only",
+    },
+  };
+  let refused = false;
+  try {
+    planScheduledClaim(
+      schedule,
+      new Date("2026-09-08T12:00:00Z"),
+      undefined,
+      malformed,
+    );
+  } catch {
+    refused = true;
+  }
+  assert(refused);
+});

@@ -13,7 +13,25 @@ import {
 } from "./online-backup-contract.ts";
 import { readPrivateJson, redactOcid, writePrivateJson } from "./oci.ts";
 
-export type ScheduledClaimStatus = "started" | "complete" | "failed";
+export type ScheduledClaimStatus =
+  | "started"
+  | "complete"
+  | "failed"
+  | "reconciliation-required";
+
+/** Durable operator action recorded when a one-time acceptance claim expires
+ * with no recorded OCI capture. Nothing here may allocate a capture identity.
+ */
+export interface ScheduledClaimReconciliation {
+  requiredAtUtc: string;
+  /** Exact expiry of the one-time acceptance window that produced the claim. */
+  expiredAtUtc: string;
+  /** False only when the runtime journal records no create intent or group ID. */
+  captureStarted: false;
+  /** Bounded read-only instruction; the exact procedure is in
+   * 06-TROUBLESHOOTING.md and never names an OCI resource to create. */
+  instruction: string;
+}
 
 /** The approved schedule authority a claim was planned under. */
 export interface ApprovedSchedule {
@@ -40,6 +58,8 @@ export interface WindowClaim {
   updatedAtUtc: string;
   /** Approved schedule authority the claim was planned under. */
   approvedSchedule?: ApprovedSchedule;
+  /** Set only on a terminal reconciliation-required claim. */
+  reconciliation?: ScheduledClaimReconciliation;
 }
 
 export interface ScheduledCycleState {
@@ -49,6 +69,9 @@ export interface ScheduledCycleState {
   updatedAtUtc?: string;
   sourceAcceptedAtUtc?: string;
   captureIdentity?: { captureTimeUtc?: string };
+  /** Durable group create intent and returned ID from the runtime journal. */
+  volumeGroupBackupIntent?: boolean;
+  volumeGroupBackupId?: string;
   retry?: OnlineBackupRetry;
 }
 
@@ -58,7 +81,13 @@ export interface ScheduledRuntimeState {
 }
 
 export type ScheduledDecision =
-  | { action: "skip"; reason: string; completedClaim?: WindowClaim }
+  | {
+    action: "skip";
+    reason: string;
+    completedClaim?: WindowClaim;
+    /** Terminal claim to persist when an operator action is required. */
+    reconciliationClaim?: WindowClaim;
+  }
   | { action: "run"; claim: WindowClaim };
 
 const CLAIM = ".private/backup-scheduled-window.json";
@@ -220,7 +249,12 @@ function retryDecision(
 function validateClaim(claim: WindowClaim): void {
   if (
     typeof claim.windowId !== "string" || claim.windowId === "" ||
-    !["started", "complete", "failed"].includes(claim.status) ||
+    ![
+      "started",
+      "complete",
+      "failed",
+      "reconciliation-required",
+    ].includes(claim.status) ||
     !parseTimestamp(claim.updatedAtUtc)
   ) throw new Error("Scheduled claim has an unknown status");
   if (claim.periodId !== undefined && claim.periodId === "") {
@@ -229,6 +263,87 @@ function validateClaim(claim: WindowClaim): void {
   if (claim.approvedSchedule !== undefined) {
     validateApprovedSchedule(claim.approvedSchedule);
   }
+  if (claim.status === "reconciliation-required") {
+    const reconciliation = claim.reconciliation;
+    if (
+      !reconciliation || reconciliation.captureStarted !== false ||
+      !parseTimestamp(reconciliation.requiredAtUtc) ||
+      !parseTimestamp(reconciliation.expiredAtUtc) ||
+      typeof reconciliation.instruction !== "string" ||
+      reconciliation.instruction === "" ||
+      reconciliation.instruction.length > 400
+    ) {
+      throw new Error("Scheduled reconciliation claim is invalid");
+    }
+  } else if (claim.reconciliation !== undefined) {
+    throw new Error(
+      "Scheduled reconciliation marker requires a terminal claim",
+    );
+  }
+}
+
+/** True when the runtime journal records a create intent or group ID.
+ * Either field means an OCI group backup operation may have occurred and the
+ * claim must keep the strict block instead of suggesting removal.
+ */
+function captureStarted(state: ScheduledRuntimeState | undefined): boolean {
+  const cycle = state?.cycle;
+  return cycle?.volumeGroupBackupIntent === true ||
+    (typeof cycle?.volumeGroupBackupId === "string" &&
+      cycle.volumeGroupBackupId !== "");
+}
+
+const RECONCILIATION_INSTRUCTION =
+  "Verify no OCI volume-group backup was created for this claim, then archive " +
+  "the failed runtime journal and this stale scheduler claim under the shared " +
+  "controller lock using the read-only steps in 06-TROUBLESHOOTING.md.";
+
+function reconciliationClaimFor(
+  existing: WindowClaim,
+  now: Date,
+): WindowClaim {
+  const expiredAtUtc = parseTimestamp(
+    existing.approvedSchedule?.acceptanceWindow?.expiresAtUtc,
+  );
+  if (expiredAtUtc === undefined) {
+    throw new Error("Stale claim has no recorded acceptance expiry");
+  }
+  return {
+    ...existing,
+    status: "reconciliation-required",
+    updatedAtUtc: now.toISOString(),
+    reconciliation: {
+      requiredAtUtc: now.toISOString(),
+      expiredAtUtc: new Date(expiredAtUtc).toISOString(),
+      captureStarted: false,
+      instruction: RECONCILIATION_INSTRUCTION,
+    },
+  };
+}
+
+/** Return the terminal claim only when a bounded acceptance claim is past its
+ * recorded expiry and the runtime proves that OCI creation never started.
+ * Keeping this check separate lets it run before a blocked retry can mask the
+ * operator-reconciliation state produced by a failed pre-capture guard.
+ */
+function expiredReconciliationClaim(
+  schedule: BackupSchedule,
+  now: Date,
+  state: ScheduledRuntimeState | undefined,
+  existing: WindowClaim | undefined,
+): WindowClaim | undefined {
+  if (
+    !existing || !isAcceptanceWindowId(existing.windowId) ||
+    state?.cycle?.phase === "complete" ||
+    currentWindow(schedule, now) === existing.windowId
+  ) return undefined;
+  const expiry = parseTimestamp(
+    existing.approvedSchedule?.acceptanceWindow?.expiresAtUtc,
+  );
+  if (
+    expiry === undefined || now.getTime() <= expiry || captureStarted(state)
+  ) return undefined;
+  return reconciliationClaimFor(existing, now);
 }
 
 function claimFor(
@@ -270,7 +385,20 @@ export function planScheduledClaim(
   const triggerId = currentWindow(schedule, now);
   if (existing) validateClaim(existing);
 
+  if (existing?.status === "reconciliation-required") {
+    // The terminal claim is the operator's action surface. It stays distinct
+    // until the operator removes only that stale claim; nothing here allocates
+    // a capture identity or bypasses the latest schedule approval.
+    return {
+      action: "skip",
+      reason: "SCHEDULE_CLAIM_RECONCILIATION_REQUIRED",
+    };
+  }
+
   const cycleComplete = state?.cycle?.phase === "complete";
+  const reconciliationClaim = !cycleComplete
+    ? expiredReconciliationClaim(schedule, now, state, existing)
+    : undefined;
   const acceptanceDue = isAcceptanceWindowId(triggerId) &&
     (captureTimestamp(state) ?? -Infinity) <
       Date.parse(triggerId.slice("acceptance@".length));
@@ -294,7 +422,29 @@ export function planScheduledClaim(
   }
 
   const retry = retryDecision(state, now);
-  if (retry) return { action: "skip", reason: retry };
+  if (retry) {
+    // A pre-capture authorization failure is persisted as a blocked retry.
+    // Surface the same terminal no-capture reconciliation state instead of
+    // letting the generic retry block permanently hide it.
+    if (
+      retry === "BACKUP_RETRY_BLOCKED" && reconciliationClaim !== undefined
+    ) {
+      return {
+        action: "skip",
+        reason: "SCHEDULE_CLAIM_RECONCILIATION_REQUIRED",
+        reconciliationClaim,
+      };
+    }
+    return { action: "skip", reason: retry };
+  }
+
+  if (reconciliationClaim !== undefined) {
+    return {
+      action: "skip",
+      reason: "SCHEDULE_CLAIM_RECONCILIATION_REQUIRED",
+      reconciliationClaim,
+    };
+  }
 
   if (!cycleComplete && existing && isAcceptanceWindowId(existing.windowId)) {
     // A one-time approval cannot silently turn into a standing approval after
@@ -354,11 +504,18 @@ export async function runScheduledBackup(): Promise<void> {
         if (decision.completedClaim) {
           await writePrivateJson(CLAIM, decision.completedClaim);
         }
+        // Persist the terminal claim before failing: a later invocation must
+        // keep skipping with its distinct reason until the operator reconciles
+        // both this stale claim and the matching failed runtime journal.
+        if (decision.reconciliationClaim) {
+          await writePrivateJson(CLAIM, decision.reconciliationClaim);
+        }
         if (
           [
             "BACKUP_RETRY_BLOCKED",
             "BACKUP_RETRY_METADATA_INVALID",
             "ACCEPTANCE_WINDOW_EXPIRED",
+            "SCHEDULE_CLAIM_RECONCILIATION_REQUIRED",
           ].includes(decision.reason)
         ) throw new Error(decision.reason);
         throw new Skipped(decision.reason);

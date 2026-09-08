@@ -60,6 +60,16 @@ loss; application data may need a separate, more frequent backup later.
 
 ## Design
 
+> ### ⚠️ DATED CONTROL NOTICE — 2026-09-08
+>
+> Routine weekly captures are **online**: the VPS stays `RUNNING` the whole
+> time. The routine path never quiesces applications, never requests
+> `SOFTSTOP`, never stops or restarts the instance or any required service,
+> and never freezes or pauses production. `SOFTSTOP` applies only to
+> separately approved disaster-recovery, restore, or historical build capture
+> work. The outage-based text below is historical record only and is not the
+> routine procedure.
+
 Use one external controller and one infrastructure writer. Keep the controller
 outside the backed-up VPS and independent of its disks, network and processes.
 Select an existing reliably available host before implementation; do not assume
@@ -67,12 +77,13 @@ the Mac stays awake or provision another host without approval. If the Pi is
 chosen, read its maintenance instructions first. Keep OCI credentials outside
 the VPS and reuse the existing private JSON configuration convention.
 
-Proposed schedule: Sunday 04:00 America/New_York, pending the user's answer.
-Skip an unattended catch-up outage outside the approved maintenance window.
-Measure the first full-backup outage before enabling the schedule. Do not promise
-a short outage before that evidence exists.
+### Historical outage-based weekly state machine — superseded 2026-09-08 (record only)
 
-Weekly state machine:
+Historical schedule note — superseded 2026-09-08: the former proposal used a
+Sunday 04:00 America/New_York outage window, skipped catch-up outside that
+window, and required measuring the first full-backup outage before activation.
+Those statements describe the retired outage model and do not apply to the
+current online scheduler.
 
 1. Acquire an exclusive controller lock and reconcile OCI, guest state, writers,
    account eligibility, all tenancy resources and free backup slots.
@@ -136,12 +147,25 @@ this first full drill is a separate trial-funded operation.
 
 ## Approval and remaining decisions
 
+> ### ⚠️ DATED CONTROL NOTICE — 2026-09-08
+>
+> The standing recurring authorization recorded below applies to the
+> **online** weekly cycle only: applications are never quiesced and the
+> instance is never stopped or restarted by a routine weekly capture.
+> `SOFTSTOP` and any quiesce/stop/restart remain restricted to separately
+> approved disaster-recovery, restore, or build work. Earlier
+> quiesce/`SOFTSTOP` wording in this section describes the historical outage
+> model; it does not authorize an outage for a routine weekly capture.
+
 On 2026-09-05 at approximately 01:51 UTC, the user explicitly approved recurring
-authorization with: "recurring auth approved". This authorizes the weekly cycle
-described above for the existing `arch` VPS: quiesce the required applications,
-clean SOFTSTOP, create a matched backup pair, restart the source, verify live
-recovery, and delete the older accepted pair only after its replacement passes
-the required checks. Do not request this recurring authorization again.
+authorization with: "recurring auth approved". For the existing `arch` VPS,
+that standing authorization now applies to the online weekly cycle: reconcile
+the source and backup headroom, create one matched online volume-group capture
+while the source remains `RUNNING`, verify continuity, and retire only the
+permitted older pair after replacement acceptance. Do not request this
+recurring authorization again. It does not authorize quiescing, `SOFTSTOP`,
+stopping, restarting, or freezing production; those actions remain separately
+approved disaster-recovery, restore, or build work only.
 
 This user authorization takes precedence over per-run approval requirements in
 repository AGENTS.md for those bounded operations. Bind the standing policy to
