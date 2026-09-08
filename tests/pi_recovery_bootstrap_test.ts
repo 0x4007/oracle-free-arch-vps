@@ -161,6 +161,18 @@ Deno.test("assembler verifies signed archive before unpacking and never reboots 
   assert(!/^\s*(?:sudo )?(?:kexec|reboot|wipefs|sfdisk)\b/m.test(script));
   assert(script.includes("rebooted:false,disksPrepared:false"));
 });
+Deno.test("missing kexec prerequisite refuses before staging or rescue readiness", () => {
+  const script = rescueAssemblerScript(input);
+  assert(script.includes("command -v kexec >/dev/null"));
+  assert(
+    script.indexOf("command -v kexec") <
+      script.indexOf('mkdir -m 700 "$rescue_dir"'),
+  );
+  assert(
+    script.indexOf("command -v kexec") < script.indexOf("RAM_RESCUE_STAGED"),
+  );
+  assert(!/\bkexec\s+(?:--exec|--load)\b/.test(script));
+});
 const allowedRead =
   (await Deno.permissions.query({ name: "read" })).state === "granted";
 Deno.test({
