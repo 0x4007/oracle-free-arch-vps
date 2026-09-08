@@ -587,8 +587,11 @@ async function applyInspectedIsolation(
     "-f",
     key,
   ]);
+  const sshPublicKeyLine =
+    /^ssh-ed25519 ([A-Za-z0-9+/]+={0,2})(?: [^\r\n]+)?$/;
   const publicKey = (await Deno.readTextFile(key + ".pub")).trim();
-  if (!/^ssh-ed25519 [A-Za-z0-9+/]+={0,2}(?: [^\r\n]+)?$/.test(publicKey)) {
+  const publicMatch = sshPublicKeyLine.exec(publicKey);
+  if (!publicMatch) {
     throw Error("Replacement host public key is malformed");
   }
   approvalMatches(plan, inspection, approval);
@@ -652,7 +655,11 @@ async function applyInspectedIsolation(
     "-f",
     await regular(ROOT, "etc/ssh/ssh_host_ed25519_key"),
   ]);
-  if (installedPublic !== publicKey.split(/\s+/).slice(0, 2).join(" ")) {
+  const installedMatch = sshPublicKeyLine.exec(installedPublic);
+  if (!installedMatch) {
+    throw Error("Derived host public key is malformed");
+  }
+  if (installedMatch[1] !== publicMatch[1]) {
     throw Error("Copied private host key does not match its public key");
   }
   if (
