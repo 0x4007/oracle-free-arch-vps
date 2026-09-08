@@ -929,6 +929,116 @@ Deno.test("trial cap and expiry validation plus the four hour approval bound", (
   assertReplacementApproval(exact.config, exact.digest, now);
 });
 
+Deno.test(
+  "durable trial authority keeps a stale valid approval usable but still refuses expired, over-lifetime, malformed or future trial authority",
+  () => {
+    const now = Date.parse("2026-09-07T01:00:00Z");
+    // Two hours old: beyond the one-hour window an agent-selected freshness
+    // check must not revoke the owner's standing trial authorization.
+    const approvedAtUtc = new Date(now - 2 * 3600000).toISOString();
+    const trialFields = {
+      spendingCapUsd: 300,
+      expiresAtUtc: new Date(now + 2 * 3600000).toISOString(),
+    };
+    const trial: ReplacementConfig = {
+      ...config,
+      action: "provision",
+      trial: trialFields,
+    };
+    const digest = replacementPlanDigest(trial);
+    const approved: ReplacementConfig = {
+      ...trial,
+      approval: {
+        approvedAtUtc,
+        planSha256: digest,
+        exactOperation: TRIAL_OPERATION,
+      },
+    };
+    assertReplacementApproval(approved, digest, now);
+    // The exact plan digest and target still bind into the durable authority.
+    refuses(() =>
+      assertReplacementApproval(
+        {
+          ...approved,
+          approval: { ...approved.approval!, planSha256: "stale-digest" },
+        },
+        digest,
+        now,
+      )
+    );
+    refuses(() =>
+      assertReplacementApproval(
+        {
+          ...approved,
+          approval: { ...approved.approval!, exactOperation: OPERATION_TEXT },
+        },
+        digest,
+        now,
+      )
+    );
+    // Expired trial coverage still fails closed.
+    const expired: ReplacementConfig = {
+      ...approved,
+      trial: {
+        ...trialFields,
+        expiresAtUtc: new Date(now - 1000).toISOString(),
+      },
+    };
+    refuses(() =>
+      assertReplacementApproval(expired, replacementPlanDigest(expired), now)
+    );
+    // A stale approval cannot stretch the trial lifetime beyond its bound.
+    const over: ReplacementConfig = {
+      ...approved,
+      trial: {
+        ...trialFields,
+        expiresAtUtc: new Date(now + 3 * 3600000).toISOString(),
+      },
+    };
+    refuses(() =>
+      assertReplacementApproval(over, replacementPlanDigest(over), now)
+    );
+    // Malformed and future approval timestamps remain refused.
+    refuses(() =>
+      assertReplacementApproval(
+        {
+          ...approved,
+          approval: { ...approved.approval!, approvedAtUtc: "not-a-date" },
+        },
+        digest,
+        now,
+      )
+    );
+    refuses(() =>
+      assertReplacementApproval(
+        {
+          ...approved,
+          approval: {
+            ...approved.approval!,
+            approvedAtUtc: new Date(now + 1000).toISOString(),
+          },
+        },
+        digest,
+        now,
+      )
+    );
+    // The ordinary free-only path never uses trial authority and still needs
+    // a fresh exact approval.
+    const normal: ReplacementConfig = {
+      ...config,
+      action: "provision",
+      approval: {
+        approvedAtUtc,
+        planSha256: replacementPlanDigest(config),
+        exactOperation: OPERATION_TEXT,
+      },
+    };
+    refuses(() =>
+      assertReplacementApproval(normal, replacementPlanDigest(config), now)
+    );
+  },
+);
+
 Deno.test("proveTrialFunding accepts the verified ACTIVE USD promotion with only two calls", async () => {
   const calls: string[] = [];
   const runner = fundingRunner(undefined, verifiedSubscription(), calls);
