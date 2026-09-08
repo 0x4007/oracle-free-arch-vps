@@ -140,6 +140,10 @@ Deno.test("RAM rescue apk world includes GNU stat for runtime permission checks"
   const world =
     rescueOverlayFiles(input).find((f) => f.path === "etc/apk/world")!.content;
   assert(world.split("\n").includes("coreutils"));
+  // Exact standalone package entry; util-linux mount is required because
+  // BusyBox typeless mounting can fail when filesystem modules are not
+  // loaded. A substring match would not prove the package is present.
+  assert(world.split("\n").includes("mount"));
 });
 Deno.test("RAM command line cannot inherit source root or a home overlay URL", () => {
   const words = rescueKernelCommandLine().split(" ");
