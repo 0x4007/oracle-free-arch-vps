@@ -225,8 +225,10 @@ test "$(cat ${RESCUE_DIRECTORY}/kernel-command-line)" = ${
     shellQuote(plan.commandLine)
   }
 printf '%s  %s\\n' '${plan.kernelSha256}' '${RESCUE_DIRECTORY}/vmlinuz-rescue' '${plan.initramfsSha256}' '${RESCUE_DIRECTORY}/initramfs-rescue' | sha256sum -c -
-# Prevent the distribution's optional kexec-load service replacing this image.
-grep -qx 'LOAD_KEXEC=false' /etc/default/kexec
+# Ubuntu 24.04 kexec-tools dropped the option that once disabled the distro
+# loader unit; refuse any present kexec-load.service that could take over or
+# replace this verified image.
+test "$(systemctl show --property=LoadState --value kexec-load.service)" = not-found
 kexec --load '${RESCUE_DIRECTORY}/vmlinuz-rescue' --initrd='${RESCUE_DIRECTORY}/initramfs-rescue' --command-line=${
     shellQuote(plan.commandLine)
   }
