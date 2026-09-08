@@ -46,6 +46,10 @@ function publicKeyFingerprint(publicKey: string): string {
 }
 /** The manifest path is produced by the bootstrap/isolation stage. This only
  * emits a public key already present on the guest; it creates no key or user.
+ * Marker output goes to the OCI AArch64 serial device (ttyAMA0), never the
+ * active console: the rescue console=ttyAMA0 precedes console=tty0, so
+ * /dev/console can resolve to a graphical tty and the marker must reach OCI
+ * serial history regardless of the active console device.
  */
 export function hostKeyConsoleCommand(
   requestId: string,
@@ -60,7 +64,7 @@ export function hostKeyConsoleCommand(
   return `test -f /etc/ssh/ssh_host_ed25519_key.pub
 printf '\\nUOS_RECOVERY_HOST_KEY %s %s %s %s %s\\n' ${shellQuote(requestId)} ${
     shellQuote(phase)
-  } "$(cat /proc/sys/kernel/random/boot_id)" "${manifest}" "$(awk '{print $1 \" \" $2}' /etc/ssh/ssh_host_ed25519_key.pub)" >/dev/console`;
+  } "$(cat /proc/sys/kernel/random/boot_id)" "${manifest}" "$(awk '{print $1 \" \" $2}' /etc/ssh/ssh_host_ed25519_key.pub)" >/dev/ttyAMA0`;
 }
 export function verifyConsoleHostKey(
   metadata: JsonRecord,

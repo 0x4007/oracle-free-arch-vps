@@ -193,6 +193,15 @@ Deno.test({
     }
   },
 });
+Deno.test("host-key marker targets the OCI serial device for every phase", () => {
+  for (const phase of ["loader", "ram", "restored"] as const) {
+    const script = hostKeyConsoleCommand(requestId, phase);
+    assert(
+      script.endsWith(">/dev/ttyAMA0") &&
+        !script.includes(">/dev/console"),
+    );
+  }
+});
 Deno.test({
   name: "console marker commands parse as shell without generating keys",
   ignore:
