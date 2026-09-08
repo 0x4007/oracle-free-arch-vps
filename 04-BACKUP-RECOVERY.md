@@ -116,6 +116,22 @@ Use `scripts/oci-restore.ts` as described in `07-OPERATIONS-AND-DRILLS.md`. Keep
 `action` set to `plan` until the private ledger contains the exact approved pair
 and operation.
 
+Accepted routine pairs are members of one online volume-group capture, created
+while the source instance stayed `RUNNING`; before any restore, the tool queries
+the live volume-group backup and proves that the selected pair consists of
+exactly those two member backups. The bootable recovery target then materializes
+the same exact member backups as one boot volume plus one block volume on the
+replacement A1 instance. OCI volume-group create-from-backup, which restores the
+group as a unit, is a supported alternative that this boot-target path
+intentionally does not use. Record the accepted capture in the optional
+`volumeGroupId` and `volumeGroupBackupId` restore-configuration fields. When
+those two fields are populated, add the same two keys with the exact values to
+`approval.approvedTargets`; for the historical golden pair, leave the optional
+top-level fields empty and omit both approval keys. Until a live Oracle restore
+drill boots a replacement from the capture and passes the full acceptance
+checklist, the online group's restore and boot status is `METADATA_PROVED`, not
+`RESTORE_DRILL_PROVED`.
+
 1. Confirm both backup names share the intended suffix.
 2. Restore the staging backup as a boot volume in the tenancy home region.
 3. Restore the root backup as a block volume in the same availability domain.

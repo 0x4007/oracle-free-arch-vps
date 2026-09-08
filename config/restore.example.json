@@ -13,6 +13,8 @@
   "reservedPublicIpId": "<RESERVED_PUBLIC_IP_OCID>",
   "instanceId": "<CURRENT_INSTANCE_OCID_OR_EMPTY>",
   "expectedPairSuffix": "<UTC_SUFFIX>",
+  "volumeGroupId": "<VOLUME_GROUP_OCID_OR_EMPTY>",
+  "volumeGroupBackupId": "<VOLUME_GROUP_BACKUP_OCID_OR_EMPTY>",
   "expectedRootUuid": "<ARCH_ROOT_UUID>",
   "stopWaitSeconds": 300,
   "approval": {
