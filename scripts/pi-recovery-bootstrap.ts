@@ -158,6 +158,10 @@ start() {
     {
       path: "etc/ssh/sshd_config",
       mode: "0600",
+      // OpenSSH session.c only performs all_permitted setup when
+      // AllowTcpForwarding is not "no", so Unix reverse sockets (GPG -R) need
+      // "remote". PermitListen none still denies every remote TCP listener and
+      // local TCP stays disabled.
       content: `PermitRootLogin no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -165,7 +169,8 @@ PermitEmptyPasswords no
 PubkeyAuthentication yes
 AuthorizedKeysFile .ssh/authorized_keys
 AllowUsers codex
-AllowTcpForwarding no
+AllowTcpForwarding remote
+PermitListen none
 AllowStreamLocalForwarding remote
 StreamLocalBindUnlink yes
 X11Forwarding no
