@@ -535,7 +535,11 @@ async function writeCopy(
   await file.sync();
   await Deno.rename(temporary, destination);
 }
-async function writeLink(relative: string, target: string) {
+async function writeLink(
+  relative: string,
+  target: string,
+  runner: CommandRunner,
+) {
   const destination = await below(ROOT, relative, true);
   const info = await Deno.lstat(destination).catch((error) => {
     if (error instanceof Deno.errors.NotFound) return null;
@@ -545,7 +549,7 @@ async function writeLink(relative: string, target: string) {
     throw Error("Copied-root mask destination changed type");
   }
   const temporary = destination + ".uos-isolation-" + crypto.randomUUID();
-  await Deno.symlink(target, temporary);
+  await command(runner, "ln", ["-s", "--", target, temporary]);
   await Deno.rename(temporary, destination);
 }
 async function applyInspectedIsolation(
@@ -615,12 +619,13 @@ async function applyInspectedIsolation(
   );
   for (const relative of inspection.masks) {
     approvalMatches(plan, inspection, approval);
-    await writeLink(relative, "/dev/null");
+    await writeLink(relative, "/dev/null", runner);
   }
   approvalMatches(plan, inspection, approval);
   await writeLink(
     "etc/systemd/system/default.target",
     "/etc/systemd/system/arch-drill.target",
+    runner,
   );
   const sshDirectory = await below(ROOT, "home/codex/.ssh");
   approvalMatches(plan, inspection, approval);

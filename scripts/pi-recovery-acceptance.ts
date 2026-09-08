@@ -135,7 +135,7 @@ export function recoveryIsolationArgs(target: RecoverySshTarget): string[] {
     "--allow-read=/run/uos-recovery,/etc,/proc,/sys,/dev",
     "--allow-write=/run/uos-recovery",
     "--allow-sys=uid",
-    "--allow-run=curl,lsblk,readlink,udevadm,findmnt,mount,umount,ssh-keygen,sha256sum,sync,bash,sh,cat,stat,uname",
+    "--allow-run=curl,lsblk,readlink,udevadm,findmnt,mount,umount,ssh-keygen,sha256sum,sync,bash,sh,cat,stat,uname,ln",
     "scripts/pi-recovery-isolation-executor.ts",
   ].join(" ");
   return recoverySshArgs(target, "bash", ["-ec", command]);
