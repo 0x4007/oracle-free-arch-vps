@@ -722,6 +722,7 @@ export function recoveryTargetRestoreArgs(
     "--allow-read=/run/uos-recovery,/etc,/proc,/sys,/dev",
     "--allow-write=/run/uos-recovery",
     "--allow-net",
+    "--allow-sys=uid",
     "--allow-run=sudo,gpg,gpgconf,tar,zstd,bash,sh,sfdisk,udevadm,pvcreate,vgcfgrestore,vgchange,mkfs.ext4,mkfs.xfs,mkfs.vfat,mount,umount,fallocate,chmod,chown,mkswap,blkid,sync,mkdir,lsblk,findmnt,readlink,curl,wipefs,blockdev,cat,stat,sha256sum,uname",
     "scripts/backblaze-stream-restore.ts",
   ].join(" ");
