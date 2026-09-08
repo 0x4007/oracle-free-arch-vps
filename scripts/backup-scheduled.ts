@@ -294,9 +294,9 @@ function captureStarted(state: ScheduledRuntimeState | undefined): boolean {
 }
 
 const RECONCILIATION_INSTRUCTION =
-  "Verify no OCI volume-group backup was created for this claim, then remove " +
-  "only this stale scheduler claim using the read-only steps in " +
-  "06-TROUBLESHOOTING.md.";
+  "Verify no OCI volume-group backup was created for this claim, then archive " +
+  "the failed runtime journal and this stale scheduler claim under the shared " +
+  "controller lock using the read-only steps in 06-TROUBLESHOOTING.md.";
 
 function reconciliationClaimFor(
   existing: WindowClaim,
@@ -505,8 +505,8 @@ export async function runScheduledBackup(): Promise<void> {
           await writePrivateJson(CLAIM, decision.completedClaim);
         }
         // Persist the terminal claim before failing: a later invocation must
-        // keep skipping with its distinct reason until the operator removes
-        // only this stale claim and the exact window is no longer recoverable.
+        // keep skipping with its distinct reason until the operator reconciles
+        // both this stale claim and the matching failed runtime journal.
         if (decision.reconciliationClaim) {
           await writePrivateJson(CLAIM, decision.reconciliationClaim);
         }

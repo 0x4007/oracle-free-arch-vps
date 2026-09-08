@@ -136,11 +136,14 @@ capture identity until the claim is removed. Reconcile read-only, in order:
    `reconciliation-required`, the recorded `reconciliation.requiredAtUtc` and
    `reconciliation.expiredAtUtc`, and that the claim names only its own window
    and period. Do not edit the claim.
-2. Read `.private/backup-runtime.json` and confirm its `cycle` journal has no
-   `volumeGroupBackupIntent: true` and no `volumeGroupBackupId`. If either is
-   present, STOP: an OCI operation may have started. Keep the scheduler block,
-   reconcile the exact recorded group backup identity first, and never remove
-   the claim or suggest its removal.
+2. Read `.private/backup-runtime.json` and confirm its `cycle` journal is the
+   failed no-capture journal for this claim, has no
+   `volumeGroupBackupIntent: true` and no `volumeGroupBackupId`, and that its
+   `policy` source, accepted pair and volume-group ID still match
+   `.private/backup-controller.json`. If either capture marker is present, or
+   the policy binding is absent or different, STOP: an OCI operation or a
+   different runtime may be involved. Keep the scheduler block, reconcile the
+   exact recorded group backup identity first, and never remove the claim.
 3. From the same runtime journal, record the exact `cycle.suffix` and
    `policy.volumeGroupId` (and confirm they are present and well-formed). Run
    the read-only inventory entry point (`deno task backup:inventory`, or a
@@ -150,12 +153,19 @@ capture identity until the claim is removed. Reconcile read-only, in order:
    If the runtime suffix or group identity is missing, malformed, or cannot be
    matched to the inventory, STOP and reconcile before removing the claim. Do
    not use any OCI write for this check.
-4. Only after steps 1-3 pass, move the claim aside into the private archive
-   (for example `mv .private/backup-scheduled-window.json
-   .private/cycles/scheduled-claim-<windowId>.expired.json`), removing only
-   that stale claim file. Do not delete or rewrite `.private/backup-runtime.json`,
-   the schedule approval, or any backup object.
-5. The next scheduled invocation plans a fresh claim under the latest approved
+4. Only after steps 1-3 pass, acquire the existing shared controller lock and
+   archive both task-local records without changing their contents: move the
+   failed `.private/backup-runtime.json` to a no-clobber private archive named
+   with its exact runtime suffix (for example
+   `.private/cycles/<suffix>.acceptance-expired.runtime.json`), and move
+   `.private/backup-scheduled-window.json` to a no-clobber archive such as
+   `.private/cycles/scheduled-claim-<windowId>.expired.json`. If either archive
+   already exists with different bytes, STOP. Do not merely remove the claim:
+   the preserved blocked runtime would continue to prevent scheduling. Do not
+   delete or rewrite the schedule approval, accepted pair, any backup object,
+   or any other runtime file.
+5. After both archives are safely recorded, the next scheduled invocation
+   creates a fresh runtime journal and claim under the latest approved
    schedule. That plan still requires the normal schedule, standing-approval
    and source-binding checks; this reconciliation approves no capture.
 

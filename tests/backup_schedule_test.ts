@@ -746,7 +746,34 @@ Deno.test("an unexpired claim that lost its acceptance window keeps the strict b
   }
 });
 
-Deno.test("after explicit claim removal a fresh plan allocates a new identity", () => {
+Deno.test("claim-only removal leaves the blocked failed runtime stopped", () => {
+  const blocked: ScheduledRuntimeState = {
+    cycle: {
+      phase: "failed",
+      suffix: "20260906T220500Z",
+      retry: {
+        disposition: "blocked",
+        resumePhase: "planned",
+        attempts: 1,
+        firstFailureAtUtc: "2026-09-06T22:05:01Z",
+        nextAttemptAtUtc: "2026-09-06T22:05:01Z",
+        deadlineAtUtc: "2026-09-07T04:05:01Z",
+      },
+    },
+  };
+  const decision = planScheduledClaim(
+    schedule,
+    new Date("2026-09-08T12:00:00Z"),
+    blocked,
+    undefined,
+  );
+  assert(decision.action === "skip");
+  if (decision.action === "skip") {
+    assert(decision.reason === "BACKUP_RETRY_BLOCKED");
+  }
+});
+
+Deno.test("after claim and failed-runtime archival a fresh plan allocates a new identity", () => {
   const decision = planScheduledClaim(
     schedule,
     new Date("2026-09-20T12:00:00Z"),
