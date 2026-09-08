@@ -419,3 +419,72 @@ Deno.test({
     assert(quoted.includes("/etc/systemd/system/arch-drill.target"));
   },
 });
+
+Deno.test({
+  name: "copied-root host key comparison matches algorithm and base64 only",
+  ignore: !READ_RELEASE_SOURCE,
+  fn: async () => {
+    // Source-bound regression: extract the production ssh-ed25519 public line
+    // predicate and the apply comparison from the executor source. Never
+    // duplicate an independent regex that could diverge from production.
+    const source = await Deno.readTextFile(RELEASE_SOURCE_URL);
+    const predicateAt = source.indexOf("const sshPublicKeyLine =");
+    const open = source.indexOf("/^ssh-ed25519", predicateAt);
+    const close = source.indexOf("$/", open);
+    if (predicateAt < 0 || open < 0 || close <= open + 2) {
+      throw Error("Copied-root host key predicate is absent");
+    }
+    const sshPublicKeyLine = new RegExp(
+      source.slice(open + 1, close + 1),
+    );
+    const compare = (derived: string, expected: string) => {
+      const installedMatch = sshPublicKeyLine.exec(derived);
+      const publicMatch = sshPublicKeyLine.exec(expected);
+      return installedMatch !== null && publicMatch !== null &&
+        installedMatch[1] === publicMatch[1];
+    };
+    const applyStart = source.indexOf("async function applyInspectedIsolation");
+    const applyEnd = source.indexOf("/** Mount only the serial/UUID-bound");
+    if (applyStart < 0 || applyEnd <= applyStart) {
+      throw Error("Copied-root host key apply is absent");
+    }
+    const apply = source.slice(applyStart, applyEnd);
+    // OpenSSH `ssh-keygen -y` emits the private key comment while the
+    // generated .pub may carry another, so the comparison must validate and
+    // compare the algorithm/base64 of both sides only.
+    assert(apply.includes("sshPublicKeyLine.exec(publicKey)"));
+    assert(apply.includes("sshPublicKeyLine.exec(installedPublic)"));
+    assert(apply.includes("installedMatch[1] !== publicMatch[1]"));
+    assert(apply.includes("Derived host public key is malformed"));
+    assert(apply.includes("Replacement host public key is malformed"));
+    assert(
+      apply.includes("Copied private host key does not match its public key"),
+    );
+    assert(!apply.includes("publicKey.split(/\\s+/)"));
+    const base64 = "A".repeat(43);
+    const other = "B".repeat(43);
+    const expected = "ssh-ed25519 " + base64;
+    // Matching key material with no, one-sided or different comments is
+    // accepted; optional comments are ignored on both sides.
+    for (const derived of [expected, expected + " codex@recovery"]) {
+      for (const peer of [expected, expected + " root@recovery"]) {
+        assert(compare(derived, peer));
+      }
+    }
+    // A differing key blob, wrong algorithm on either side, missing separator,
+    // malformed and multiline derived output are all rejected.
+    assert(!compare("ssh-ed25519 " + other, expected));
+    assert(!compare(expected, "ssh-ed25519 " + other));
+    assert(!compare("ssh-rsa " + base64 + " codex@recovery", expected));
+    assert(!compare(expected, "ssh-rsa " + base64 + " root@recovery"));
+    assert(!compare(expected + "codex@recovery", expected));
+    assert(!compare("ssh-ed25519", expected));
+    assert(!compare("ssh-ed25519 not-base64 codex@recovery", expected));
+    assert(
+      !compare(
+        expected + "\n" + "ssh-ed25519 " + other,
+        expected,
+      ),
+    );
+  },
+});
