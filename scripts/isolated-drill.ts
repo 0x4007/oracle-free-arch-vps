@@ -18,6 +18,21 @@ export interface DrillPlan {
   helperImageId: string;
   offlineFilesSha256: string;
 }
+
+/** The exact reviewed-plan fields the isolated-network proof depends on. Both
+ * `DrillPlan` and the group-restore plan satisfy this structural subset, so
+ * there is exactly one routed-network proof and no duplicated or
+ * contradictory rule set. When the reviewed isolated identities are present
+ * the network must equal them exactly; absent (legacy plan) only the
+ * production disjointness remains. */
+export interface DrillNetworkPlan {
+  source: BackupSource;
+  productionSubnetId: string;
+  productionVcnId: string;
+  controllerIpv4: string;
+  isolatedSubnetId?: string;
+  isolatedVcnId?: string;
+}
 export interface DrillApproval {
   approvedAtUtc: string;
   expiresAtUtc: string;
@@ -32,6 +47,7 @@ export interface DrillAccountEvidence {
   availableTrialCreditsUsd: number;
 }
 export interface DrillNetworkEvidence {
+  vcn: JsonRecord;
   subnet: JsonRecord;
   securityLists: JsonRecord[];
   routeTable: JsonRecord;
@@ -52,7 +68,7 @@ export function controllerCidr(ip: string): string {
   ) throw new Error("Controller SSH source is not a public IPv4 address");
   return ip + "/32";
 }
-export function drillSecurityRules(plan: DrillPlan) {
+export function drillSecurityRules(plan: DrillNetworkPlan) {
   return {
     ingressSecurityRules: [{
       protocol: "6",
@@ -159,15 +175,25 @@ export async function validateDrillApproval(
  * OCI security lists are additive: a second permissive list invalidates proof.
  */
 export function verifyDrillRoutedNetwork(
-  plan: DrillPlan,
+  plan: DrillNetworkPlan,
   network: DrillNetworkEvidence,
 ): void {
-  const { subnet, securityLists, routeTable, internetGateway, dhcpOptions } =
-    network;
+  const {
+    vcn,
+    subnet,
+    securityLists,
+    routeTable,
+    internetGateway,
+    dhcpOptions,
+  } = network;
   const ids = subnet["security-list-ids"];
   if (
     subnet.id === plan.productionSubnetId || !subnet.id ||
     subnet["vcn-id"] === plan.productionVcnId ||
+    (plan.isolatedSubnetId !== undefined &&
+      subnet.id !== plan.isolatedSubnetId) ||
+    (plan.isolatedVcnId !== undefined &&
+      subnet["vcn-id"] !== plan.isolatedVcnId) ||
     subnet["compartment-id"] !== plan.source.compartmentId ||
     subnet["prohibit-public-ip-on-vnic"] !== false ||
     subnet["lifecycle-state"] !== "AVAILABLE" ||
@@ -179,8 +205,11 @@ export function verifyDrillRoutedNetwork(
     (subnet["ipv6-cidr-block"] != null) ||
     (Array.isArray(subnet["ipv6-cidr-blocks"]) &&
       subnet["ipv6-cidr-blocks"].length !== 0) ||
+    vcn.id !== subnet["vcn-id"] || !vcn.id ||
+    (plan.isolatedVcnId !== undefined && vcn.id !== plan.isolatedVcnId) ||
+    vcn["compartment-id"] !== plan.source.compartmentId ||
     [routeTable, internetGateway, dhcpOptions, ...securityLists].some((r) =>
-      r["vcn-id"] !== subnet["vcn-id"] ||
+      r["vcn-id"] !== vcn.id ||
       r["compartment-id"] !== plan.source.compartmentId
     ) ||
     internetGateway["is-enabled"] !== true

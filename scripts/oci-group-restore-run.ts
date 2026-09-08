@@ -79,10 +79,13 @@ export interface GroupRestoreRunDeps {
     lifetime: GroupRestoreLifetime,
   ) => GroupRestoreExecutionPorts;
   /** True only when the caller's ports carry a real pre-boot isolation
-   * verifier. The create action refuses before any input/state read or
-   * provider call while this is false: launching the restored clone without a
-   * configured verifier would let an unprepared or duplicate-job guest boot
-   * beside production. */
+   * verifier: the OCI gate proves the reviewed isolated network and exact
+   * restored targets AND a typed copied-volume preparation adapter
+   * (`GroupRestorePreBootIsolationAdapter`) is configured for the duplicate-
+   * job masking hook. The create action refuses before any input/state read
+   * or provider call while this is false: launching the restored clone
+   * without the preparation hook would let an unprepared or duplicate-job
+   * guest boot beside production. */
   preBootIsolationReady: boolean;
 }
 
@@ -551,9 +554,12 @@ async function main(): Promise<void> {
       runner,
       makePorts: (plan, lifetime) =>
         ociGroupRestorePorts(plan, runner, { lifetime }),
-      // Intentional safety refusal: ociGroupRestorePorts currently has no
-      // configured verifyPreBootIsolation implementation, so create must
-      // fail closed before any read or provider call.
+      // Intentional safety refusal: this executable has no input path that can
+      // supply the required GroupRestorePreBootIsolationAdapter copied-volume
+      // preparation hook (read-only OCI checks never mask duplicate jobs), so
+      // create must fail closed before any read or provider call. A later Pi
+      // or helper wrapper may satisfy that typed adapter and set readiness
+      // true; never set readiness true merely to bypass the guard.
       preBootIsolationReady: false,
     });
     console.log(JSON.stringify(result, null, 2));

@@ -855,9 +855,20 @@ Deno.test("run guard binds exact deterministic steps and never claims proof", as
   assertEquals(guard.steps.map((step) => step.kind), [
     "boot-volume",
     "root-volume",
-    "instance",
   ]);
   for (const step of guard.steps) {
+    // Hard cutover: the guard carries no pre-boot isolation proof, so it must
+    // never emit or authorize an instance-launch step or an instance launch
+    // argv before isolation.
+    if (step.kind === "instance") {
+      throw new Error("Guard emitted an instance step before isolation");
+    }
+    if (
+      step.argv[0] === "compute" && step.argv[1] === "instance" &&
+      step.argv[2] === "launch"
+    ) {
+      throw new Error("Guard emitted an instance-launch argv before isolation");
+    }
     assertEquals(step.intent, "create");
     assertEquals(step.ociCliPath, runner.ociCliPath);
     assertEquals(step.request.suffix, plan.suffix);
@@ -874,18 +885,6 @@ Deno.test("run guard binds exact deterministic steps and never claims proof", as
     guard.steps[1].argv,
     groupRestoreCliArgs(runner, buildRestoredRootVolumeRequest(plan)),
   );
-  assertEquals(
-    guard.steps[2].argv,
-    groupRestoreCliArgs(
-      runner,
-      buildGroupRestoreLaunchRequest(
-        plan,
-        runTargets.bootVolumeId,
-        runTargets.rootVolumeId,
-      ),
-    ),
-  );
-  assertNoLaunchOptions(guard.steps[2].argv);
   assertEquals(guard.cleanup, groupRestoreCleanupOrder(plan));
   // No production identity or reserved production IP may appear anywhere.
   for (const step of guard.steps) {
