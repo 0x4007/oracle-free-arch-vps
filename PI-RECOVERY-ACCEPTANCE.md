@@ -1,5 +1,37 @@
 # Pi-orchestrated replacement recovery
 
+## Current verified recovery state, 2026-09-08
+
+On 2026-09-08, independent generation `generation-a0f12b6f-6c4b-436a-b547-58090e39ae71`
+was streamed directly B2-to-isolated-Oracle: all six filesystem archives reconstructed,
+swap rebuilt, no source files required, and no bulk payload traversed Pi, Mac or home.
+Restored disk boot `0a09ad14-96cb-49ed-a216-7868a0a39a98` passed console-bound SSH,
+root/EFI mounts, captured kernel/initramfs hashes and staging parity, the Oracle
+fallback entry, retained Codex config/session presence, Docker/Guacamole/Xvnc,
+copied-job masks, firewall ordering and metadata block, and the Xfce desktop was
+visually inspected at 2026-09-08T03:23:57.540Z.
+
+This was an operator-repaired drill, not a clean unattended or fully latest-bundle
+run: the bootstrap/controller froze and target amendments were recorded. Restricted
+symlink creation and SSH key-comment comparison were corrected in PRs #46/#47 and
+integrated at d4d5f0b7b46a7613c3c26649ad8c051c42fbfc58; corrected source is retained
+in the Pi operational recovery kit and independent Mac spare, with only small
+source/control data transferred.
+
+The standing shared USD 300 trial authority recorded in DEVELOPMENT-BUDGET.md,
+with no production interruption, supersedes the historical free-only development
+restrictions below; trial credit is not permanent free eligibility. At this note's
+evidence cutoff, task cleanup is in progress and final deployment/timer restoration
+is pending: no cleanup or deployment success is claimed here. Dated private cleanup,
+deployment and timer receipts hold final outcomes; source review is not live proof.
+
+Still open: separate online Oracle-group restore/boot remains unproved; three weekly
+B2 points exist and the fourth must accumulate naturally; four Oracle backup members
+leave only one free object slot while paired rotation needs two; unrelated historical
+copies await the retention decision (issue #29); exact installed scheduled-wrapper
+startup-race proof is unproved (issue #35); post-trial API eligibility mapping is
+unverified. The dated sections below are historical, not current acceptance.
+
 Audit started 2026-09-07 against bf70caf210fcbd19b27fde91c36361fa71d4d06c.
 The owner-controlled repository-root PROJECT-VISION.md remains the authority.
 The owner has prohibited all backup payload transfers through the home network.
