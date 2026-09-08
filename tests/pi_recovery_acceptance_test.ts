@@ -196,6 +196,30 @@ Deno.test("isolation SSH runtime allows every inspection command", () => {
   assert(command.includes("--allow-run=") && command.includes(",uname"));
 });
 
+Deno.test("isolation launcher permits ln without widening write access", () => {
+  const target = {
+    host: {
+      requestId: binding.requestId,
+      instanceId: binding.instanceId,
+      phase: "ram",
+      bootId: binding.bootId,
+      manifestSha256: "b".repeat(64),
+      publicKey: validPublicKey,
+      fingerprint: validFingerprint,
+      consoleHistoryId: "ocid1.consolehistory.example",
+      consoleCapturedAtUtc: "2026-09-07T04:00:00.000Z",
+    },
+    address: "203.0.113.3",
+    knownHostsPath:
+      `/tmp/recovery-known-hosts/${binding.requestId}-ram-${binding.bootId}`,
+  } as RecoverySshTarget;
+  const command = recoveryIsolationArgs(target).join(" ");
+  const write = command.match(/--allow-write=([^ ]+)/)?.[1];
+  const run = command.match(/--allow-run=([^ ]+)/)?.[1] ?? "";
+  assert(write === "/run/uos-recovery");
+  assert(run.split(",").includes("ln"));
+});
+
 Deno.test("application acceptance requires live Docker and Xvnc evidence", async () => {
   const target = {
     host: {
@@ -329,5 +353,69 @@ Deno.test({
     ]) {
       assert(!id.test(os));
     }
+  },
+});
+
+Deno.test({
+  name: "isolation links go through the injected runner argv with guards",
+  ignore: !READ_RELEASE_SOURCE,
+  fn: async () => {
+    // Source-bound regression: extract the production writeLink and its apply
+    // call sites so the runner argv, destination/type/rename guards and the
+    // bound link target literals cannot diverge from the shipped module.
+    const source = await Deno.readTextFile(RELEASE_SOURCE_URL);
+    const linkStart = source.indexOf("async function writeLink");
+    const applyStart = source.indexOf("async function applyInspectedIsolation");
+    if (linkStart < 0 || applyStart <= linkStart) {
+      throw Error("Copied-root writeLink is absent");
+    }
+    const body = source.slice(linkStart, applyStart).replaceAll(/\s+/g, " ");
+    assert(
+      body.includes(
+        "async function writeLink( relative: string, target: string, runner: CommandRunner, )",
+      ),
+    );
+    // The injected runner receives an argv array; no shell interpolation can
+    // reinterpret the bound link target or the temporary name.
+    assert(
+      body.includes(
+        'await command(runner, "ln", ["-s", "--", target, temporary])',
+      ),
+    );
+    assert(!body.includes("Deno.symlink"));
+    assert(!body.includes(".join("));
+    assert(!body.includes("bash") && !body.includes("sh -c"));
+    // Destination, type-change, unique temporary and atomic rename guards stay.
+    assert(
+      body.includes("const destination = await below(ROOT, relative, true)"),
+    );
+    assert(
+      body.includes("if (info && !info.isFile && !info.isSymlink)"),
+    );
+    assert(body.includes("Copied-root mask destination changed type"));
+    assert(
+      body.includes('destination + ".uos-isolation-" + crypto.randomUUID()'),
+    );
+    assert(body.includes("await Deno.rename(temporary, destination)"));
+    // Every apply call site threads the runner and uses only the two bound
+    // link target literals.
+    const apply = source.slice(
+      applyStart,
+      source.indexOf("/** Mount only the serial/UUID-bound"),
+    );
+    const calls = [...apply.matchAll(/writeLink\(([\s\S]*?)\)/g)].map((match) =>
+      match[1].replaceAll(/\s+/g, " ").trim()
+    );
+    assert(calls.length === 2);
+    for (const call of calls) {
+      assert(call.endsWith("runner") || call.endsWith("runner,"));
+    }
+    const quoted = calls.flatMap((call) =>
+      [...call.matchAll(/"([^"]*)"/g)].map((match) => match[1])
+    );
+    assert(quoted.length === 3);
+    assert(quoted.includes("/dev/null"));
+    assert(quoted.includes("etc/systemd/system/default.target"));
+    assert(quoted.includes("/etc/systemd/system/arch-drill.target"));
   },
 });
