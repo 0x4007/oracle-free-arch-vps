@@ -12,6 +12,7 @@ import type {
   IsolationInspection,
 } from "../scripts/pi-recovery-isolation-executor.ts";
 import type { RecoveryIsolationPlan } from "../scripts/pi-recovery-isolation.ts";
+import { recoveryTargetRestoreArgs } from "../scripts/pi-recovery-restore.ts";
 import type { RecoverySshTarget } from "../scripts/pi-recovery-ssh.ts";
 
 const hash = (value: unknown) =>
@@ -189,7 +190,9 @@ Deno.test("isolation SSH runtime allows every inspection command", () => {
       `/tmp/recovery-known-hosts/${binding.requestId}-ram-${binding.bootId}`,
   } as RecoverySshTarget;
   const command = recoveryIsolationArgs(target).join(" ");
+  const restoreCommand = recoveryTargetRestoreArgs(target).join(" ");
   assert(command.includes("--allow-sys=uid"));
+  assert(restoreCommand.includes("--allow-sys=uid"));
   assert(command.includes("--allow-run=") && command.includes(",uname"));
 });
 
