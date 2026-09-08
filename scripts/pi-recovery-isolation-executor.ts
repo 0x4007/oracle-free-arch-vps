@@ -415,7 +415,9 @@ export async function inspectCopiedRootIsolation(
   const osPath = await regular(ROOT, releaseRelative);
   if (
     (await Deno.stat(osPath)).size > 65536 ||
-    !/^ID=(?:arch|"arch")$/m.test(await Deno.readTextFile(osPath))
+    !/^ID=(?:arch|"arch"|archarm|"archarm")$/m.test(
+      await Deno.readTextFile(osPath),
+    )
   ) throw Error("Copied root is not Arch");
   await regular(ROOT, "usr/bin/nft");
   const home = await below(ROOT, "home/codex");
