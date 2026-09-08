@@ -38,6 +38,9 @@ const PACKAGES = [
   "ifupdown-ng",
   "lsblk",
   "lvm2",
+  // util-linux mount is required because BusyBox typeless mounting can fail
+  // when filesystem modules are not loaded.
+  "mount",
   "openssh",
   "openssl",
   "sfdisk",
