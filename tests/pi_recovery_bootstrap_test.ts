@@ -120,6 +120,12 @@ Deno.test("bootstrap rejects private keys, malformed public keys and injected id
     rescueOverlayFiles({ ...input, requestId: requestId + ";reboot" })
   );
 });
+Deno.test("RAM rescue apk world includes GNU stat for runtime permission checks", () => {
+  const world = rescueOverlayFiles(input).find((f) =>
+    f.path === "etc/apk/world"
+  )!.content;
+  assert(world.split("\n").includes("coreutils"));
+});
 Deno.test("RAM command line cannot inherit source root or a home overlay URL", () => {
   const words = rescueKernelCommandLine().split(" ");
   assert(
