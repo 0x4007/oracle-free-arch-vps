@@ -411,3 +411,132 @@ Deno.test({
     assert((await child.output()).success);
   },
 });
+const RUN_BASH =
+  (await Deno.permissions.query({ name: "run", command: "bash" })).state ===
+    "granted";
+const RUN_AWK =
+  (await Deno.permissions.query({ name: "run", command: "awk" })).state ===
+    "granted";
+const ISOLATION_SOURCE_URL = new URL(
+  "../scripts/pi-recovery-isolation-executor.ts",
+  import.meta.url,
+);
+const READ_ISOLATION_SOURCE = (await Deno.permissions.query({
+  name: "read",
+  path: ISOLATION_SOURCE_URL.pathname,
+})).state === "granted";
+const KDEV_STATUS = "Name:\tkdevtmpfs\nKthread:\t1\n";
+const KDEV_MOUNTINFO =
+  "7 6 0:6 / / rw,nosuid,noexec,relatime - devtmpfs devtmpfs rw,size=10240k,nr_inodes=1525127,mode=755,inode64\n";
+const STATUS_AWK = /awk '([^']+)' "\$proc\/status"/;
+const MOUNTINFO_AWK = /awk '([^']+)' "\$proc\/mountinfo"/;
+function guardAwks(guard: string) {
+  const status = guard.match(STATUS_AWK)?.[1];
+  const mountinfo = guard.match(MOUNTINFO_AWK)?.[1];
+  if (!status || !mountinfo) {
+    throw Error("Guard evidence predicates are absent");
+  }
+  return { status, mountinfo };
+}
+async function isolationMountGuard() {
+  const source = await Deno.readTextFile(ISOLATION_SOURCE_URL);
+  const line = source.split("\n").find((text) =>
+    text.includes("own=$(readlink /proc/self/ns/mnt)") &&
+    text.includes("for ns in /proc/[0-9]*/ns/mnt")
+  );
+  if (!line) throw Error("Isolation mount-namespace guard is absent");
+  return line
+    .slice(line.indexOf("own=$(readlink"), line.lastIndexOf("'"))
+    .replaceAll("\\'", "'");
+}
+async function bashSyntaxOk(script: string) {
+  const child = new Deno.Command("bash", {
+    args: ["-n"],
+    stdin: "piped",
+    stdout: "null",
+    stderr: "piped",
+  }).spawn();
+  const writer = child.stdin.getWriter();
+  await writer.write(new TextEncoder().encode(script));
+  await writer.close();
+  writer.releaseLock();
+  return (await child.output()).success;
+}
+async function awkAccepts(program: string, provided: string) {
+  const child = new Deno.Command("awk", {
+    args: [program],
+    stdin: "piped",
+    stdout: "null",
+    stderr: "null",
+  }).spawn();
+  const writer = child.stdin.getWriter();
+  await writer.write(new TextEncoder().encode(provided));
+  await writer.close();
+  writer.releaseLock();
+  return (await child.output()).success;
+}
+Deno.test({
+  name:
+    "both mount-namespace guards require kdevtmpfs status, one-row mountinfo and a namespace re-read",
+  ignore: !READ_ISOLATION_SOURCE || !RUN_BASH,
+  fn: async () => {
+    const f = fixture();
+    await inspectPreparationDisks(binding, f.runner);
+    for (const guard of [f.state.readGuard, await isolationMountGuard()]) {
+      assert(guard.includes("$proc/status"));
+      assert(guard.includes("$proc/mountinfo"));
+      assert(guard.includes('test "$(readlink "$ns")" = "$observed"'));
+      const { status, mountinfo } = guardAwks(guard);
+      assert(status.includes("kdevtmpfs"));
+      assert(status.includes("Kthread:"));
+      assert(mountinfo.includes("devtmpfs"));
+      assert(await bashSyntaxOk(guard));
+    }
+  },
+});
+Deno.test({
+  name:
+    "mount-namespace guard predicates admit only the kernel kdevtmpfs root row",
+  ignore: !READ_ISOLATION_SOURCE || !RUN_AWK,
+  fn: async () => {
+    const f = fixture();
+    await inspectPreparationDisks(binding, f.runner);
+    const guards = [
+      guardAwks(f.state.readGuard),
+      guardAwks(await isolationMountGuard()),
+    ];
+    for (const { status, mountinfo } of guards) {
+      assert(await awkAccepts(status, KDEV_STATUS));
+      assert(!await awkAccepts(status, "Name:\tinit\nKthread:\t1\n"));
+      assert(!await awkAccepts(status, "Name:\tkdevtmpfs\nKthread:\t0\n"));
+      assert(!await awkAccepts(status, ""));
+      assert(await awkAccepts(mountinfo, KDEV_MOUNTINFO));
+      assert(
+        !await awkAccepts(
+          mountinfo,
+          KDEV_MOUNTINFO + "8 7 0:7 / / rw - devtmpfs devtmpfs rw\n",
+        ),
+      );
+      assert(
+        !await awkAccepts(
+          mountinfo,
+          "7 6 1:6 / / rw - devtmpfs devtmpfs rw\n",
+        ),
+      );
+      assert(
+        !await awkAccepts(
+          mountinfo,
+          "83 1 8:1 / / rw,relatime - ext4 /dev/root rw\n",
+        ),
+      );
+      assert(
+        !await awkAccepts(
+          mountinfo,
+          "7 6 0:6 / / rw - devtmpfs devtmpfs\n",
+        ),
+      );
+      assert(!await awkAccepts(mountinfo, ""));
+      assert(!await awkAccepts(mountinfo, "not mountinfo\n"));
+    }
+  },
+});
