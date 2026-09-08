@@ -259,6 +259,9 @@ test "$(id -u)" = 0
 test "$(uname -m)" = aarch64
 . /etc/os-release
 test "$ID:$VERSION_ID" = ubuntu:24.04
+# kexec-tools is the approved reboot mechanism; refuse to claim rescue
+# readiness when the package step did not install it.
+command -v kexec >/dev/null
 test "$(findmnt -n -o FSTYPE --target /run)" = tmpfs
 rescue_dir=${shellQuote(RESCUE_DIRECTORY)}
 test ! -e "$rescue_dir"
