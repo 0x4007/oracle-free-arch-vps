@@ -2388,6 +2388,8 @@ function preparationOciFixture(
   options: {
     failDetach?: "boot" | "root";
     initiallyAttaching?: "boot" | "root";
+    bootDevice?: string | null;
+    rootDevice?: string | null;
   } = {},
 ): {
   runner: GroupRestoreRunner;
@@ -2481,6 +2483,16 @@ function preparationOciFixture(
         stderr: "",
       });
     }
+    if (joined.includes("compute device list-instance")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: object([{
+          name: "/dev/oracleoci/oraclevdb",
+          "is-available": true,
+        }]),
+        stderr: "",
+      });
+    }
     if (joined.includes("volume-attachment attach")) {
       if (joined.includes("target-boot-volume")) {
         bootAttached = true;
@@ -2493,8 +2505,18 @@ function preparationOciFixture(
         code: 0,
         stdout: object(
           joined.includes("target-boot-volume")
-            ? bootAttachmentRecord()
-            : rootAttachmentRecord(),
+            ? {
+              ...bootAttachmentRecord(),
+              ...(Object.hasOwn(options, "bootDevice")
+                ? { device: options.bootDevice }
+                : {}),
+            }
+            : {
+              ...rootAttachmentRecord(),
+              ...(Object.hasOwn(options, "rootDevice")
+                ? { device: options.rootDevice }
+                : {}),
+            },
         ),
         stderr: "",
       });
@@ -2517,20 +2539,54 @@ function preparationOciFixture(
       const boot = joined.includes("boot-attachment");
       return Promise.resolve({
         code: 0,
-        stdout: object(boot ? bootAttachmentRecord() : rootAttachmentRecord()),
+        stdout: object(
+          boot
+            ? {
+              ...bootAttachmentRecord(),
+              ...(Object.hasOwn(options, "bootDevice")
+                ? { device: options.bootDevice }
+                : {}),
+            }
+            : {
+              ...rootAttachmentRecord(),
+              ...(Object.hasOwn(options, "rootDevice")
+                ? { device: options.rootDevice }
+                : {}),
+            },
+        ),
         stderr: "",
       });
     }
     if (joined.includes("volume-attachment list")) {
       const bootState = bootAttached
         ? options.initiallyAttaching === "boot" && bootAttachmentPolls++ === 0
-          ? bootAttachmentRecord("ATTACHING")
-          : bootAttachmentRecord()
+          ? {
+            ...bootAttachmentRecord("ATTACHING"),
+            ...(Object.hasOwn(options, "bootDevice")
+              ? { device: options.bootDevice }
+              : {}),
+          }
+          : {
+            ...bootAttachmentRecord(),
+            ...(Object.hasOwn(options, "bootDevice")
+              ? { device: options.bootDevice }
+              : {}),
+          }
         : undefined;
       const rootState = rootAttached
         ? options.initiallyAttaching === "root" && rootAttachmentPolls++ === 0
-          ? rootAttachmentRecord("ATTACHING")
-          : rootAttachmentRecord()
+          ? {
+            ...rootAttachmentRecord("ATTACHING"),
+            ...(Object.hasOwn(options, "rootDevice")
+              ? { device: options.rootDevice }
+              : {}),
+          }
+          : {
+            ...rootAttachmentRecord(),
+            ...(Object.hasOwn(options, "rootDevice")
+              ? { device: options.rootDevice }
+              : {}),
+          }
         : undefined;
       return Promise.resolve({
         code: 0,
@@ -2577,6 +2633,12 @@ function preparationMarkerJson(
     helperInstanceId: config.helper.instanceId,
     firstBootProved: false,
   }));
+}
+
+function preparationReleaseOutput(
+  config: GroupRestorePreparationConfig,
+): string {
+  return `ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256}\n`;
 }
 
 Deno.test("real preparation adapter binds the exact targets to the reviewed helper and prepares before launch", async () => {
@@ -2637,6 +2699,10 @@ Deno.test("real preparation adapter binds the exact targets to the reviewed help
     command.includes("mask"),
     "duplicate-job masking must be in the guarded command",
   );
+  assert(
+    !command.includes("ro,noload") && !command.includes("remount,rw"),
+    "online copied roots must recover ext4 before the write mount",
+  );
   const flat = fixture.events.map((line) =>
     line.replace(/^.*? (compute|network|bv) /, "")
   );
@@ -2651,6 +2717,14 @@ Deno.test("real preparation adapter binds the exact targets to the reviewed help
       line.includes("volume-attachment attach") &&
       line.includes("target-root-volume")
     ),
+  );
+  assert(
+    flat.some((line) =>
+      line.includes("volume-attachment attach") &&
+      line.includes("target-root-volume") &&
+      line.includes("--device /dev/oracleoci/oraclevdb")
+    ),
+    "the root copy must request the OCI-selected consistent device path",
   );
   const rootDetach = flat.findIndex((line) =>
     line.includes("volume-attachment detach")
@@ -2686,6 +2760,39 @@ Deno.test("real preparation adapter binds the exact targets to the reviewed help
   assert(
     fixture.ready() === false,
     "both copies must be detached after preparation",
+  );
+});
+
+Deno.test("real preparation adapter permits OCI automatic boot-device discovery", async () => {
+  const config = await prepConfigWithDigest();
+  const fixture = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    {},
+    { bootDevice: null },
+  );
+  const sshCalls: string[][] = [];
+  const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    ssh: (_command, args) => {
+      sshCalls.push(args);
+      return preparationMarkerJson(config).then((stdout) =>
+        Promise.resolve({ code: 0, stdout, stderr: "" })
+      );
+    },
+  });
+  await adapter.prepareCopiedVolumes({
+    bootVolumeId: "target-boot-volume",
+    rootVolumeId: "target-root-volume",
+  });
+  assert(
+    sshCalls.length === 1,
+    "automatic boot discovery must still prepare once",
+  );
+  assert(
+    sshCalls[0]![sshCalls[0]!.length - 1]!.includes(
+      "Only the boot copy may use automatic device discovery",
+    ),
+    "the guarded helper command must retain the boot-only discovery guard",
   );
 });
 
@@ -3024,17 +3131,26 @@ Deno.test("real preparation adapter attempts both detaches when the root detach 
 
 Deno.test("real preparation adapter fails closed when the guarded command fails or the marker is unbound", async () => {
   const failure = preparationOciFixture();
+  const failureConfig = await prepConfigWithDigest();
   const failedAdapter = groupRestorePreparationAdapter(
-    await prepConfigWithDigest(),
+    failureConfig,
     plan,
     failure.runner,
     {
-      ssh: () =>
-        Promise.resolve({
-          code: 1,
-          stdout: "",
-          stderr: "interactive authentication failed",
-        }),
+      ssh: (_command, args) => {
+        const command = args[args.length - 1]!;
+        return command.includes("ARCH_DRILL_PREPARATION_RELEASED")
+          ? Promise.resolve({
+            code: 0,
+            stdout: preparationReleaseOutput(failureConfig),
+            stderr: "",
+          })
+          : Promise.resolve({
+            code: 1,
+            stdout: "",
+            stderr: "interactive authentication failed",
+          });
+      },
     },
   );
   await rejects(async () => {
@@ -3066,7 +3182,16 @@ Deno.test("real preparation adapter fails closed when the guarded command fails 
     plan,
     unbound.runner,
     {
-      ssh: (_command, _args) => {
+      ssh: (_command, args) => {
+        if (
+          args[args.length - 1]!.includes("ARCH_DRILL_PREPARATION_RELEASED")
+        ) {
+          return Promise.resolve({
+            code: 0,
+            stdout: preparationReleaseOutput(config),
+            stderr: "",
+          });
+        }
         const stdout = JSON.stringify({
           status: "OFFLINE_FILES_PREPARED",
           planSha256: PREP_BUNDLE.planSha256,
@@ -3093,6 +3218,33 @@ Deno.test("real preparation adapter fails closed when the guarded command fails 
       throw error;
     }
   });
+});
+
+Deno.test("real preparation adapter preserves attachments when helper release is unproved", async () => {
+  const fixture = preparationOciFixture();
+  const config = await prepConfigWithDigest();
+  const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    ssh: () =>
+      Promise.resolve({
+        code: 1,
+        stdout: "",
+        stderr: "connection lost",
+      }),
+  });
+  await rejects(() =>
+    adapter.prepareCopiedVolumes({
+      bootVolumeId: "target-boot-volume",
+      rootVolumeId: "target-root-volume",
+    })
+  );
+  assert(
+    fixture.ready() === true,
+    "attachments must remain for manual reconciliation when release is unproved",
+  );
+  assert(
+    fixture.events.every((line) => !line.includes("volume-attachment detach")),
+    "no detach may run while helper release is uncertain",
+  );
 });
 
 Deno.test("real preparation adapter refusals hold the pre-boot gate before any instance create", async () => {

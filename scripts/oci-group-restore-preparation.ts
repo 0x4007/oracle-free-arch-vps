@@ -380,9 +380,11 @@ export function validateGroupRestorePreparationEvidence(
   const bootDevice = evidence.bootAttachment.device;
   const rootDevice = evidence.rootAttachment.device;
   if (
-    typeof bootDevice !== "string" || !ROOT_DEVICE_PATTERN.test(bootDevice) ||
+    (bootDevice !== null &&
+      (typeof bootDevice !== "string" ||
+        !ROOT_DEVICE_PATTERN.test(bootDevice))) ||
     typeof rootDevice !== "string" || !ROOT_DEVICE_PATTERN.test(rootDevice) ||
-    bootDevice === rootDevice
+    (typeof bootDevice === "string" && bootDevice === rootDevice)
   ) {
     throw new Error(
       "Restored copy device identities are not the reviewed OCI whole-disk paths",
@@ -435,21 +437,38 @@ export async function groupRestorePreparationCommand(
     ).join(""),
   );
   const script =
-    `import base64,hashlib,json,os,pathlib,re,stat,subprocess,urllib.request
+    `import atexit,base64,hashlib,json,os,pathlib,re,stat,subprocess,urllib.request
 p=json.loads(base64.b64decode('${payload}'))
 e=p['evidence']; b=p['bundle']
 assert p['preparationPlanSha256']==b['planSha256'], 'Preparation plan binding changed'
+active=pathlib.Path('/run/arch-drill-preparation-'+b['planSha256']+'.active')
+with active.open('x') as marker_file:
+ marker_file.write('ACTIVE '+str(os.getpid()))
+os.chmod(active,0o600)
+def release_marker():
+ paths=[pathlib.Path('/mnt/arch-drill/root'),pathlib.Path('/mnt/arch-drill/stage'),pathlib.Path('/mnt/arch-drill')]
+ try:
+  if all(not path.is_mount() and not path.exists() for path in paths):
+   active.write_text('RELEASED '+str(os.getpid()))
+   os.chmod(active,0o600)
+ except Exception: pass
+atexit.register(release_marker)
 request=urllib.request.Request('http://169.254.169.254/opc/v2/instance/',headers={'Authorization':'Bearer Oracle'})
 with urllib.request.urlopen(request,timeout=10) as response: identity=json.load(response)
 assert identity['id']==e['helper']['id'] and identity['id']!=p['plan']['source']['instanceId'], 'Wrong helper instance'
 def run(*args): return subprocess.check_output(args,text=True).strip()
 def disk(attachment,uuid,fstype,size):
  args=['lsblk','--json','--tree','--paths','--bytes','--output','PATH,TYPE,UUID,FSTYPE,SIZE,MOUNTPOINTS']
- assert isinstance(attachment.get('device'),str) and re.fullmatch(r'/dev/oracleoci/oraclevd[b-z]',attachment['device']), 'Copied attachment device is not an OCI data-volume path'
- args.append(os.path.realpath(attachment['device']))
+ if attachment.get('device') is not None:
+  assert isinstance(attachment['device'],str) and re.fullmatch(r'/dev/oracleoci/oraclevd[b-z]',attachment['device']), 'Copied attachment device is not an OCI data-volume path'
+  args.append(os.path.realpath(attachment['device']))
+ else:
+  assert attachment is e['bootAttachment'], 'Only the boot copy may use automatic device discovery'
  tree=json.loads(run(*args))['blockdevices']
  def has_mounts(item):
   return any(item.get('mountpoints') or []) or any(has_mounts(child) for child in item.get('children',[]))
+ if attachment.get('device') is None:
+  tree=[item for item in tree if item['type']=='disk' and not has_mounts(item) and any(child.get('uuid')==uuid and child.get('fstype')==fstype for child in item.get('children',[]))]
  assert len(tree)==1 and tree[0]['type']=='disk' and int(tree[0]['size'])==size, 'Unexpected disk size or type'
  assert stat.S_ISBLK(os.stat(tree[0]['path']).st_mode), 'Attachment is not a block device'
  def unmounted(item):
@@ -469,8 +488,15 @@ base.mkdir(mode=0o700,exist_ok=True)
 assert not base.is_symlink() and not any(base.iterdir()), 'Preparation mount directory is not empty'
 r=base/'root';s=base/'stage';r.mkdir();s.mkdir()
 mounted=[]
+marker=None
 try:
- subprocess.run(['mount','-o','ro,noload',root['path'],str(r)],check=True);mounted.append(r)
+ # A crash-consistent online snapshot can have pending ext4 journal work. A
+ # plain read-only mount replays that journal on this copied disk; noload
+ # would leave the copy unrecovered and remounting it read-write would not
+ # replay the journal.
+ subprocess.run(['mount','-o','ro',root['path'],str(r)],check=True)
+ subprocess.run(['umount',str(r)],check=True)
+ subprocess.run(['mount','-o','rw',root['path'],str(r)],check=True);mounted.append(r)
  subprocess.run(['mount','-o','ro,norecovery,nouuid',stage['path'],str(s)],check=True);mounted.append(s)
  def digest(path):
   h=hashlib.sha256()
@@ -487,7 +513,6 @@ try:
  assert 'root=UUID='+e['rootUuid'] in grub and 'Oracle Linux (fallback)' in grub, 'Boot contract missing'
  assert 'ID=arch' in (r/'etc/os-release').read_text(), 'Copied root is not Arch'
  assert (r/'usr/bin/nft').is_file(), 'Copied nftables executable missing'
- subprocess.run(['mount','-o','remount,rw',str(r)],check=True)
  def target(name):
   path=r/name
   assert not pathlib.PurePosixPath(name).is_absolute() and '..' not in pathlib.PurePosixPath(name).parts
@@ -523,11 +548,39 @@ try:
  os.chmod(marker,0o600)
  os.sync()
  subprocess.run(['mount','-o','remount,ro',str(r)],check=True)
- print(json.dumps({'status':'OFFLINE_FILES_PREPARED','planSha256':b['planSha256'],'bootVolumeId':e['bootVolumeId'],'rootVolumeId':e['rootVolumeId'],'helperInstanceId':e['helper']['id'],'firstBootProved':False,'bootDevicePath':stage['diskPath'],'rootDevicePath':root['diskPath']}))
+ marker={'status':'OFFLINE_FILES_PREPARED','planSha256':b['planSha256'],'bootVolumeId':e['bootVolumeId'],'rootVolumeId':e['rootVolumeId'],'helperInstanceId':e['helper']['id'],'firstBootProved':False,'bootDevicePath':stage['diskPath'],'rootDevicePath':root['diskPath']}
 finally:
- for path in reversed(mounted): subprocess.run(['umount',str(path)],check=True)
- for path in [s,r]: path.rmdir()
- base.rmdir()
+ cleanup_errors=[]
+ for path in reversed(mounted):
+  try: subprocess.run(['umount',str(path)],check=True)
+  except Exception as error: cleanup_errors.append(error)
+ for path in [s,r]:
+  try: path.rmdir()
+  except Exception as error: cleanup_errors.append(error)
+ try: base.rmdir()
+ except Exception as error: cleanup_errors.append(error)
+ if cleanup_errors: raise RuntimeError('Copied-volume cleanup did not release every guest mount') from cleanup_errors[0]
+assert marker is not None, 'Preparation marker was not produced'
+print(json.dumps(marker))
+`;
+  return "sudo -n python3 -c " + shellQuote(script);
+}
+
+/** Read-only helper-side proof used before a failure-path OCI detach. The
+ * preparation command creates the per-plan active marker before any metadata
+ * or disk check, then changes its content to a positive RELEASED token only
+ * after every owned mount and directory has been released. This proves that a
+ * lost SSH response cannot still have a writer using the copied disks. */
+function groupRestorePreparationReleaseCommand(
+  config: GroupRestorePreparationConfig,
+): string {
+  const script = `import pathlib
+active=pathlib.Path('/run/arch-drill-preparation-${config.planSha256}.active')
+assert active.exists() and not active.is_symlink(), 'Preparation completion marker is missing or ambiguous'
+assert active.read_text().startswith('RELEASED '), 'Preparation is still active or did not positively complete'
+for path in [pathlib.Path('/mnt/arch-drill/root'),pathlib.Path('/mnt/arch-drill/stage'),pathlib.Path('/mnt/arch-drill')]:
+ assert not path.is_mount() and not path.exists(), 'Copied preparation path is still present or mounted'
+print('ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256}')
 `;
   return "sudo -n python3 -c " + shellQuote(script);
 }
@@ -588,6 +641,39 @@ export function groupRestorePreparationAdapter(
   const now = options.now ?? Date.now;
   const sleep = options.sleep ??
     ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const sshArgs = (command: string): string[] => [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=yes",
+    "-o",
+    "IdentitiesOnly=yes",
+    "-o",
+    `UserKnownHostsFile=${config.ssh.knownHostsFile}`,
+    "-o",
+    `ConnectTimeout=${config.ssh.connectTimeoutSeconds}`,
+    "-p",
+    String(config.ssh.port),
+    "-i",
+    config.ssh.identityFile,
+    config.ssh.user + "@" + config.ssh.host,
+    command,
+  ];
+  const proveHelperReleased = async (): Promise<void> => {
+    const result = await options.ssh(
+      "ssh",
+      sshArgs(groupRestorePreparationReleaseCommand(config)),
+    );
+    const expected = `ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256}`;
+    if (
+      result.code !== 0 ||
+      !result.stdout.split("\n").some((line) => line.trim() === expected)
+    ) {
+      throw new Error(
+        "Could not prove the helper released copied disks; preserving attachments",
+      );
+    }
+  };
   const call = async (argv: string[]): Promise<JsonRecord> => {
     const result = await runner.run(
       runner.ociCliPath,
@@ -634,6 +720,34 @@ export function groupRestorePreparationAdapter(
   const attachmentVolumeId = (row: JsonRecord): string =>
     stringField(row, "volume-id");
 
+  const availableRootDevice = async (): Promise<string> => {
+    const devices = dataArray(
+      await call([
+        "compute",
+        "device",
+        "list-instance",
+        "--instance-id",
+        config.helper.instanceId,
+        "--is-available",
+        "true",
+        "--all",
+      ]),
+    );
+    const candidates = devices
+      .filter((row) => row["is-available"] === true)
+      .map((row) => row.name)
+      .filter((name): name is string =>
+        typeof name === "string" && ROOT_DEVICE_PATTERN.test(name)
+      )
+      .sort();
+    if (candidates.length === 0) {
+      throw new Error(
+        "OCI did not report an available consistent device path for the copied root",
+      );
+    }
+    return candidates[0]!;
+  };
+
   const ensureAttached = async (
     kind: "boot" | "root",
     volumeId: string,
@@ -664,35 +778,24 @@ export function groupRestorePreparationAdapter(
         "Copied-volume target is already attached; refusing to adopt it",
       );
     }
+    const device = kind === "root" ? await availableRootDevice() : undefined;
     // Persist ownership in the caller before the provider request. If the
     // response is lost after OCI accepts it, cleanup can reconcile the exact
     // target and detach it; a pre-existing target was rejected above.
     onAttachAttempt();
-    await call(
-      kind === "boot"
-        ? [
-          "compute",
-          "volume-attachment",
-          "attach",
-          "--instance-id",
-          config.helper.instanceId,
-          "--volume-id",
-          volumeId,
-          "--type",
-          "paravirtualized",
-        ]
-        : [
-          "compute",
-          "volume-attachment",
-          "attach",
-          "--instance-id",
-          config.helper.instanceId,
-          "--volume-id",
-          volumeId,
-          "--type",
-          "paravirtualized",
-        ],
-    );
+    const attachArgs = [
+      "compute",
+      "volume-attachment",
+      "attach",
+      "--instance-id",
+      config.helper.instanceId,
+      "--volume-id",
+      volumeId,
+      "--type",
+      "paravirtualized",
+      ...(device === undefined ? [] : ["--device", device]),
+    ];
+    await call(attachArgs);
     const started = now();
     while (now() - started < GROUP_RESTORE_DETACH_POLL_BUDGET_MS) {
       const current = (await listAttachments(kind)).filter((row) =>
@@ -832,6 +935,7 @@ export function groupRestorePreparationAdapter(
       let rootAttachmentId: string | undefined;
       let bootAttachAttempted = false;
       let rootAttachAttempted = false;
+      let preparationStarted = false;
       let operationFailed = false;
       let operationError: unknown;
       try {
@@ -887,25 +991,11 @@ export function groupRestorePreparationAdapter(
           evidence,
           bundle,
         );
-        const connection = config.ssh.user + "@" + config.ssh.host;
-        const sshResult: CommandResult = await options.ssh("ssh", [
-          "-o",
-          "BatchMode=yes",
-          "-o",
-          "StrictHostKeyChecking=yes",
-          "-o",
-          "IdentitiesOnly=yes",
-          "-o",
-          `UserKnownHostsFile=${config.ssh.knownHostsFile}`,
-          "-o",
-          `ConnectTimeout=${config.ssh.connectTimeoutSeconds}`,
-          "-p",
-          String(config.ssh.port),
-          "-i",
-          config.ssh.identityFile,
-          connection,
-          command,
-        ]);
+        preparationStarted = true;
+        const sshResult: CommandResult = await options.ssh(
+          "ssh",
+          sshArgs(command),
+        );
         if (sshResult.code !== 0) {
           throw new Error(
             `Copied-volume preparation failed on the helper (${sshResult.code}): ${
@@ -922,6 +1012,21 @@ export function groupRestorePreparationAdapter(
       } catch (error) {
         operationFailed = true;
         operationError = error;
+      }
+      // A failed SSH operation may still be running on the helper after the
+      // client lost its response. Do not detach a copied disk until a fresh,
+      // read-only helper probe proves the per-plan marker and all mount paths
+      // are gone. If proof is unavailable, preserve the attachments for
+      // manual reconciliation rather than risking an unclean detach.
+      if (operationFailed && preparationStarted) {
+        try {
+          await proveHelperReleased();
+        } catch (error) {
+          throw new AggregateError(
+            operationError === undefined ? [error] : [operationError, error],
+            "Copied-volume preparation cleanup blocked; helper release was not proved and attachments were preserved",
+          );
+        }
       }
       // The copies must never stay attached after preparation (success or
       // failure). Attempt both detaches independently so a root detach error
