@@ -9,6 +9,7 @@ import {
   groupRestoreDisplayName,
   type GroupRestoreEvidence,
   type GroupRestoreJournal,
+  groupRestoreLifetime,
   groupRestoreMetadataState,
   type GroupRestorePlan,
   groupRestorePlanDigest,
@@ -18,9 +19,12 @@ import {
   type GroupRestoreRunner,
   guardGroupRestoreRun,
   journalGroupRestoreIntent,
+  OCI_CLI_DISCIPLINE_FLAGS,
   reconcileGroupRestoreResource,
+  TRIAL_EVIDENCE_MAX_AGE_MS,
   validateGroupRestoreApproval,
   validateGroupRestoreEvidence,
+  validateGroupRestoreLifetime,
   validateGroupRestorePlan,
   validateGroupRestoreTargets,
 } from "../scripts/oci-group-restore-drill.ts";
@@ -127,6 +131,12 @@ Deno.test("plan accepts a valid group-backed plan and member metadata", async ()
     exactOperation:
       "one isolated trial-funded volume-group restore drill" as const,
     planSha256: await groupRestorePlanDigest(plan),
+    subscriptionTier: "FREE_AND_TRIAL" as const,
+    paymentModel: "FREE_TRIAL" as const,
+    availableTrialCreditsUsd: 300,
+    estimatedCostUsd: 0.05,
+    trialExpiresAtUtc: "2026-09-29T23:59:59.999Z",
+    observedAtUtc: "2026-09-05T09:20:00.000Z",
   };
   assertEquals(
     new Date(approval.expiresAtUtc).getTime() -
@@ -438,6 +448,43 @@ Deno.test("request builders emit exact safe fields and no production references"
   ]);
 });
 
+Deno.test("every crafted provider argv keeps the CLI discipline and no retry token", () => {
+  const requests = [
+    buildRestoredBootVolumeRequest(plan),
+    buildRestoredRootVolumeRequest(plan),
+    buildGroupRestoreLaunchRequest(plan, "target-boot", "target-root"),
+  ];
+  for (const request of requests) {
+    const argv = groupRestoreCliArgs(runner, request);
+    const subcommandStart = argv.indexOf(request[0]!);
+    for (const flag of OCI_CLI_DISCIPLINE_FLAGS) {
+      if (!argv.includes(flag)) {
+        throw new Error(
+          `Missing discipline flag ${flag} in ${JSON.stringify(argv)}`,
+        );
+      }
+      if (subcommandStart !== -1 && argv.indexOf(flag) > subcommandStart) {
+        throw new Error(`Discipline flag ${flag} is not before the subcommand`);
+      }
+    }
+    if (
+      argv.some((arg) =>
+        arg === "--opc-retry-token" || arg === "--opc-request-id"
+      )
+    ) {
+      throw new Error(
+        `Unsupported retry/request token leaked into ${JSON.stringify(argv)}`,
+      );
+    }
+    if (
+      request.includes("--opc-retry-token") ||
+      request.includes("--opc-request-id")
+    ) {
+      throw new Error("Request builder emitted an unsupported token");
+    }
+  }
+});
+
 const NOW = "2026-09-05T09:00:00.000Z";
 
 function requestFor(
@@ -607,6 +654,12 @@ Deno.test("approval validator binds the exact operation, digest and window", asy
     exactOperation:
       "one isolated trial-funded volume-group restore drill" as const,
     planSha256: await groupRestorePlanDigest(plan),
+    subscriptionTier: "FREE_AND_TRIAL" as const,
+    paymentModel: "FREE_TRIAL" as const,
+    availableTrialCreditsUsd: 300,
+    estimatedCostUsd: 0.05,
+    trialExpiresAtUtc: "2026-09-29T23:59:59.999Z",
+    observedAtUtc: "2026-09-05T09:20:00.000Z",
   };
   await refuses(() =>
     validateGroupRestoreApproval(
@@ -634,6 +687,106 @@ Deno.test("approval validator binds the exact operation, digest and window", asy
   );
 });
 
+Deno.test("approval validator requires live FREE_TRIAL coverage for the full window", async () => {
+  const digest = await groupRestorePlanDigest(plan);
+  const approved = new Date("2026-09-05T09:30:00Z");
+  const good: GroupRestoreApproval = {
+    approvedAtUtc: "2026-09-05T09:00:00.000Z",
+    expiresAtUtc: "2026-09-05T09:59:59.999Z",
+    exactOperation: "one isolated trial-funded volume-group restore drill",
+    planSha256: digest,
+    subscriptionTier: "FREE_AND_TRIAL",
+    paymentModel: "FREE_TRIAL",
+    availableTrialCreditsUsd: 300,
+    estimatedCostUsd: 0.05,
+    trialExpiresAtUtc: "2026-09-29T23:59:59.999Z",
+    observedAtUtc: "2026-09-05T09:28:00.000Z",
+  };
+  await validateGroupRestoreApproval(plan, good, approved);
+  const cases: GroupRestoreApproval[] = [
+    { ...good, subscriptionTier: "PAID" } as unknown as GroupRestoreApproval,
+    {
+      ...good,
+      paymentModel: "PAY_AS_YOU_GO",
+    } as unknown as GroupRestoreApproval,
+    { ...good, estimatedCostUsd: plan.spendingCapUsd + 0.01 },
+    { ...good, estimatedCostUsd: 0 },
+    { ...good, estimatedCostUsd: Number.NaN },
+    { ...good, availableTrialCreditsUsd: plan.spendingCapUsd - 0.01 },
+    { ...good, availableTrialCreditsUsd: Number.NaN },
+    { ...good, trialExpiresAtUtc: "2026-09-05T13:29:59.999Z" },
+    { ...good, trialExpiresAtUtc: "2026-09-05T13:30:00.000Z" },
+    { ...good, trialExpiresAtUtc: "2026-09-05T09:00:00Z" },
+    { ...good, observedAtUtc: "2026-09-05T09:45:00.000Z" },
+    {
+      ...good,
+      observedAtUtc: new Date(
+        approved.getTime() - TRIAL_EVIDENCE_MAX_AGE_MS - 1,
+      )
+        .toISOString(),
+    },
+    { ...good, observedAtUtc: "not-a-time" },
+    { ...good, trialExpiresAtUtc: "not-a-time" },
+    // Loose or non-canonical timestamp text must be refused outright:
+    // only strict canonical UTC with an optional exactly-3-digit fraction.
+    { ...good, approvedAtUtc: "2026-09-05 09:00:00.000Z" },
+    { ...good, approvedAtUtc: "2026-09-05T09:00:00+00:00" },
+    { ...good, expiresAtUtc: "2026-09-05T09:59:59.999-04:00" },
+    { ...good, expiresAtUtc: "2026-09-05T09:59:59.9Z" },
+    { ...good, observedAtUtc: "2026-09-05T09:20:00.000000Z" },
+    { ...good, trialExpiresAtUtc: "2026-09-29T23:59:59.999+00:00" },
+  ];
+  for (const bad of cases) {
+    await refuses(() => validateGroupRestoreApproval(plan, bad, approved));
+  }
+});
+
+Deno.test("lifetime is exact, durable and refused once elapsed or malformed", async () => {
+  const now = new Date("2026-09-05T09:30:00Z");
+  const lifetime = groupRestoreLifetime(now, plan);
+  assertEquals(
+    new Date(lifetime.deadlineAtUtc).getTime() -
+      new Date(lifetime.startedAtUtc).getTime(),
+    plan.maxDurationHours * 3_600_000,
+  );
+  validateGroupRestoreLifetime(lifetime, plan, now);
+  await refuses(() =>
+    validateGroupRestoreLifetime(
+      lifetime,
+      plan,
+      new Date("2026-09-05T13:30:00Z"),
+    )
+  );
+  await refuses(() =>
+    validateGroupRestoreLifetime(
+      { ...lifetime, deadlineAtUtc: now.toISOString() },
+      plan,
+      now,
+    )
+  );
+  await refuses(() =>
+    validateGroupRestoreLifetime(
+      { ...lifetime, deadlineAtUtc: "2026-09-05T13:31:00.000Z" },
+      plan,
+      now,
+    )
+  );
+  await refuses(() =>
+    validateGroupRestoreLifetime(
+      { ...lifetime, startedAtUtc: "2026-09-05T09:31:00.000Z" },
+      plan,
+      now,
+    )
+  );
+  await refuses(() =>
+    validateGroupRestoreLifetime(
+      { startedAtUtc: "soon", deadlineAtUtc: "later" },
+      plan,
+      now,
+    )
+  );
+});
+
 const runner: GroupRestoreRunner = {
   ociCliPath: "/home/pi/.venvs/oci/bin/oci",
   ociProfile: "DEFAULT",
@@ -646,6 +799,12 @@ const runApproval: GroupRestoreApproval = {
   expiresAtUtc: "2026-09-05T09:59:59.999Z",
   exactOperation: "one isolated trial-funded volume-group restore drill",
   planSha256: await groupRestorePlanDigest(plan),
+  subscriptionTier: "FREE_AND_TRIAL",
+  paymentModel: "FREE_TRIAL",
+  availableTrialCreditsUsd: 300,
+  estimatedCostUsd: 0.05,
+  trialExpiresAtUtc: "2026-09-29T23:59:59.999Z",
+  observedAtUtc: "2026-09-05T09:20:00.000Z",
 };
 
 const runTargets = {
@@ -654,12 +813,17 @@ const runTargets = {
   instanceId: "target-instance",
 };
 
-Deno.test("runner argv binds the exact injected surface", async () => {
+Deno.test("runner argv binds the exact injected surface and CLI discipline", async () => {
   assertEquals(groupRestoreCliArgs(runner, ["bv", "volume", "list"]), [
     "--profile",
     "DEFAULT",
     "--region",
     "us-ashburn-1",
+    "--no-retry",
+    "--connection-timeout",
+    "10",
+    "--read-timeout",
+    "60",
     "bv",
     "volume",
     "list",
@@ -839,5 +1003,14 @@ Deno.test("run guard refuses stale, ambiguous, mismatched and unbound runs", asy
   );
   await refuses(() =>
     guardGroupRestoreRun(base, { ...runner, region: "eu-frankfurt-1" })
+  );
+  await refuses(() =>
+    guardGroupRestoreRun({
+      ...base,
+      lifetime: groupRestoreLifetime(
+        new Date("2026-09-05T05:30:00Z"),
+        plan,
+      ),
+    }, runner)
   );
 });

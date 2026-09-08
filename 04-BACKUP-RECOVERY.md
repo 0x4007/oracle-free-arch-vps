@@ -132,15 +132,63 @@ drill boots a replacement from the capture and passes the full acceptance
 checklist, the online group's restore and boot status is `METADATA_PROVED`, not
 `RESTORE_DRILL_PROVED`.
 
-The isolated volume-group restore drill's plan gate is a source-only contract in
+The isolated volume-group restore drill has a source-only plan gate in
 `scripts/oci-group-restore-drill.ts`. It validates the exact bound plan, the
-reviewed one-hour approval over the plan digest, the live group-capture member
-metadata, the distinct restored targets and the durable journal, then builds the
-deterministic OCI CLI requests and the journal-guarded cleanup order. It never
-issues a provider call and never claims live recovery: its states are
-`PLAN_VALID`, `METADATA_PROVED` and the `RUN_READY` run guard, each with
-`restoreDrillProved` false. Live execution belongs to the primary-owned runner
-and the guest acceptance checklist below.
+reviewed one-hour approval over the plan digest (including typed
+`FREE_AND_TRIAL`/`FREE_TRIAL` trial evidence: a positive spending cap, an
+estimated cost at or below the cap, available trial credits that cover the cap,
+a trial expiry past the whole `maxDurationHours` window, and account evidence
+observed at most 15 minutes before use; every approval timestamp must be strict
+canonical UTC), the live group-capture member metadata, the distinct restored
+targets and the durable journal, then builds the deterministic OCI CLI requests
+and the journal-guarded cleanup order. It never issues a provider call and never
+claims live recovery: its states are `PLAN_VALID`, `METADATA_PROVED` and the
+`RUN_READY` run guard, each with `restoreDrillProved` false.
+
+Live execution belongs to `scripts/oci-group-restore-run.ts`
+(`deno task
+group-restore`) over the journaled state machine in
+`scripts/oci-group-restore-executor.ts`. It reads only the explicit private JSON
+inputs (`--plan`, `--approval`, `--evidence`, `--runner`, plus the
+operator-supplied `--acceptance` for accept/cleanup), refuses missing,
+placeholder or ambiguous state, and persists only the lifetime, journal and
+result. Every input path and every persisted path must be a relative path rooted
+exactly at `.private` with no `.`/`..`/empty segments and no absolute path, so
+no input or state write can escape the private directory. The single `--action`
+gate is `create` (stops at a durable `CREATED` result), `accept` (a separate
+typed acceptance receipt only, whose observation must fall inside the durably
+recorded drill window) and `cleanup` (allowed after the durably recorded
+lifetime deadline, reporting `deadlineExceeded` instead of extending the
+window). Every create boundary re-checks the durably recorded lifetime against
+the current adapter clock, so a long provider create that crosses the deadline
+cannot hide behind a stale run-start timestamp. The injected production verifier
+runs before the first create and after all deletes and reconciles the reviewed
+source: `RUNNING` in the plan's availability domain, exactly 2 OCPU/12 GB, 200
+GB live storage, one public IP (the read-only probe is region-scoped and limited
+to RESERVED addresses; ephemeral clone IPs are availability-domain scoped),
+exact source IDs/attachments and volume-group accounting from the group object's
+`volume-ids` list.
+
+The group path intentionally uses an **ephemeral** public IP: the clone is
+launched with `--assign-public-ip true` in the isolated subnet/VCN and the
+production reserved IP and DNS are never moved, reassigned or referenced by this
+code. The isolated network must block egress and instance metadata
+(`169.254.169.254`) and the clone's duplicate sync jobs must be masked before
+its first boot; reach the clone through the isolated network, never by opening
+the production network. The independent encrypted Backblaze generations remain
+the direct fallback recovery path (see `ONLINE-BACKUP-CONTRACT.md`). This source
+change provides no new live proof: until a real operator boot and acceptance
+drill runs against the capture, the online group's restore status is
+`METADATA_PROVED`, not `RESTORE_DRILL_PROVED`.
+
+The executor also requires the injected `verifyPreBootIsolation` gate after the
+two restored volumes are identified and before it launches the clone. That gate
+must prove the isolated subnet, egress and metadata controls and prepare the
+copied volumes so duplicate timers, agents and sync jobs are masked before the
+first boot. The default OCI adapter has no such proof and fails closed; an
+acceptance receipt cannot substitute for this pre-boot gate. Create and cleanup
+journals are persisted around every provider mutation so a controller crash
+leaves an exact resumable intent instead of silently issuing a duplicate.
 
 1. Confirm both backup names share the intended suffix.
 2. Restore the staging backup as a boot volume in the tenancy home region.
@@ -149,11 +197,22 @@ and the guest acceptance checklist below.
 5. Launch `VM.Standard.A1.Flex` with the current free-safe OCPU/RAM allocation
    from the restored staging volume.
 6. Attach the restored root volume paravirtualized.
-7. Assign the reserved public IP to the new primary private IP.
+7. The group restore drill launches the clone with an **ephemeral** public IP in
+   the isolated subnet/VCN and never assigns the production reserved IP or
+   changes production DNS. Only the separate legacy `oci-restore.ts` path
+   assigns the reserved IP, and only with exact approval.
 8. Verify UEFI -> GRUB -> staged kernel/initramfs -> UUID root boot.
 9. Verify SSH host-key expectations. A restored image may intentionally have the
    old host key; a rebuilt machine should have a newly recorded key.
 10. Confirm staged kernel and initramfs parity before normal operation.
+11. Prove the clone's isolation: no production route, blocked instance metadata,
+    masked duplicate sync/job copies before first boot.
+12. Supply the typed acceptance receipt (all `GroupRestoreAcceptanceChecks`
+    true, exact UUIDs and SHA-256 values bound to the reviewed plan) as a
+    separate operator action before recording `RESTORE_DRILL_PROVED`.
+13. After cleanup, run the production verifier again and prove the tenancy
+    returned to the original footprint (2 OCPU/12 GB, 200 GB live storage, one
+    public IP, exact source IDs and volume-group accounting).
 
 A backup does not reserve A1 capacity. If no A1 capacity is available, try
 another availability domain in the home region or retry later. Do not create a

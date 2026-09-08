@@ -27,6 +27,17 @@ export const SUFFIX_PATTERN = /^\d{8}T\d{6}Z$/;
 export const GROUP_RESTORE_APPROVAL_OPERATION =
   "one isolated trial-funded volume-group restore drill";
 export const APPROVAL_MAX_AGE_MS = 60 * 60 * 1000;
+/** Account/trial evidence must be observed within this window before use. */
+export const TRIAL_EVIDENCE_MAX_AGE_MS = 15 * 60 * 1000;
+/** Provider-wide CLI discipline: no retries, short bounds, JSON output is
+ * appended by the adapter before the subcommand arguments are executed. */
+export const OCI_CLI_DISCIPLINE_FLAGS = [
+  "--no-retry",
+  "--connection-timeout",
+  "10",
+  "--read-timeout",
+  "60",
+] as const;
 
 export type GroupRestoreResourceKind =
   | "boot-volume"
@@ -59,6 +70,20 @@ export interface GroupRestoreApproval {
   expiresAtUtc: string;
   exactOperation: "one isolated trial-funded volume-group restore drill";
   planSha256: string;
+  subscriptionTier: "FREE_AND_TRIAL";
+  paymentModel: "FREE_TRIAL";
+  availableTrialCreditsUsd: number;
+  estimatedCostUsd: number;
+  trialExpiresAtUtc: string;
+  observedAtUtc: string;
+}
+
+/** Durable started/deadline window for one drill. The run wrapper persists it
+ * before the first provider mutation and the state machine refuses new creates
+ * or acceptance once the deadline elapsed. */
+export interface GroupRestoreLifetime {
+  startedAtUtc: string;
+  deadlineAtUtc: string;
 }
 
 /** Restored drill resources as created by this contract's request builders. */
@@ -249,29 +274,107 @@ export async function groupRestorePlanDigest(
 }
 
 /** Exact-approval binding over the reviewed plan digest with the standard
- * one-hour approval window. Trial and account evidence stay in the existing
- * isolated-drill approval path. */
+ * one-hour approval window, plus the typed account/trial evidence: the
+ * subscription must be FREE_AND_TRIAL / FREE_TRIAL with finite observed
+ * coverage that still covers the complete `maxDurationHours` window, fresh
+ * (at most 15 minutes old), with positive credits at or above the approved
+ * spending cap and the estimated cost bounded by that cap. Every timestamp
+ * must be strict canonical UTC; loose or offset timestamp text is refused
+ * before any Date.parse result is trusted. */
 export async function validateGroupRestoreApproval(
   plan: GroupRestorePlan,
   approval: GroupRestoreApproval,
   now: Date,
 ): Promise<void> {
   validateGroupRestorePlan(plan);
+  assertTimestampUtc(approval.approvedAtUtc, "Approval approved timestamp");
+  assertTimestampUtc(approval.expiresAtUtc, "Approval expiry timestamp");
+  assertTimestampUtc(approval.observedAtUtc, "Approval evidence timestamp");
+  assertTimestampUtc(approval.trialExpiresAtUtc, "Trial expiry timestamp");
   const approvedAt = Date.parse(approval.approvedAtUtc);
   const expiresAt = Date.parse(approval.expiresAtUtc);
+  const observedAt = Date.parse(approval.observedAtUtc);
+  const trialExpiresAt = Date.parse(approval.trialExpiresAtUtc);
   const timestamp = now.getTime();
   if (
     approval.exactOperation !== GROUP_RESTORE_APPROVAL_OPERATION ||
     approval.planSha256 !== await groupRestorePlanDigest(plan) ||
+    approval.subscriptionTier !== "FREE_AND_TRIAL" ||
+    approval.paymentModel !== "FREE_TRIAL" ||
+    !Number.isFinite(approval.availableTrialCreditsUsd) ||
+    !Number.isFinite(approval.estimatedCostUsd) ||
+    approval.availableTrialCreditsUsd < plan.spendingCapUsd ||
+    approval.estimatedCostUsd <= 0 ||
+    approval.estimatedCostUsd > plan.spendingCapUsd ||
     !Number.isFinite(approvedAt) || !Number.isFinite(expiresAt) ||
+    !Number.isFinite(observedAt) || !Number.isFinite(trialExpiresAt) ||
+    observedAt > timestamp ||
+    timestamp - observedAt > TRIAL_EVIDENCE_MAX_AGE_MS ||
+    trialExpiresAt - timestamp <= plan.maxDurationHours * 3_600_000 ||
     approvedAt > timestamp || timestamp >= expiresAt ||
     expiresAt - approvedAt > APPROVAL_MAX_AGE_MS ||
     timestamp - approvedAt > APPROVAL_MAX_AGE_MS
   ) {
     throw new Error(
-      "Exact drill approval is absent, expired, or does not match the plan",
+      "Exact drill approval, fresh trial coverage or plan binding is absent, expired or does not match the plan",
     );
   }
+}
+
+/** Compute the durable lifetime window for one drill run: the plan's exact
+ * `maxDurationHours` from the moment the wrapper starts the run. */
+export function groupRestoreLifetime(
+  now: Date,
+  plan: GroupRestorePlan,
+): GroupRestoreLifetime {
+  if (!Number.isFinite(now.getTime())) {
+    throw new Error("Run time is invalid");
+  }
+  return {
+    startedAtUtc: now.toISOString(),
+    deadlineAtUtc: new Date(
+      now.getTime() + plan.maxDurationHours * 3_600_000,
+    ).toISOString(),
+  };
+}
+
+/** Refuse a malformed lifetime or one whose window has elapsed. This is the
+ * only lifetime check used by creates and acceptance; cleanup may still run
+ * after the deadline and reports the condition in its result. */
+export function validateGroupRestoreLifetime(
+  lifetime: GroupRestoreLifetime,
+  plan: GroupRestorePlan,
+  now: Date,
+): void {
+  if (!Number.isFinite(now.getTime())) {
+    throw new Error("Run time is invalid");
+  }
+  assertTimestampUtc(lifetime.startedAtUtc, "Lifetime start timestamp");
+  assertTimestampUtc(lifetime.deadlineAtUtc, "Lifetime deadline timestamp");
+  const startedAt = Date.parse(lifetime.startedAtUtc);
+  const deadlineAt = Date.parse(lifetime.deadlineAtUtc);
+  if (startedAt > now.getTime()) {
+    throw new Error("Durably recorded drill lifetime starts in the future");
+  }
+  if (deadlineAt - startedAt !== plan.maxDurationHours * 3_600_000) {
+    throw new Error(
+      "Durably recorded drill lifetime does not match the plan window",
+    );
+  }
+  if (now.getTime() >= deadlineAt) {
+    throw new Error(
+      "Drill lifetime elapsed; new creates and acceptance are refused",
+    );
+  }
+}
+
+/** Whether the deadline has passed at `now`; reported in the result/journal
+ * instead of silently extending the window. */
+export function groupRestoreDeadlineExceeded(
+  lifetime: GroupRestoreLifetime,
+  now: Date,
+): boolean {
+  return now.getTime() >= Date.parse(lifetime.deadlineAtUtc);
 }
 
 /** Restored target volumes and clone must stay beside the running source and
@@ -502,7 +605,7 @@ function validateResourceRequest(request: GroupRestoreResourceRequest): void {
   assertPlanned(request.requestName, "requestName");
 }
 
-function assertTimestampUtc(value: string, label: string): void {
+export function assertTimestampUtc(value: string, label: string): void {
   if (
     !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value) ||
     !Number.isFinite(Date.parse(value))
@@ -559,6 +662,7 @@ export function journalGroupRestoreIntent(
   assertTimestampUtc(nowUtc, "Journal timestamp");
   const entries = entriesFor(journal, request);
   const create = entries.find((entry) => entry.intent === "create");
+  let deleteIdentity: GroupRestoreIdentity | undefined;
   const done = entries.some((entry) =>
     entry.intent === "delete" && Boolean(entry.completedAtUtc)
   );
@@ -569,7 +673,7 @@ export function journalGroupRestoreIntent(
         "Delete intent requires the exact recorded create identity",
       );
     }
-    exactIdentity(create.identity);
+    deleteIdentity = exactIdentity(create.identity);
     if (entries.length !== 1) {
       // A second intent or another create is ambiguous.
       throw new Error("Ambiguous journal state for this resource request");
@@ -592,6 +696,7 @@ export function journalGroupRestoreIntent(
     request,
     intent,
     createdAtUtc: nowUtc,
+    ...(deleteIdentity ? { identity: deleteIdentity } : {}),
   }];
 }
 
@@ -693,8 +798,10 @@ export interface GroupRestoreRunner {
 }
 
 /** Deterministic OCI CLI argv for the exact injected runner surface:
- * provider-wide flags first, then the reviewed subcommand request. Every
- * value must be bound to concrete non-placeholder text. */
+ * provider-wide flags first (profile, region, no-retry and bounded
+ * connection/read timeouts), then the reviewed subcommand request. Every
+ * value must be bound to concrete non-placeholder text. The adapter appends
+ * `--output json` for every call. */
 export function groupRestoreCliArgs(
   runner: GroupRestoreRunner,
   args: string[],
@@ -723,6 +830,7 @@ export function groupRestoreCliArgs(
     runner.ociProfile,
     "--region",
     runner.region,
+    ...OCI_CLI_DISCIPLINE_FLAGS,
     ...args,
   ];
 }
@@ -737,6 +845,8 @@ export interface GroupRestoreRunInput {
   targets: GroupRestoreTargetResources;
   journal: GroupRestoreJournal;
   now: Date;
+  /** Durable window persisted by the wrapper; required for a resume. */
+  lifetime?: GroupRestoreLifetime;
 }
 
 /** One deterministic create step of a guarded run. The primary journals the
@@ -818,6 +928,9 @@ export async function guardGroupRestoreRun(
   validateGroupRestoreEvidence(plan, evidence);
   validateGroupRestoreTargets(plan, targets);
   validateGroupRestoreJournal(journal, plan);
+  if (input.lifetime !== undefined) {
+    validateGroupRestoreLifetime(input.lifetime, plan, now);
+  }
   const steps: GroupRestoreRunStep[] = [];
   for (const kind of RESOURCE_KINDS) {
     const request = exactResourceRequest(plan, kind);
