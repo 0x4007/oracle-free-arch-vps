@@ -173,6 +173,24 @@ Deno.test("rescue account requires RAM and non-root public-key SSH", () => {
     ),
   );
 });
+Deno.test("RAM SSH config permits Unix reverse sockets but denies remote TCP listeners", () => {
+  const sshdConfig =
+    rescueOverlayFiles(input).find((f) => f.path === "etc/ssh/sshd_config")!
+      .content;
+  assert(sshdConfig.includes("AllowTcpForwarding remote\n"));
+  assert(sshdConfig.includes("PermitListen none\n"));
+  assert(sshdConfig.includes("AllowStreamLocalForwarding remote\n"));
+  assert(!sshdConfig.includes("AllowTcpForwarding yes"));
+  assert(sshdConfig.includes("PermitRootLogin no\n"));
+  assert(
+    sshdConfig.indexOf("AllowTcpForwarding remote") <
+      sshdConfig.indexOf("PermitListen none"),
+  );
+  assert(
+    sshdConfig.indexOf("PermitListen none") <
+      sshdConfig.indexOf("AllowStreamLocalForwarding remote"),
+  );
+});
 Deno.test("rescue account prepares the GPG runtime after codex identity checks and before SSH keys", () => {
   const script =
     rescueOverlayFiles(input).find((f) =>
