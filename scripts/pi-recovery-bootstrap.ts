@@ -27,6 +27,7 @@ const PACKAGES = [
   "bash",
   "blkid",
   "ca-certificates",
+  "coreutils",
   "curl",
   "deno=2.7.4-r2",
   "dosfstools",
