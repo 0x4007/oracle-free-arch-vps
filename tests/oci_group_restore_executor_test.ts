@@ -19,6 +19,7 @@ import {
   verifyGroupRestoreProduction,
 } from "../scripts/oci-group-restore-executor.ts";
 import {
+  BOOT_MEMBER_SIZE_GB,
   type GroupRestoreApproval,
   type GroupRestoreCleanupStep,
   groupRestoreDisplayName,
@@ -32,6 +33,7 @@ import {
   type GroupRestoreRunner,
   journalGroupRestoreIntent,
   reconcileGroupRestoreResource,
+  ROOT_MEMBER_SIZE_GB,
 } from "../scripts/oci-group-restore-drill.ts";
 import type { DrillNetworkEvidence } from "../scripts/isolated-drill.ts";
 import type { CommandRunner, JsonRecord } from "../scripts/oci.ts";
@@ -197,6 +199,7 @@ function trueChecks() {
 const ROOT_UUID = "9f7e0d1c-2a3b-4c5d-8e9f-001122334455";
 const STAGING_UUID = "1a2b3c4d-5e6f-4a7b-8c9d-001122334455";
 const SHA256 = "ab".repeat(32);
+const PREP_ATTEMPT_TOKEN = "01234567-89ab-4cde-8fab-0123456789ab";
 
 function receipt(
   observedAtUtc: string = now.toISOString(),
@@ -2719,8 +2722,25 @@ function preparationMarkerJson(
 
 function preparationReleaseOutput(
   config: GroupRestorePreparationConfig,
+  attemptToken: string = PREP_ATTEMPT_TOKEN,
 ): string {
-  return `ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256}\n`;
+  return `ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256} ${attemptToken}\n`;
+}
+
+function preparationAttemptTokenFromCommand(
+  config: GroupRestorePreparationConfig,
+  command: string,
+): string {
+  const match = command.match(
+    new RegExp(
+      `ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256} ([0-9a-f-]{36})`,
+    ),
+  );
+  assert(
+    match?.[1] !== undefined,
+    "the release command must carry its attempt token",
+  );
+  return match[1];
 }
 
 Deno.test("real preparation adapter binds the exact targets to the reviewed helper and prepares before launch", async () => {
@@ -3240,7 +3260,10 @@ Deno.test("real preparation adapter fails closed when the guarded command fails 
         return command.includes("ARCH_DRILL_PREPARATION_RELEASED")
           ? Promise.resolve({
             code: 0,
-            stdout: preparationReleaseOutput(failureConfig),
+            stdout: preparationReleaseOutput(
+              failureConfig,
+              preparationAttemptTokenFromCommand(failureConfig, command),
+            ),
             stderr: "",
           })
           : Promise.resolve({
@@ -3287,7 +3310,13 @@ Deno.test("real preparation adapter fails closed when the guarded command fails 
         ) {
           return Promise.resolve({
             code: 0,
-            stdout: preparationReleaseOutput(config),
+            stdout: preparationReleaseOutput(
+              config,
+              preparationAttemptTokenFromCommand(
+                config,
+                args[args.length - 1]!,
+              ),
+            ),
             stderr: "",
           });
         }
@@ -3317,6 +3346,61 @@ Deno.test("real preparation adapter fails closed when the guarded command fails 
       throw error;
     }
   });
+});
+
+Deno.test("a release proof from an earlier preparation attempt cannot detach fresh attachments", async () => {
+  const fixture = preparationOciFixture();
+  const config = await prepConfigWithDigest();
+  const releaseCommands: string[] = [];
+  const adapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    fixture.runner,
+    {
+      attachState: new MemoryIntentStore(),
+      ssh: (_command, args) => {
+        const command = args[args.length - 1]!;
+        if (command.includes("ARCH_DRILL_PREPARATION_RELEASED")) {
+          releaseCommands.push(command);
+          // This is the legacy/stale proof a prior invocation could leave in
+          // place. The current invocation must require its own UUID token.
+          return Promise.resolve({
+            code: 0,
+            stdout: `ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256}\n`,
+            stderr: "",
+          });
+        }
+        return Promise.resolve({
+          code: 1,
+          stdout: "",
+          stderr: "connection lost before the helper command started",
+        });
+      },
+    },
+  );
+  await rejects(() => adapter.prepareCopiedVolumes(prepTargets));
+  assert(
+    releaseCommands.length === 1,
+    "the failure path must request release proof",
+  );
+  const attemptToken = preparationAttemptTokenFromCommand(
+    config,
+    releaseCommands[0]!,
+  );
+  assert(
+    !releaseCommands[0]!.includes(
+      `ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256}\n`,
+    ),
+    "the release command must bind a fresh attempt token",
+  );
+  assert(
+    attemptToken !== PREP_ATTEMPT_TOKEN,
+    "the adapter must generate a new token for each invocation",
+  );
+  assert(
+    fixture.ready() === true,
+    "stale release proof must preserve both copied attachments",
+  );
 });
 
 Deno.test("real preparation adapter preserves attachments when helper release is unproved", async () => {
@@ -3795,7 +3879,10 @@ Deno.test("preparation marks the durable intents released only after a proved de
         return command.includes("ARCH_DRILL_PREPARATION_RELEASED")
           ? Promise.resolve({
             code: 0,
-            stdout: preparationReleaseOutput(config),
+            stdout: preparationReleaseOutput(
+              config,
+              preparationAttemptTokenFromCommand(config, command),
+            ),
             stderr: "",
           })
           : Promise.resolve({
@@ -4295,8 +4382,12 @@ Deno.test("generated preparation and release bodies are both sent to python3 -m 
     config,
     evidence,
     PREP_BUNDLE,
+    PREP_ATTEMPT_TOKEN,
   );
-  const releaseBody = groupRestorePreparationReleaseScriptBody(config);
+  const releaseBody = groupRestorePreparationReleaseScriptBody(
+    config,
+    PREP_ATTEMPT_TOKEN,
+  );
   const calls: Array<{ command: string; args: string[]; stdin: string }> = [];
   await validateGroupRestorePreparationPythonScripts(
     preparationBody,
@@ -4330,8 +4421,14 @@ Deno.test("malformed parser output fails closed without executing the guarded co
   await rejects(async () => {
     try {
       await validateGroupRestorePreparationPythonScripts(
-        groupRestorePreparationScriptBody(plan, config, evidence, PREP_BUNDLE),
-        groupRestorePreparationReleaseScriptBody(config),
+        groupRestorePreparationScriptBody(
+          plan,
+          config,
+          evidence,
+          PREP_BUNDLE,
+          PREP_ATTEMPT_TOKEN,
+        ),
+        groupRestorePreparationReleaseScriptBody(config, PREP_ATTEMPT_TOKEN),
         () =>
           Promise.resolve({
             code: 1,
@@ -4384,6 +4481,7 @@ Deno.test("the shell command still carries the exact plan and target bindings", 
     config,
     evidence,
     PREP_BUNDLE,
+    PREP_ATTEMPT_TOKEN,
   );
   const command = "sudo -n python3 -c " + body;
   assert(
@@ -4397,6 +4495,7 @@ Deno.test("the shell command still carries the exact plan and target bindings", 
     evidence: GroupRestorePreparationEvidence;
     bundle: { planSha256: string };
     preparationPlanSha256: string;
+    preparationAttemptToken: string;
   };
   assert(payload.plan.suffix === plan.suffix, "the plan suffix must bind");
   assert(
@@ -4418,9 +4517,578 @@ Deno.test("the shell command still carries the exact plan and target bindings", 
     "the reviewed plan and isolation-file digests must bind",
   );
   assert(
-    groupRestorePreparationReleaseScriptBody(config).includes(
+    payload.preparationAttemptToken === PREP_ATTEMPT_TOKEN,
+    "the fresh preparation attempt token must bind",
+  );
+  assert(
+    groupRestorePreparationReleaseScriptBody(
+      config,
+      PREP_ATTEMPT_TOKEN,
+    ).includes(
       config.planSha256,
     ),
     "the release command must bind the exact reviewed plan digest",
   );
+});
+
+// ---------------------------------------------------------------------------
+// The exact generated preparation body is executed (not parsed) inside a
+// temporary helper-like filesystem root, so the real Python script proves the
+// retry reconciliation of a prior strictly released marker and the unsafe
+// marker states. Only unavoidable host operations are stubbed before the body
+// runs: the OCI metadata service, the block-device/mount layer, and the
+// helper paths /run, /mnt and /sys/class/block (the dev host has no helper
+// instance and cannot create those roots) are redirected into the temporary
+// root; the body itself, its plan/evidence payload and its marker protocol run
+// unchanged.
+
+const FIXTURE_KERNEL_BYTES = new TextEncoder().encode(
+  "arch kernel bytes for the copied root device\n",
+);
+const FIXTURE_INITRAMFS_BYTES = new TextEncoder().encode(
+  "arch initramfs bytes for the copied root device\n",
+);
+const FIXTURE_HOME_CONF_BYTES = new TextEncoder().encode(
+  "copied home drop-in content for the isolation fixture\n",
+);
+const FIXTURE_OS_RELEASE_BYTES = new TextEncoder().encode(
+  'NAME="Arch Linux"\nID=arch\n',
+);
+const FIXTURE_NFT_BYTES = new TextEncoder().encode("#! /usr/bin/nft -f\n");
+
+function fixtureGrubContent(): string {
+  return [
+    "set default=0",
+    'menuentry "Arch Linux ARM" {',
+    `    linux /boot/vmlinuz-linux-aarch64 root=UUID=${ROOT_UUID} rw`,
+    "}",
+    "",
+    'menuentry "Oracle Linux (fallback)" {',
+    "}",
+    "",
+  ].join("\n");
+}
+
+async function fixtureSha256(data: Uint8Array): Promise<string> {
+  const bytes = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new Uint8Array(data)),
+  );
+  return Array.from(
+    bytes,
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+function joinPath(...parts: string[]): string {
+  return parts.join("/");
+}
+
+function dirnameOf(path: string): string {
+  const index = path.lastIndexOf("/");
+  return index <= 0 ? path : path.slice(0, index);
+}
+
+interface FixtureDeviceTree {
+  directories: string[];
+  files: Array<[string, Uint8Array]>;
+}
+
+/** Copied root-device content: the boot bytes, the Arch identities and the
+ * copied home tree the generated body re-proves and masks. */
+function fixtureRootDeviceTree(): FixtureDeviceTree {
+  return {
+    directories: [
+      "boot",
+      "etc",
+      "etc/systemd/system",
+      "etc/systemd/user",
+      "home",
+      "home/codex",
+      "home/codex/.config",
+      "home/codex/.config/systemd",
+      "home/codex/.config/systemd/user",
+      "home/codex/.config/systemd/user/vncserver.service.d",
+      "home/codex/.config/systemd/user/codex-remote-daemon.service.d",
+      "usr",
+      "usr/bin",
+      "usr/lib",
+      "usr/lib/systemd",
+      "usr/lib/systemd/system",
+      "usr/lib/systemd/user",
+    ],
+    files: [
+      ["boot/Image", FIXTURE_KERNEL_BYTES],
+      ["boot/initramfs-linux.img", FIXTURE_INITRAMFS_BYTES],
+      ["etc/os-release", FIXTURE_OS_RELEASE_BYTES],
+      ["usr/bin/nft", FIXTURE_NFT_BYTES],
+      [
+        "home/codex/.config/systemd/user/vncserver.service.d/" +
+        "backup-recovery.conf",
+        FIXTURE_HOME_CONF_BYTES,
+      ],
+      [
+        "home/codex/.config/systemd/user/codex-remote-daemon.service.d/" +
+        "backup-recovery.conf",
+        FIXTURE_HOME_CONF_BYTES,
+      ],
+    ],
+  };
+}
+
+/** Copied stage-volume content: the same boot bytes plus the reviewed GRUB
+ * configuration the generated body verifies byte-for-byte. */
+function fixtureStageDeviceTree(grub: Uint8Array): FixtureDeviceTree {
+  return {
+    directories: ["grub2"],
+    files: [
+      ["arch-vmlinuz", FIXTURE_KERNEL_BYTES],
+      ["arch-initrd.img", FIXTURE_INITRAMFS_BYTES],
+      ["grub2/grub.cfg", grub],
+    ],
+  };
+}
+
+async function writeFixtureDeviceTree(
+  root: string,
+  name: string,
+  tree: FixtureDeviceTree,
+): Promise<void> {
+  const base = joinPath(root, "stub-devices", name);
+  for (const directory of tree.directories) {
+    await Deno.mkdir(joinPath(base, directory), { recursive: true });
+  }
+  for (const [relative, bytes] of tree.files) {
+    const target = joinPath(base, relative);
+    await Deno.mkdir(dirnameOf(target), { recursive: true });
+    await Deno.writeFile(target, bytes);
+  }
+}
+
+/** Python started before the fixture body, exactly like the helper-side
+ * `python3 -c` path: it redirects only the helper-only path roots and the
+ * metadata/device/mount operations into the fixture, then the generated body
+ * runs unmodified. */
+const FIXTURE_SITECUSTOMIZE = `
+import json,os,pathlib,shutil,stat,subprocess,urllib.request
+root=os.path.abspath(os.environ['ARCH_DRILL_FIXTURE_ROOT'])
+state=json.load(open(os.path.join(root,'stub-state.json'),encoding='utf-8'))
+mounted={root+path for path in state['mounted']}
+def remap(value):
+ if not isinstance(value,str):
+  return value
+ for prefix in ('/run','/mnt','/sys/class/block'):
+  if value==prefix or value.startswith(prefix+'/'):
+   return root+value
+ return value
+class FixturePath(pathlib.Path):
+ def __new__(cls,*args):
+  return super().__new__(cls,*[remap(arg) for arg in args])
+pathlib.Path=FixturePath
+_real_is_mount=pathlib.PosixPath.is_mount
+def fixture_is_mount(self):
+ return str(self) in mounted or _real_is_mount(self)
+pathlib.PosixPath.is_mount=fixture_is_mount
+_real_stat=os.stat
+def fixture_stat(path,*args,**kwargs):
+ value=os.fspath(path)
+ if value.startswith('/dev/oracleoci/'):
+  size=int(state['devices'][os.path.basename(value)]['size'])
+  return os.stat_result((stat.S_IFBLK|0o600,123,456,1,0,0,size,0,0,0))
+ return _real_stat(path,*args,**kwargs)
+os.stat=fixture_stat
+def fixture_check_output(args,**kwargs):
+ argv=[os.fspath(arg) for arg in args]
+ if argv and argv[0]=='lsblk':
+  devices=state['blockdevices']
+  for arg in argv[1:]:
+   if isinstance(arg,str) and arg.startswith('/dev/'):
+    devices=[device for device in devices if device['path']==arg]
+  return json.dumps({'blockdevices':devices})
+ raise AssertionError('unexpected check_output: '+repr(argv))
+subprocess.check_output=fixture_check_output
+def copy_tree(source,target):
+ for name in os.listdir(source):
+  item=os.path.join(source,name)
+  destination=os.path.join(target,name)
+  if os.path.isdir(item):
+   shutil.copytree(item,destination)
+  else:
+   shutil.copy2(item,destination)
+def clear_tree(target):
+ for name in os.listdir(target):
+  item=os.path.join(target,name)
+  if os.path.isdir(item) and not os.path.islink(item):
+   shutil.rmtree(item)
+  else:
+   os.unlink(item)
+def fixture_run(args,**kwargs):
+ argv=[os.fspath(arg) for arg in args]
+ if argv[0]=='mount':
+  if 'remount' in argv[2]:
+   return subprocess.CompletedProcess(argv,0)
+  device=os.path.basename(argv[3])
+  name=next((candidate for candidate in state['devices'] if device.startswith(candidate)),device)
+  copy_tree(os.path.join(root,'stub-devices',name),argv[4])
+  return subprocess.CompletedProcess(argv,0)
+ if argv[0]=='umount':
+  clear_tree(argv[1])
+  return subprocess.CompletedProcess(argv,0)
+ raise AssertionError('unexpected run: '+repr(argv))
+subprocess.run=fixture_run
+class FixtureResponse:
+ def __init__(self,payload):
+  self.payload=payload
+ def __enter__(self):
+  return self
+ def __exit__(self,*args):
+  return False
+ def read(self):
+  return self.payload
+def fixture_urlopen(request,**kwargs):
+ return FixtureResponse(json.dumps(state['instance']).encode('utf-8'))
+urllib.request.urlopen=fixture_urlopen
+`;
+
+type FixtureMarkerState =
+  | "released"
+  | "active"
+  | "malformed"
+  | "bare"
+  | "zero"
+  | "trailing"
+  | "symlink"
+  | "directory";
+
+interface FixtureBodyOptions {
+  marker: FixtureMarkerState | "missing";
+  /** Virtual preparation paths pre-created under the fixture /mnt root. */
+  presentPaths?: string[];
+  /** Virtual preparation paths the boot strapping reports as mounted. */
+  mountedPaths?: string[];
+}
+
+interface FixtureBodyRun {
+  code: number;
+  stdout: string;
+  stderr: string;
+  root: string;
+  markerPath: string;
+  releasedContent: string | undefined;
+  markerIsSymlink: boolean;
+  markerIsDirectory: boolean;
+  ownedPreparationPathsPresent: boolean[];
+}
+
+async function fixturePathExists(path: string): Promise<boolean> {
+  try {
+    await Deno.stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function runPreparationBodyFixture(
+  options: FixtureBodyOptions,
+): Promise<FixtureBodyRun> {
+  const config = await prepConfigWithDigest();
+  const evidence = prepEvidence();
+  const grubBytes = new TextEncoder().encode(fixtureGrubContent());
+  evidence.kernelSha256 = await fixtureSha256(FIXTURE_KERNEL_BYTES);
+  evidence.initramfsSha256 = await fixtureSha256(FIXTURE_INITRAMFS_BYTES);
+  evidence.grubSha256 = await fixtureSha256(grubBytes);
+  const body = groupRestorePreparationScriptBody(
+    plan,
+    config,
+    evidence,
+    PREP_BUNDLE,
+    PREP_ATTEMPT_TOKEN,
+  );
+  const root = await Deno.makeTempDir({ prefix: "arch-drill-prep-body-" });
+  try {
+    const runDir = joinPath(root, "run");
+    await Deno.mkdir(runDir, { recursive: true });
+    await Deno.mkdir(joinPath(root, "mnt"), { recursive: true });
+    const markerRel =
+      `run/arch-drill-preparation-${PREP_BUNDLE.planSha256}.active`;
+    const markerPath = joinPath(root, markerRel);
+    if (options.marker !== "missing") {
+      switch (options.marker) {
+        case "released":
+          await Deno.writeTextFile(markerPath, "RELEASED 4242");
+          break;
+        case "active":
+          await Deno.writeTextFile(markerPath, "ACTIVE 4242");
+          break;
+        case "malformed":
+          await Deno.writeTextFile(markerPath, "RELEASED not-a-pid");
+          break;
+        case "bare":
+          await Deno.writeTextFile(markerPath, "RELEASED");
+          break;
+        case "zero":
+          await Deno.writeTextFile(markerPath, "RELEASED 0");
+          break;
+        case "trailing":
+          await Deno.writeTextFile(markerPath, "RELEASED 4242\n");
+          break;
+        case "symlink":
+          await Deno.writeTextFile(
+            joinPath(runDir, "released-target"),
+            "RELEASED 4242",
+          );
+          await Deno.symlink("released-target", markerPath);
+          break;
+        case "directory":
+          await Deno.mkdir(markerPath);
+          break;
+      }
+    }
+    for (const present of options.presentPaths ?? []) {
+      await Deno.mkdir(joinPath(root, present!), { recursive: true });
+    }
+    const systemStart = joinPath(
+      root,
+      "sys/class/block/oraclevdb1/start",
+    );
+    await Deno.mkdir(dirnameOf(systemStart), { recursive: true });
+    await Deno.writeTextFile(
+      systemStart,
+      String(evidence.rootPartitionStartSector),
+    );
+    await writeFixtureDeviceTree(root, "oraclevdb", fixtureRootDeviceTree());
+    await writeFixtureDeviceTree(
+      root,
+      "oraclevdc",
+      fixtureStageDeviceTree(
+        grubBytes,
+      ),
+    );
+    const state = {
+      instance: { id: config.helper.instanceId },
+      mounted: options.mountedPaths ?? [],
+      devices: {
+        oraclevdb: { size: ROOT_MEMBER_SIZE_GB * 1024 ** 3 },
+        oraclevdc: { size: BOOT_MEMBER_SIZE_GB * 1024 ** 3 },
+      },
+      blockdevices: [{
+        path: "/dev/oracleoci/oraclevdb",
+        type: "disk",
+        size: ROOT_MEMBER_SIZE_GB * 1024 ** 3,
+        mountpoints: [],
+        children: [{
+          path: "/dev/oracleoci/oraclevdb1",
+          type: "part",
+          uuid: ROOT_UUID,
+          fstype: "ext4",
+          size: ROOT_MEMBER_SIZE_GB * 1024 ** 3,
+          mountpoints: [],
+        }],
+      }, {
+        path: "/dev/oracleoci/oraclevdc",
+        type: "disk",
+        size: BOOT_MEMBER_SIZE_GB * 1024 ** 3,
+        mountpoints: [],
+        children: [{
+          path: "/dev/oracleoci/oraclevdc1",
+          type: "part",
+          uuid: STAGING_UUID,
+          fstype: "xfs",
+          size: BOOT_MEMBER_SIZE_GB * 1024 ** 3,
+          mountpoints: [],
+        }],
+      }],
+    };
+    await Deno.writeTextFile(
+      joinPath(root, "stub-state.json"),
+      JSON.stringify(state),
+    );
+    await Deno.writeTextFile(
+      joinPath(root, "sitecustomize.py"),
+      FIXTURE_SITECUSTOMIZE,
+    );
+    const result = await new Deno.Command("python3", {
+      args: ["-c", body],
+      env: {
+        PYTHONPATH: root,
+        ARCH_DRILL_FIXTURE_ROOT: root,
+      },
+      stdin: "null",
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    let releasedContent: string | undefined;
+    let markerIsSymlink = false;
+    let markerIsDirectory = false;
+    try {
+      const details = await Deno.lstat(markerPath);
+      if (details.isSymlink) {
+        markerIsSymlink = true;
+      } else if (details.isDirectory) {
+        markerIsDirectory = true;
+      } else {
+        releasedContent = await Deno.readTextFile(markerPath);
+      }
+    } catch {
+      // marker absent
+    }
+    const ownedPreparationPaths = [
+      joinPath(root, "mnt/arch-drill/root"),
+      joinPath(root, "mnt/arch-drill/stage"),
+      joinPath(root, "mnt/arch-drill"),
+    ];
+    // Capture cleanup state before the enclosing finally removes the entire
+    // fixture root. The caller can then assert the generated body released
+    // its paths without checking an already-deleted temporary directory.
+    const ownedPreparationPathsPresent = await Promise.all(
+      ownedPreparationPaths.map((path) => fixturePathExists(path)),
+    );
+    return {
+      code: result.code,
+      stdout: new TextDecoder().decode(result.stdout),
+      stderr: new TextDecoder().decode(result.stderr),
+      root,
+      markerPath,
+      releasedContent,
+      markerIsSymlink,
+      markerIsDirectory,
+      ownedPreparationPathsPresent,
+    };
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+}
+
+const fixturePythonAllowed =
+  (await Deno.permissions.query({ name: "run", command: "python3" })).state ===
+    "granted" &&
+  (await Deno.permissions.query({ name: "read" })).state === "granted" &&
+  (await Deno.permissions.query({ name: "write" })).state === "granted";
+
+Deno.test({
+  name:
+    "generated preparation body retries after a strictly released marker and release-cleans the fresh marker",
+  ignore: !fixturePythonAllowed,
+  fn: async () => {
+    const run = await runPreparationBodyFixture({ marker: "released" });
+    assert(
+      run.code === 0,
+      `the generated body must retry after a RELEASED marker: ${
+        run.stderr || run.stdout
+      }`,
+    );
+    assert(
+      run.stdout.includes('"status": "OFFLINE_FILES_PREPARED"') &&
+        run.stdout.includes(PREP_BUNDLE.planSha256) &&
+        run.stdout.includes("target-boot-volume") &&
+        run.stdout.includes("target-root-volume") &&
+        run.stdout.includes('"helperInstanceId": "helper-instance"'),
+      "the body must run to completion and print the typed preparation marker",
+    );
+    assert(
+      run.releasedContent !== undefined &&
+        new RegExp(
+          `^RELEASED [1-9][0-9]* ${PREP_ATTEMPT_TOKEN}$`,
+        ).test(run.releasedContent),
+      "the fresh marker must be released with a strict RELEASED token",
+    );
+    for (
+      const [index, owned] of [
+        "mnt/arch-drill/root",
+        "mnt/arch-drill/stage",
+        "mnt/arch-drill",
+      ].entries()
+    ) {
+      assert(
+        !run.ownedPreparationPathsPresent[index],
+        `the owned preparation path ${
+          joinPath(run.root, owned)
+        } must be released`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name: "generated preparation body also runs cleanly without a prior marker",
+  ignore: !fixturePythonAllowed,
+  fn: async () => {
+    const run = await runPreparationBodyFixture({ marker: "missing" });
+    assert(
+      run.code === 0,
+      `a fresh plan must still create its active marker: ${
+        run.stderr || run.stdout
+      }`,
+    );
+    assert(
+      run.stdout.includes('"status": "OFFLINE_FILES_PREPARED"'),
+      "the fresh body must complete preparation",
+    );
+  },
+});
+
+Deno.test({
+  name:
+    "generated preparation body refuses unsafe marker states and never clobbers them",
+  ignore: !fixturePythonAllowed,
+  fn: async () => {
+    const cases: Array<[string, FixtureMarkerState, string]> = [
+      ["active", "active", "ACTIVE 4242"],
+      ["malformed", "malformed", "RELEASED not-a-pid"],
+      ["bare", "bare", "RELEASED"],
+      ["zero", "zero", "RELEASED 0"],
+      ["trailing", "trailing", "RELEASED 4242\n"],
+    ];
+    for (const [label, marker, content] of cases) {
+      const run = await runPreparationBodyFixture({ marker });
+      assert(
+        run.code !== 0,
+        `an ${label} marker must refuse the retry`,
+      );
+      assert(
+        run.releasedContent === content,
+        `the ${label} marker must be left untouched`,
+      );
+      assert(
+        !run.stdout.includes("OFFLINE_FILES_PREPARED"),
+        `no preparation may run for an ${label} marker`,
+      );
+    }
+    const symlink = await runPreparationBodyFixture({ marker: "symlink" });
+    assert(symlink.code !== 0, "a symlink marker must be refused");
+    assert(
+      symlink.markerIsSymlink && symlink.releasedContent === undefined,
+      "the symlink marker must be left untouched",
+    );
+    const directory = await runPreparationBodyFixture({ marker: "directory" });
+    assert(directory.code !== 0, "a directory marker must be refused");
+    assert(
+      directory.markerIsDirectory && directory.releasedContent === undefined,
+      "the directory marker must be left untouched",
+    );
+    const present = await runPreparationBodyFixture({
+      marker: "released",
+      presentPaths: ["mnt/arch-drill/root"],
+    });
+    assert(
+      present.code !== 0,
+      "a present preparation path must refuse the retry",
+    );
+    assert(
+      present.releasedContent === "RELEASED 4242",
+      "the released marker must stay untouched while a path is present",
+    );
+    const mounted = await runPreparationBodyFixture({
+      marker: "released",
+      mountedPaths: ["/mnt/arch-drill/root"],
+    });
+    assert(
+      mounted.code !== 0,
+      "a mounted preparation path must refuse the retry",
+    );
+    assert(
+      mounted.releasedContent === "RELEASED 4242",
+      "the released marker must stay untouched while a path is mounted",
+    );
+  },
 });
