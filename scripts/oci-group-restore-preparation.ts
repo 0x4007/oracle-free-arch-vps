@@ -617,9 +617,15 @@ export function validateGroupRestorePreparationEvidence(
  * sector and the reviewed boot bytes before writing only the copies, then
  * masks duplicate jobs/timers, installs the isolation files and the drill
  * default target, and prints the typed preparation marker. No source volume is
- * reachable: the helper can only see its own attachments. The body is exposed
- * separately so the deterministic syntax-validation path and tests can obtain
- * the exact script that is sent to the helper. */
+ * reachable: the helper can only see its own attachments. A per-plan advisory
+ * lock serializes helper invocations before marker reconciliation. Before
+ * creating the exclusive active marker it reconciles the exact plan-bound
+ * marker of a prior run: a regular non-symlink file carrying a strictly valid
+ * RELEASED token with every owned preparation path absent and unmounted may be
+ * removed for a retry, while a symlink, directory, ACTIVE, malformed or
+ * ambiguous marker or any present/mounted preparation path fails closed. The
+ * body is exposed separately so the deterministic syntax-validation path and
+ * tests can obtain the exact script that is sent to the helper. */
 export function groupRestorePreparationScriptBody(
   plan: GroupRestorePlan,
   config: GroupRestorePreparationConfig,
@@ -640,11 +646,34 @@ export function groupRestorePreparationScriptBody(
     ).join(""),
   );
   return `
-import atexit,base64,hashlib,json,os,pathlib,re,stat,subprocess,urllib.request
+import atexit,base64,fcntl,hashlib,json,os,pathlib,re,stat,subprocess,urllib.request
 p=json.loads(base64.b64decode('${payload}'))
 e=p['evidence']; b=p['bundle']
 assert p['preparationPlanSha256']==b['planSha256'], 'Preparation plan binding changed'
+lock=pathlib.Path('/run/arch-drill-preparation-'+b['planSha256']+'.lock')
+lock_fd=os.open(lock,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+os.fchmod(lock_fd,0o600)
+fcntl.flock(lock_fd,fcntl.LOCK_EX)
 active=pathlib.Path('/run/arch-drill-preparation-'+b['planSha256']+'.active')
+def reclaim_released_marker(marker):
+ info=os.lstat(marker)
+ assert stat.S_ISREG(info.st_mode),'Preparation marker is not a regular file'
+ handle=os.open(marker,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+ try:
+  assert (os.fstat(handle).st_dev,os.fstat(handle).st_ino)==(info.st_dev,info.st_ino),'Preparation marker changed while reconciling'
+  token=os.read(handle,65536).decode()
+  assert re.fullmatch(r'RELEASED [1-9][0-9]*',token),'Preparation marker is not a strictly released token'
+  paths=[pathlib.Path('/mnt/arch-drill/root'),pathlib.Path('/mnt/arch-drill/stage'),pathlib.Path('/mnt/arch-drill')]
+  assert all(not path.is_mount() and not path.exists() for path in paths),'Copied preparation path is still present or mounted'
+  current=os.lstat(marker)
+  assert (current.st_dev,current.st_ino)==(info.st_dev,info.st_ino),'Preparation marker changed while reconciling'
+  os.unlink(marker)
+ finally:
+  os.close(handle)
+try:
+ reclaim_released_marker(active)
+except FileNotFoundError:
+ pass
 with active.open('x') as marker_file:
  marker_file.write('ACTIVE '+str(os.getpid()))
 os.chmod(active,0o600)
