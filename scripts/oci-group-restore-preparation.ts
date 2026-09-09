@@ -319,6 +319,17 @@ const UUID_PATTERN =
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const ROOT_DEVICE_PATTERN = /^\/dev\/oracleoci\/oraclevd[b-z]$/;
 
+/** A preparation attempt token is generated afresh for every helper command.
+ * It binds a failure-path release proof to the marker written by that exact
+ * command, so a stale RELEASED marker from an earlier invocation cannot prove
+ * that a command which never started released the copied disks. */
+function assertPreparationAttemptToken(value: string): string {
+  if (!UUID_PATTERN.test(value)) {
+    throw new Error("Preparation attempt token is not a UUID");
+  }
+  return value;
+}
+
 /** Fail-closed signature of an OCI copied-root device conflict: the exact
  * requested device was refused because it is already in use on the instance.
  * Only this narrow signature admits the bounded conflict recovery; any other
@@ -631,7 +642,9 @@ export function groupRestorePreparationScriptBody(
   config: GroupRestorePreparationConfig,
   evidence: GroupRestorePreparationEvidence,
   bundle: DrillGuestBundle,
+  attemptToken: string,
 ): string {
+  assertPreparationAttemptToken(attemptToken);
   const payload = btoa(
     Array.from(
       new TextEncoder().encode(
@@ -640,6 +653,7 @@ export function groupRestorePreparationScriptBody(
           evidence,
           bundle,
           preparationPlanSha256: config.planSha256,
+          preparationAttemptToken: attemptToken,
         }),
       ),
       (byte) => String.fromCharCode(byte),
@@ -650,6 +664,8 @@ import atexit,base64,fcntl,hashlib,json,os,pathlib,re,stat,subprocess,urllib.req
 p=json.loads(base64.b64decode('${payload}'))
 e=p['evidence']; b=p['bundle']
 assert p['preparationPlanSha256']==b['planSha256'], 'Preparation plan binding changed'
+attempt_token=p['preparationAttemptToken']
+assert re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',attempt_token), 'Preparation attempt token is malformed'
 lock=pathlib.Path('/run/arch-drill-preparation-'+b['planSha256']+'.lock')
 lock_fd=os.open(lock,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
 os.fchmod(lock_fd,0o600)
@@ -662,7 +678,7 @@ def reclaim_released_marker(marker):
  try:
   assert (os.fstat(handle).st_dev,os.fstat(handle).st_ino)==(info.st_dev,info.st_ino),'Preparation marker changed while reconciling'
   token=os.read(handle,65536).decode()
-  assert re.fullmatch(r'RELEASED [1-9][0-9]*',token),'Preparation marker is not a strictly released token'
+  assert re.fullmatch(r'RELEASED [1-9][0-9]*(?: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?',token),'Preparation marker is not a strictly released token'
   paths=[pathlib.Path('/mnt/arch-drill/root'),pathlib.Path('/mnt/arch-drill/stage'),pathlib.Path('/mnt/arch-drill')]
   assert all(not path.is_mount() and not path.exists() for path in paths),'Copied preparation path is still present or mounted'
   current=os.lstat(marker)
@@ -675,13 +691,13 @@ try:
 except FileNotFoundError:
  pass
 with active.open('x') as marker_file:
- marker_file.write('ACTIVE '+str(os.getpid()))
+ marker_file.write('ACTIVE '+str(os.getpid())+' '+attempt_token)
 os.chmod(active,0o600)
 def release_marker():
  paths=[pathlib.Path('/mnt/arch-drill/root'),pathlib.Path('/mnt/arch-drill/stage'),pathlib.Path('/mnt/arch-drill')]
  try:
   if all(not path.is_mount() and not path.exists() for path in paths):
-   active.write_text('RELEASED '+str(os.getpid()))
+   active.write_text('RELEASED '+str(os.getpid())+' '+attempt_token)
    os.chmod(active,0o600)
  except Exception: pass
 atexit.register(release_marker)
@@ -804,12 +820,20 @@ export async function groupRestorePreparationCommand(
   config: GroupRestorePreparationConfig,
   evidence: GroupRestorePreparationEvidence,
   bundle: DrillGuestBundle,
+  attemptToken: string,
 ): Promise<string> {
   await validateGroupRestorePreparationConfig(config, plan, bundle);
   validateGroupRestorePreparationEvidence(config, plan, evidence);
+  assertPreparationAttemptToken(attemptToken);
   return "sudo -n python3 -c " +
     shellQuote(
-      groupRestorePreparationScriptBody(plan, config, evidence, bundle),
+      groupRestorePreparationScriptBody(
+        plan,
+        config,
+        evidence,
+        bundle,
+        attemptToken,
+      ),
     );
 }
 
@@ -821,15 +845,19 @@ export async function groupRestorePreparationCommand(
  * the deterministic syntax-validation path and tests obtain the exact body. */
 export function groupRestorePreparationReleaseScriptBody(
   config: GroupRestorePreparationConfig,
+  attemptToken: string,
 ): string {
+  assertPreparationAttemptToken(attemptToken);
   return `
 import pathlib
 active=pathlib.Path('/run/arch-drill-preparation-${config.planSha256}.active')
-assert active.exists() and not active.is_symlink(), 'Preparation completion marker is missing or ambiguous'
-assert active.read_text().startswith('RELEASED '), 'Preparation is still active or did not positively complete'
+assert active.is_file() and not active.is_symlink(), 'Preparation completion marker is missing or ambiguous'
+marker=active.read_text()
+parts=marker.split(' ')
+assert len(parts)==3 and parts[0]=='RELEASED' and parts[1].isdigit() and int(parts[1])>0 and parts[2]=='${attemptToken}', 'Preparation release marker is stale, active or unbound'
 for path in [pathlib.Path('/mnt/arch-drill/root'),pathlib.Path('/mnt/arch-drill/stage'),pathlib.Path('/mnt/arch-drill')]:
  assert not path.is_mount() and not path.exists(), 'Copied preparation path is still present or mounted'
-print('ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256}')
+print('ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256} ${attemptToken}')
 `;
 }
 
@@ -837,9 +865,11 @@ print('ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256}')
  * detach: the release body over passwordless sudo on the helper. */
 export function groupRestorePreparationReleaseCommand(
   config: GroupRestorePreparationConfig,
+  attemptToken: string,
 ): string {
+  assertPreparationAttemptToken(attemptToken);
   return "sudo -n python3 -c " +
-    shellQuote(groupRestorePreparationReleaseScriptBody(config));
+    shellQuote(groupRestorePreparationReleaseScriptBody(config, attemptToken));
 }
 
 /** Stdin-capable command runner for the deterministic local Python syntax
@@ -974,12 +1004,14 @@ export function groupRestorePreparationAdapter(
     config.ssh.user + "@" + config.ssh.host,
     command,
   ];
-  const proveHelperReleased = async (): Promise<void> => {
+  const proveHelperReleased = async (attemptToken: string): Promise<void> => {
+    assertPreparationAttemptToken(attemptToken);
     const result = await options.ssh(
       "ssh",
-      sshArgs(groupRestorePreparationReleaseCommand(config)),
+      sshArgs(groupRestorePreparationReleaseCommand(config, attemptToken)),
     );
-    const expected = `ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256}`;
+    const expected =
+      `ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256} ${attemptToken}`;
     if (
       result.code !== 0 ||
       !result.stdout.split("\n").some((line) => line.trim() === expected)
@@ -1447,6 +1479,10 @@ export function groupRestorePreparationAdapter(
 
   return {
     prepareCopiedVolumes: async (targets) => {
+      // Every helper invocation gets a fresh token. A failure before the SSH
+      // command starts therefore cannot accept a RELEASED marker left by an
+      // earlier invocation during failure-path cleanup.
+      const attemptToken = assertPreparationAttemptToken(crypto.randomUUID());
       const bundle = await groupRestorePreparationBundle(plan);
       await validateGroupRestorePreparationConfig(config, plan, bundle);
       validateGroupRestorePreparationTargets(plan, targets);
@@ -1568,14 +1604,21 @@ export function groupRestorePreparationAdapter(
           config,
           evidence,
           bundle,
+          attemptToken,
         );
         if (options.python !== undefined) {
           // Fail closed locally before the guarded command can reach the
           // helper: both generated bodies must parse on the exact stdio
           // runner. No cloud call is made by this check.
           await validateGroupRestorePreparationPythonScripts(
-            groupRestorePreparationScriptBody(plan, config, evidence, bundle),
-            groupRestorePreparationReleaseScriptBody(config),
+            groupRestorePreparationScriptBody(
+              plan,
+              config,
+              evidence,
+              bundle,
+              attemptToken,
+            ),
+            groupRestorePreparationReleaseScriptBody(config, attemptToken),
             options.python,
           );
         }
@@ -1622,7 +1665,7 @@ export function groupRestorePreparationAdapter(
       // manual reconciliation rather than risking an unclean detach.
       if (operationFailed && preparationStarted && !preparationSucceeded) {
         try {
-          await proveHelperReleased();
+          await proveHelperReleased(attemptToken);
           // The read-only proof is durable before any detach may run, so the
           // per-detach reconciliation below never probes twice.
           for (
@@ -1670,7 +1713,7 @@ export function groupRestorePreparationAdapter(
             intent?.preparationStarted === true &&
             intent.releaseProvedAtUtc === undefined && !releaseProved
           ) {
-            await proveHelperReleased();
+            await proveHelperReleased(attemptToken);
             await writeIntent({
               ...intent,
               releaseProvedAtUtc: nowIso(),

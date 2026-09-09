@@ -199,6 +199,7 @@ function trueChecks() {
 const ROOT_UUID = "9f7e0d1c-2a3b-4c5d-8e9f-001122334455";
 const STAGING_UUID = "1a2b3c4d-5e6f-4a7b-8c9d-001122334455";
 const SHA256 = "ab".repeat(32);
+const PREP_ATTEMPT_TOKEN = "01234567-89ab-4cde-8fab-0123456789ab";
 
 function receipt(
   observedAtUtc: string = now.toISOString(),
@@ -2721,8 +2722,25 @@ function preparationMarkerJson(
 
 function preparationReleaseOutput(
   config: GroupRestorePreparationConfig,
+  attemptToken: string = PREP_ATTEMPT_TOKEN,
 ): string {
-  return `ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256}\n`;
+  return `ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256} ${attemptToken}\n`;
+}
+
+function preparationAttemptTokenFromCommand(
+  config: GroupRestorePreparationConfig,
+  command: string,
+): string {
+  const match = command.match(
+    new RegExp(
+      `ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256} ([0-9a-f-]{36})`,
+    ),
+  );
+  assert(
+    match?.[1] !== undefined,
+    "the release command must carry its attempt token",
+  );
+  return match[1];
 }
 
 Deno.test("real preparation adapter binds the exact targets to the reviewed helper and prepares before launch", async () => {
@@ -3242,7 +3260,10 @@ Deno.test("real preparation adapter fails closed when the guarded command fails 
         return command.includes("ARCH_DRILL_PREPARATION_RELEASED")
           ? Promise.resolve({
             code: 0,
-            stdout: preparationReleaseOutput(failureConfig),
+            stdout: preparationReleaseOutput(
+              failureConfig,
+              preparationAttemptTokenFromCommand(failureConfig, command),
+            ),
             stderr: "",
           })
           : Promise.resolve({
@@ -3289,7 +3310,13 @@ Deno.test("real preparation adapter fails closed when the guarded command fails 
         ) {
           return Promise.resolve({
             code: 0,
-            stdout: preparationReleaseOutput(config),
+            stdout: preparationReleaseOutput(
+              config,
+              preparationAttemptTokenFromCommand(
+                config,
+                args[args.length - 1]!,
+              ),
+            ),
             stderr: "",
           });
         }
@@ -3319,6 +3346,61 @@ Deno.test("real preparation adapter fails closed when the guarded command fails 
       throw error;
     }
   });
+});
+
+Deno.test("a release proof from an earlier preparation attempt cannot detach fresh attachments", async () => {
+  const fixture = preparationOciFixture();
+  const config = await prepConfigWithDigest();
+  const releaseCommands: string[] = [];
+  const adapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    fixture.runner,
+    {
+      attachState: new MemoryIntentStore(),
+      ssh: (_command, args) => {
+        const command = args[args.length - 1]!;
+        if (command.includes("ARCH_DRILL_PREPARATION_RELEASED")) {
+          releaseCommands.push(command);
+          // This is the legacy/stale proof a prior invocation could leave in
+          // place. The current invocation must require its own UUID token.
+          return Promise.resolve({
+            code: 0,
+            stdout: `ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256}\n`,
+            stderr: "",
+          });
+        }
+        return Promise.resolve({
+          code: 1,
+          stdout: "",
+          stderr: "connection lost before the helper command started",
+        });
+      },
+    },
+  );
+  await rejects(() => adapter.prepareCopiedVolumes(prepTargets));
+  assert(
+    releaseCommands.length === 1,
+    "the failure path must request release proof",
+  );
+  const attemptToken = preparationAttemptTokenFromCommand(
+    config,
+    releaseCommands[0]!,
+  );
+  assert(
+    !releaseCommands[0]!.includes(
+      `ARCH_DRILL_PREPARATION_RELEASED ${config.planSha256}\n`,
+    ),
+    "the release command must bind a fresh attempt token",
+  );
+  assert(
+    attemptToken !== PREP_ATTEMPT_TOKEN,
+    "the adapter must generate a new token for each invocation",
+  );
+  assert(
+    fixture.ready() === true,
+    "stale release proof must preserve both copied attachments",
+  );
 });
 
 Deno.test("real preparation adapter preserves attachments when helper release is unproved", async () => {
@@ -3797,7 +3879,10 @@ Deno.test("preparation marks the durable intents released only after a proved de
         return command.includes("ARCH_DRILL_PREPARATION_RELEASED")
           ? Promise.resolve({
             code: 0,
-            stdout: preparationReleaseOutput(config),
+            stdout: preparationReleaseOutput(
+              config,
+              preparationAttemptTokenFromCommand(config, command),
+            ),
             stderr: "",
           })
           : Promise.resolve({
@@ -4297,8 +4382,12 @@ Deno.test("generated preparation and release bodies are both sent to python3 -m 
     config,
     evidence,
     PREP_BUNDLE,
+    PREP_ATTEMPT_TOKEN,
   );
-  const releaseBody = groupRestorePreparationReleaseScriptBody(config);
+  const releaseBody = groupRestorePreparationReleaseScriptBody(
+    config,
+    PREP_ATTEMPT_TOKEN,
+  );
   const calls: Array<{ command: string; args: string[]; stdin: string }> = [];
   await validateGroupRestorePreparationPythonScripts(
     preparationBody,
@@ -4332,8 +4421,14 @@ Deno.test("malformed parser output fails closed without executing the guarded co
   await rejects(async () => {
     try {
       await validateGroupRestorePreparationPythonScripts(
-        groupRestorePreparationScriptBody(plan, config, evidence, PREP_BUNDLE),
-        groupRestorePreparationReleaseScriptBody(config),
+        groupRestorePreparationScriptBody(
+          plan,
+          config,
+          evidence,
+          PREP_BUNDLE,
+          PREP_ATTEMPT_TOKEN,
+        ),
+        groupRestorePreparationReleaseScriptBody(config, PREP_ATTEMPT_TOKEN),
         () =>
           Promise.resolve({
             code: 1,
@@ -4386,6 +4481,7 @@ Deno.test("the shell command still carries the exact plan and target bindings", 
     config,
     evidence,
     PREP_BUNDLE,
+    PREP_ATTEMPT_TOKEN,
   );
   const command = "sudo -n python3 -c " + body;
   assert(
@@ -4399,6 +4495,7 @@ Deno.test("the shell command still carries the exact plan and target bindings", 
     evidence: GroupRestorePreparationEvidence;
     bundle: { planSha256: string };
     preparationPlanSha256: string;
+    preparationAttemptToken: string;
   };
   assert(payload.plan.suffix === plan.suffix, "the plan suffix must bind");
   assert(
@@ -4420,7 +4517,14 @@ Deno.test("the shell command still carries the exact plan and target bindings", 
     "the reviewed plan and isolation-file digests must bind",
   );
   assert(
-    groupRestorePreparationReleaseScriptBody(config).includes(
+    payload.preparationAttemptToken === PREP_ATTEMPT_TOKEN,
+    "the fresh preparation attempt token must bind",
+  );
+  assert(
+    groupRestorePreparationReleaseScriptBody(
+      config,
+      PREP_ATTEMPT_TOKEN,
+    ).includes(
       config.planSha256,
     ),
     "the release command must bind the exact reviewed plan digest",
@@ -4672,6 +4776,7 @@ interface FixtureBodyRun {
   releasedContent: string | undefined;
   markerIsSymlink: boolean;
   markerIsDirectory: boolean;
+  ownedPreparationPathsPresent: boolean[];
 }
 
 async function fixturePathExists(path: string): Promise<boolean> {
@@ -4697,6 +4802,7 @@ async function runPreparationBodyFixture(
     config,
     evidence,
     PREP_BUNDLE,
+    PREP_ATTEMPT_TOKEN,
   );
   const root = await Deno.makeTempDir({ prefix: "arch-drill-prep-body-" });
   try {
@@ -4826,6 +4932,17 @@ async function runPreparationBodyFixture(
     } catch {
       // marker absent
     }
+    const ownedPreparationPaths = [
+      joinPath(root, "mnt/arch-drill/root"),
+      joinPath(root, "mnt/arch-drill/stage"),
+      joinPath(root, "mnt/arch-drill"),
+    ];
+    // Capture cleanup state before the enclosing finally removes the entire
+    // fixture root. The caller can then assert the generated body released
+    // its paths without checking an already-deleted temporary directory.
+    const ownedPreparationPathsPresent = await Promise.all(
+      ownedPreparationPaths.map((path) => fixturePathExists(path)),
+    );
     return {
       code: result.code,
       stdout: new TextDecoder().decode(result.stdout),
@@ -4835,6 +4952,7 @@ async function runPreparationBodyFixture(
       releasedContent,
       markerIsSymlink,
       markerIsDirectory,
+      ownedPreparationPathsPresent,
     };
   } finally {
     await Deno.remove(root, { recursive: true });
@@ -4869,19 +4987,23 @@ Deno.test({
     );
     assert(
       run.releasedContent !== undefined &&
-        /^RELEASED [1-9][0-9]*$/.test(run.releasedContent),
+        new RegExp(
+          `^RELEASED [1-9][0-9]* ${PREP_ATTEMPT_TOKEN}$`,
+        ).test(run.releasedContent),
       "the fresh marker must be released with a strict RELEASED token",
     );
     for (
-      const owned of [
-        joinPath(run.root, "mnt/arch-drill/root"),
-        joinPath(run.root, "mnt/arch-drill/stage"),
-        joinPath(run.root, "mnt/arch-drill"),
-      ]
+      const [index, owned] of [
+        "mnt/arch-drill/root",
+        "mnt/arch-drill/stage",
+        "mnt/arch-drill",
+      ].entries()
     ) {
       assert(
-        !await fixturePathExists(owned),
-        `the owned preparation path ${owned} must be released`,
+        !run.ownedPreparationPathsPresent[index],
+        `the owned preparation path ${
+          joinPath(run.root, owned)
+        } must be released`,
       );
     }
   },
