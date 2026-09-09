@@ -1623,7 +1623,7 @@ export function groupRestorePreBootIsolationVerifier(
         "network",
         "route-table",
         "get",
-        "--route-table-id",
+        "--rt-id",
         routeTableId,
       ]),
     );
@@ -1669,7 +1669,7 @@ export function groupRestorePreBootIsolationVerifier(
         "network",
         "dhcp-options",
         "get",
-        "--dhcp-options-id",
+        "--dhcp-id",
         dhcpOptionsId,
       ]),
     );

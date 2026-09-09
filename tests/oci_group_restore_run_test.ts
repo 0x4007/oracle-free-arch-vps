@@ -57,6 +57,7 @@ const plan: GroupRestorePlan = {
   productionReservedIpId: "production-ip",
   isolatedSubnetId: "isolated-subnet",
   isolatedVcnId: "isolated-vcn",
+  isolatedCidrBlock: "10.77.0.0/28",
   controllerIpv4: "74.72.113.64",
   suffix: "20260908T140000Z",
   maxDurationHours: 4,

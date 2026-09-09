@@ -94,6 +94,7 @@ const plan: GroupRestorePlan = {
   productionReservedIpId: "production-ip",
   isolatedSubnetId: "isolated-subnet",
   isolatedVcnId: "isolated-vcn",
+  isolatedCidrBlock: "10.77.0.0/28",
   controllerIpv4: "74.72.113.64",
   suffix: "20260908T140000Z",
   maxDurationHours: 4,
@@ -1764,6 +1765,24 @@ Deno.test("pre-boot isolation proof accepts the reviewed isolated network and ex
   );
 });
 
+Deno.test("pre-boot isolation proof uses the reviewed clone subnet CIDR", () => {
+  const alternatePlan = {
+    ...plan,
+    isolatedCidrBlock: "10.78.0.0/28",
+  };
+  const network = goodIsolationNetwork();
+  network.subnet = {
+    ...network.subnet,
+    "cidr-block": alternatePlan.isolatedCidrBlock,
+  };
+  verifyGroupRestorePreBootIsolation(
+    alternatePlan,
+    network,
+    isolationTargets,
+    goodTargetObservation(),
+  );
+});
+
 Deno.test("pre-boot isolation proof refuses production, permissive and contradictory network evidence", async () => {
   const good = goodIsolationNetwork();
   const ingress = good.securityLists[0]!["ingress-security-rules"] as unknown[];
@@ -2041,9 +2060,9 @@ Deno.test("pre-boot isolation adapter reads only read-only evidence and runs the
       "network subnet get --subnet-id isolated-subnet",
       "network vcn get --vcn-id isolated-vcn",
       "network security-list get --security-list-id isolated-security-list",
-      "network route-table get --route-table-id isolated-route-table",
+      "network route-table get --rt-id isolated-route-table",
       "network internet-gateway get --ig-id isolated-igw",
-      "network dhcp-options get --dhcp-options-id isolated-dhcp",
+      "network dhcp-options get --dhcp-id isolated-dhcp",
       "bv boot-volume get --boot-volume-id target-boot-volume",
       "bv volume get --volume-id target-root-volume",
     ]

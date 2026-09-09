@@ -65,6 +65,7 @@ export interface GroupRestorePlan {
   productionReservedIpId: string;
   isolatedSubnetId: string;
   isolatedVcnId: string;
+  isolatedCidrBlock: string;
   controllerIpv4: string;
   suffix: string;
   maxDurationHours: number;
@@ -211,6 +212,14 @@ export function validateGroupRestorePlan(plan: GroupRestorePlan): void {
   assertPlanned(plan.productionReservedIpId, "productionReservedIpId");
   assertPlanned(plan.isolatedSubnetId, "isolatedSubnetId");
   assertPlanned(plan.isolatedVcnId, "isolatedVcnId");
+  if (
+    !/^(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}\/(?:3[0-2]|[12]?\d)$/
+      .test(
+        plan.isolatedCidrBlock,
+      )
+  ) {
+    throw new Error("isolatedCidrBlock is not a valid IPv4 CIDR");
+  }
   assertPlanned(plan.source.instanceId, "source.instanceId");
   assertPlanned(plan.source.bootVolumeId, "source.bootVolumeId");
   assertPlanned(plan.source.rootVolumeId, "source.rootVolumeId");
