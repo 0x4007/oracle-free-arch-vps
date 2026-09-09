@@ -22,6 +22,7 @@ const COMMUNITY_REPOSITORY =
   "https://dl-cdn.alpinelinux.org/alpine/v3.24/community";
 const MODLOOP_URL =
   "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/netboot-3.24.1/modloop-virt";
+const UBUNTU_PORTS_MIRROR = "https://ports.ubuntu.com/ubuntu-ports";
 const PACKAGES = [
   "alpine-base",
   "bash",
@@ -378,6 +379,11 @@ export async function buildRescueCloudInit(
       disable_root: true,
       ssh_pwauth: false,
       bootcmd: [["bash", "-ec", guard]],
+      apt: {
+        preserve_sources_list: false,
+        primary: [{ arches: ["arm64", "default"], uri: UBUNTU_PORTS_MIRROR }],
+        security: [{ arches: ["arm64", "default"], uri: UBUNTU_PORTS_MIRROR }],
+      },
       packages: [
         "kexec-tools",
         "cpio",

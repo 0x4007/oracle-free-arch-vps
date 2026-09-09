@@ -262,6 +262,16 @@ Deno.test({
     const config = JSON.parse(text.slice("#cloud-config\n".length));
     assert(config.disable_root === true && config.ssh_pwauth === false);
     assert(config.users.length === 1 && config.users[0].name === "codex");
+    assert(config.apt?.preserve_sources_list === false);
+    for (
+      const mirror of [config.apt?.primary?.[0], config.apt?.security?.[0]]
+    ) {
+      assert(mirror?.uri === "https://ports.ubuntu.com/ubuntu-ports");
+      assert(
+        mirror.arches.includes("arm64") && mirror.arches.includes("default"),
+      );
+    }
+    assert(!text.includes("http://ports.ubuntu.com/ubuntu-ports"));
     assert(
       config.runcmd.length === 1 &&
         config.runcmd[0][0] === "/usr/local/sbin/uos-prepare-ram-rescue",
