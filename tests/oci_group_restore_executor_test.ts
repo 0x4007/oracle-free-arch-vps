@@ -2060,9 +2060,9 @@ Deno.test("pre-boot isolation adapter reads only read-only evidence and runs the
       "network subnet get --subnet-id isolated-subnet",
       "network vcn get --vcn-id isolated-vcn",
       "network security-list get --security-list-id isolated-security-list",
-      "network route-table get --route-table-id isolated-route-table",
+      "network route-table get --rt-id isolated-route-table",
       "network internet-gateway get --ig-id isolated-igw",
-      "network dhcp-options get --dhcp-options-id isolated-dhcp",
+      "network dhcp-options get --dhcp-id isolated-dhcp",
       "bv boot-volume get --boot-volume-id target-boot-volume",
       "bv volume get --volume-id target-root-volume",
     ]
