@@ -37,10 +37,18 @@ import type { DrillNetworkEvidence } from "../scripts/isolated-drill.ts";
 import type { CommandRunner, JsonRecord } from "../scripts/oci.ts";
 import { drillGuestFilesDigest } from "../scripts/drill-offline-preparation.ts";
 import {
+  GROUP_RESTORE_DETACH_POLL_INTERVAL_MS,
+  type GroupRestoreAttachIntent,
+  type GroupRestoreAttachIntentKey,
+  type GroupRestoreAttachIntentStore,
   groupRestorePreparationAdapter,
   groupRestorePreparationBundle,
   type GroupRestorePreparationConfig,
+  type GroupRestorePreparationEvidence,
+  groupRestorePreparationReleaseScriptBody,
+  groupRestorePreparationScriptBody,
   validateGroupRestorePreparationConfig,
+  validateGroupRestorePreparationPythonScripts,
   validateGroupRestorePreparationTargets,
 } from "../scripts/oci-group-restore-preparation.ts";
 
@@ -2292,6 +2300,44 @@ Deno.test("cleanup fails closed when a retried exact delete is still live and pr
 
 const PREP_SSH_HOST = "203.0.113.10";
 
+/** In-memory durable attachment-intent store for adapter tests. */
+class MemoryIntentStore implements GroupRestoreAttachIntentStore {
+  records = new Map<string, GroupRestoreAttachIntent>();
+
+  private keyId(
+    value: GroupRestoreAttachIntent | GroupRestoreAttachIntentKey,
+  ): string {
+    return JSON.stringify([
+      value.planSha256,
+      value.helperInstanceId,
+      value.kind,
+      value.volumeId,
+    ]);
+  }
+
+  read(
+    key: GroupRestoreAttachIntentKey,
+  ): Promise<GroupRestoreAttachIntent | undefined> {
+    return Promise.resolve(this.records.get(this.keyId(key)));
+  }
+
+  write(intent: GroupRestoreAttachIntent): Promise<void> {
+    this.records.set(this.keyId(intent), structuredClone(intent));
+    return Promise.resolve();
+  }
+}
+
+function attachIntentKey(kind: "boot" | "root"): GroupRestoreAttachIntentKey {
+  return {
+    planSha256: PLAN_SHA,
+    helperInstanceId: "helper-instance",
+    kind,
+    volumeId: kind === "boot" ? "target-boot-volume" : "target-root-volume",
+  };
+}
+
+const PREP_ATTACH_TIME = "2026-09-08T14:31:00.000Z";
+
 function preparationConfig(): GroupRestorePreparationConfig {
   return {
     planSha256: PLAN_SHA,
@@ -2390,6 +2436,24 @@ function preparationOciFixture(
     initiallyAttaching?: "boot" | "root";
     bootDevice?: string | null;
     rootDevice?: string | null;
+    /** The attach request is accepted by OCI but its response is lost. */
+    attachResponseLost?: boolean;
+    /** Only this volume's attach response is lost (bounded no-retry scope). */
+    attachResponseLostOn?: "boot" | "root";
+    /** Attachment list rows stay ATTACHING forever. */
+    stayAttaching?: boolean;
+    /** A detach request is answered but the row never disappears. */
+    hangDetach?: boolean;
+    /** Stateful names returned by `compute device list-instance --is-available
+     * true`; the default is the static single-device inventory. */
+    deviceNames?: () => string[];
+    /** Root attach requests for these exact devices are refused with an OCI
+     * device-conflict error and create no attachment row (unless
+     * `rootConflictAccepted` says OCI accepted them anyway). */
+    rootConflictsOn?: string[];
+    /** A refused root attach was actually accepted by OCI: the row exists
+     * with the requested device (uncertain acceptance). */
+    rootConflictAccepted?: boolean;
   } = {},
 ): {
   runner: GroupRestoreRunner;
@@ -2401,6 +2465,15 @@ function preparationOciFixture(
   let rootAttached = false;
   let bootAttachmentPolls = 0;
   let rootAttachmentPolls = 0;
+  // The OCI device of each live copied-volume attachment row: an explicit
+  // root request is honored by the provider (so the row carries the exact
+  // requested device), while the boot copy keeps its automatic assignment.
+  const bootDeviceName: string | null = Object.hasOwn(options, "bootDevice")
+    ? options.bootDevice ?? null
+    : "/dev/oracleoci/oraclevdc";
+  let rootDeviceName: string | null = Object.hasOwn(options, "rootDevice")
+    ? options.rootDevice ?? null
+    : "/dev/oracleoci/oraclevdb";
   const network = goodIsolationNetwork();
   const targets = goodTargetObservation();
   const run: CommandRunner = (_command, args) => {
@@ -2484,12 +2557,12 @@ function preparationOciFixture(
       });
     }
     if (joined.includes("compute device list-instance")) {
+      const names = options.deviceNames?.() ?? ["/dev/oracleoci/oraclevdb"];
       return Promise.resolve({
         code: 0,
-        stdout: object([{
-          name: "/dev/oracleoci/oraclevdb",
-          "is-available": true,
-        }]),
+        stdout: object(
+          names.map((name) => ({ name, "is-available": true })),
+        ),
         stderr: "",
       });
     }
@@ -2498,25 +2571,43 @@ function preparationOciFixture(
         bootAttached = true;
         bootAttachmentPolls = 0;
       } else {
+        const requested = joined.match(/--device (\S+)/)?.[1];
+        if (options.rootConflictsOn?.includes(requested ?? "")) {
+          if (options.rootConflictAccepted === true) {
+            // OCI accepted the attach even though the response reported the
+            // conflict: the row exists with the requested device.
+            rootAttached = true;
+            rootAttachmentPolls = 0;
+            if (requested !== undefined) rootDeviceName = requested;
+          }
+          return Promise.resolve({
+            code: 1,
+            stdout: "",
+            stderr:
+              `Error: (400, InvalidParameter, The specified device ${requested} is already in use by another attachment.)`,
+          });
+        }
         rootAttached = true;
         rootAttachmentPolls = 0;
+        if (requested !== undefined) rootDeviceName = requested;
+      }
+      if (
+        options.attachResponseLost ||
+        options.attachResponseLostOn ===
+          (joined.includes("target-boot-volume") ? "boot" : "root")
+      ) {
+        return Promise.resolve({
+          code: 1,
+          stdout: "",
+          stderr: "connection lost",
+        });
       }
       return Promise.resolve({
         code: 0,
         stdout: object(
           joined.includes("target-boot-volume")
-            ? {
-              ...bootAttachmentRecord(),
-              ...(Object.hasOwn(options, "bootDevice")
-                ? { device: options.bootDevice }
-                : {}),
-            }
-            : {
-              ...rootAttachmentRecord(),
-              ...(Object.hasOwn(options, "rootDevice")
-                ? { device: options.rootDevice }
-                : {}),
-            },
+            ? { ...bootAttachmentRecord(), device: bootDeviceName }
+            : { ...rootAttachmentRecord(), device: rootDeviceName },
         ),
         stderr: "",
       });
@@ -2531,8 +2622,19 @@ function preparationOciFixture(
           stderr: `${kind} detach failed`,
         });
       }
-      if (boot) bootAttached = false;
-      else rootAttached = false;
+      if (!options.hangDetach) {
+        if (boot) {
+          bootAttached = false;
+          held.boot = (held.boot ?? []).filter((row) =>
+            row.id !== "boot-attachment"
+          );
+        } else {
+          rootAttached = false;
+          held.root = (held.root ?? []).filter((row) =>
+            row.id !== "root-attachment"
+          );
+        }
+      }
       return Promise.resolve({ code: 0, stdout: object({}), stderr: "" });
     }
     if (joined.includes("volume-attachment get")) {
@@ -2541,52 +2643,32 @@ function preparationOciFixture(
         code: 0,
         stdout: object(
           boot
-            ? {
-              ...bootAttachmentRecord(),
-              ...(Object.hasOwn(options, "bootDevice")
-                ? { device: options.bootDevice }
-                : {}),
-            }
-            : {
-              ...rootAttachmentRecord(),
-              ...(Object.hasOwn(options, "rootDevice")
-                ? { device: options.rootDevice }
-                : {}),
-            },
+            ? { ...bootAttachmentRecord(), device: bootDeviceName }
+            : { ...rootAttachmentRecord(), device: rootDeviceName },
         ),
         stderr: "",
       });
     }
     if (joined.includes("volume-attachment list")) {
       const bootState = bootAttached
-        ? options.initiallyAttaching === "boot" && bootAttachmentPolls++ === 0
+        ? options.stayAttaching === true ||
+            (options.initiallyAttaching === "boot" &&
+              bootAttachmentPolls++ === 0)
           ? {
             ...bootAttachmentRecord("ATTACHING"),
-            ...(Object.hasOwn(options, "bootDevice")
-              ? { device: options.bootDevice }
-              : {}),
+            device: bootDeviceName,
           }
-          : {
-            ...bootAttachmentRecord(),
-            ...(Object.hasOwn(options, "bootDevice")
-              ? { device: options.bootDevice }
-              : {}),
-          }
+          : { ...bootAttachmentRecord(), device: bootDeviceName }
         : undefined;
       const rootState = rootAttached
-        ? options.initiallyAttaching === "root" && rootAttachmentPolls++ === 0
+        ? options.stayAttaching === true ||
+            (options.initiallyAttaching === "root" &&
+              rootAttachmentPolls++ === 0)
           ? {
             ...rootAttachmentRecord("ATTACHING"),
-            ...(Object.hasOwn(options, "rootDevice")
-              ? { device: options.rootDevice }
-              : {}),
+            device: rootDeviceName,
           }
-          : {
-            ...rootAttachmentRecord(),
-            ...(Object.hasOwn(options, "rootDevice")
-              ? { device: options.rootDevice }
-              : {}),
-          }
+          : { ...rootAttachmentRecord(), device: rootDeviceName }
         : undefined;
       return Promise.resolve({
         code: 0,
@@ -2646,6 +2728,7 @@ Deno.test("real preparation adapter binds the exact targets to the reviewed help
   const fixture = preparationOciFixture();
   const sshCalls: string[][] = [];
   const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    attachState: new MemoryIntentStore(),
     ssh: (_command, args) => {
       sshCalls.push(args);
       return preparationMarkerJson(config).then((stdout) =>
@@ -2773,6 +2856,7 @@ Deno.test("real preparation adapter permits OCI automatic boot-device discovery"
   );
   const sshCalls: string[][] = [];
   const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    attachState: new MemoryIntentStore(),
     ssh: (_command, args) => {
       sshCalls.push(args);
       return preparationMarkerJson(config).then((stdout) =>
@@ -2806,6 +2890,7 @@ Deno.test("real preparation adapter waits for asynchronous data-volume attachmen
   );
   let sleeps = 0;
   const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    attachState: new MemoryIntentStore(),
     ssh: (_command, _args) =>
       preparationMarkerJson(config).then((stdout) =>
         Promise.resolve({ code: 0, stdout, stderr: "" })
@@ -2833,6 +2918,7 @@ Deno.test("real preparation adapter ignores terminal DETACHED history and owns o
     },
   );
   const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    attachState: new MemoryIntentStore(),
     ssh: (_command, _args) =>
       preparationMarkerJson(config).then((stdout) =>
         Promise.resolve({ code: 0, stdout, stderr: "" })
@@ -2863,6 +2949,7 @@ Deno.test("real preparation adapter fails closed on a missing or mismatching con
     plan,
     fixture.runner,
     {
+      attachState: new MemoryIntentStore(),
       ssh: () => {
         sshCalls += 1;
         return Promise.resolve({ code: 0, stdout: "", stderr: "" });
@@ -2943,6 +3030,7 @@ Deno.test("real preparation adapter refuses a helper outside the reviewed identi
         plan,
         fixture.runner,
         {
+          attachState: new MemoryIntentStore(),
           ssh: (_command, args) => {
             sshCalls.push(args);
             return Promise.resolve({ code: 0, stdout: "", stderr: "" });
@@ -2971,7 +3059,10 @@ Deno.test("real preparation adapter refuses a helper outside the reviewed identi
     await prepConfigWithDigest(),
     plan,
     onProduction.runner,
-    { ssh: () => Promise.resolve({ code: 0, stdout: "", stderr: "" }) },
+    {
+      attachState: new MemoryIntentStore(),
+      ssh: () => Promise.resolve({ code: 0, stdout: "", stderr: "" }),
+    },
   );
   await rejects(() =>
     adapter.prepareCopiedVolumes({
@@ -3006,7 +3097,10 @@ Deno.test("real preparation adapter refuses a helper outside the reviewed identi
       await prepConfigWithDigest(),
       plan,
       mismatch.runner,
-      { ssh: () => Promise.resolve({ code: 0, stdout: "", stderr: "" }) },
+      {
+        attachState: new MemoryIntentStore(),
+        ssh: () => Promise.resolve({ code: 0, stdout: "", stderr: "" }),
+      },
     );
     await rejects(() =>
       mismatchAdapter.prepareCopiedVolumes({
@@ -3036,6 +3130,7 @@ Deno.test("real preparation adapter refuses a helper that already holds a source
   const fixture = preparationOciFixture(helperRecord(), helperVnic(), held);
   let sshCalls = 0;
   const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    attachState: new MemoryIntentStore(),
     ssh: () => {
       sshCalls += 1;
       return Promise.resolve({ code: 0, stdout: "", stderr: "" });
@@ -3077,6 +3172,7 @@ Deno.test("real preparation adapter refuses pre-existing target attachments with
   };
   const fixture = preparationOciFixture(helperRecord(), helperVnic(), held);
   const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    attachState: new MemoryIntentStore(),
     ssh: () => Promise.resolve({ code: 0, stdout: "", stderr: "" }),
   });
   await rejects(() =>
@@ -3104,6 +3200,7 @@ Deno.test("real preparation adapter attempts both detaches when the root detach 
     { failDetach: "root" },
   );
   const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    attachState: new MemoryIntentStore(),
     ssh: (_command, _args) =>
       preparationMarkerJson(config).then((stdout) =>
         Promise.resolve({ code: 0, stdout, stderr: "" })
@@ -3137,6 +3234,7 @@ Deno.test("real preparation adapter fails closed when the guarded command fails 
     plan,
     failure.runner,
     {
+      attachState: new MemoryIntentStore(),
       ssh: (_command, args) => {
         const command = args[args.length - 1]!;
         return command.includes("ARCH_DRILL_PREPARATION_RELEASED")
@@ -3182,6 +3280,7 @@ Deno.test("real preparation adapter fails closed when the guarded command fails 
     plan,
     unbound.runner,
     {
+      attachState: new MemoryIntentStore(),
       ssh: (_command, args) => {
         if (
           args[args.length - 1]!.includes("ARCH_DRILL_PREPARATION_RELEASED")
@@ -3224,6 +3323,7 @@ Deno.test("real preparation adapter preserves attachments when helper release is
   const fixture = preparationOciFixture();
   const config = await prepConfigWithDigest();
   const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    attachState: new MemoryIntentStore(),
     ssh: () =>
       Promise.resolve({
         code: 1,
@@ -3251,6 +3351,7 @@ Deno.test("real preparation adapter refusals hold the pre-boot gate before any i
   const fixture = preparationOciFixture();
   const config = await prepConfigWithDigest();
   const failing = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    attachState: new MemoryIntentStore(),
     ssh: () =>
       Promise.resolve({ code: 1, stdout: "", stderr: "preparation not ready" }),
   });
@@ -3273,6 +3374,7 @@ Deno.test("real gate runs the read-only proofs before the preparation adapter an
   const config = await prepConfigWithDigest();
   const sshCalls: string[][] = [];
   const adapter = groupRestorePreparationAdapter(config, plan, fixture.runner, {
+    attachState: new MemoryIntentStore(),
     ssh: (_command, args) => {
       sshCalls.push(args);
       return preparationMarkerJson(config).then((stdout) =>
@@ -3305,5 +3407,1020 @@ Deno.test("real gate runs the read-only proofs before the preparation adapter an
   assert(
     rootDetach > helperRead,
     "preparation must finish its attaches before detach",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Durable attachment-intent recovery (F1) and lifetime-bounded polling (F5)
+// ---------------------------------------------------------------------------
+
+const prepTargets = {
+  bootVolumeId: "target-boot-volume",
+  rootVolumeId: "target-root-volume",
+};
+
+function prepEvidence(): GroupRestorePreparationEvidence {
+  return {
+    helper: helperRecord(),
+    bootAttachment: bootAttachmentRecord(),
+    rootAttachment: rootAttachmentRecord(),
+    bootVolumeId: "target-boot-volume",
+    rootVolumeId: "target-root-volume",
+    rootUuid: ROOT_UUID,
+    stagingUuid: STAGING_UUID,
+    rootPartitionStartSector: 1050624,
+    kernelSha256: SHA256,
+    initramfsSha256: SHA256,
+    grubSha256: SHA256,
+  };
+}
+
+function prepSshMarker(): CommandRunner {
+  return (_command, args) => {
+    const command = args[args.length - 1]!;
+    if (command.includes("ARCH_DRILL_PREPARATION_RELEASED")) {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    return Promise.resolve({
+      code: 0,
+      stdout: JSON.stringify({
+        status: "OFFLINE_FILES_PREPARED",
+        planSha256: PREP_BUNDLE.planSha256,
+        bootVolumeId: "target-boot-volume",
+        rootVolumeId: "target-root-volume",
+        helperInstanceId: "helper-instance",
+        firstBootProved: false,
+      }),
+      stderr: "",
+    });
+  };
+}
+
+function baselineIntent(
+  kind: "boot" | "root",
+): GroupRestoreAttachIntent {
+  return {
+    schemaVersion: 1,
+    planSha256: PLAN_SHA,
+    helperInstanceId: "helper-instance",
+    kind,
+    volumeId: kind === "boot" ? "target-boot-volume" : "target-root-volume",
+    attachRequestedAtUtc: PREP_ATTACH_TIME,
+    attachmentId: `${kind}-attachment`,
+    attachmentState: "ATTACHED",
+  };
+}
+
+Deno.test("preparation resumes a crash before the attach response: durable intent adopts the exact target without a duplicate attach", async () => {
+  const config = await prepConfigWithDigest();
+  const state = new MemoryIntentStore();
+  // Run 1: OCI accepts the attach but the response is lost and the detach is
+  // refused, leaving the boot copy attached with no recorded attachment id.
+  const first = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    {},
+    { attachResponseLost: true, failDetach: "boot" },
+  );
+  const firstAdapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    first.runner,
+    {
+      ssh: () => Promise.resolve({ code: 0, stdout: "", stderr: "" }),
+      attachState: state,
+    },
+  );
+  await rejects(() => firstAdapter.prepareCopiedVolumes(prepTargets));
+  const bootIntent = await state.read(attachIntentKey("boot"));
+  assert(
+    bootIntent !== undefined,
+    "the attach intent must survive the lost response",
+  );
+  assert(
+    bootIntent.attachmentId === undefined,
+    "a lost attach response must not record an attachment id",
+  );
+  assert(
+    first.events.filter((line) => line.includes("volume-attachment attach"))
+      .length === 1,
+    "only the boot attach may be requested before the response is lost",
+  );
+  // Run 2 with the same durable state: the exact live boot target is adopted,
+  // no attach is re-issued, and preparation completes and detaches.
+  const second = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    { boot: [bootAttachmentRecord()] },
+  );
+  const secondAdapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    second.runner,
+    { ssh: prepSshMarker(), attachState: state },
+  );
+  await secondAdapter.prepareCopiedVolumes(prepTargets);
+  assert(
+    second.events.filter((line) => line.includes("volume-attachment attach"))
+      .length === 1,
+    "the exact adopted target must never be attached a second time",
+  );
+  assert(
+    second.events.some((line) =>
+      line.includes("volume-attachment attach") &&
+      line.includes("target-root-volume")
+    ),
+    "only the root copy must be attached fresh on resume",
+  );
+  const bootSettled = await state.read(attachIntentKey("boot"));
+  const rootSettled = await state.read(attachIntentKey("root"));
+  for (const settled of [bootSettled, rootSettled]) {
+    assert(settled !== undefined, "both durable intents must survive");
+    assert(
+      settled.detachedAtUtc !== undefined,
+      "each adopted/fresh copy must record a proved detach",
+    );
+    assert(
+      settled.releaseProvedAtUtc !== undefined,
+      "each preparation release must be durably proved",
+    );
+  }
+  assert(second.ready() === false, "all copies must be detached");
+});
+
+Deno.test("preparation resumes an exact ATTACHED target after unproved helper release and completes cleanly", async () => {
+  const config = await prepConfigWithDigest();
+  const state = new MemoryIntentStore();
+  // Run 1: the guarded command fails and the release probe is unproved, so
+  // both attachments stay in place with durable intents recording the
+  // preparation and the recorded attachment ids.
+  const first = preparationOciFixture();
+  const firstAdapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    first.runner,
+    {
+      ssh: () =>
+        Promise.resolve({ code: 1, stdout: "", stderr: "connection lost" }),
+      attachState: state,
+    },
+  );
+  await rejects(() => firstAdapter.prepareCopiedVolumes(prepTargets));
+  assert(
+    first.ready() === true,
+    "both copies must stay attached after unproved release",
+  );
+  const boot = await state.read(attachIntentKey("boot"));
+  const root = await state.read(attachIntentKey("root"));
+  assert(
+    boot?.preparationStarted === true && root?.preparationStarted === true,
+    "the durable intents must record that preparation may have run",
+  );
+  assert(
+    boot?.attachmentId === "boot-attachment" &&
+      root?.attachmentId === "root-attachment",
+    "the recorded attachment ids must survive the failed run",
+  );
+  // Run 2: the exact attachments still exist; they are adopted, prepared
+  // again and cleanly detached.
+  const second = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    { boot: [bootAttachmentRecord()], root: [rootAttachmentRecord()] },
+  );
+  const secondAdapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    second.runner,
+    { ssh: prepSshMarker(), attachState: state },
+  );
+  await secondAdapter.prepareCopiedVolumes(prepTargets);
+  assert(
+    second.events.every((line) => !line.includes("volume-attachment attach")),
+    "a resume must adopt the exact live targets without re-attaching",
+  );
+  const bootSettled = await state.read(attachIntentKey("boot"));
+  const rootSettled = await state.read(attachIntentKey("root"));
+  assert(
+    bootSettled?.detachedAtUtc !== undefined &&
+      rootSettled?.detachedAtUtc !== undefined,
+    "the adopted copies must record the proved detach",
+  );
+});
+
+Deno.test("preparation refuses a durable intent that differs from the live attachment", async () => {
+  const config = await prepConfigWithDigest();
+  const state = new MemoryIntentStore();
+  await state.write({
+    ...baselineIntent("boot"),
+    attachmentId: "other-attachment",
+  });
+  const fixture = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    { boot: [bootAttachmentRecord()] },
+  );
+  const sshCalls: string[][] = [];
+  const adapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    fixture.runner,
+    {
+      ssh: (_command, args) => {
+        sshCalls.push(args);
+        return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+      },
+      attachState: state,
+    },
+  );
+  await rejects(async () => {
+    try {
+      await adapter.prepareCopiedVolumes(prepTargets);
+    } catch (error) {
+      assert(
+        String(error).includes("differs from the live attachment"),
+        "a mismatching durable intent must be named",
+      );
+      throw error;
+    }
+  });
+  assert(
+    fixture.events.every((line) => !line.includes(" attach ")),
+    "no attach may run for a mismatching intent",
+  );
+  assert(
+    fixture.events.every((line) => !line.includes(" detach ")),
+    "a mismatching intent must never be detached",
+  );
+  assert(sshCalls.length === 0, "no preparation may run after the refusal");
+});
+
+Deno.test("preparation reconciles absent and completed attachments before retrying, and refuses a completed intent that is live again", async () => {
+  const config = await prepConfigWithDigest();
+  // A completed record with no live attachment is reconciled and retried.
+  const state = new MemoryIntentStore();
+  await state.write({
+    ...baselineIntent("boot"),
+    preparationStarted: true,
+    releaseProvedAtUtc: PREP_ATTACH_TIME,
+    detachedAtUtc: PREP_ATTACH_TIME,
+  });
+  const fixture = preparationOciFixture();
+  const adapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    fixture.runner,
+    { ssh: prepSshMarker(), attachState: state },
+  );
+  await adapter.prepareCopiedVolumes(prepTargets);
+  assert(
+    fixture.events.filter((line) => line.includes("volume-attachment attach"))
+      .length === 2,
+    "an absent completed target must be attached fresh on the retry",
+  );
+  const retriedBoot = await state.read(attachIntentKey("boot"));
+  assert(
+    retriedBoot?.detachedAtUtc !== undefined &&
+      retriedBoot.releaseProvedAtUtc !== undefined,
+    "the retried copy must end durably released",
+  );
+  // A completed intent whose live attachment reappeared is never adopted:
+  // the operator has to reconcile that state first.
+  const liveState = new MemoryIntentStore();
+  await liveState.write({
+    ...baselineIntent("boot"),
+    preparationStarted: true,
+    releaseProvedAtUtc: PREP_ATTACH_TIME,
+    detachedAtUtc: PREP_ATTACH_TIME,
+  });
+  const liveFixture = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    { boot: [bootAttachmentRecord()], root: [rootAttachmentRecord()] },
+  );
+  const liveAdapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    liveFixture.runner,
+    { ssh: prepSshMarker(), attachState: liveState },
+  );
+  await rejects(async () => {
+    try {
+      await liveAdapter.prepareCopiedVolumes(prepTargets);
+    } catch (error) {
+      assert(
+        String(error).includes("Completed attachment intent is live again"),
+        "a completed-but-live attachment must be named",
+      );
+      throw error;
+    }
+  });
+  assert(
+    liveFixture.events.every((line) => !line.includes(" attach ")),
+    "a completed-but-live target must not be re-attached",
+  );
+  assert(
+    liveFixture.events.every((line) => !line.includes(" detach ")),
+    "a completed-but-live target must never be detached",
+  );
+});
+
+Deno.test("preparation marks the durable intents released only after a proved detach and preserves unresolved records", async () => {
+  const config = await prepConfigWithDigest();
+  const state = new MemoryIntentStore();
+  const fixture = preparationOciFixture();
+  const adapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    fixture.runner,
+    { ssh: prepSshMarker(), attachState: state },
+  );
+  await adapter.prepareCopiedVolumes(prepTargets);
+  const boot = await state.read(attachIntentKey("boot"));
+  const root = await state.read(attachIntentKey("root"));
+  assert(
+    boot !== undefined && root !== undefined,
+    "completed records stay present for audit",
+  );
+  for (const settled of [boot, root]) {
+    assert(
+      settled.releaseProvedAtUtc !== undefined &&
+        settled.detachedAtUtc !== undefined,
+      "release and detach must be durable after a proved detach",
+    );
+  }
+  assert(
+    state.records.size === 2,
+    "completed records must not be silently deleted",
+  );
+  // An unproved release leaves both intents unresolved and preserved.
+  const failing = new MemoryIntentStore();
+  const failingFixture = preparationOciFixture();
+  const failingAdapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    failingFixture.runner,
+    {
+      ssh: () =>
+        Promise.resolve({ code: 1, stdout: "", stderr: "connection lost" }),
+      attachState: failing,
+    },
+  );
+  await rejects(() => failingAdapter.prepareCopiedVolumes(prepTargets));
+  const pendingBoot = await failing.read(attachIntentKey("boot"));
+  const pendingRoot = await failing.read(attachIntentKey("root"));
+  assert(
+    pendingBoot?.preparationStarted === true &&
+      pendingRoot?.preparationStarted === true,
+    "an unproved release must keep the preparation-started intents",
+  );
+  assert(
+    pendingBoot.releaseProvedAtUtc === undefined &&
+      pendingRoot.releaseProvedAtUtc === undefined &&
+      pendingBoot.detachedAtUtc === undefined &&
+      pendingRoot.detachedAtUtc === undefined,
+    "neither release nor detach may be recorded before it is proved",
+  );
+  // A failed preparation with a working fresh release probe records the
+  // durable release (once) and keeps it after the detach is proved.
+  const recovered = new MemoryIntentStore();
+  const recoveredFixture = preparationOciFixture();
+  const recoveredAdapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    recoveredFixture.runner,
+    {
+      ssh: (_command, args) => {
+        const command = args[args.length - 1]!;
+        return command.includes("ARCH_DRILL_PREPARATION_RELEASED")
+          ? Promise.resolve({
+            code: 0,
+            stdout: preparationReleaseOutput(config),
+            stderr: "",
+          })
+          : Promise.resolve({
+            code: 1,
+            stdout: "",
+            stderr: "preparation not ready",
+          });
+      },
+      attachState: recovered,
+    },
+  );
+  await rejects(() => recoveredAdapter.prepareCopiedVolumes(prepTargets));
+  const recoveredBoot = await recovered.read(attachIntentKey("boot"));
+  const recoveredRoot = await recovered.read(attachIntentKey("root"));
+  assert(
+    recoveredBoot?.releaseProvedAtUtc !== undefined &&
+      recoveredBoot.detachedAtUtc !== undefined &&
+      recoveredRoot?.releaseProvedAtUtc !== undefined &&
+      recoveredRoot.detachedAtUtc !== undefined,
+    "a proved release plus a proved detach must stay durable after a failed preparation",
+  );
+});
+
+Deno.test("a short remaining lifetime bounds attach and detach polling", async () => {
+  const config = await prepConfigWithDigest();
+  // Attach polling: the copy stays ATTACHING; the remaining window is 30s, so
+  // the adapter may sleep only three 10s intervals before failing closed.
+  const attachFixture = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    {},
+    { stayAttaching: true },
+  );
+  let clock = Date.parse("2026-09-08T14:40:00.000Z");
+  let attachSleeps = 0;
+  const limitedLifetime = {
+    startedAtUtc: "2026-09-08T14:30:00.000Z",
+    deadlineAtUtc: "2026-09-08T14:40:30.000Z",
+  };
+  const attachAdapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    attachFixture.runner,
+    {
+      ssh: prepSshMarker(),
+      attachState: new MemoryIntentStore(),
+      now: () => clock,
+      sleep: () => {
+        attachSleeps += 1;
+        clock += GROUP_RESTORE_DETACH_POLL_INTERVAL_MS;
+        return Promise.resolve();
+      },
+      lifetime: () => Promise.resolve(limitedLifetime),
+    },
+  );
+  await rejects(async () => {
+    try {
+      await attachAdapter.prepareCopiedVolumes(prepTargets);
+    } catch (error) {
+      assert(
+        error instanceof AggregateError &&
+          error.errors.some((inner) =>
+            String(inner).includes("within the bounded budget")
+          ),
+        "attach polling must fail closed with the lifetime-derived budget",
+      );
+      throw error;
+    }
+  });
+  assert(
+    attachSleeps === 3,
+    "a 30s remaining window must allow exactly three 10s attach polls",
+  );
+  // Detach polling: a hung detach must also stop after the same remaining
+  // window instead of the old fixed two-minute budget.
+  const detachFixture = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    {},
+    { hangDetach: true },
+  );
+  clock = Date.parse("2026-09-08T14:40:00.000Z");
+  let detachSleeps = 0;
+  const detachAdapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    detachFixture.runner,
+    {
+      ssh: prepSshMarker(),
+      attachState: new MemoryIntentStore(),
+      now: () => clock,
+      sleep: () => {
+        detachSleeps += 1;
+        clock += GROUP_RESTORE_DETACH_POLL_INTERVAL_MS;
+        return Promise.resolve();
+      },
+      lifetime: () => Promise.resolve(limitedLifetime),
+    },
+  );
+  await rejects(() => detachAdapter.prepareCopiedVolumes(prepTargets));
+  assert(
+    detachSleeps > 0 && detachSleeps <= 3,
+    "a hung detach must be bounded by the short remaining lifetime",
+  );
+});
+
+Deno.test("attach and detach polling stay finite when no durable lifetime is supplied", async () => {
+  const config = await prepConfigWithDigest();
+  const fixture = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    {},
+    { stayAttaching: true },
+  );
+  let clock = Date.parse("2026-09-08T14:40:00.000Z");
+  let sleeps = 0;
+  const adapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    fixture.runner,
+    {
+      ssh: prepSshMarker(),
+      attachState: new MemoryIntentStore(),
+      now: () => clock,
+      sleep: () => {
+        sleeps += 1;
+        clock += GROUP_RESTORE_DETACH_POLL_INTERVAL_MS;
+        return Promise.resolve();
+      },
+    },
+  );
+  await rejects(() => adapter.prepareCopiedVolumes(prepTargets));
+  assert(
+    sleeps === 6,
+    "without a lifetime the bounded fallback budget (60s) must cap polling at six 10s intervals",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Copied-volume device resolution and bounded conflict recovery (F3)
+// ---------------------------------------------------------------------------
+
+function rootAttachEvents(events: string[]): string[] {
+  return events.filter((line) =>
+    line.includes("volume-attachment attach") &&
+    line.includes("target-root-volume")
+  );
+}
+
+Deno.test("preparation resolves the copied root device against the fresh inventory and never collides with the boot auto-assignment", async () => {
+  const config = await prepConfigWithDigest();
+  // The boot copy is auto-assigned oraclevdb while the provider's stale
+  // available-device list still reports it free: the exact attachment
+  // inventory must exclude the occupied boot device, so the root copy is
+  // attached to the distinct next candidate with no conflict at all.
+  const fixture = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    {},
+    {
+      bootDevice: "/dev/oracleoci/oraclevdb",
+      deviceNames: () => [
+        "/dev/oracleoci/oraclevdb",
+        "/dev/oracleoci/oraclevde",
+      ],
+    },
+  );
+  const sshCalls: string[][] = [];
+  const adapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    fixture.runner,
+    {
+      attachState: new MemoryIntentStore(),
+      ssh: (_command, args) => {
+        sshCalls.push(args);
+        return preparationMarkerJson(config).then((stdout) =>
+          Promise.resolve({ code: 0, stdout, stderr: "" })
+        );
+      },
+    },
+  );
+  await adapter.prepareCopiedVolumes(prepTargets);
+  const rootAttaches = rootAttachEvents(fixture.events);
+  assert(
+    rootAttaches.length === 1,
+    "the root copy must be attached exactly once when the inventory resolves a distinct device",
+  );
+  assert(
+    rootAttaches[0]!.includes("--device /dev/oracleoci/oraclevde"),
+    "the root copy must request the distinct device from the fresh inventory",
+  );
+  assert(
+    !rootAttaches[0]!.includes("/dev/oracleoci/oraclevdb"),
+    "the occupied boot device must never be requested for the copied root",
+  );
+  const bootAttach = fixture.events.find((line) =>
+    line.includes("volume-attachment attach") &&
+    line.includes("target-boot-volume")
+  );
+  assert(
+    bootAttach !== undefined && !bootAttach.includes("--device"),
+    "the boot copy must keep its automatic OCI device assignment",
+  );
+  assert(sshCalls.length === 1, "preparation must run exactly once");
+  assert(fixture.ready() === false, "both copies must detach cleanly");
+});
+
+Deno.test("preparation retries a copied-root device conflict exactly once with the distinct next candidate", async () => {
+  const config = await prepConfigWithDigest();
+  // OCI refuses the first root candidate because a stale inventory raced the
+  // boot auto-assignment; after the reconcile proves the root target absent,
+  // a fresh inventory admits exactly one retry on the distinct next device.
+  let deviceListCalls = 0;
+  const fixture = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    {},
+    {
+      bootDevice: "/dev/oracleoci/oraclevdb",
+      rootConflictsOn: ["/dev/oracleoci/oraclevde"],
+      deviceNames: () => {
+        deviceListCalls += 1;
+        return deviceListCalls === 1
+          ? ["/dev/oracleoci/oraclevdb", "/dev/oracleoci/oraclevde"]
+          : [
+            "/dev/oracleoci/oraclevdb",
+            "/dev/oracleoci/oraclevde",
+            "/dev/oracleoci/oraclevdf",
+          ];
+      },
+    },
+  );
+  const sshCalls: string[][] = [];
+  const adapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    fixture.runner,
+    {
+      attachState: new MemoryIntentStore(),
+      ssh: (_command, args) => {
+        sshCalls.push(args);
+        return preparationMarkerJson(config).then((stdout) =>
+          Promise.resolve({ code: 0, stdout, stderr: "" })
+        );
+      },
+    },
+  );
+  await adapter.prepareCopiedVolumes(prepTargets);
+  const rootAttaches = rootAttachEvents(fixture.events);
+  assert(
+    rootAttaches.length === 2,
+    "a device conflict must admit exactly the single bounded retry",
+  );
+  assertEquals(
+    rootAttaches.map((line) => line.match(/--device (\S+)/)?.[1]),
+    ["/dev/oracleoci/oraclevde", "/dev/oracleoci/oraclevdf"],
+  );
+  assertEquals(deviceListCalls, 2);
+  assert(sshCalls.length === 1, "preparation must run exactly once");
+  assert(fixture.ready() === false, "both copies must detach cleanly");
+});
+
+Deno.test("preparation adopts the exact root attach OCI accepted despite the reported conflict and never re-attaches", async () => {
+  const config = await prepConfigWithDigest();
+  const state = new MemoryIntentStore();
+  // The conflict response lies about acceptance: OCI actually created the
+  // root attachment on the requested device. The recovery must reconcile the
+  // exact target, durably adopt it and never issue a duplicate attach.
+  const fixture = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    {},
+    {
+      rootConflictsOn: ["/dev/oracleoci/oraclevde"],
+      rootConflictAccepted: true,
+      deviceNames: () => ["/dev/oracleoci/oraclevde"],
+    },
+  );
+  const sshCalls: string[][] = [];
+  const adapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    fixture.runner,
+    {
+      attachState: state,
+      ssh: (_command, args) => {
+        sshCalls.push(args);
+        return preparationMarkerJson(config).then((stdout) =>
+          Promise.resolve({ code: 0, stdout, stderr: "" })
+        );
+      },
+    },
+  );
+  await adapter.prepareCopiedVolumes(prepTargets);
+  const rootAttaches = rootAttachEvents(fixture.events);
+  assert(
+    rootAttaches.length === 1,
+    "an uncertain conflict acceptance must never be attached a second time",
+  );
+  const rootIntent = await state.read(attachIntentKey("root"));
+  assert(
+    rootIntent?.attachmentId === "root-attachment" &&
+      rootIntent.attachmentState === "ATTACHED",
+    "the adopted exact attachment must be durably recorded",
+  );
+  assert(
+    rootIntent?.detachedAtUtc !== undefined,
+    "the adopted copy must end with a proved detach",
+  );
+  assert(sshCalls.length === 1, "preparation must run exactly once");
+  assert(fixture.ready() === false, "both copies must detach cleanly");
+});
+
+Deno.test("preparation fails closed when the single root device-conflict retry also fails and preserves the durable intent", async () => {
+  const config = await prepConfigWithDigest();
+  const state = new MemoryIntentStore();
+  let deviceListCalls = 0;
+  const fixture = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    {},
+    {
+      bootDevice: "/dev/oracleoci/oraclevdb",
+      rootConflictsOn: ["/dev/oracleoci/oraclevde", "/dev/oracleoci/oraclevdf"],
+      deviceNames: () => {
+        deviceListCalls += 1;
+        return deviceListCalls === 1
+          ? ["/dev/oracleoci/oraclevdb", "/dev/oracleoci/oraclevde"]
+          : [
+            "/dev/oracleoci/oraclevdb",
+            "/dev/oracleoci/oraclevde",
+            "/dev/oracleoci/oraclevdf",
+          ];
+      },
+    },
+  );
+  const adapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    fixture.runner,
+    { ssh: prepSshMarker(), attachState: state },
+  );
+  await rejects(async () => {
+    try {
+      await adapter.prepareCopiedVolumes(prepTargets);
+    } catch (error) {
+      assert(
+        error instanceof AggregateError &&
+          String(error).includes("device conflict retry failed"),
+        "the exhausted bounded retry must fail closed",
+      );
+      throw error;
+    }
+  });
+  assert(
+    rootAttachEvents(fixture.events).length === 2,
+    "no attach may ever be issued beyond the single bounded retry",
+  );
+  assertEquals(deviceListCalls, 2);
+  const rootIntent = await state.read(attachIntentKey("root"));
+  assert(
+    rootIntent !== undefined && rootIntent.attachmentId === undefined &&
+      rootIntent.attachmentState === undefined,
+    "an unresolved root conflict must preserve the durable intent without recording an attachment",
+  );
+  assert(
+    fixture.ready() === false,
+    "the absent root copy must stay detached and the boot copy must be released",
+  );
+});
+
+Deno.test("preparation never re-issues a root attach after its response is lost and adopts the exact target on the next run", async () => {
+  const config = await prepConfigWithDigest();
+  const state = new MemoryIntentStore();
+  // Run 1: the boot copy attaches normally, the root response is lost (the
+  // provider accepted it), so no conflict signature exists: the same run must
+  // fail without any retry and keep the durable root intent unresolved.
+  const first = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    {},
+    { attachResponseLostOn: "root", failDetach: "root" },
+  );
+  const firstAdapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    first.runner,
+    {
+      ssh: () => Promise.resolve({ code: 0, stdout: "", stderr: "" }),
+      attachState: state,
+    },
+  );
+  await rejects(() => firstAdapter.prepareCopiedVolumes(prepTargets));
+  assert(
+    rootAttachEvents(first.events).length === 1,
+    "a lost root attach response must never be re-issued in the same run",
+  );
+  const pendingRoot = await state.read(attachIntentKey("root"));
+  assert(
+    pendingRoot !== undefined && pendingRoot.attachmentId === undefined,
+    "the lost-response root intent must stay unresolved",
+  );
+  // Run 2 with the same durable state: the exact live root target is adopted
+  // without a duplicate attach and preparation completes.
+  const second = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    { root: [rootAttachmentRecord()] },
+  );
+  const secondAdapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    second.runner,
+    { ssh: prepSshMarker(), attachState: state },
+  );
+  await secondAdapter.prepareCopiedVolumes(prepTargets);
+  assert(
+    second.events.every((line) =>
+      !(line.includes("volume-attachment attach") &&
+        line.includes("target-root-volume"))
+    ),
+    "the adopted root target must never be attached a second time",
+  );
+  const settledRoot = await state.read(attachIntentKey("root"));
+  assert(
+    settledRoot?.attachmentId === "root-attachment" &&
+      settledRoot.detachedAtUtc !== undefined,
+    "the adopted root copy must end durably attached-then-detached",
+  );
+  assert(second.ready() === false, "both copies must detach cleanly");
+});
+
+Deno.test("preparation preserves the durable intent and fails when no distinct next device exists after a conflict", async () => {
+  const config = await prepConfigWithDigest();
+  const state = new MemoryIntentStore();
+  // Boot occupies oraclevdb and the provider inventory has no next candidate:
+  // the conflict cannot be recovered and must fail closed without touching
+  // the durable intent or issuing any duplicate attach.
+  const fixture = preparationOciFixture(
+    helperRecord(),
+    helperVnic(),
+    {},
+    {
+      bootDevice: "/dev/oracleoci/oraclevdb",
+      rootConflictsOn: ["/dev/oracleoci/oraclevde"],
+      deviceNames:
+        () => ["/dev/oracleoci/oraclevdb", "/dev/oracleoci/oraclevde"],
+    },
+  );
+  const adapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    fixture.runner,
+    { ssh: prepSshMarker(), attachState: state },
+  );
+  await rejects(async () => {
+    try {
+      await adapter.prepareCopiedVolumes(prepTargets);
+    } catch (error) {
+      assert(
+        String(error).includes("no distinct next OCI device path is available"),
+        "the unrecoverable conflict must be named",
+      );
+      throw error;
+    }
+  });
+  assert(
+    rootAttachEvents(fixture.events).length === 1,
+    "no retry may run without a distinct next candidate",
+  );
+  const rootIntent = await state.read(attachIntentKey("root"));
+  assert(
+    rootIntent !== undefined && rootIntent.attachmentId === undefined &&
+      rootIntent.attachmentState === undefined,
+    "the durable intent must be preserved without an attachment record when no next device exists",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Generated Python syntax validation (F2)
+// ---------------------------------------------------------------------------
+
+// The normal Deno suite runs without subprocess permission (`deno test tests`
+// has no `--allow-run`), so the deterministic parser is exercised through the
+// injected stdio runner: both exact generated bodies are locally compiled with
+// `python3 -m py_compile` and fail closed on a malformed result. The live
+// product path (`oci-group-restore-run.ts` main) supplies the real local
+// python3 runner through the same injection point before the guarded command
+// ever reaches the helper over SSH; no cloud call and no product flag are
+// involved on either path.
+Deno.test("generated preparation and release bodies are both sent to python3 -m py_compile", async () => {
+  const config = await prepConfigWithDigest();
+  const evidence = prepEvidence();
+  const preparationBody = groupRestorePreparationScriptBody(
+    plan,
+    config,
+    evidence,
+    PREP_BUNDLE,
+  );
+  const releaseBody = groupRestorePreparationReleaseScriptBody(config);
+  const calls: Array<{ command: string; args: string[]; stdin: string }> = [];
+  await validateGroupRestorePreparationPythonScripts(
+    preparationBody,
+    releaseBody,
+    (command, args, stdin) => {
+      calls.push({ command, args, stdin });
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    },
+  );
+  assert(calls.length === 2, "both current scripts must reach the parser");
+  for (const call of calls) {
+    assert(call.command === "python3", "the parser is python3");
+    assert(
+      JSON.stringify(call.args) === JSON.stringify(["-m", "py_compile"]),
+      "the parser receives each materialized body",
+    );
+  }
+  assert(
+    calls[0]!.stdin.includes("OFFLINE_FILES_PREPARED"),
+    "the preparation body must be sent exactly as generated",
+  );
+  assert(
+    calls[1]!.stdin.includes("ARCH_DRILL_PREPARATION_RELEASED"),
+    "the release body must be sent exactly as generated",
+  );
+});
+
+Deno.test("malformed parser output fails closed without executing the guarded command", async () => {
+  const config = await prepConfigWithDigest();
+  const evidence = prepEvidence();
+  await rejects(async () => {
+    try {
+      await validateGroupRestorePreparationPythonScripts(
+        groupRestorePreparationScriptBody(plan, config, evidence, PREP_BUNDLE),
+        groupRestorePreparationReleaseScriptBody(config),
+        () =>
+          Promise.resolve({
+            code: 1,
+            stdout: "",
+            stderr: "SyntaxError: invalid syntax",
+          }),
+      );
+    } catch (error) {
+      assert(
+        String(error).includes("failed syntax validation") &&
+          String(error).includes("invalid syntax"),
+        "the parser status and stderr must be reported",
+      );
+      throw error;
+    }
+  });
+});
+
+Deno.test("the adapter runs the deterministic syntax check before the guarded command is sent", async () => {
+  const config = await prepConfigWithDigest();
+  const fixture = preparationOciFixture();
+  const parsed: string[] = [];
+  const adapter = groupRestorePreparationAdapter(
+    config,
+    plan,
+    fixture.runner,
+    {
+      ssh: prepSshMarker(),
+      attachState: new MemoryIntentStore(),
+      python: (_command, _args, stdin) => {
+        parsed.push(stdin);
+        return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+      },
+    },
+  );
+  await adapter.prepareCopiedVolumes(prepTargets);
+  assert(parsed.length === 2, "both bodies must be parsed before the SSH run");
+  assert(
+    parsed[0]!.includes("OFFLINE_FILES_PREPARED") &&
+      parsed[1]!.includes("ARCH_DRILL_PREPARATION_RELEASED"),
+    "the parsed bodies must be the exact generated scripts",
+  );
+});
+
+Deno.test("the shell command still carries the exact plan and target bindings", async () => {
+  const config = await prepConfigWithDigest();
+  const evidence = prepEvidence();
+  const body = groupRestorePreparationScriptBody(
+    plan,
+    config,
+    evidence,
+    PREP_BUNDLE,
+  );
+  const command = "sudo -n python3 -c " + body;
+  assert(
+    command.startsWith("sudo -n python3 -c "),
+    "the guarded command must run over sudo",
+  );
+  const match = body.match(/b64decode\('([^']+)'\)/);
+  assert(match !== null, "the shell command must carry the base64 payload");
+  const payload = JSON.parse(atob(match[1]!)) as {
+    plan: GroupRestorePlan;
+    evidence: GroupRestorePreparationEvidence;
+    bundle: { planSha256: string };
+    preparationPlanSha256: string;
+  };
+  assert(payload.plan.suffix === plan.suffix, "the plan suffix must bind");
+  assert(
+    payload.plan.source.instanceId === plan.source.instanceId,
+    "the reviewed source must bind",
+  );
+  assert(
+    payload.evidence.bootVolumeId === "target-boot-volume" &&
+      payload.evidence.rootVolumeId === "target-root-volume",
+    "the exact restored targets must bind",
+  );
+  assert(
+    payload.evidence.helper.id === config.helper.instanceId,
+    "the reviewed helper must bind",
+  );
+  assert(
+    payload.preparationPlanSha256 === config.planSha256 &&
+      payload.bundle.planSha256 === PREP_BUNDLE.planSha256,
+    "the reviewed plan and isolation-file digests must bind",
+  );
+  assert(
+    groupRestorePreparationReleaseScriptBody(config).includes(
+      config.planSha256,
+    ),
+    "the release command must bind the exact reviewed plan digest",
   );
 });
