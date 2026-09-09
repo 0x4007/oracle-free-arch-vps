@@ -36,7 +36,6 @@ import {
   type GroupRestoreExecutionPorts,
   type GroupRestoreExecutionResult,
   type GroupRestorePartialCleanupResult,
-  type GroupRestorePreBootIsolationAdapter,
   ociGroupRestorePorts,
   prepareGroupRestoreExecution,
 } from "./oci-group-restore-executor.ts";
@@ -51,9 +50,13 @@ import {
   validateGroupRestoreApproval,
 } from "./oci-group-restore-drill.ts";
 import {
+  type GroupRestoreAttachIntentStore,
   groupRestorePreparationAdapter,
   groupRestorePreparationBundle,
   type GroupRestorePreparationConfig,
+  type GroupRestorePythonSyntaxRunner,
+  parseGroupRestoreAttachIntent,
+  sameGroupRestoreAttachIntentKey,
   validateGroupRestorePreparationConfig,
 } from "./oci-group-restore-preparation.ts";
 import { defaultRunner, readPrivateJson, writePrivateJson } from "./oci.ts";
@@ -93,7 +96,13 @@ export interface GroupRestoreRunDeps {
   makePorts: (
     plan: GroupRestorePlan,
     lifetime: GroupRestoreLifetime,
+    attachStateStore: GroupRestoreAttachIntentStore,
   ) => GroupRestoreExecutionPorts;
+  /** Durable attachment-intent store for the pre-boot copied-volume
+   * preparation adapter (file-backed in the executable wrapper under the
+   * private state directory). The create action refuses before any input or
+   * state read while this is not supplied by the caller. */
+  attachStateStore: GroupRestoreAttachIntentStore;
   /** True only when the caller's ports carry a real pre-boot isolation
    * verifier: the OCI gate proves the reviewed isolated network and exact
    * restored targets AND a typed copied-volume preparation adapter
@@ -109,6 +118,9 @@ export const GROUP_RESTORE_STATE_FILES = {
   lifetime: "group-restore-lifetime.json",
   journal: "group-restore-journal.json",
   result: "group-restore-result.json",
+  // Durable copied-volume attachment intents of the preparation adapter,
+  // persisted under the same private state directory.
+  attachIntents: "group-restore-attach-intents.json",
 } as const;
 
 function assertBound(value: string, label: string): string {
@@ -173,6 +185,51 @@ async function readOptionalJson<T>(
   }
 }
 
+/** File-backed durable attachment-intent store over the deterministic
+ * `group-restore-attach-intents.json` state file under the private directory.
+ * The exact helper/plan/kind/volume key decides a match; a malformed file or
+ * record throws instead of being treated as absent, and a completed record is
+ * kept (replaced only by a later state of the same exact key), so an
+ * unresolved record is never silently deleted or overwritten. */
+export function groupRestoreAttachIntentStateStore(
+  privateDir: string,
+  readJson: GroupRestoreRunDeps["readJson"],
+  writeJson: GroupRestoreRunDeps["writeJson"],
+): GroupRestoreAttachIntentStore {
+  const path = statePath(privateDir, GROUP_RESTORE_STATE_FILES.attachIntents);
+  const recordsFor = async () => {
+    const records = await readOptionalJson<unknown>(path, readJson);
+    if (records === undefined) return [];
+    if (!Array.isArray(records)) {
+      throw new Error(
+        "Durable copied-volume attachment intents are malformed: not a list",
+      );
+    }
+    return records.map(parseGroupRestoreAttachIntent);
+  };
+  return {
+    async read(key) {
+      const matches = (await recordsFor()).filter((intent) =>
+        sameGroupRestoreAttachIntentKey(intent, key)
+      );
+      if (matches.length > 1) {
+        throw new Error(
+          "Durable copied-volume attachment intents are ambiguous for the exact target",
+        );
+      }
+      return matches[0];
+    },
+    async write(intent) {
+      const parsed = parseGroupRestoreAttachIntent(intent);
+      const existing = await recordsFor();
+      const rest = existing.filter((record) =>
+        !sameGroupRestoreAttachIntentKey(record, parsed)
+      );
+      await writeJson(path, [...rest, parsed]);
+    },
+  };
+}
+
 function receiptsEqual(
   left: GroupRestoreAcceptanceReceipt,
   right: GroupRestoreAcceptanceReceipt,
@@ -204,6 +261,11 @@ export async function runGroupRestoreCycle(
   if (config.action === "create" && !deps.preBootIsolationReady) {
     throw new Error(
       "Drill create is refused: this executable requires a configured pre-boot isolation verifier",
+    );
+  }
+  if (config.action === "create" && deps.attachStateStore === undefined) {
+    throw new Error(
+      "Drill create is refused: a durable attachment-intent store is required",
     );
   }
   const privateDir = assertPrivatePath(config.privateDir, "State directory");
@@ -306,7 +368,7 @@ export async function runGroupRestoreCycle(
     const result = await executeGroupRestoreCreates(
       input,
       deps.runner,
-      deps.makePorts(plan, lifetime),
+      deps.makePorts(plan, lifetime, deps.attachStateStore),
       (nextJournal) => deps.writeJson(journalPath, nextJournal),
     );
     await deps.writeJson(journalPath, result.journal);
@@ -337,7 +399,7 @@ export async function runGroupRestoreCycle(
       plan,
       evidence,
       deps.runner,
-      deps.makePorts(plan, persistedLifetime),
+      deps.makePorts(plan, persistedLifetime, deps.attachStateStore),
       persistedLifetime,
       persistedJournal,
       now,
@@ -435,7 +497,7 @@ export async function runGroupRestoreCycle(
     approval,
     evidence,
     deps.runner,
-    deps.makePorts(plan, persistedResult.lifetime),
+    deps.makePorts(plan, persistedResult.lifetime, deps.attachStateStore),
     now,
     (nextJournal) => deps.writeJson(journalPath, nextJournal),
   );
@@ -554,6 +616,55 @@ export async function withGroupRestoreControllerGate<T>(
   });
 }
 
+/** Deterministic local Python syntax runner used by the real entry point.
+ * The exact generated body is materialized as one private module under the
+ * state directory and that concrete path is handed to `python3 -m py_compile`;
+ * passing `-` would make Python try to open a file literally named `-`, so the
+ * body is never sent as a filename or mistaken for a list of stdin paths. Any
+ * syntax defect makes the compiler exit nonzero with parser detail on stderr,
+ * and the injected validation then fails closed before the guarded command can
+ * reach the helper. The parse result is deterministic, no cloud call is made,
+ * and the temporary module plus its bytecode cache are removed afterwards. */
+const localPythonSyntaxRunner = (
+  privateDir: string,
+): GroupRestorePythonSyntaxRunner =>
+async (command: string, args: string[], stdin: string) => {
+  const tempModule = `${privateDir}/restore-prep-syntax-check.py`;
+  await Deno.writeTextFile(tempModule, stdin);
+  const parserArgs = [...args, tempModule];
+  const output = await new Deno.Command(command, {
+    args: parserArgs,
+    stdin: "null",
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  try {
+    return {
+      code: output.code,
+      stdout: new TextDecoder().decode(output.stdout),
+      stderr: new TextDecoder().decode(output.stderr),
+    };
+  } finally {
+    try {
+      await Deno.remove(tempModule);
+    } catch {
+      // Best-effort cleanup; the parser status is authoritative.
+    }
+    try {
+      const pycache = `${privateDir}/__pycache__`;
+      for (const entry of Deno.readDirSync(pycache)) {
+        if (
+          entry.isFile && entry.name.startsWith("restore-prep-syntax-check.")
+        ) {
+          await Deno.remove(`${pycache}/${entry.name}`);
+        }
+      }
+    } catch {
+      // Bytecode cache removal is best-effort only.
+    }
+  }
+};
+
 async function main(): Promise<void> {
   const { config, runnerPath } = parseGroupRestoreRunArgs(Deno.args);
   await withGroupRestoreControllerGate(async () => {
@@ -579,37 +690,57 @@ async function main(): Promise<void> {
     // (the state machine's own gate still refuses a create without the typed
     // adapter). The hook is never replaced by a readiness flag, mock success
     // or a read-only network check.
-    let preparation: GroupRestorePreBootIsolationAdapter | undefined;
+    let preparationConfig: GroupRestorePreparationConfig | undefined;
     let preBootIsolationReady = false;
     if (config.action === "create") {
       const reviewedPlan = await readPrivateJson<GroupRestorePlan>(
         config.inputs.planPath,
       );
-      const preparationConfig = await readPrivateJson<
-        GroupRestorePreparationConfig
-      >(config.inputs.preparationPath!);
+      preparationConfig = await readPrivateJson<GroupRestorePreparationConfig>(
+        config.inputs.preparationPath!,
+      );
       await validateGroupRestorePreparationConfig(
         preparationConfig,
         reviewedPlan,
         await groupRestorePreparationBundle(reviewedPlan),
       );
-      preparation = groupRestorePreparationAdapter(
-        preparationConfig,
-        reviewedPlan,
-        runner,
-        { ssh: defaultRunner },
-      );
       preBootIsolationReady = true;
     }
+    // Durable copied-volume attachment intents, persisted under the same
+    // private state directory and threaded through the cycle into the
+    // preparation adapter construction.
+    const attachStateStore = groupRestoreAttachIntentStateStore(
+      config.privateDir,
+      readPrivateJson,
+      writePrivateJson,
+    );
     const result = await runGroupRestoreCycle(config, {
       now: () => new Date(),
       readJson: readPrivateJson,
       writeJson: writePrivateJson,
       runner,
-      makePorts: (plan, lifetime) =>
+      attachStateStore,
+      makePorts: (plan, lifetime, store) =>
         ociGroupRestorePorts(plan, runner, {
           lifetime,
-          preBootIsolation: preparation,
+          preBootIsolation:
+            preBootIsolationReady && preparationConfig !== undefined
+              // The durable lifetime and the file-backed attachment-intent
+              // store reach the adapter through this construction path; the
+              // local stdio runner deterministically syntax-checks both
+              // generated Python bodies before they are sent to the helper.
+              ? groupRestorePreparationAdapter(
+                preparationConfig,
+                plan,
+                runner,
+                {
+                  ssh: defaultRunner,
+                  attachState: store,
+                  lifetime: () => Promise.resolve(lifetime),
+                  python: localPythonSyntaxRunner(config.privateDir),
+                },
+              )
+              : undefined,
         }),
       preBootIsolationReady,
     });

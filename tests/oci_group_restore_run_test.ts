@@ -14,6 +14,7 @@ import {
 } from "../scripts/oci-group-restore-drill.ts";
 import {
   GROUP_RESTORE_STATE_FILES,
+  groupRestoreAttachIntentStateStore,
   type GroupRestoreRunConfig,
   type GroupRestoreRunDeps,
   parseGroupRestoreRunArgs,
@@ -257,6 +258,8 @@ interface Harness {
   deps: GroupRestoreRunDeps;
   /** Advancing this clock also advances the fake ports' clock. */
   advance: (to: Date) => void;
+  /** File-backed durable attachment-intent store over the same MemoryStore. */
+  attachState: ReturnType<typeof groupRestoreAttachIntentStateStore>;
 }
 
 function harness(
@@ -276,12 +279,18 @@ function harness(
   store.files.set(files.approvalPath!, approval);
   store.files.set(files.evidencePath!, evidence);
   store.files.set(files.acceptancePath!, receipt());
+  const attachState = groupRestoreAttachIntentStateStore(
+    PRIVATE_DIR,
+    store.readJson.bind(store),
+    store.writeJson.bind(store),
+  );
   const deps: GroupRestoreRunDeps = {
     now: () => current,
     readJson: store.readJson.bind(store),
     writeJson: store.writeJson.bind(store),
     runner,
     makePorts: () => ports,
+    attachStateStore: attachState,
     preBootIsolationReady: true,
   };
   return {
@@ -291,6 +300,7 @@ function harness(
     advance: (to) => {
       current = to;
     },
+    attachState,
   };
 }
 
@@ -1235,4 +1245,121 @@ Deno.test("run entry-point create fails closed without a bound preparation confi
     ".private/inputs/runner.json",
   ]);
   assert(cleanup.config.inputs.preparationPath === undefined);
+});
+
+Deno.test("run create wires the durable attachment-intent store into port construction", async () => {
+  const { deps } = harness();
+  let received: unknown[] | undefined;
+  const forwarded: GroupRestoreRunDeps = {
+    ...deps,
+    makePorts: (...args) => {
+      received = args;
+      return deps.makePorts(...args);
+    },
+  };
+  const result = await runGroupRestoreCycle(config("create"), forwarded);
+  assert(result.state === "CREATED");
+  assert(
+    received![2] === deps.attachStateStore,
+    "the cycle must forward the durable attachment-intent store to port construction",
+  );
+});
+
+Deno.test("run attachment-intent store persists the deterministic private file and fails closed on malformed state", async () => {
+  const { attachState, store } = harness();
+  const key = {
+    planSha256: PLAN_SHA,
+    helperInstanceId: "helper-instance",
+    kind: "boot" as const,
+    volumeId: "target-boot-volume",
+  };
+  const intent = {
+    schemaVersion: 1 as const,
+    ...key,
+    attachRequestedAtUtc: now.toISOString(),
+    attachmentId: "boot-attachment",
+    attachmentState: "ATTACHED" as const,
+    preparationStarted: true,
+  };
+  await attachState.write(intent);
+  const path = statePath(GROUP_RESTORE_STATE_FILES.attachIntents);
+  assert(
+    store.writePaths.includes(path),
+    "the durable intent must land in the deterministic private state file",
+  );
+  assert(
+    JSON.stringify(await attachState.read(key)) === JSON.stringify(intent),
+    "the exact helper/plan/kind/volume key must read back the durable intent",
+  );
+  assert(
+    (await attachState.read({ ...key, volumeId: "target-root-volume" })) ===
+      undefined,
+    "a different exact key is genuinely absent and must never match",
+  );
+  // Malformed content never reads as absence: the resumed create must fail
+  // closed instead of adopting or re-attaching unknown state.
+  store.files.set(path, { not: "a list" });
+  await rejects(() => attachState.read(key));
+  store.malformed.add(path);
+  await rejects(() => attachState.read(key));
+  // A record with unknown or missing fields is malformed too.
+  store.malformed.delete(path);
+  store.files.set(path, [{ ...intent, unknownField: "x" }]);
+  await rejects(() => attachState.read(key));
+  store.files.set(path, [{ ...intent, schemaVersion: 2 }]);
+  await rejects(() => attachState.write(intent));
+  // Restore a clean file; the malformed earlier content must stay refused
+  // rather than being silently discarded.
+  store.files.set(path, [{ ...intent }]);
+  // A completed record stays for audit under the same exact key rather than
+  // being silently dropped by a later write of another key.
+  await attachState.write({
+    ...intent,
+    releaseProvedAtUtc: now.toISOString(),
+    detachedAtUtc: now.toISOString(),
+  });
+  await attachState.write({
+    ...intent,
+    volumeId: "target-root-volume",
+  });
+  const records = store.files.get(path) as unknown[];
+  assert(
+    records.length === 2,
+    "other-key writes must preserve the completed audit record",
+  );
+  assert(
+    JSON.stringify(await attachState.read(key)) !== undefined,
+    "the completed record must remain readable for audit",
+  );
+});
+
+Deno.test("run create refuses without a durable attachment-intent store before any read or provider call", async () => {
+  const { store, deps, ports } = harness();
+  let reads = 0;
+  const unbacked: GroupRestoreRunDeps = {
+    ...deps,
+    attachStateStore:
+      undefined as unknown as GroupRestoreRunDeps["attachStateStore"],
+    readJson: <T>(path: string) => {
+      reads += 1;
+      return (store.readJson as (path: string) => Promise<T>)(path);
+    },
+  };
+  await rejects(async () => {
+    try {
+      await runGroupRestoreCycle(config("create"), unbacked);
+    } catch (error) {
+      assert(
+        String(error).includes("a durable attachment-intent store is required"),
+        "the refusal must name the missing attachment-intent store",
+      );
+      throw error;
+    }
+  });
+  assert(reads === 0, "create must refuse before any input or state read");
+  assert(store.writePaths.length === 0, "create must refuse before any write");
+  assert(
+    ports.verifyCalls === 0,
+    "create must refuse before any provider call",
+  );
 });
