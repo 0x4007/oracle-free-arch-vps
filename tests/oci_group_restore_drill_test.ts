@@ -47,6 +47,7 @@ const plan: GroupRestorePlan = {
   productionReservedIpId: "ip-production",
   isolatedSubnetId: "subnet-isolated",
   isolatedVcnId: "vcn-isolated",
+  isolatedCidrBlock: "10.77.0.0/28",
   controllerIpv4: "74.72.113.64",
   suffix: "20260905T090000Z",
   maxDurationHours: 4,
@@ -248,6 +249,11 @@ Deno.test("plan rejects production network, malformed bounds and bad controller 
       source: { ...plan.source, region: "eu-frankfurt-1" },
     })
   );
+  for (const cidr of ["10.78.0.0", "10.78.0.0/33", "10.78.0.256/28", ""]) {
+    await refuses(() =>
+      validateGroupRestorePlan({ ...plan, isolatedCidrBlock: cidr })
+    );
+  }
   for (
     const ip of [
       "10.0.0.1",

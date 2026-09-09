@@ -32,6 +32,10 @@ export interface DrillNetworkPlan {
   controllerIpv4: string;
   isolatedSubnetId?: string;
   isolatedVcnId?: string;
+  /** Explicit reviewed IPv4 CIDR of the isolated subnet. Older generic drill
+   * plans may omit this and retain the original 10.77.0.0/28 contract; the
+   * current group-restore plan always binds it explicitly. */
+  isolatedCidrBlock?: string;
 }
 export interface DrillApproval {
   approvedAtUtc: string;
@@ -197,7 +201,8 @@ export function verifyDrillRoutedNetwork(
     subnet["compartment-id"] !== plan.source.compartmentId ||
     subnet["prohibit-public-ip-on-vnic"] !== false ||
     subnet["lifecycle-state"] !== "AVAILABLE" ||
-    subnet["cidr-block"] !== "10.77.0.0/28" ||
+    subnet["cidr-block"] !==
+      (plan.isolatedCidrBlock ?? "10.77.0.0/28") ||
     !Array.isArray(ids) || ids.length !== 1 || securityLists.length !== 1 ||
     ids[0] !== securityLists[0].id ||
     subnet["route-table-id"] !== routeTable.id || !subnet["vcn-id"] ||

@@ -94,6 +94,7 @@ const plan: GroupRestorePlan = {
   productionReservedIpId: "production-ip",
   isolatedSubnetId: "isolated-subnet",
   isolatedVcnId: "isolated-vcn",
+  isolatedCidrBlock: "10.77.0.0/28",
   controllerIpv4: "74.72.113.64",
   suffix: "20260908T140000Z",
   maxDurationHours: 4,
@@ -1759,6 +1760,24 @@ Deno.test("pre-boot isolation proof accepts the reviewed isolated network and ex
   verifyGroupRestorePreBootIsolation(
     plan,
     goodIsolationNetwork(),
+    isolationTargets,
+    goodTargetObservation(),
+  );
+});
+
+Deno.test("pre-boot isolation proof uses the reviewed clone subnet CIDR", () => {
+  const alternatePlan = {
+    ...plan,
+    isolatedCidrBlock: "10.78.0.0/28",
+  };
+  const network = goodIsolationNetwork();
+  network.subnet = {
+    ...network.subnet,
+    "cidr-block": alternatePlan.isolatedCidrBlock,
+  };
+  verifyGroupRestorePreBootIsolation(
+    alternatePlan,
+    network,
     isolationTargets,
     goodTargetObservation(),
   );
