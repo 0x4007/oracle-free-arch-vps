@@ -12,7 +12,7 @@
     "backup:run": "deno run --allow-read=.private --allow-write=.private --allow-run --allow-net=docs.oracle.com scripts/backup-runtime.ts",
     "backup:scheduled": "deno run --allow-read=.private --allow-write=.private --allow-run --allow-net=docs.oracle.com scripts/backup-scheduled.ts",
     "backup:watchdog": "deno run --allow-read=.private --allow-write=.private --allow-run=ssh scripts/backup-watchdog.ts",
-    "backup:replace": "deno run --allow-read=.private,config --allow-write=.private --allow-run --allow-net=docs.oracle.com scripts/pi-recovery-session.ts",
+    "backup:replace": "deno run --allow-read=.,.private,config --allow-write=.private --allow-run --allow-net=docs.oracle.com scripts/pi-recovery-session.ts",
     "backup:recover": "deno run --allow-read=.private --allow-write=.private --allow-run --allow-net=docs.oracle.com scripts/backup-recovery.ts"
   }
 }
