@@ -25,6 +25,9 @@ interface AuditConfig {
 
 interface SeriesSummary {
   points: number;
+  coveredHours: number;
+  missingHours: number;
+  status: "unavailable" | "incomplete" | "complete";
   firstUtc?: string;
   lastUtc?: string;
   minimum?: number;
@@ -60,21 +63,55 @@ function percentile(values: number[], fraction: number): number | undefined {
   return sorted[Math.max(0, Math.min(index, sorted.length - 1))];
 }
 
-export function summarizeSeries(series: JsonRecord[]): SeriesSummary {
-  const points = series.flatMap((item) => {
-    const values = item["aggregated-datapoints"];
-    return Array.isArray(values) ? values as JsonRecord[] : [];
-  }).filter((item) =>
-    typeof item.value === "number" && typeof item.timestamp === "string"
-  );
-  const values = points.map((item) => numberField(item, "value"));
-  const timestamps = points.map((item) => stringField(item, "timestamp"))
-    .sort();
-  if (values.length === 0) return { points: 0 };
-  return {
+export function summarizeSeries(
+  series: JsonRecord[],
+  start: string,
+  end: string,
+): SeriesSummary {
+  const startMs = Date.parse(start);
+  const endMs = Date.parse(end);
+  const expectedHours = (endMs - startMs) / 3_600_000;
+  if (!Number.isInteger(expectedHours) || expectedHours <= 0) {
+    throw new Error("Metric window must contain whole hours");
+  }
+  const hourlyPoints = new Map<number, number>();
+  for (
+    const item of series.flatMap((item) => {
+      const values = item["aggregated-datapoints"];
+      return Array.isArray(values) ? values as JsonRecord[] : [];
+    })
+  ) {
+    const timestamp = Date.parse(String(item.timestamp));
+    if (
+      typeof item.value !== "number" || !Number.isFinite(item.value) ||
+      !Number.isFinite(timestamp) || timestamp < startMs ||
+      timestamp >= endMs ||
+      (timestamp - startMs) % 3_600_000 !== 0
+    ) continue;
+    if (
+      hourlyPoints.has(timestamp) && hourlyPoints.get(timestamp) !== item.value
+    ) {
+      throw new Error("Conflicting metric values for one hourly timestamp");
+    }
+    hourlyPoints.set(timestamp, item.value);
+  }
+  const values = [...hourlyPoints.values()];
+  const timestamps = [...hourlyPoints.keys()].sort((a, b) => a - b);
+  const coverage = {
     points: values.length,
-    firstUtc: timestamps[0],
-    lastUtc: timestamps.at(-1),
+    coveredHours: values.length,
+    missingHours: expectedHours - values.length,
+    status: values.length === 0
+      ? "unavailable" as const
+      : values.length === expectedHours
+      ? "complete" as const
+      : "incomplete" as const,
+  };
+  if (values.length === 0) return coverage;
+  return {
+    ...coverage,
+    firstUtc: new Date(timestamps[0]).toISOString(),
+    lastUtc: new Date(timestamps.at(-1)!).toISOString(),
     minimum: Math.min(...values),
     maximum: Math.max(...values),
     mean: values.reduce((sum, value) => sum + value, 0) / values.length,
@@ -83,24 +120,21 @@ export function summarizeSeries(series: JsonRecord[]): SeriesSummary {
   };
 }
 
-export function idleAssessment(
-  cpu: SeriesSummary,
-  memory: SeriesSummary,
-  coveredHours: number,
-): string {
-  if (
-    coveredHours < 167 || cpu.points < 168 || memory.points < 168 ||
-    cpu.percentile95 === undefined || memory.mean === undefined
-  ) return "pending-seven-day-window";
-  if (cpu.percentile95 >= 20) return "not-idle-cpu";
-  if (memory.mean >= 20) return "not-idle-memory";
-  return "indeterminate-network-percentage";
+export function observationWindowStatus(series: SeriesSummary[]): string {
+  if (series.some((item) => item.status === "unavailable")) {
+    return "telemetry-unavailable";
+  }
+  return series.every((item) => item.status === "complete")
+    ? "complete"
+    : "incomplete-observation-window";
 }
 
-function seriesCoverageHours(series: SeriesSummary): number {
-  return series.firstUtc && series.lastUtc
-    ? (Date.parse(series.lastUtc) - Date.parse(series.firstUtc)) / 3_600_000
-    : 0;
+export function idleAssessment(series: SeriesSummary[]): string {
+  const status = observationWindowStatus(series);
+  if (status !== "complete") return `unverified-${status}`;
+  // Hypervisor CPU and guest byte counters do not establish Oracle's full
+  // idle-policy evaluation, including its network utilization percentage.
+  return "indeterminate-network-percentage";
 }
 
 function ociArgs(config: AuditConfig, args: string[]): string[] {
@@ -113,13 +147,16 @@ function ociArgs(config: AuditConfig, args: string[]): string[] {
   ];
 }
 
-async function metric(
+export async function metric(
   config: AuditConfig,
   runner: CommandRunner,
   name: string,
   start: string,
   end: string,
-): Promise<SeriesSummary> {
+) {
+  const namespace = name === "CpuUtilization"
+    ? "oci_vmi_resource_utilization"
+    : "oci_computeagent";
   const query = `${name}[1h]{resourceId = "${config.instanceId}"}.mean()`;
   const response = await runJson(
     config.ociCliPath,
@@ -130,7 +167,7 @@ async function metric(
       "--compartment-id",
       config.compartmentId,
       "--namespace",
-      "oci_computeagent",
+      namespace,
       "--start-time",
       start,
       "--end-time",
@@ -142,7 +179,21 @@ async function metric(
     ]),
     runner,
   );
-  return summarizeSeries(dataArray(response));
+  const series = dataArray(response);
+  if (
+    series.some((item) =>
+      item.namespace !== namespace || item.name !== name ||
+      (item.dimensions as JsonRecord | undefined)?.resourceId !==
+        config.instanceId
+    )
+  ) throw new Error("Metric response does not match the requested source");
+  return {
+    ...summarizeSeries(series, start, end),
+    namespace,
+    source: name === "CpuUtilization" ? "hypervisor" : "guest-agent",
+    resourceId: config.instanceId,
+    metricName: name,
+  };
 }
 
 export async function objectStorage(
@@ -309,7 +360,11 @@ export async function main(
       "compartmentId must be the tenancy OCID for a tenancy-wide audit",
     );
   }
-  const end = new Date();
+  const generatedAt = new Date();
+  // Exclude the current partial hour and OCI's inclusive end-boundary point.
+  const end = new Date(
+    Math.floor(generatedAt.getTime() / 3_600_000) * 3_600_000,
+  );
   const start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
   const [cpu, memory, networkIn, networkOut, storage] = await Promise.all([
     metric(
@@ -342,33 +397,24 @@ export async function main(
     ),
     objectStorage(config, runner),
   ]);
-  const coveredHours = Math.min(
-    seriesCoverageHours(cpu),
-    seriesCoverageHours(memory),
-    seriesCoverageHours(networkIn),
-    seriesCoverageHours(networkOut),
-  );
-  const completeMetricWindow = coveredHours >= 167 &&
-    [cpu, memory, networkIn, networkOut].every((series) =>
-      series.points >= 168
-    );
+  const series = [cpu, memory, networkIn, networkOut];
   const report = {
-    generatedAtUtc: end.toISOString(),
+    generatedAtUtc: generatedAt.toISOString(),
+    windowStartUtc: start.toISOString(),
+    windowEndUtcExclusive: end.toISOString(),
     requestedWindowHours: 168,
-    coveredHours,
-    windowStatus: completeMetricWindow
-      ? "complete"
-      : "pending-seven-day-window",
-    idleReclamationAssessment: idleAssessment(cpu, memory, coveredHours),
+    coveredHours: Math.min(...series.map((item) => item.coveredHours)),
+    windowStatus: observationWindowStatus(series),
+    idleReclamationAssessment: idleAssessment(series),
     policyCaveat:
-      "OCI publishes network byte metrics, but the Always Free page does not define how to convert them to its network utilization percentage. Do not infer that percentage.",
+      "CPU is collected by Oracle's hypervisor, not Oracle Cloud Agent. Guest memory/network telemetry requires a running guest publisher; unavailable telemetry is not a pending healthy collector. Network bytes do not establish Oracle's network utilization percentage or its full idle-risk verdict.",
     cpuUtilizationPercent: cpu,
     memoryUtilizationPercent: memory,
     networkBytesIn: networkIn,
     networkBytesOut: networkOut,
     objectStorage: storage,
   };
-  const stamp = end.toISOString().replaceAll(/[-:.]/g, "").replace("Z", "Z");
+  const stamp = generatedAt.toISOString().replaceAll(/[-:.]/g, "");
   const path = `.private/reports/weekly-${stamp}.json`;
   await writePrivateJson(path, report);
   console.log(JSON.stringify({ ...report, privateReport: path }, null, 2));
