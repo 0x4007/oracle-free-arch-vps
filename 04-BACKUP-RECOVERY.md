@@ -132,6 +132,12 @@ drill boots a replacement from the capture and passes the full acceptance
 checklist, the online group's restore and boot status is `METADATA_PROVED`, not
 `RESTORE_DRILL_PROVED`.
 
+The group `arch-online-golden-20260908T061252Z` passed its separate restored
+boot and application/visual acceptance on September 10, followed by cleanup. See
+[RECOVERY-PROCEDURE.md](RECOVERY-PROCEDURE.md) for the corrected operator
+sequence and the exact dated evidence. Other groups still need their own
+evidence; a source-only plan gate cannot establish boot proof.
+
 The isolated volume-group restore drill has a source-only plan gate in
 `scripts/oci-group-restore-drill.ts`. It validates the exact bound plan, the
 reviewed one-hour approval over the plan digest (including typed
