@@ -115,9 +115,12 @@ agent.
   `SOFTSTOP`, waits for `STOPPED`, plans, restores, and verifies the two-volume
   recovery unit. It never performs an immediate stop, reset, or automatic
   cleanup.
-- `scripts/oci-weekly-audit.ts` reports the trailing OCI compute metrics and the
-  tenancy-wide Object Storage total, including noncurrent object versions when
-  bucket versioning is enabled.
+- `scripts/oci-weekly-audit.ts` reports 168 completed UTC hours of OCI
+  hypervisor CPU (`oci_vmi_resource_utilization`) and guest-agent memory/network
+  metrics. Each metric reports its source and missing hours. Unavailable guest
+  telemetry is distinct from a partially observed window; neither proves a full
+  idle-risk verdict. The report also includes the tenancy-wide Object Storage
+  total, including noncurrent object versions when bucket versioning is enabled.
 - Both tools read ignored mode-`0600` files under `.private/`. The repository
   contains placeholder examples only.
 
