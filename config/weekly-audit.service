@@ -1,0 +1,11 @@
+[Unit]
+Description=OCI telemetry and Object Storage audit
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/pi/ops/weekly-backup-controller
+ExecStart=/usr/local/bin/safepi deno task weekly:audit
+TimeoutStartSec=5min
+UMask=0077

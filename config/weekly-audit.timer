@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly OCI telemetry audit
+
+[Timer]
+OnCalendar=Sun *-*-* 00:10:00 America/New_York
+Persistent=true
+AccuracySec=1min
+Unit=weekly-audit.service
+
+[Install]
+WantedBy=timers.target

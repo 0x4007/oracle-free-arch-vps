@@ -121,6 +121,10 @@ agent.
   telemetry is distinct from a partially observed window; neither proves a full
   idle-risk verdict. The report also includes the tenancy-wide Object Storage
   total, including noncurrent object versions when bucket versioning is enabled.
+  `config/weekly-audit.timer` runs it on the Pi controller each Sunday at 00:10
+  America/New_York. Configure `.private/weekly-audit.json` before enabling the
+  timer. Missing telemetry leaves exit status 3 visible; it does not trigger a
+  backup, repair, or automatic restart.
 - Both tools read ignored mode-`0600` files under `.private/`. The repository
   contains placeholder examples only.
 
