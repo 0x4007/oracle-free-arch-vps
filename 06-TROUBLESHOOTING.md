@@ -181,11 +181,39 @@ operation before doing anything else.
 - Mark an ignored failure only with a documented owner, reason, and expiry.
 - Do not convert partial success to exit zero.
 
-## Seven-day metric coverage is incomplete
+## Seven-day metrics are unavailable or incomplete
 
-Report `pending-seven-day-window`. Keep collecting normal OCI metrics until at
-least 167 hours separate the earliest and latest hourly points. Do not replace
-OCI metrics with guest-local load data and do not generate artificial activity.
+The audit queries CPU from `oci_vmi_resource_utilization` and labels it as
+hypervisor data. Memory and network metrics still require the guest's Oracle
+Cloud Agent publisher. A permitted monitoring configuration does not establish
+that the publisher is installed or running.
+
+`telemetry-unavailable` means at least one metric has no accepted hourly data
+in the requested window. Diagnose publication and the exact source query;
+waiting seven days alone will not repair an absent guest publisher.
+`incomplete-observation-window` means data exists but some hours are missing.
+Both leave the full idle assessment unverified and return exit status 3.
+
+Coverage requires every unique hourly timestamp in the explicit 168-hour
+window, excluding its end boundary and the current partial hour. Duplicate or
+out-of-window points cannot fill missing hours. Do not replace OCI metrics
+with guest-local load data or generate artificial activity. Even complete
+byte counters do not define Oracle's network utilization percentage.
+
+## Application data mount is missing
+
+The former `oracle-vps` scaffold identified a useful failure case: an application
+can write into a mount directory on the root filesystem when its intended data
+volume is absent. Check the exact mount target, source device and filesystem
+UUID against the selected recovery metadata. A directory's existence or a
+successful `findmnt -T` lookup only proves that a containing filesystem exists;
+it does not prove that the intended volume is mounted at that target.
+
+Preserve unexpected files in the unmounted directory. Do not format a device,
+move data or stop production applications as an automatic repair. Keep a
+recovery target's application acceptance incomplete until its actual mounts
+match the recorded layout. The old scaffold's `/srv/data` layout is historical
+and must not replace this machine's current filesystem identities.
 
 ## Object Storage total is incomplete
 

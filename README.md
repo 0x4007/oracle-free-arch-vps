@@ -108,6 +108,9 @@ agent.
 
 ## Included automation
 
+The former sibling scaffold is covered by
+[the oracle-vps consolidation record](ORACLE-VPS-CONSOLIDATION.md).
+
 - [Direct encrypted Backblaze backups](BACKBLAZE-DIRECT-BACKUP.md) send filesystem
   archives between the VPS and Backblaze. The Pi schedules and verifies jobs,
   records recovery points, and sends status notifications.
