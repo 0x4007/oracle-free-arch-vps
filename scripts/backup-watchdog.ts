@@ -8,6 +8,11 @@ import { readPrivateJson, writePrivateJson } from "./oci.ts";
 import { notifyMac } from "./backup-mac-alert.ts";
 import { readGate } from "./backblaze-controller-gate.ts";
 import type { OnlineBackupRetry } from "./online-backup-contract.ts";
+import type { GroupRestorePlan } from "./oci-group-restore-drill.ts";
+import {
+  type GroupRestoreAcceptanceReceipt,
+  validateGroupRestoreAcceptance,
+} from "./oci-group-restore-executor.ts";
 import {
   assessBackblazeWatchdog,
   type ControllerState,
@@ -86,6 +91,50 @@ export async function readBootDrillEvidence(path: string, now: Date) {
   }
 }
 
+/** Read the retained typed Oracle receipt with its digest-bound plan. This is
+ * dated proof for exactly that group and its two members, never a claim that a
+ * later capture has booted. No deleted clone or live source is needed. */
+export async function assessOracleBootDrillEvidence(
+  proof: { plan: GroupRestorePlan; acceptance: GroupRestoreAcceptanceReceipt },
+  now: Date,
+  currentGroupBackupId?: string,
+) {
+  await validateGroupRestoreAcceptance(proof.acceptance, proof.plan, now);
+  return {
+    status: "RESTORE_DRILL_PROVED",
+    observedAtUtc: proof.acceptance.observedAtUtc,
+    generation: proof.plan.volumeGroupBackupId,
+    bootMemberBackupId: proof.plan.bootMemberBackupId,
+    rootMemberBackupId: proof.plan.rootMemberBackupId,
+    planSha256: proof.acceptance.planSha256,
+    currentCaptureProved: currentGroupBackupId === undefined
+      ? null
+      : currentGroupBackupId === proof.plan.volumeGroupBackupId,
+  };
+}
+
+export async function readOracleBootDrillEvidence(
+  path: string,
+  now: Date,
+  currentGroupBackupId?: string,
+) {
+  try {
+    return await assessOracleBootDrillEvidence(
+      await readPrivateJson(path),
+      now,
+      currentGroupBackupId,
+    );
+  } catch (error) {
+    return {
+      status: error instanceof Deno.errors.NotFound
+        ? "BOOT_DRILL_UNPROVED"
+        : "BOOT_DRILL_EVIDENCE_INVALID",
+      observedAtUtc: null,
+      currentCaptureProved: null,
+    };
+  }
+}
+
 /** Preserve the existing Oracle assessment report and add the Backblaze
  * job/gate assessment; both notifications reuse the same bounded status
  * string and job UUID form. A delivery failure always remains visible.
@@ -123,7 +172,10 @@ export async function main(): Promise<void> {
     let state: {
       lastSuccessfulCaptureAtUtc?: string;
       cycle: BackupWatchdogState & {
-        captureIdentity?: { captureTimeUtc: string };
+        captureIdentity?: {
+          captureTimeUtc: string;
+          volumeGroupBackupId: string;
+        };
         retry?: OnlineBackupRetry;
       };
     } | undefined;
@@ -140,9 +192,10 @@ export async function main(): Promise<void> {
           state.lastSuccessfulCaptureAtUtc ?? null
         : state?.lastSuccessfulCaptureAtUtc ?? null,
       lastArchiveVerificationAtUtc: null,
-      lastBootDrill: await readBootDrillEvidence(
+      lastBootDrill: await readOracleBootDrillEvidence(
         ".private/reports/online-oracle-boot.json",
         now,
+        state?.cycle.captureIdentity?.volumeGroupBackupId,
       ),
       observedAtUtc: now.toISOString(),
       notificationSent: false,

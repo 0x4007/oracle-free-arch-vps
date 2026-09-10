@@ -4,6 +4,31 @@ Canonical lane: `weekly-backup-restore-cycle-g2f1e8856a4`, branch
 `codex/weekly-backup-restore-cycle-g2f1e8856a4`. The controlling handoff is
 `ONLINE-BACKUP-RECOVERY-HANDOFF-2026-09-06.md` in the repository root.
 
+## Recovery evidence update, 2026-09-10
+
+The online Oracle group `arch-online-golden-20260908T061252Z` now has its own
+accepted restore, eleven typed checks, visual desktop proof and completed
+cleanup. Plan digest:
+`fd665dbb9edc6ceff76313165c62d51b1763c50585225594f66a41ea1b3e350b`. This
+supersedes the September 6 deferral and unproved status for that group only. It
+does not transfer boot proof to later captures.
+
+Independent Backblaze generation
+`generation-a0f12b6f-6c4b-436a-b547-58090e39ae71` has direct cloud recovery
+evidence: September 8 visual desktop proof and a separate September 9
+application acceptance at runtime `6993583`. These are different boots, not one
+combined acceptance run. Both recovery paths were operator-assisted. Use
+[RECOVERY-PROCEDURE.md](RECOVERY-PROCEDURE.md) with a complete retained
+revision; historical private operator scripts are not replay instructions.
+
+Later cleanup proved three Oracle backup members and two free slots with
+production unchanged. Runtime and kit deployment are revision-bound in their
+receipts. Clean unchanged-bundle restoration, continued weekly history and
+post-trial zero-bill observations remain unverified. The corrected audit proves
+168 CPU hours, but unavailable guest memory/network telemetry prevents a full
+idle-risk verdict. Dated observations below remain historical evidence, not
+current missing-work claims.
+
 ## Running Oracle path
 
 The Pi runs `backup-scheduled.ts` through the existing weekly service. Its normal
@@ -99,7 +124,9 @@ Use `backblaze-machine-restore.ts` with the existing private JSON input conventi
 selected index and digest, matching metadata, verified plaintext descriptors,
 and an approved serial-bound target. It returns `FILESYSTEMS_REBUILT`, never a
 boot claim. Before boot, set clone identities, mask outbound jobs, isolate the
-network, refresh hostname-bound X11 authentication, and remove the rescue share.
+network, test hostname-bound X11 authentication, and remove the rescue share.
+Repair the X11 cookie only if the actual desktop authentication check fails;
+retain and verify that intervention.
 Then run the SSH, filesystem, data, application and desktop acceptance checks.
 The private kit retains the exact tested host/rescue commands and library hashes.
 

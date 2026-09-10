@@ -94,6 +94,9 @@ separately approved disaster recovery, restore, or one-time build work.
    online weekly pairs follow `ONLINE-BACKUP-CONTRACT.md` instead.
 6. Pass every item in `05-ACCEPTANCE.md`.
 7. Use `06-TROUBLESHOOTING.md` for evidence-first recovery from failures.
+8. Use [RECOVERY-PROCEDURE.md](RECOVERY-PROCEDURE.md) for the retained Oracle
+   and independent Backblaze restore sequence, required off-source inputs and
+   the limits of the dated operator-assisted recovery proof.
 8. Configure the restore and weekly audit tools in
    `07-OPERATIONS-AND-DRILLS.md`.
 9. Use `templates/FINAL-REPORT.md` for the evidence handoff.

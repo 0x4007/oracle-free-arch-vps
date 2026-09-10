@@ -1,6 +1,48 @@
 # Pi-orchestrated replacement recovery
 
-## Current verified state, 2026-09-08 07:39 UTC
+## Current evidence, 2026-09-10
+
+The Oracle group `arch-online-golden-20260908T061252Z` passed real restored
+boot, all eleven typed acceptance checks and visual Xfce inspection on
+September 10. Its plan digest is
+`fd665dbb9edc6ceff76313165c62d51b1763c50585225594f66a41ea1b3e350b` and its clone
+boot is `c5890f7a-2705-4b25-ae43-5dc02a9bb554`. The accepted result is `CLEANED`
+with `restoreDrillProved=true`. This is exact-group proof, not proof for another
+capture or a separate fallback-OS boot.
+
+Backblaze generation `generation-a0f12b6f-6c4b-436a-b547-58090e39ae71`, index
+digest `617de2f54e795c52958f0579d93695d10dac9a0697b5d0d54c2abf8a7649c72a`, has
+September 8 visual proof for boot `0a09ad14-96cb-49ed-a216-7868a0a39a98` and a
+separate September 9 `RESTORED_APPLICATIONS_ACCEPTED` receipt for boot
+`d8a59e46-7f6a-4c1b-bc5e-f8039797e7d2` at runtime `6993583`. The latter is not
+an additional visual-desktop receipt or a successor-kit execution.
+
+Both paths required recorded operator corrections. Use
+[RECOVERY-PROCEDURE.md](RECOVERY-PROCEDURE.md) for the retained procedure and
+exact input/stage boundaries. Clean unchanged-bundle and fully unattended
+restoration remain unverified. The private evidence is retained under
+`fresh-closeout-20260909/01-delivery-kit`, `02-oracle-restore` and
+`03-final-verification`, plus the independent dated recovery kit.
+
+September 10 cleanup evidence proves one running production VPS, 2 OCPU, 12 GB
+RAM, 200 GB disks, one IP, three backup members and two free member slots.
+Source boot and required services stayed unchanged. PR #62 deployed 53 runtime
+files at `052830e`; the preceding revision-bound kit is `fc690b0`. Deployment
+receipts and kit manifests identify subsequent deliveries separately from these
+dated live restore runs.
+
+The corrected weekly audit has 168 completed CPU hours from the hypervisor
+namespace. Guest memory/network data remain unavailable, so the full idle-risk
+verdict remains unverified. Four naturally accumulated weekly periods, later
+unattended cycles and lasting post-trial zero cost remain observation gaps. The
+later September 8 overlap receipt keeps issue #35's ordinary overlap property
+proved; older negative flags below do not reopen it.
+
+All sections below are historical observations or implementation-stage records.
+Their old unproved, cleanup-pending and free-only restrictions are superseded
+only by the dated evidence above and standing `DEVELOPMENT-BUDGET.md` authority.
+
+## Historical state, 2026-09-08 07:39 UTC
 
 The latest verified live deployment and Pi runtime are at source revision
 `8dcf3edc0e47f7aa68097759d23819a728732df7`. The canonical branch contains
@@ -40,7 +82,7 @@ Always Free production VPS plus its accepted online recovery unit and safe
 rotation headroom. These are evidence boundaries, not cleanup or deployment
 pending states.
 
-## Current verified recovery state, 2026-09-08
+## Historical recovery state, 2026-09-08
 
 On 2026-09-08, independent generation `generation-a0f12b6f-6c4b-436a-b547-58090e39ae71`
 was streamed directly B2-to-isolated-Oracle: all six filesystem archives reconstructed,
