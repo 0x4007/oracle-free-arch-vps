@@ -118,6 +118,11 @@ The former sibling scaffold is covered by
 and network observations through read-only SSH; it does not replace Oracle's
 native metrics or establish its idle-policy verdict.
 
+[Bounded unattended reconstruction](UNATTENDED-RECOVERY.md) uses one exact
+reconstruction authorization. [Calendar observations](CALENDAR-OBSERVATIONS.md)
+retain dated weekly, telemetry and provisional billing evidence. Future dates
+and a clean live unattended restore remain separate acceptance requirements.
+
 - [Direct encrypted Backblaze backups](BACKBLAZE-DIRECT-BACKUP.md) send filesystem
   archives between the VPS and Backblaze. The Pi schedules and verifies jobs,
   records recovery points, and sends status notifications.

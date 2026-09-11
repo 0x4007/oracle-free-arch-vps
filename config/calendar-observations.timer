@@ -1,0 +1,16 @@
+[Unit]
+Description=Observe real recovery milestones on their calendar dates
+
+[Timer]
+OnCalendar=2026-09-13 06:00:00 UTC
+OnCalendar=2026-09-18 06:00:00 UTC
+OnCalendar=2026-09-20 06:00:00 UTC
+OnCalendar=2026-09-27 06:00:00 UTC
+OnCalendar=2026-09-30 06:00:00 UTC
+OnCalendar=2026-10-02 06:00:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=calendar-observations.service
+
+[Install]
+WantedBy=timers.target
