@@ -33,6 +33,9 @@ type ControllerProcess = {
   args: string;
 };
 
+/** No mutation may proceed while another writer is not proved safe. */
+export class ControllerWriterActiveError extends Error {}
+
 /** Another controller's startup chain can contain shell/launcher processes
  * before its Deno process reaches the shared lock. A wrapper never proves a
  * queued lock by itself; it only bounds the fresh observations allowed while
@@ -229,7 +232,9 @@ export function backupControllerEvidence(
     },
     assertNoOtherController: async () => {
       const writerActive = () =>
-        new Error("Another backup or infrastructure writer is active");
+        new ControllerWriterActiveError(
+          "Another backup or infrastructure writer is active",
+        );
       type OwnedLockIdentity = {
         pid: number;
         path: string;

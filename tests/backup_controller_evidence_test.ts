@@ -5,6 +5,59 @@ import {
 } from "../scripts/backup-controller-evidence.ts";
 import { objectStorage } from "../scripts/oci-weekly-audit.ts";
 import { RetryableObservationError } from "../scripts/online-backup-contract.ts";
+import { runUnattendedStep } from "../scripts/pi-recovery-session.ts";
+
+Deno.test("unattended handoff waits for a real writer guard and rechecks before continuing", async () => {
+  let competingWriter = true;
+  let mutations = 0;
+  const evidence = backupControllerEvidence(
+    {
+      ociCliPath: "oci",
+      ociProfile: "DEFAULT",
+      tenancyId: "tenancy",
+      source: {
+        instanceId: "instance",
+        bootVolumeId: "boot",
+        rootVolumeId: "root",
+        compartmentId: "tenancy",
+        region: "region",
+      },
+    },
+    () =>
+      Promise.resolve({
+        code: 0,
+        stdout: "1 0 init init" +
+          (competingWriter ? "\n30 1 oci oci bv backup create" : ""),
+        stderr: "",
+      }),
+  );
+  const step = () =>
+    runUnattendedStep(async () => {
+      await evidence.assertNoOtherController();
+      mutations++;
+      return "CONSOLE_PENDING";
+    });
+  assert(await step() === "CONTROLLER_BUSY");
+  assert(mutations === 0);
+  competingWriter = false;
+  assert(await step() === "CONSOLE_PENDING");
+  assert(Number(mutations) === 1);
+  for (
+    const failure of [
+      new Error("Another backup or infrastructure writer is active"),
+      new Error("Uncertain create response"),
+      new Error("Approval expired"),
+    ]
+  ) {
+    let caught: unknown;
+    try {
+      await runUnattendedStep(() => Promise.reject(failure));
+    } catch (error) {
+      caught = error;
+    }
+    assert(caught === failure);
+  }
+});
 
 function assert(value: unknown): asserts value {
   if (!value) throw new Error("Assertion failed");

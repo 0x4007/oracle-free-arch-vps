@@ -4,7 +4,10 @@
  */
 import { createHash } from "node:crypto";
 import { withBackupLock } from "./backup-lock.ts";
-import { backupControllerEvidence } from "./backup-controller-evidence.ts";
+import {
+  backupControllerEvidence,
+  ControllerWriterActiveError,
+} from "./backup-controller-evidence.ts";
 import {
   assertOracleMutationAllowed,
   readGate,
@@ -1141,6 +1144,17 @@ export async function runRecoverySession(
 /** One process owns the whole unattended run; individual steps retain the shared
  * infrastructure lock. Only explicit pending states are polled. Exceptions and
  * uncertain writes remain visible failures and never trigger blind retries. */
+export async function runUnattendedStep(
+  work: () => Promise<string>,
+): Promise<string> {
+  try {
+    return await work();
+  } catch (error) {
+    if (error instanceof ControllerWriterActiveError) return "CONTROLLER_BUSY";
+    throw error;
+  }
+}
+
 export async function runRecovery(): Promise<void> {
   const initial = await readPrivateJson<SessionConfig>(CONFIG);
   if (!initial.unattended) {
@@ -1201,7 +1215,7 @@ export async function runRecovery(): Promise<void> {
         config.requestId !== initial.requestId
       ) throw Error("Unattended run authority changed");
       await unattendedContext(config);
-      const status = await runRecoverySession();
+      const status = await runUnattendedStep(() => runRecoverySession());
       await writePrivateJson(".private/reports/pi-recovery-unattended.json", {
         status,
         requestId: config.requestId,
@@ -1216,6 +1230,7 @@ export async function runRecovery(): Promise<void> {
       if (
         ![
           "REPLACEMENT_PROVISIONING",
+          "CONTROLLER_BUSY",
           "CONSOLE_PENDING",
           "CONSOLE_APPROVAL_REQUIRED",
           "RESCUE_STAGING_PENDING",
@@ -1227,6 +1242,25 @@ export async function runRecovery(): Promise<void> {
       await new Promise((resolve) => setTimeout(resolve, 15000));
     }
     throw Error("Unattended recovery step bound exhausted");
+  }).catch(async (error: unknown) => {
+    // Retain code locations without command output, arguments or secret values.
+    await writePrivateJson(
+      ".private/reports/pi-recovery-unattended-failure.json",
+      {
+        status: "UNATTENDED_RECOVERY_FAILED",
+        requestId: initial.requestId,
+        authorizationSha256: originalAuthority,
+        observedAtUtc: new Date().toISOString(),
+        applicationAccepted: false,
+        frames: error instanceof Error
+          ? (error.stack ?? "").split("\n").filter((line) =>
+            /^\s+at (?:[A-Za-z0-9_.<>]+ )?\(?file:\/\/[^\s()]+:\d+:\d+\)?$/
+              .test(line)
+          ).slice(0, 12)
+          : [],
+      },
+    );
+    throw error;
   });
 }
 if (import.meta.main) {

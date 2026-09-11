@@ -1,9 +1,9 @@
 # Bounded unattended reconstruction
 
-`deno task backup:replace` uses the existing Pi recovery entry point. An explicit
-`unattended` authorization in `.private/pi-machine-recovery.json` enables one
-bounded reconstruction run after the destination and independent generation are
-selected. Provisioning approval alone does not enable this mode.
+`deno task backup:replace` uses the existing Pi recovery entry point. An
+explicit `unattended` authorization in `.private/pi-machine-recovery.json`
+enables one bounded reconstruction run after the destination and independent
+generation are selected. Provisioning approval alone does not enable this mode.
 
 Read the owner-controlled PROJECT-VISION.md, DEVELOPMENT-BUDGET.md and
 RECOVERY-PROCEDURE.md first. This implementation has not yet passed a clean live
@@ -18,13 +18,13 @@ request; never clear uncertain work to start over. Keep the source online.
 
 The existing replacement configuration must include its exact provisioning
 approval and existing RSA console public key. The selected generation must occur
-exactly once in `.private/file-backup/controller.json`. The controller loads this
-off-source catalog and its deployed runtime receipt; it does not fetch recovery
-inputs from production.
+exactly once in `.private/file-backup/controller.json`. The controller loads
+this off-source catalog and its deployed runtime receipt; it does not fetch
+recovery inputs from production.
 
-Use `unattendedRecoveryPlan` from `scripts/pi-recovery-authority.ts` to calculate
-the authorization digest from the replacement configuration, selected index
-SHA-256, deployed source revision and expiry. Record these fields under
+Use `unattendedRecoveryPlan` from `scripts/pi-recovery-authority.ts` to
+calculate the authorization digest from the replacement configuration, selected
+index SHA-256, deployed source revision and expiry. Record these fields under
 `unattended` in the existing private configuration:
 
 - `planSha256`: the returned digest.
@@ -54,18 +54,30 @@ existing key-agent socket temporarily; it does not relay archives.
 Only explicit pending states are revisited, at 15-second intervals, with at most
 480 steps and repeated authority checks. Exceptions, exhausted console attempts,
 changed identities and uncertain disk/restore/isolation writes stop visibly.
-Reconcile these exact operations before continuation; never delete their intents.
-The controller rechecks trial coverage before mutations and cannot silently
-extend its authorization. An operation already in flight retains its existing
-stage-specific bounds; the authorization is not a forced process-kill deadline.
+Reconcile these exact operations before continuation; never delete their
+intents. The controller rechecks trial coverage before mutations and cannot
+silently extend its authorization. An operation already in flight retains its
+existing stage-specific bounds; the authorization is not a forced process-kill
+deadline.
 
 Read `.private/reports/pi-recovery-unattended.json` for progress and
 `.private/reports/pi-recovery-session.json` plus the stage journals for details.
-`RESTORED_APPLICATIONS_ACCEPTED` means the existing SSH/application checks passed.
-It does not establish visual desktop acceptance or cleanup. Keep independent
-visual/runtime acceptance and exact task-owned cleanup as separate drill stages.
+`RESTORED_APPLICATIONS_ACCEPTED` means the existing SSH/application checks
+passed. It does not establish visual desktop acceptance or cleanup. Keep
+independent visual/runtime acceptance and exact task-owned cleanup as separate
+drill stages.
 
-A first unattended run refuses pre-existing session, restoration or restore-input
-state and operator-supplied stage approvals. A resumed run must retain its own
-request and authorization journal. This prevents an earlier repaired restoration
-from being reported as a clean unattended run.
+A first unattended run refuses pre-existing session, restoration or
+restore-input state and operator-supplied stage approvals. A resumed run must
+retain its own request and authorization journal. This prevents an earlier
+repaired restoration from being reported as a clean unattended run.
+
+# Transient writer conflicts
+
+The unattended driver records `CONTROLLER_BUSY` when the infrastructure writer
+guard refuses a step. It makes no guarded mutation, waits within the original
+deadline, then repeats reconciliation. This does not bypass the writer guard.
+Other errors, including uncertain writes and expired authority, still stop the
+run. A stopped run retains source-code failure locations in the private
+`pi-recovery-unattended-failure.json` report without command arguments or
+output.
