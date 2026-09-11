@@ -380,38 +380,44 @@ Deno.test("gate change after durable intent prevents the SSH reboot", async () =
   assert(f.reboots === 0 && f.saved.rebootIntent);
 });
 
-Deno.test("new unattended run rejects an old checkpoint before provider access", async () => {
-  const { runRecovery } = await import("../scripts/pi-recovery-session.ts");
-  const previous = Deno.cwd();
-  const directory = await Deno.makeTempDir();
-  try {
-    Deno.chdir(directory);
-    await Deno.mkdir(".private");
-    // No cloud configuration or credentials: preflight must stop before using them.
-    await Deno.writeTextFile(
-      ".private/pi-machine-recovery.json",
-      JSON.stringify({
-        requestId: request.requestId,
-        unattended: {},
-      }),
-      { mode: 0o600 },
-    );
-    const checkpoint = "historical checkpoint preserved byte-for-byte\n";
-    await Deno.writeTextFile(
-      ".private/pi-recovery-checkpoint.json",
-      checkpoint,
-    );
-    await rejects(runRecovery(), "Pre-existing reconstruction state");
-    assert(
-      await Deno.readTextFile(".private/pi-recovery-checkpoint.json") ===
+Deno.test({
+  name: "new unattended run rejects an old checkpoint before provider access",
+  ignore:
+    (await Deno.permissions.query({ name: "read" })).state !== "granted" ||
+    (await Deno.permissions.query({ name: "write" })).state !== "granted",
+  fn: async () => {
+    const { runRecovery } = await import("../scripts/pi-recovery-session.ts");
+    const previous = Deno.cwd();
+    const directory = await Deno.makeTempDir();
+    try {
+      Deno.chdir(directory);
+      await Deno.mkdir(".private");
+      // No cloud configuration or credentials: preflight must stop before using them.
+      await Deno.writeTextFile(
+        ".private/pi-machine-recovery.json",
+        JSON.stringify({
+          requestId: request.requestId,
+          unattended: {},
+        }),
+        { mode: 0o600 },
+      );
+      const checkpoint = "historical checkpoint preserved byte-for-byte\n";
+      await Deno.writeTextFile(
+        ".private/pi-recovery-checkpoint.json",
         checkpoint,
-    );
-    await rejects(
-      Deno.lstat(".private/pi-recovery-unattended.json"),
-      "No such file",
-    );
-  } finally {
-    Deno.chdir(previous);
-    await Deno.remove(directory, { recursive: true });
-  }
+      );
+      await rejects(runRecovery(), "Pre-existing reconstruction state");
+      assert(
+        await Deno.readTextFile(".private/pi-recovery-checkpoint.json") ===
+          checkpoint,
+      );
+      await rejects(
+        Deno.lstat(".private/pi-recovery-unattended.json"),
+        "No such file",
+      );
+    } finally {
+      Deno.chdir(previous);
+      await Deno.remove(directory, { recursive: true });
+    }
+  },
 });
