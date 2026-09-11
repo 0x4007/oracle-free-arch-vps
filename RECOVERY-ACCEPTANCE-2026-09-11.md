@@ -71,10 +71,12 @@ billing remain pending actual observations. A scheduled timer cannot establish
 those results in advance. Read
 [CALENDAR-OBSERVATIONS.md](CALENDAR-OBSERVATIONS.md).
 
-Known limits remain tracked: telemetry interrupted-append loss
+The accepted restore revision had three tracked observation defects: telemetry interrupted-append loss
 [#64](https://github.com/0x4007/oracle-free-arch-vps/issues/64), cost pagination
 [#67](https://github.com/0x4007/oracle-free-arch-vps/issues/67), and missing
 guest surface status
-[#68](https://github.com/0x4007/oracle-free-arch-vps/issues/68). These are
-unresolved, not waived or verified fixes. The full owner charter is not complete
+[#68](https://github.com/0x4007/oracle-free-arch-vps/issues/68). Subsequent collector
+corrections preserve record boundaries, follow bounded cost pagination and report
+unavailable guest summaries as partial. Local regressions cover these failures;
+they do not change or extend the historical restore proof. The full owner charter is not complete
 while calendar evidence and its other required outcomes remain open.

@@ -1,6 +1,8 @@
 import {
   guestNetworkRate,
+  main,
   parseGuestSample,
+  readGuestTelemetrySummary,
   summarizeGuestSamples,
 } from "../scripts/guest-telemetry.ts";
 const root = "11111111-1111-4111-8111-111111111111";
@@ -157,4 +159,44 @@ Deno.test("guest network discontinuity remains visible with complete memory cove
     result.status === "complete" && result.networkStatus === "incomplete" &&
       result.networkIntervalsObserved === 0,
   );
+});
+
+Deno.test({
+  name:
+    "collector preserves an interrupted fragment and the next successful sample",
+  ignore:
+    (await Deno.permissions.query({ name: "read" })).state !== "granted" ||
+    (await Deno.permissions.query({ name: "write" })).state !== "granted",
+  fn: async () => {
+    const previous = Deno.cwd(), directory = await Deno.makeTempDir();
+    try {
+      Deno.chdir(directory);
+      await Deno.mkdir(".private/guest-telemetry", { recursive: true });
+      await Deno.writeTextFile(
+        ".private/backup-controller.json",
+        JSON.stringify({
+          source: { instanceId: instance },
+          guest: { host: "codex@vps.pavlovcik.com", rootUuid: root },
+        }),
+        { mode: 0o600 },
+      );
+      const date = new Date().toISOString().slice(0, 10);
+      const path = `.private/guest-telemetry/${date}.jsonl`;
+      await Deno.writeTextFile(path, '{"sample":');
+      await main(() => Promise.resolve({ code: 0, stdout: raw, stderr: "" }));
+      const lines = (await Deno.readTextFile(path)).trimEnd().split("\n");
+      assert(lines.length === 2 && lines[0] === '{"sample":');
+      assert(JSON.parse(lines[1]).sample.instanceId === instance);
+      const end = new Date(Math.floor(Date.now() / 60000) * 60000 + 60000);
+      const summary = await readGuestTelemetrySummary(
+        instance,
+        new Date(end.getTime() - 120000),
+        end,
+      );
+      assert(summary.observedMinutes === 1 && summary.malformedRecords === 1);
+    } finally {
+      Deno.chdir(previous);
+      await Deno.remove(directory, { recursive: true });
+    }
+  },
 });

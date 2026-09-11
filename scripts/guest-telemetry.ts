@@ -316,10 +316,23 @@ export async function main(
     using file = await Deno.open(`${DIRECTORY}/${date}.jsonl`, {
       create: true,
       append: true,
+      read: true,
       write: true,
       mode: 0o600,
     });
-    const bytes = new TextEncoder().encode(JSON.stringify(record) + "\n");
+    let separator = "";
+    if ((await file.stat()).size > 0) {
+      await file.seek(-1, Deno.SeekMode.End);
+      const last = new Uint8Array(1);
+      if (await file.read(last) !== 1) {
+        throw Error("Telemetry tail is unreadable");
+      }
+      // Preserve an interrupted fragment, but do not join the new sample to it.
+      if (last[0] !== 10) separator = "\n";
+    }
+    const bytes = new TextEncoder().encode(
+      separator + JSON.stringify(record) + "\n",
+    );
     let offset = 0;
     while (offset < bytes.length) {
       offset += await file.write(bytes.subarray(offset));
