@@ -296,6 +296,28 @@ const allowedRun =
   (await Deno.permissions.query({ name: "run", command: "bash" })).state ===
     "granted";
 Deno.test({
+  name: "loader waits for assigned-IP egress before the package stage",
+  ignore: !allowedRead || !allowedRun,
+  fn: async () => {
+    const config = JSON.parse(
+      (await buildRescueCloudInit(input)).slice("#cloud-config\n".length),
+    );
+    const wait = config.bootcmd[1];
+    assert(wait[0] === "timeout" && wait[1] === "1800");
+    assert(wait[2] === "bash" && wait[3] === "-ec");
+    // Exercise the generated loop without network or delays: egress becomes
+    // available on the third probe, just as the reserved IP can arrive later.
+    const fixture =
+      `attempts=0\ncurl() { attempts=$((attempts + 1)); test "$attempts" -ge 3; }\nsleep() { :; }\n${
+        wait[4]
+      }\ntest "$attempts" = 3`;
+    const result = await new Deno.Command("bash", { args: ["-ec", fixture] })
+      .output();
+    if (!result.success) throw Error(new TextDecoder().decode(result.stderr));
+    assert(config.packages.includes("kexec-tools"));
+  },
+});
+Deno.test({
   name: "generated assembler and account scripts pass actual shell parsing",
   ignore: !allowedRun,
   fn: async () => {

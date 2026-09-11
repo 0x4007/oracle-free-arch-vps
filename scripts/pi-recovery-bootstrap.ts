@@ -378,7 +378,15 @@ export async function buildRescueCloudInit(
       }],
       disable_root: true,
       ssh_pwauth: false,
-      bootcmd: [["bash", "-ec", guard]],
+      // This isolated subnet has no NAT. The reserved IP is assigned after
+      // launch, so package installation must wait for actual outbound access.
+      bootcmd: [["bash", "-ec", guard], [
+        "timeout",
+        "1800",
+        "bash",
+        "-ec",
+        `until curl --ipv4 --fail --silent --show-error --connect-timeout 10 --max-time 20 --output /dev/null ${UBUNTU_PORTS_MIRROR}/dists/noble/InRelease; do sleep 15; done`,
+      ]],
       apt: {
         preserve_sources_list: false,
         primary: [{ arches: ["arm64", "default"], uri: UBUNTU_PORTS_MIRROR }],
