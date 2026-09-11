@@ -580,6 +580,8 @@ export async function proveTrialFunding(
   }
 }
 
+export class ReplacementPendingError extends Error {}
+
 export async function runReplacement(
   runner: CommandRunner = defaultRunner,
   fetchDocument?: () => Promise<string>,
@@ -669,11 +671,6 @@ export async function runReplacement(
       }
       if (instances[0]) {
         const instance = instances[0];
-        if (instance["lifecycle-state"] !== "RUNNING") {
-          throw Error(
-            "Replacement is not running; reconcile this request before continuing",
-          );
-        }
         const shape = dataObject({ data: instance["shape-config"] });
         if (
           instance.shape !== "VM.Standard.A1.Flex" || shape.ocpus !== 2 ||
@@ -686,6 +683,21 @@ export async function runReplacement(
           state.instanceId && state.instanceId !== instance.id
         ) throw Error("Replacement instance specification drift");
         state.instanceId = stringField(instance, "id");
+        if (
+          ["PROVISIONING", "STARTING"].includes(
+            String(instance["lifecycle-state"]),
+          )
+        ) {
+          await save();
+          throw new ReplacementPendingError(
+            "The exact replacement instance is still starting",
+          );
+        }
+        if (instance["lifecycle-state"] !== "RUNNING") {
+          throw Error(
+            "Replacement is not running; reconcile this request before continuing",
+          );
+        }
         const attachments = dataArray(
           await call([
             "compute",
@@ -976,10 +988,13 @@ export async function runReplacement(
       const root = dataObject(
         await call(["bv", "volume", "get", "--volume-id", state.rootVolumeId]),
       );
-      if (root["lifecycle-state"] !== "AVAILABLE") {
-        throw Error(
+      if (root["lifecycle-state"] === "PROVISIONING") {
+        throw new ReplacementPendingError(
           "Replacement root is still provisioning; resume this same request later",
         );
+      }
+      if (root["lifecycle-state"] !== "AVAILABLE") {
+        throw Error("Replacement root is not available or provisioning");
       }
       await preMutation();
       if (state.instanceId) {

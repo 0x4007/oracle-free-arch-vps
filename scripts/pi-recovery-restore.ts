@@ -977,12 +977,21 @@ export interface RecoveryRestorationPorts {
   beforeMutation: () => Promise<void>;
   persist: (state: RecoveryRestorationState) => Promise<void>;
   report: (value: unknown) => Promise<void>;
-  installationApproval: () => Promise<
+  installationApproval: (
+    plan: ReturnType<typeof recoveryTargetInstallPlan>,
+  ) => Promise<
     RecoveryTargetInstallApproval | undefined
   >;
-  preparationApproval: () => Promise<PreparationApproval | undefined>;
-  isolationApproval: () => Promise<IsolationExecutionApproval | undefined>;
-  restoredBootApproval: () => Promise<
+  preparationApproval: (
+    plan: DiskPreparationPlan,
+  ) => Promise<PreparationApproval | undefined>;
+  isolationApproval: (
+    plan: RecoveryIsolationPlan,
+    inspection: IsolationInspection,
+  ) => Promise<IsolationExecutionApproval | undefined>;
+  restoredBootApproval: (
+    plan: import("./pi-recovery-acceptance.ts").RestoredBootPlan,
+  ) => Promise<
     import("./pi-recovery-acceptance.ts").RestoredBootApproval | undefined
   >;
   isolationEvent?: (value: unknown) => Promise<void>;
@@ -1074,7 +1083,10 @@ export async function continueReplacementRestoration(
         });
         return "COPIED_ROOT_ISOLATION_RECONCILIATION_REQUIRED";
       }
-      const approval = await ports.isolationApproval();
+      const approval = await ports.isolationApproval(
+        state.isolationPlan,
+        state.isolationInspection,
+      );
       if (!approval) {
         await ports.report({
           status: "COPIED_ROOT_ISOLATION_APPROVAL_REQUIRED",
@@ -1119,7 +1131,7 @@ export async function continueReplacementRestoration(
       await save();
     }
     if (!state.restoredBootIntent) {
-      const approval = await ports.restoredBootApproval();
+      const approval = await ports.restoredBootApproval(state.restoredBootPlan);
       if (!approval) {
         await ports.report({
           status: "RESTORED_BOOT_APPROVAL_REQUIRED",
@@ -1166,7 +1178,7 @@ export async function continueReplacementRestoration(
     });
     return "RESTORE_RECONCILIATION_REQUIRED";
   }
-  const installation = await ports.installationApproval();
+  const installation = await ports.installationApproval(plan);
   if (!installation) {
     await ports.report({
       status: "RESTORE_INSTALLATION_APPROVAL_REQUIRED",
@@ -1207,7 +1219,7 @@ export async function continueReplacementRestoration(
     }
     state.preparationPlan = diskPlan;
     await save();
-    const approval = await ports.preparationApproval();
+    const approval = await ports.preparationApproval(diskPlan);
     if (!approval) {
       await ports.report({
         status: "DISK_PREPARATION_APPROVAL_REQUIRED",
@@ -1220,7 +1232,7 @@ export async function continueReplacementRestoration(
       approval,
       async (event) => {
         await ports.beforeMutation();
-        const fresh = await ports.preparationApproval();
+        const fresh = await ports.preparationApproval(diskPlan);
         if (JSON.stringify(fresh) !== JSON.stringify(approval)) {
           throw Error("Disk preparation authority changed");
         }
@@ -1236,7 +1248,7 @@ export async function continueReplacementRestoration(
     await save();
   }
   await ports.beforeMutation();
-  const freshInstallation = await ports.installationApproval();
+  const freshInstallation = await ports.installationApproval(plan);
   assertInstallApproval(plan, freshInstallation!);
   const socket = await ssh("gpgconf", [
     "--homedir",
