@@ -4,7 +4,15 @@ Canonical lane: `weekly-backup-restore-cycle-g2f1e8856a4`, branch
 `codex/weekly-backup-restore-cycle-g2f1e8856a4`. The controlling handoff is
 `ONLINE-BACKUP-RECOVERY-HANDOFF-2026-09-06.md` in the repository root.
 
-## Recovery evidence update, 2026-09-10
+## Recovery evidence update, 2026-09-11
+
+One clean unattended Backblaze reconstruction at runtime
+`d462c6d159dc2103af3d94b703a61b530dfd051b` passed application acceptance on
+September 11 at 11:43 UTC, followed by a separate visual desktop check. See
+[the exact run and remaining limits](RECOVERY-ACCEPTANCE-2026-09-11.md).
+Guest minute collection and the dated calendar observer are installed; complete
+seven-day coverage, natural weekly accumulation and post-trial zero billing
+remain pending. The following September 10 evidence remains historical.
 
 The online Oracle group `arch-online-golden-20260908T061252Z` now has its own
 accepted restore, eleven typed checks, visual desktop proof and completed

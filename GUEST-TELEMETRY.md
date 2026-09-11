@@ -27,7 +27,10 @@ It reports unique minute coverage, missing minutes, memory statistics and
 network interval coverage for the same completed seven-day window. Duplicate
 samples and the current partial hour cannot fill missing minutes. An interrupted
 JSONL write remains visible as a malformed record; it is not fabricated data.
-Successful collection today does not establish a complete seven-day history.
+Successful collection today does not establish a complete seven-day history. The
+interrupted-append defect tracked in
+[#64](https://github.com/0x4007/oracle-free-arch-vps/issues/64) can also cause
+the next appended sample to join that fragment and be excluded from coverage.
 
 ## Oracle-native metrics remain separate
 
