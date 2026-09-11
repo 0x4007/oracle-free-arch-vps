@@ -671,11 +671,6 @@ export async function runReplacement(
       }
       if (instances[0]) {
         const instance = instances[0];
-        if (instance["lifecycle-state"] !== "RUNNING") {
-          throw Error(
-            "Replacement is not running; reconcile this request before continuing",
-          );
-        }
         const shape = dataObject({ data: instance["shape-config"] });
         if (
           instance.shape !== "VM.Standard.A1.Flex" || shape.ocpus !== 2 ||
@@ -688,6 +683,21 @@ export async function runReplacement(
           state.instanceId && state.instanceId !== instance.id
         ) throw Error("Replacement instance specification drift");
         state.instanceId = stringField(instance, "id");
+        if (
+          ["PROVISIONING", "STARTING"].includes(
+            String(instance["lifecycle-state"]),
+          )
+        ) {
+          await save();
+          throw new ReplacementPendingError(
+            "The exact replacement instance is still starting",
+          );
+        }
+        if (instance["lifecycle-state"] !== "RUNNING") {
+          throw Error(
+            "Replacement is not running; reconcile this request before continuing",
+          );
+        }
         const attachments = dataArray(
           await call([
             "compute",

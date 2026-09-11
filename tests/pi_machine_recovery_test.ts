@@ -5,6 +5,7 @@ import {
   proveTrialFunding,
   type ReplacementConfig,
   type ReplacementInventory,
+  ReplacementPendingError,
   replacementPlanDigest,
   type ReplacementState,
   runReplacement,
@@ -379,6 +380,8 @@ Deno.test({
       let eligibilityReads = 0;
       let assignedIp: string | null = null;
       let assignments = 0;
+      let instanceLifecycle = "RUNNING";
+      let wrongShape = false;
       const runner: CommandRunner = (command, args) => {
         if (command === "ps") {
           return Promise.resolve({
@@ -497,14 +500,14 @@ Deno.test({
           data = launches
             ? [{
               id: "ocid1.instance.example",
-              shape: "VM.Standard.A1.Flex",
+              shape: wrongShape ? "wrong" : "VM.Standard.A1.Flex",
               "shape-config": { ocpus: 2, "memory-in-gbs": 12 },
               "image-id": config.platformImageId,
               "launch-options": { "is-consistent-volume-naming-enabled": true },
               "compartment-id": config.compartmentId,
               "availability-domain": config.availabilityDomain,
               "freeform-tags": { uosRecoveryRequest: config.requestId },
-              "lifecycle-state": "RUNNING",
+              "lifecycle-state": instanceLifecycle,
             }]
             : [];
         } else if (line.includes("bv boot-volume list")) {
@@ -604,6 +607,40 @@ Deno.test({
         final.rootVolumeId === root!.id &&
           final.instanceId === "ocid1.instance.example" && !final.pending,
       );
+      for (const lifecycle of ["PROVISIONING", "STARTING"]) {
+        instanceLifecycle = lifecycle;
+        let pending = false;
+        try {
+          await run();
+        } catch (error) {
+          pending = error instanceof ReplacementPendingError;
+        }
+        assert(pending, "Expected bounded pending lifecycle: " + lifecycle);
+        assert(assignments === 0 && creates === 1 && Number(launches) === 1);
+      }
+      wrongShape = true;
+      let drift: unknown;
+      try {
+        await run();
+      } catch (error) {
+        drift = error;
+      }
+      assert(
+        drift instanceof Error && !(drift instanceof ReplacementPendingError),
+      );
+      wrongShape = false;
+      instanceLifecycle = "STOPPED";
+      let stopped: unknown;
+      try {
+        await run();
+      } catch (error) {
+        stopped = error;
+      }
+      assert(
+        stopped instanceof Error &&
+          !(stopped instanceof ReplacementPendingError),
+      );
+      instanceLifecycle = "RUNNING";
       await run();
       await run();
       assert(assignments === 1 && creates === 1 && Number(launches) === 1);
