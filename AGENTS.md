@@ -18,6 +18,18 @@
 - Treat implementation, backup creation, restart, and live acceptance as
   separate stages.
 
+## Oracle sign-in
+
+- Agents may automatically sign in to Oracle for authorized project work using
+  `ORACLE_USERNAME`, `ORACLE_PASSWORD`, and `ORACLE_TOTP_SECRET` from this
+  repository's local `.env`. No separate sign-in approval is required.
+- Generate the mandatory 2FA code from `ORACLE_TOTP_SECRET` using TOTP with
+  SHA-1, six digits, and a 30-second period.
+- Never print, log, commit, or include these secrets or generated codes in
+  messages. Keep `.env` local and excluded from Git.
+- Sign-in authority does not change the resource, spending, or destructive
+  action approval gates below.
+
 ## Account and cost safety
 
 - Owner authorization dated 2026-09-07: use the shared USD 300 Oracle trial
