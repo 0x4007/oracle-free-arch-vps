@@ -11,6 +11,7 @@ import {
   type CommandRunner,
   dataObject,
   defaultRunner,
+  type JsonRecord,
   readPrivateJson,
   runJson,
   writePrivateJson,
@@ -109,6 +110,59 @@ export function summarizeWeeklyCatalog(values: unknown[], now: Date) {
   };
 }
 
+export async function readPostedCosts(
+  query: (args: string[]) => Promise<JsonRecord>,
+  args: string[],
+) {
+  const responses: JsonRecord[] = [];
+  const items: unknown[] = [];
+  const seen = new Set<string>();
+  let page: string | undefined;
+  try {
+    // Bound provider time within the existing 15-minute observer service.
+    for (let count = 0; count < 5; count++) {
+      const response = await query([
+        ...args,
+        ...(page ? ["--page", page] : []),
+      ]);
+      responses.push(response);
+      summarizePostedCosts(response);
+      items.push(...dataObject(response).items as unknown[]);
+      const next = response["opc-next-page"];
+      if (next === undefined || next === null || next === "") {
+        return {
+          responses,
+          summary: summarizePostedCosts({ data: { items } }),
+          collectionComplete: true,
+        };
+      }
+      if (typeof next !== "string" || seen.has(next)) {
+        throw Error("Invalid cost continuation");
+      }
+      seen.add(next);
+      page = next;
+    }
+    throw Error("Cost page bound exhausted");
+  } catch {
+    return {
+      responses,
+      summary: null,
+      collectionComplete: false,
+    };
+  }
+}
+
+export function observationFailure(value: unknown): string | undefined {
+  if (value && typeof value === "object") {
+    if ("collectionComplete" in value && value.collectionComplete === false) {
+      return "Cost collection incomplete; inspect retained pages";
+    }
+    if ("status" in value && value.status === "unavailable") {
+      return "Observation surface unavailable; inspect retained coverage";
+    }
+  }
+}
+
 export async function main(runner: CommandRunner = defaultRunner) {
   await withBackupLock(".private/calendar-observations.lock", async () => {
     const started = new Date();
@@ -146,6 +200,8 @@ export async function main(runner: CommandRunner = defaultRunner) {
     const observe = async (name: string, read: () => Promise<unknown>) => {
       try {
         observations[name] = await read();
+        const failure = observationFailure(observations[name]);
+        if (failure) failures[name] = failure;
       } catch (error) {
         failures[name] = error instanceof Error
           ? error.message.slice(0, 4096)
@@ -185,7 +241,7 @@ export async function main(runner: CommandRunner = defaultRunner) {
       };
     });
     await observe("postedCost", async () => {
-      const response = await query([
+      const result = await readPostedCosts(query, [
         "usage-api",
         "usage-summary",
         "request-summarized-usages",
@@ -205,8 +261,7 @@ export async function main(runner: CommandRunner = defaultRunner) {
       return {
         queryStartUtc: queryStart.toISOString(),
         queryEndUtc: queryEnd.toISOString(),
-        summary: summarizePostedCosts(response),
-        response,
+        ...result,
       };
     });
     await observe("retainedCatalog", async () => {
