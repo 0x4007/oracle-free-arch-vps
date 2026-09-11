@@ -17,7 +17,12 @@ posted cost, retained catalog, Oracle controller journal and seven completed
 hours-based days of supporting guest telemetry. Reports are private dated JSON
 files named `.private/reports/calendar-*.json`.
 
-A missing or failed surface produces `PARTIAL_OBSERVATION` and nonzero exit. A
+Thrown collection failures produce `PARTIAL_OBSERVATION` and nonzero exit. The
+current observer has two tracked limits: [#67](https://github.com/0x4007/oracle-free-arch-vps/issues/67)
+covers incomplete cost pagination, and [#68](https://github.com/0x4007/oracle-free-arch-vps/issues/68)
+covers a missing guest surface returning an unavailable summary without a failed
+overall status. Inspect the retained surfaces; `OBSERVATIONS_RECORDED` alone
+does not prove full coverage. A
 persistent timer that catches up after a missed date records its actual current
 observation time; it cannot recover historical state that was not observed.
 Baseline manual execution before the first date is labelled `baseline`.

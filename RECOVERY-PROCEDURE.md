@@ -8,10 +8,13 @@ Verify every manifest hash before use. Keep protected credentials and private
 recovery keys outside the public source snapshot.
 
 This procedure incorporates the corrections used in the September 8–10 drills.
-Those runs prove dated, operator-assisted recovery. They do not prove a clean
-unattended restoration from the successor bundle. A controller approval report
-is a checkpoint for binding an authorized operation, not permission to invent
-acceptance or to extend an expired resource lifetime.
+Those runs prove dated, operator-assisted recovery. A separate September 11 run
+proved clean unattended reconstruction and application acceptance at revision
+`d462c6d159dc2103af3d94b703a61b530dfd051b`, followed by visual desktop
+acceptance. Read [the dated evidence](RECOVERY-ACCEPTANCE-2026-09-11.md) and
+[the unattended entry point](UNATTENDED-RECOVERY.md). A controller approval
+report is a checkpoint for binding an authorized operation, not permission to
+invent acceptance or to extend an expired resource lifetime.
 
 ## Inputs that must survive source loss
 
@@ -215,8 +218,8 @@ different boots. September 9 used runtime `6993583`, not its successor kit.
 
 Repeat a bounded affected path only when a material change lacks valid proof. Do
 not create a target solely to recheck documentation, receipt transfer mode,
-status projection or an already-tested permission correction. Keep clean
-unchanged-bundle and fully unattended restoration unverified until observed. The
-fourth naturally accumulated weekly point, continued unattended cycles, guest
+status projection or an already-tested permission correction. The September 11
+clean run applies only to its recorded revision and generation. The fourth
+naturally accumulated weekly point, continued unattended cycles, guest
 memory/network telemetry and post-trial zero-bill observations remain separate
 requirements. Do not poll for calendar events to close this procedure.

@@ -6,8 +6,12 @@ enables one bounded reconstruction run after the destination and independent
 generation are selected. Provisioning approval alone does not enable this mode.
 
 Read the owner-controlled PROJECT-VISION.md, DEVELOPMENT-BUDGET.md and
-RECOVERY-PROCEDURE.md first. This implementation has not yet passed a clean live
-unattended restore. Earlier operator-assisted proofs remain dated evidence.
+RECOVERY-PROCEDURE.md first. A clean live run at revision
+`d462c6d159dc2103af3d94b703a61b530dfd051b` passed application acceptance on
+September 11, 2026, at 11:43 UTC. A separate visual desktop check passed at
+11:44 UTC. See
+[the dated evidence and limits](RECOVERY-ACCEPTANCE-2026-09-11.md). Earlier
+operator-assisted proofs remain separate historical evidence.
 
 ## Select and authorize once
 
@@ -67,9 +71,9 @@ passed. It does not establish visual desktop acceptance or cleanup. Keep
 independent visual/runtime acceptance and exact task-owned cleanup as separate
 drill stages.
 
-A first unattended run refuses pre-existing session, restoration or
-restore-input state and operator-supplied stage approvals. A resumed run must
-retain its own request and authorization journal. This prevents an earlier
+A first unattended run refuses pre-existing session, restoration, restore-input
+or target-checkpoint state and operator-supplied stage approvals. A resumed run
+must retain its own request and authorization journal. This prevents an earlier
 repaired restoration from being reported as a clean unattended run.
 
 # Transient writer conflicts

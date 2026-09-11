@@ -121,7 +121,9 @@ native metrics or establish its idle-policy verdict.
 [Bounded unattended reconstruction](UNATTENDED-RECOVERY.md) uses one exact
 reconstruction authorization. [Calendar observations](CALENDAR-OBSERVATIONS.md)
 retain dated weekly, telemetry and provisional billing evidence. Future dates
-and a clean live unattended restore remain separate acceptance requirements.
+remain separate acceptance requirements. The September 11 clean unattended
+restore passed application and visual desktop checks; see
+[its exact revision, generation and remaining limits](RECOVERY-ACCEPTANCE-2026-09-11.md).
 
 - [Direct encrypted Backblaze backups](BACKBLAZE-DIRECT-BACKUP.md) send filesystem
   archives between the VPS and Backblaze. The Pi schedules and verifies jobs,
