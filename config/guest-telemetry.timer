@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect bounded guest telemetry each minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+Persistent=true
+AccuracySec=1s
+Unit=guest-telemetry.service
+
+[Install]
+WantedBy=timers.target

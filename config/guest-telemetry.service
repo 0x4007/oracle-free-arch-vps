@@ -1,0 +1,11 @@
+[Unit]
+Description=Read-only Arch VPS guest memory and network telemetry
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/pi/ops/weekly-backup-controller
+ExecStart=/usr/local/bin/safepi deno run --allow-read=.private --allow-write=.private --allow-run=ssh scripts/guest-telemetry.ts
+TimeoutStartSec=45s
+UMask=0077

@@ -114,6 +114,10 @@ agent.
 The former sibling scaffold is covered by
 [the oracle-vps consolidation record](ORACLE-VPS-CONSOLIDATION.md).
 
+[Arch guest telemetry](GUEST-TELEMETRY.md) supplies separately labelled memory
+and network observations through read-only SSH; it does not replace Oracle's
+native metrics or establish its idle-policy verdict.
+
 - [Direct encrypted Backblaze backups](BACKBLAZE-DIRECT-BACKUP.md) send filesystem
   archives between the VPS and Backblaze. The Pi schedules and verifies jobs,
   records recovery points, and sends status notifications.
