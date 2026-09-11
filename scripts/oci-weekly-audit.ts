@@ -11,6 +11,7 @@ import {
   stringField,
   writePrivateJson,
 } from "./oci.ts";
+import { readGuestTelemetrySummary } from "./guest-telemetry.ts";
 
 const CONFIG_PATH = ".private/weekly-audit.json";
 
@@ -412,6 +413,11 @@ export async function main(
     memoryUtilizationPercent: memory,
     networkBytesIn: networkIn,
     networkBytesOut: networkOut,
+    supportingGuestTelemetry: await readGuestTelemetrySummary(
+      config.instanceId,
+      start,
+      end,
+    ),
     objectStorage: storage,
   };
   const stamp = generatedAt.toISOString().replaceAll(/[-:.]/g, "");
