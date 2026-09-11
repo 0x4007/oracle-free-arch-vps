@@ -67,6 +67,7 @@ import {
 import {
   buildRecoveryTargetBundle,
   continueReplacementRestoration,
+  RECOVERY_TARGET_CHECKPOINT,
   type RecoveryRestorationState,
   type RecoveryTargetControlInput,
   type RecoveryTargetInstallApproval,
@@ -1188,6 +1189,7 @@ export async function runRecovery(): Promise<void> {
           STATE,
           ".private/pi-recovery-restoration.json",
           ".private/backblaze-machine-restore.json",
+          RECOVERY_TARGET_CHECKPOINT,
         ]
       ) {
         try {
