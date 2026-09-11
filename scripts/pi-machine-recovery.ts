@@ -580,6 +580,8 @@ export async function proveTrialFunding(
   }
 }
 
+export class ReplacementPendingError extends Error {}
+
 export async function runReplacement(
   runner: CommandRunner = defaultRunner,
   fetchDocument?: () => Promise<string>,
@@ -976,10 +978,13 @@ export async function runReplacement(
       const root = dataObject(
         await call(["bv", "volume", "get", "--volume-id", state.rootVolumeId]),
       );
-      if (root["lifecycle-state"] !== "AVAILABLE") {
-        throw Error(
+      if (root["lifecycle-state"] === "PROVISIONING") {
+        throw new ReplacementPendingError(
           "Replacement root is still provisioning; resume this same request later",
         );
+      }
+      if (root["lifecycle-state"] !== "AVAILABLE") {
+        throw Error("Replacement root is not available or provisioning");
       }
       await preMutation();
       if (state.instanceId) {

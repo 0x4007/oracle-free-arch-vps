@@ -19,7 +19,10 @@ import {
   writePrivateJson,
 } from "./oci.ts";
 import {
+  assertReplacementApproval,
+  proveTrialFunding,
   type ReplacementConfig,
+  ReplacementPendingError,
   replacementPlanDigest,
   type ReplacementState,
   runReplacement,
@@ -80,11 +83,20 @@ import {
   stepConsoleConnection,
 } from "./pi-recovery-console-connection.ts";
 
+import {
+  assertUnattendedRecoveryAuthority,
+  deriveRecoveryStageApproval,
+  type UnattendedRecoveryConfig,
+} from "./pi-recovery-authority.ts";
+import { machineRestoreIndexSha256 } from "./backblaze-machine-restore.ts";
+import { RECOVERY_TARGET_PUBLIC_HOME } from "./pi-recovery-restore.ts";
+import { ISOLATION_EXECUTION_OPERATION } from "./pi-recovery-isolation-executor.ts";
+
 const CONFIG = ".private/pi-machine-recovery.json";
 const STATE = ".private/pi-recovery-session.json";
 const REPORT = ".private/reports/pi-recovery-session.json";
 type RebootApproval = Parameters<typeof approvedRescueBootScript>[1];
-interface SessionConfig extends ReplacementConfig {
+interface SessionConfig extends UnattendedRecoveryConfig {
   /** Existing RSA public key; no private key or new credential is generated. */
   consolePublicKey?: string;
   sessionApprovals?: {
@@ -128,7 +140,9 @@ export interface SessionPorts {
   ssh: (target: RecoverySshTarget) => CommandRunner;
   provider: () => Promise<LoaderProviderEvidence>;
   beforeMutation: () => Promise<void>;
-  rebootApproval: () => Promise<RebootApproval | undefined>;
+  rebootApproval: (
+    plan: ReturnType<typeof rescueBootPlan>,
+  ) => Promise<RebootApproval | undefined>;
 }
 const hash = (value: unknown) =>
   createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -274,7 +288,7 @@ export async function stepRecoverySession(
     status: "RESCUE_REBOOT_APPROVAL_REQUIRED",
     plan: rebootPlan,
   });
-  const approval = await ports.rebootApproval();
+  const approval = await ports.rebootApproval(rebootPlan);
   if (!approval) return "RESCUE_REBOOT_APPROVAL_REQUIRED";
   await ports.beforeMutation();
   // Repeat authenticated attachment/guest checks immediately before intent.
@@ -299,7 +313,7 @@ export async function stepRecoverySession(
   await ports.beforeMutation();
   approvedRescueBootScript(
     binding,
-    (await ports.rebootApproval())!,
+    (await ports.rebootApproval(rebootPlan))!,
     ports.now(),
   );
   // Lost SSH response leaves the durable intent; never retry the reboot blindly.
@@ -330,17 +344,77 @@ export async function validateSessionBootstrap(config: ReplacementConfig) {
   return input;
 }
 
+async function unattendedContext(config: SessionConfig) {
+  if (!config.unattended) return undefined;
+  const catalogState = await readPrivateJson<{ catalog: unknown[] }>(
+    ".private/file-backup/controller.json",
+  );
+  const selected = catalogState.catalog.map(validateCatalogEntry).filter(
+    (entry) => entry.index.generation === config.generation,
+  );
+  if (selected.length !== 1) {
+    throw Error("Unattended generation is absent or ambiguous");
+  }
+  const catalog = selected[0];
+  const release = await readPrivateJson<
+    { sourceRevision: string; hashes: Record<string, string> }
+  >(".private/reports/pi-session-deployment.json");
+  const authority = assertUnattendedRecoveryAuthority(
+    config,
+    machineRestoreIndexSha256(catalog.index),
+    release.sourceRevision,
+  );
+  for (const [path, digest] of Object.entries(release.hashes)) {
+    if (
+      !/^(scripts|config)\/[A-Za-z0-9_.-]+$/.test(path) && path !== "deno.json"
+    ) throw Error("Unsafe runtime receipt path");
+    if (
+      createHash("sha256").update(await Deno.readFile(path)).digest("hex") !==
+        digest
+    ) throw Error("Unattended runtime drift: " + path);
+  }
+  for (
+    const path of [
+      "scripts/pi-recovery-session.ts",
+      "scripts/pi-recovery-authority.ts",
+      "scripts/pi-recovery-restore.ts",
+    ]
+  ) {
+    if (!release.hashes[path]) {
+      throw Error("Unattended runtime dependency is not in its receipt");
+    }
+  }
+  return { catalog, authority, sourceRevision: release.sourceRevision };
+}
+
 export async function runRecoverySession(
   runner: CommandRunner = recoveryControlRunner,
-): Promise<void> {
+): Promise<string> {
   const initial = await readPrivateJson<SessionConfig>(CONFIG);
+  const unattended = await unattendedContext(initial);
   if (initial.action === "provision") await validateSessionBootstrap(initial);
   // Provisioner repeats the bootstrap preflight under its own lock immediately
   // before each cloud mutation, as well as capacity and eligibility checks.
-  await runReplacement(runner, undefined, validateSessionBootstrap);
-  await withBackupLock(".private/backup-controller.lock", async () => {
+  try {
+    await runReplacement(runner, undefined, async (current) => {
+      await validateSessionBootstrap(current);
+      if (unattended) {
+        if (
+          hash((current as SessionConfig).unattended) !==
+            hash(initial.unattended)
+        ) throw Error("Unattended provisioning authority changed");
+        await unattendedContext(current as SessionConfig);
+      }
+    });
+  } catch (error) {
+    if (unattended && error instanceof ReplacementPendingError) {
+      return "REPLACEMENT_PROVISIONING";
+    }
+    throw error;
+  }
+  return await withBackupLock(".private/backup-controller.lock", async () => {
     const config = await readPrivateJson<SessionConfig>(CONFIG);
-    if (config.action === "plan") return;
+    if (config.action === "plan") return "PLAN_READY";
     const controller = await readPrivateJson<BackupInventoryConfig>(
       ".private/backup-controller.json",
     );
@@ -350,10 +424,15 @@ export async function runRecoverySession(
     const digest = replacementPlanDigest(config);
     if (
       replacement.requestId !== config.requestId ||
-      replacement.planSha256 !== digest || !replacement.instanceId ||
-      !replacement.bootVolumeId || !replacement.rootVolumeId ||
-      !replacement.privateIpId
-    ) throw Error("Provisioning is not complete for this session");
+      replacement.planSha256 !== digest
+    ) throw Error("Provisioning belongs to another session");
+    if (
+      !replacement.instanceId || !replacement.bootVolumeId ||
+      !replacement.rootVolumeId || !replacement.privateIpId
+    ) {
+      if (unattended) return "REPLACEMENT_PROVISIONING";
+      throw Error("Provisioning is not complete for this session");
+    }
     const publicInput = await validateSessionBootstrap(config);
     const request: LoaderIdentityRequest = {
       requestId: config.requestId,
@@ -441,6 +520,21 @@ export async function runRecoverySession(
         current.action !== "provision" ||
         replacementPlanDigest(current) !== digest
       ) throw Error("Recovery authority or configuration changed");
+      assertReplacementApproval(current, digest);
+      if (current.trial) await proveTrialFunding(controller, current, runner);
+      if (unattended) {
+        const release = await readPrivateJson<{ sourceRevision: string }>(
+          ".private/reports/pi-session-deployment.json",
+        );
+        assertUnattendedRecoveryAuthority(
+          current,
+          machineRestoreIndexSha256(unattended.catalog.index),
+          release.sourceRevision,
+        );
+        if (hash(current.unattended) !== hash(initial.unattended)) {
+          throw Error("Unattended authority changed during session");
+        }
+      }
     };
     await beforeMutation();
     let state: RecoverySession;
@@ -470,6 +564,35 @@ export async function runRecoverySession(
         replacementPlanDigest(current) !== digest
       ) throw Error("Recovery approval configuration changed");
       return current.sessionApprovals;
+    };
+    const stageApproval = async <T extends string>(
+      key: keyof NonNullable<SessionConfig["sessionApprovals"]>,
+      plan: { planSha256: string; operation: T },
+      inspectionSha256?: string,
+    ) => {
+      if (!unattended) return (await approvals())?.[key];
+      await beforeMutation();
+      const current = await readPrivateJson<SessionConfig>(CONFIG);
+      const existing = current.sessionApprovals?.[key];
+      if (existing) {
+        if (
+          existing.planSha256 !== plan.planSha256 ||
+          existing.exactOperation !== plan.operation ||
+          (inspectionSha256 !== undefined &&
+            (!("inspectionSha256" in existing) ||
+              existing.inspectionSha256 !== inspectionSha256))
+        ) throw Error("Retained stage approval changed");
+        return existing;
+      }
+      const receipt = {
+        ...deriveRecoveryStageApproval(plan, unattended.authority),
+        ...(inspectionSha256 ? { inspectionSha256 } : {}),
+      };
+      await writePrivateJson(CONFIG, {
+        ...current,
+        sessionApprovals: { ...current.sessionApprovals, [key]: receipt },
+      });
+      return receipt;
     };
     const targetForHost = async (
       host: import("./pi-recovery-ssh.ts").VerifiedRecoveryHost,
@@ -588,7 +711,7 @@ export async function runRecoverySession(
         previousBootId: restoration.restoredBootPlan.binding.bootId,
         manifestSha256: restoration.isolationPlan.restoredManifestSha256,
       }, config.compartmentId);
-      const approval = (await approvals())?.restoredConsole;
+      const approval = await stageApproval("restoredConsole", plan);
       if (!approval) {
         await writePrivateJson(REPORT, {
           status: "RESTORED_CONSOLE_APPROVAL_REQUIRED",
@@ -616,7 +739,7 @@ export async function runRecoverySession(
           await persist(state);
         },
         async () => {
-          const current = (await approvals())?.restoredConsole;
+          const current = await stageApproval("restoredConsole", plan);
           if (!current) {
             throw Error("Exact restored console approval is absent");
           }
@@ -691,8 +814,9 @@ export async function runRecoverySession(
       if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
     if (restoration?.restoredBootIntent) {
-      await acceptRestored(restoration);
-      return;
+      return await acceptRestored(restoration)
+        ? "RESTORED_APPLICATIONS_ACCEPTED"
+        : "RESTORED_CONSOLE_PENDING";
     }
     let acceptedTarget: RecoverySshTarget | undefined;
     let status = await stepRecoverySession(
@@ -705,7 +829,8 @@ export async function runRecoverySession(
         report: (value) => writePrivateJson(REPORT, value),
         provider,
         beforeMutation,
-        rebootApproval: async () => (await approvals())?.rescueReboot,
+        rebootApproval: async (plan) =>
+          await stageApproval("rescueReboot", plan),
         ssh: recoverySshRunner,
         target: async (capture) => {
           acceptedTarget = await targetForHost(capture.host!);
@@ -713,13 +838,13 @@ export async function runRecoverySession(
         },
         capture: async (plan, captureState, phase) => {
           const key = phase === "loader" ? "loaderConsole" : "ramConsole";
-          const approval = (await approvals())?.[key];
+          const approval = await stageApproval(key, plan);
           if (
             !approval && !captureState.host &&
             captureState.attempts.length === 0
           ) return undefined;
           const getApproval = async () => {
-            const value = (await approvals())?.[key];
+            const value = await stageApproval(key, plan);
             if (!value) throw Error("Exact console approval is absent");
             return value;
           };
@@ -776,7 +901,8 @@ export async function runRecoverySession(
                     state.consoleConnection = value;
                     await persist(state);
                   },
-                  approval: async () => (await approvals())?.consoleConnection,
+                  approval: async () =>
+                    await stageApproval("consoleConnection", connectionPlan),
                   beforeMutation: async () => {
                     await beforeMutation();
                     const fresh = await readPrivateJson<SessionConfig>(CONFIG);
@@ -831,6 +957,7 @@ export async function runRecoverySession(
                   ports,
                 )).state;
               }
+              if (unattended) return undefined;
             }
             throw error;
           }
@@ -848,6 +975,43 @@ export async function runRecoverySession(
       } catch (error) {
         if (!(error instanceof Deno.errors.NotFound)) throw error;
       }
+      if (!input && unattended) {
+        await beforeMutation();
+        const preparation = preparationBindingFromLoader(
+          state.loaderIdentity,
+          state.ramAccepted.bootId,
+          state.manifestSha256,
+        );
+        assertRetainedProviderBinding(state.loaderIdentity, await provider());
+        const target = {
+          targetId: request.instanceId,
+          architecture: "aarch64",
+          bootDiskPath: preparation.boot.path,
+          rootDiskPath: preparation.root.path,
+          bootDiskBytes: preparation.boot.bytes,
+          rootDiskBytes: preparation.root.bytes,
+          bootDiskSerial: preparation.boot.serial,
+          rootDiskSerial: preparation.root.serial,
+          workDirectory: "/run/uos-recovery",
+          approval: {
+            targetId: request.instanceId,
+            bootDiskPath: preparation.boot.path,
+            rootDiskPath: preparation.root.path,
+            bootDiskSerial: preparation.boot.serial,
+            rootDiskSerial: preparation.root.serial,
+            approvedAtUtc: new Date().toISOString(),
+          },
+        };
+        input = {
+          catalog: unattended.catalog,
+          requestId: request.requestId,
+          loaderBootId: state.loaderIdentity.loaderBootId,
+          rescueManifestSha256: state.manifestSha256,
+          target,
+          publicHome: RECOVERY_TARGET_PUBLIC_HOME,
+        };
+        await writePrivateJson(inputPath, input);
+      }
       if (!input) {
         status = "RESTORE_CONFIGURATION_REQUIRED";
         await writePrivateJson(REPORT, {
@@ -864,6 +1028,12 @@ export async function runRecoverySession(
             "Restoration generation differs from the replacement plan",
           );
         }
+        if (
+          unattended &&
+          machineRestoreIndexSha256(
+              validateCatalogEntry(input.catalog).index,
+            ) !== unattended.authority.indexSha256
+        ) throw Error("Restore input index differs from unattended authority");
         const inputDigest = hash(input);
         const preparation = preparationBindingFromLoader(
           state.loaderIdentity,
@@ -926,12 +1096,21 @@ export async function runRecoverySession(
             },
             persist: (value) => writePrivateJson(restorationPath, value),
             report: (value) => writePrivateJson(REPORT, value),
-            installationApproval: async () =>
-              (await approvals())?.restoreInstallation,
-            preparationApproval: async () =>
-              (await approvals())?.diskPreparation,
-            isolationApproval: async () => (await approvals())?.isolation,
-            restoredBootApproval: async () => (await approvals())?.restoredBoot,
+            installationApproval: async (plan) =>
+              await stageApproval("restoreInstallation", plan),
+            preparationApproval: async (plan) =>
+              await stageApproval("diskPreparation", plan) as
+                | PreparationApproval
+                | undefined,
+            isolationApproval: async (plan, inspection) =>
+              await stageApproval("isolation", {
+                ...plan,
+                operation: ISOLATION_EXECUTION_OPERATION,
+              }, inspection.inspectionSha256) as
+                | IsolationExecutionApproval
+                | undefined,
+            restoredBootApproval: async (plan) =>
+              await stageApproval("restoredBoot", plan),
             isolationEvent: (value) =>
               writePrivateJson(REPORT, {
                 status: "COPIED_ROOT_ISOLATION_PROGRESS",
@@ -944,6 +1123,11 @@ export async function runRecoverySession(
         );
       }
     }
+    await writePrivateJson(".private/reports/pi-recovery-progress.json", {
+      status,
+      observedAtUtc: new Date().toISOString(),
+      requestId: request.requestId,
+    });
     console.log(
       JSON.stringify({
         status,
@@ -951,11 +1135,103 @@ export async function runRecoverySession(
         applicationAccepted: false,
       }),
     );
+    return status;
+  });
+}
+/** One process owns the whole unattended run; individual steps retain the shared
+ * infrastructure lock. Only explicit pending states are polled. Exceptions and
+ * uncertain writes remain visible failures and never trigger blind retries. */
+export async function runRecovery(): Promise<void> {
+  const initial = await readPrivateJson<SessionConfig>(CONFIG);
+  if (!initial.unattended) {
+    await runRecoverySession();
+    return;
+  }
+  const originalAuthority = hash(initial.unattended);
+  await withBackupLock(".private/recovery-unattended.lock", async () => {
+    const runPath = ".private/pi-recovery-unattended.json";
+    let run: {
+      requestId: string;
+      authorizationSha256: string;
+      startedAtUtc: string;
+    };
+    try {
+      run = await readPrivateJson(runPath);
+      if (
+        run.requestId !== initial.requestId ||
+        run.authorizationSha256 !== originalAuthority ||
+        !Number.isFinite(Date.parse(run.startedAtUtc))
+      ) throw Error("Unattended run journal differs");
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+      if (Object.keys(initial.sessionApprovals ?? {}).length) {
+        throw Error(
+          "Operator-assisted stage approvals cannot become unattended proof",
+        );
+      }
+      for (
+        const path of [
+          STATE,
+          ".private/pi-recovery-restoration.json",
+          ".private/backblaze-machine-restore.json",
+        ]
+      ) {
+        try {
+          await Deno.lstat(path);
+          throw Error(
+            "Pre-existing reconstruction state requires a separate reconciled run",
+          );
+        } catch (error) {
+          if (!(error instanceof Deno.errors.NotFound)) throw error;
+        }
+      }
+      await unattendedContext(initial);
+      run = {
+        requestId: initial.requestId,
+        authorizationSha256: originalAuthority,
+        startedAtUtc: new Date().toISOString(),
+      };
+      await writePrivateJson(runPath, run);
+    }
+    const startedAtUtc = run.startedAtUtc;
+    for (let step = 0; step < 480; step++) {
+      const config = await readPrivateJson<SessionConfig>(CONFIG);
+      if (
+        hash(config.unattended) !== originalAuthority ||
+        config.requestId !== initial.requestId
+      ) throw Error("Unattended run authority changed");
+      await unattendedContext(config);
+      const status = await runRecoverySession();
+      await writePrivateJson(".private/reports/pi-recovery-unattended.json", {
+        status,
+        requestId: config.requestId,
+        authorizationSha256: originalAuthority,
+        startedAtUtc,
+        observedAtUtc: new Date().toISOString(),
+        steps: step + 1,
+        unattended: true,
+        applicationAccepted: status === "RESTORED_APPLICATIONS_ACCEPTED",
+      });
+      if (status === "RESTORED_APPLICATIONS_ACCEPTED") return;
+      if (
+        ![
+          "REPLACEMENT_PROVISIONING",
+          "CONSOLE_PENDING",
+          "CONSOLE_APPROVAL_REQUIRED",
+          "RESCUE_STAGING_PENDING",
+          "RESCUE_REBOOT_REQUESTED",
+          "RESTORED_BOOT_PENDING",
+          "RESTORED_CONSOLE_PENDING",
+        ].includes(status)
+      ) throw Error("Unattended recovery requires reconciliation: " + status);
+      await new Promise((resolve) => setTimeout(resolve, 15000));
+    }
+    throw Error("Unattended recovery step bound exhausted");
   });
 }
 if (import.meta.main) {
   try {
-    await runRecoverySession();
+    await runRecovery();
   } catch {
     console.error(
       "Pi recovery session stopped; inspect its private report and journal before resuming",
