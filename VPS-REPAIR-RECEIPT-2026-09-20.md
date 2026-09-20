@@ -181,3 +181,43 @@ Note the benign case is reported on stderr, not silently swallowed.
 
 The host key is unchanged from before the incident, so SSH trust and the
 recorded fingerprints still hold and no known-hosts repair is required.
+
+## Corrections and one new finding
+
+### Evidence-label correction
+
+The capture preserved as "post-restart" was actually taken at 07:34 UTC, before
+the repair restart. It is corrected on the Mac to
+`pre-restart-console-capture-at-0734Z.txt`, and its `SUMMARY.txt` now records the
+correction. A genuine post-restart console capture could not be created: the
+instance sits at its 10-object console-history limit, so `console-history
+capture` returns `LimitExceeded`. The post-restart boot is instead proved by
+stronger, purpose-built evidence: the guest journal line
+`systemd-fsck[169]: ROOT: recovering journal` plus `Clearing orphaned inode …`
+at 08:20:11–08:20:12, followed by a mounted ext4 filesystem reported `clean`,
+zero `EXT4-fs error` entries this boot, and live SSH/service/external checks.
+Deleting a console history to make room was not authorized, so it was not done.
+
+### Timer overlap (found during final audit)
+
+`backblaze-file-backup.timer` carries both `OnCalendar=Sun *-*-* 00:05:00` and
+`OnUnitInactiveSec=15min`, with `Persistent=true`. Because the failed
+`backblaze-file-backup.service` keeps auto-restarting on a 30-minute
+`RestartSec`, the unit repeatedly goes inactive and re-triggers the timer. Its
+real next elapse is therefore ~05:20 EDT today, not next Sunday — the timer's
+`NextElapseUSecRealtime` of `Sun 2026-09-27 00:05:00 EDT` is the calendar leg
+only. Today's period is already satisfied by the `FAILED` journal, so these
+re-fires re-persist the same failure and do not create a capture; but it means
+Sunday's run is not a clean single shot, and the same pattern will repeat
+whenever a capture fails. `StartLimitIntervalUSec=10s` /
+`StartLimitBurst=5` bounds runaway restarting.
+
+No timer was changed: the handoff's standing instruction is to leave timers as
+found. This is recorded as a defect to fix deliberately, not silently.
+
+### Deployment-surface check
+
+`git diff e5d7fa3 ed847b4` touches only `scripts/backblaze-capture.ts` and
+`tests/backblaze_capture_test.ts` (73 insertions, 2 deletions). The deploy
+helper ships all 53 `scripts/*.ts`, but they are byte-identical to `e5d7fa3`
+apart from the capture module, so the live change is exactly the reviewed fix.
