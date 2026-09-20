@@ -630,6 +630,50 @@ Deno.test("malformed mountpoint data is rejected", () => {
 });
 
 runtimeTest(
+  "tar producer tolerates the benign file-changed status and stays fatal otherwise",
+  async () => {
+    const producers = [
+      {
+        label: "tar",
+        variable: "ts",
+        exitCode: 60,
+        benignExitCodes: [1],
+      },
+      { label: "zstd", variable: "zs", exitCode: 61 },
+    ];
+    // exit 1 = file changed while reading: reported, not fatal
+    const benign = await runBash([
+      "set -u",
+      "set -o pipefail",
+      ...pipelineStatusLines("false | cat", producers),
+      "printf 'reached-end\\n'",
+    ].join("\n"));
+    assert(benign.code === 0, `unexpected ${benign.code}: ${benign.stderr}`);
+    assert(benign.stdout.includes("reached-end"), benign.stdout);
+    assert(
+      benign.stderr.includes("tar producer exit 1 tolerated"),
+      benign.stderr,
+    );
+    // exit 2 = a real tar error: still fatal with the capture exit code
+    const fatal = await runBash([
+      "set -u",
+      "set -o pipefail",
+      ...pipelineStatusLines("bash -c 'exit 2' | cat", producers),
+    ].join("\n"));
+    assert(fatal.code === 60, `unexpected ${fatal.code}: ${fatal.stderr}`);
+    assert(fatal.stderr.includes("tar producer exit 2"), fatal.stderr);
+    assert(!fatal.stderr.includes("tolerated"), fatal.stderr);
+    // a failing zstd is never tolerated
+    const zstdFatal = await runBash([
+      "set -u",
+      "set -o pipefail",
+      ...pipelineStatusLines("false | false", producers),
+    ].join("\n"));
+    assert(zstdFatal.code === 61, `unexpected ${zstdFatal.code}`);
+  },
+);
+
+runtimeTest(
   "generated producer checks snapshot PIPESTATUS once and pass on success",
   async () => {
     const producers = [

@@ -780,10 +780,20 @@ export interface PipelineProducer {
   variable: string;
   /** Capture exit code used when this producer fails. */
   exitCode: number;
+  /** Statuses that are reported but not fatal. GNU tar exits 1 when a file
+   * changed while it was read: the live copy already captured the earlier
+   * bytes, and the later zstd integrity and exact inventory checks still prove
+   * the archive is complete. Exit 2 and every unexpected status stay fatal. */
+  benignExitCodes?: readonly number[];
 }
 
 const TAR_ZSTD_PRODUCERS: PipelineProducer[] = [
-  { label: "tar", variable: "ts", exitCode: 60 },
+  {
+    label: "tar",
+    variable: "ts",
+    exitCode: 60,
+    benignExitCodes: [1],
+  },
   { label: "zstd", variable: "zs", exitCode: 61 },
 ];
 const INVENTORY_PRODUCERS: PipelineProducer[] = [
@@ -817,9 +827,26 @@ export function pipelineStatusLines(
     lines.push(`${producer.variable}=\${ps[${index}]}`);
   });
   for (const producer of producers) {
+    const benign = producer.benignExitCodes ?? [];
+    for (const code of benign) {
+      if (!Number.isInteger(code) || code === 0) fail("script:generate");
+    }
+    if (benign.length === 0) {
+      lines.push(
+        `test "$${producer.variable}" -eq 0 || { printf '${producer.label} producer exit %s\\n' "$${producer.variable}" >&2; exit ${producer.exitCode}; }`,
+      );
+      continue;
+    }
+    const tolerated = benign.join("|");
+    lines.push(`case "$${producer.variable}" in`);
+    lines.push("  0) ;;");
     lines.push(
-      `test "$${producer.variable}" -eq 0 || { printf '${producer.label} producer exit %s\\n' "$${producer.variable}" >&2; exit ${producer.exitCode}; }`,
+      `  ${tolerated}) printf '${producer.label} producer exit %s tolerated: file changed while reading\\n' "$${producer.variable}" >&2 ;;`,
     );
+    lines.push(
+      `  *) printf '${producer.label} producer exit %s\\n' "$${producer.variable}" >&2; exit ${producer.exitCode} ;;`,
+    );
+    lines.push("esac");
   }
   return lines;
 }
