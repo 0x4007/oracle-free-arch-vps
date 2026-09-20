@@ -167,3 +167,17 @@ test "$zs" -eq 0 || { printf 'zstd producer exit %s\n' "$zs" >&2; exit 61; }
 ```
 
 Note the benign case is reported on stderr, not silently swallowed.
+
+## Security posture re-checked after the repair
+
+| Check | Result |
+| --- | --- |
+| `PermitRootLogin` | `no` |
+| `PasswordAuthentication` | `no` |
+| `KbdInteractiveAuthentication` | `no` |
+| Public listener on TCP 9090 | none |
+| Host key (ed25519) | `SHA256:/iteYFq+8aaVsv/uwYWgI4nxzHJAxzExf8XXD4TqTaA root@arch-vps` |
+| Passwordless SSH for `codex` | works (BatchMode, public key) |
+
+The host key is unchanged from before the incident, so SSH trust and the
+recorded fingerprints still hold and no known-hosts repair is required.
