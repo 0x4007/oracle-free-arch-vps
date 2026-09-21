@@ -13,8 +13,10 @@ import {
   MAX_CHUNK_BYTES,
 } from "../scripts/backblaze-storage.ts";
 import {
+  createTransferPacer,
   generationChunkName,
   planReadTestSeam,
+  TRANSFER_BYTES_PER_SECOND,
   UPLOAD_ROLE_ORDER,
   uploadCapturedGeneration,
   type UploadProgressRecord,
@@ -1315,4 +1317,44 @@ runtimeTest("stage and archive hardening rejects unsafe fixtures", async () => {
       await removeFixture(fixture);
     }
   }
+});
+
+Deno.test("transfer pacer defaults to the documented 4 MiB/s ceiling", () => {
+  assert(TRANSFER_BYTES_PER_SECOND === 4 * 1024 * 1024);
+});
+
+Deno.test("transfer pacer allows one chunk of burst then paces the average", async () => {
+  // Deterministic clock: no real waiting, so the test is fast and stable.
+  // Counters live in an object so TypeScript cannot narrow the array shape
+  // between the two assertions.
+  const clock = { now: 0 };
+  const waits: number[] = [];
+  const pace = createTransferPacer(
+    1000, // 1000 bytes/s keeps the arithmetic trivial
+    () => clock.now,
+    (ms) => {
+      waits.push(ms);
+      clock.now += ms; // the wait advances the virtual clock
+      return Promise.resolve();
+    },
+  );
+  // First transfer fits inside the one-second burst allowance.
+  await pace(1000);
+  const afterFirst = waits.length;
+  assert(afterFirst === 0, `unexpected wait after first: ${afterFirst}`);
+  // A second identical transfer must now be throttled by ~1000 ms.
+  await pace(1000);
+  const afterSecond = waits.length;
+  assert(afterSecond === 1, `expected one pace wait, got ${afterSecond}`);
+  const firstWait = waits[0];
+  assert(
+    firstWait >= 900 && firstWait <= 1000,
+    `wait was ${firstWait} ms`,
+  );
+});
+
+Deno.test("transfer pacer rejects an invalid rate", () => {
+  assertThrows(() => createTransferPacer(0));
+  assertThrows(() => createTransferPacer(-1));
+  assertThrows(() => createTransferPacer(1.5));
 });

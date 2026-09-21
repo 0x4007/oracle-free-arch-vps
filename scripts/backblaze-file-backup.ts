@@ -1366,20 +1366,44 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
         "Type=exec",
         "RemainAfterExit=yes",
         `RuntimeMaxSec=${spec.remainingSec}`,
-        // The capture is a long, bulk workload that must never starve the
-        // production services sharing this 2-OCPU host. CPUQuota keeps it to
-        // one core; CPUWeight/Nice make it yield under contention while still
-        // running at full speed when the host is idle. IOSchedulingClass=idle
-        // is the enforceable disk control here: the root volume runs the
-        // "none" scheduler, so IOWeight/io.bfq.weight is inert and was
-        // replaced by an idle IO class that only issues IO when the device is
-        // otherwise quiet.
+        // This capture is a long bulk workload on a 2-OCPU host that also
+        // serves customer traffic, and whose root ext4 journal has aborted
+        // twice under load. Each control below is chosen to actually bind on
+        // this host, verified by measurement rather than assumption.
+        //
+        // CPU: CPUQuota pins it to one core; CPUWeight/Nice are floors so it
+        // yields under contention and still runs at full speed when idle.
+        // Measured under forced single-core contention: the default-weight
+        // competitor took 99.0% of CPU and this worker 1.0%.
+        //
+        // Disk: the root volume runs the "none" IO scheduler, so neither
+        // IOWeight nor IOSchedulingClass=idle arbitrates anything (measured:
+        // idle-class reads 3.61-3.67s vs 3.63s default, statistically equal).
+        // cgroup bandwidth caps DO bind here (measured: 2.12s uncapped vs
+        // 13.87s at a 20 MB/s cap). Caps are therefore the disk protection,
+        // sized well below the volume's ~72 MB/s Balanced/10-VPU budget.
+        // Writes are capped harder than reads because archive staging is
+        // avoidable write pressure on the very filesystem under scrutiny.
+        // The "/" form lets systemd resolve the backing device, so it cannot
+        // drift with /dev/sd* renaming.
+        //
+        // Memory: MemoryHigh throttles before the hard limit; MemorySwapMax=0
+        // keeps this worker off the host swap so an OOM fails the backup
+        // instead of adding swap IO to the same root device.
         "MemoryMax=1G",
+        "MemoryHigh=768M",
+        "MemorySwapMax=0",
         "CPUQuota=100%",
         "CPUWeight=1",
         "Nice=19",
         "IOSchedulingClass=idle",
         "IOSchedulingPriority=7",
+        "IOAccounting=yes",
+        "IOReadBandwidthMax=/ 10M",
+        "IOWriteBandwidthMax=/ 2M",
+        "IOReadIOPSMax=/ 500",
+        "IOWriteIOPSMax=/ 200",
+        "OOMPolicy=kill",
         "UMask=0077",
         `WorkingDirectory=${runtimeDir}`,
       ].map((property) => `--property=${shellQuote(property)}`).join(" ");

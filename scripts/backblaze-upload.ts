@@ -226,6 +226,8 @@ interface UploadContext {
   processed: number;
   totalChunks: number;
   progress?: (record: UploadProgressRecord) => Promise<void>;
+  /** Sustained transfer ceiling shared by upload and readback bytes. */
+  pace: (bytes: number) => Promise<void>;
 }
 
 const FAIL_PREFIX = "Upload failed (";
@@ -239,8 +241,57 @@ const JOURNAL_VERSION = 1;
 const JOURNAL_NAME = "upload-journal.json";
 const MAX_JOURNAL_BYTES = 64 * 1024 * 1024;
 
+/** Sustained transfer ceiling for B2 upload and readback, in bytes/second.
+ *
+ * This worker shares a 2-OCPU host with customer-facing services, so the ~10 GB
+ * upload must not be allowed to saturate the link. The transfer loop is already
+ * sequential with one object in flight, but a single connection is not a rate
+ * limit on its own, so the loop is additionally paced to this ceiling.
+ *
+ * 4 MiB/s (~33.6 Mbit/s) is a deliberately conservative starting budget against
+ * the shape's nominal 2 Gbit/s ceiling; it is an engineering budget, not a
+ * measured threshold below which this host cannot degrade. */
+export const TRANSFER_BYTES_PER_SECOND = 4 * 1024 * 1024;
+
 function fail(label: string): never {
   throw new Error(`${FAIL_PREFIX}${label})`);
+}
+
+/** Paces a sequential transfer loop to a sustained byte ceiling.
+ *
+ * `charge` is called with the bytes just transferred; it returns a promise that
+ * resolves when that work is "paid for" at the configured rate. A small burst
+ * allowance lets a fast chunk finish without an artificial stall, and the
+ * deficit is repaid by later chunks so the long-run average holds. */
+export function createTransferPacer(
+  bytesPerSecond: number = TRANSFER_BYTES_PER_SECOND,
+  now: () => number = () => performance.now(),
+  sleep: (ms: number) => Promise<void> = (ms) =>
+    new Promise((resolve) => setTimeout(resolve, ms)),
+): (bytes: number) => Promise<void> {
+  if (!Number.isSafeInteger(bytesPerSecond) || bytesPerSecond <= 0) {
+    fail("pacer:rate");
+  }
+  // One chunk of burst: the loop cannot pre-pay more than a single transfer.
+  const burstBytes = bytesPerSecond;
+  let allowance = burstBytes;
+  let last = now();
+  return async (bytes: number): Promise<void> => {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) fail("pacer:bytes");
+    const t = now();
+    allowance = Math.min(
+      burstBytes,
+      allowance + ((t - last) / 1000) * bytesPerSecond,
+    );
+    last = t;
+    allowance -= bytes;
+    if (allowance < 0) {
+      const waitMs = Math.ceil(((-allowance) / bytesPerSecond) * 1000);
+      allowance = 0;
+      await sleep(waitMs);
+      last = now();
+    }
+  };
 }
 
 function isIsoUtc(value: unknown): value is string {
@@ -964,6 +1015,7 @@ async function processChunk(
       if (journaled !== undefined) primary = journaled;
     }
     const readback = await ctx.store.get(identityToObject(primary, chunk));
+    await ctx.pace(readback.byteLength);
     assertReadback(chunk, readback);
     return {
       chunk: verifiedChunk(chunk, primary, true, versions),
@@ -973,6 +1025,7 @@ async function processChunk(
   let put: B2Object;
   try {
     put = await ctx.store.put(chunk.name, buffer);
+    await ctx.pace(buffer.byteLength);
   } catch (error) {
     const refreshed = classifyInventory(
       await ctx.store.versions(),
@@ -991,6 +1044,7 @@ async function processChunk(
     };
   }
   const readback = await ctx.store.get(put);
+  await ctx.pace(readback.byteLength);
   assertReadback(chunk, readback);
   // The saved journal identity is absent from the snapshot inventory (no
   // candidates at all), so only this successfully put identity is reported.
@@ -1157,6 +1211,7 @@ export async function uploadCapturedGeneration(
     processed: 0,
     totalChunks,
     progress,
+    pace: createTransferPacer(),
   };
   const archiveResults: UploadedArchive[] = [];
   for (const plan of plans) {
