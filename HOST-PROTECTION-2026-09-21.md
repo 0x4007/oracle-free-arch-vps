@@ -123,3 +123,25 @@ Applied to the real worker path, not just source:
 - The failed 2026-09-20 job is still `FAILED` in the controller journal. The
   next Sunday run allocates the next period normally; its 15-minute rechecks
   will simply re-report the existing failure until then.
+
+## Note: unrelated endpoint change (not caused here)
+
+`https://ubiquity-prospector.ubq.fi/api/health` returned 200 earlier on
+2026-09-20 and returns 404 now. This is **not** caused by these changes:
+
+- The 404 body carries `server: cloudflare` and
+  `x-deno-error: {"code":"DEPLOYMENT_NOT_FOUND"}`, so it is answered by Deno
+  Deploy, not this VPS.
+- DNS for that name resolves to Cloudflare (`172.67.145.138`,
+  `104.21.81.178`), not to the VPS reserved address `129.158.58.222`.
+- The VPS-local service is healthy: `127.0.0.1:8000/api/health` returns 200 and
+  `ubiquity-prospector.service` is active with zero restarts.
+- An unrelated `prospector` worktree is active on the Mac right now, and
+  `/etc/caddy/prospector-sh/Caddyfile` was rewritten at 03:28 today with the
+  service cycling at 03:30 — that is another writer's in-flight domain
+  migration (`handoffs/prospector-sh-domain-config-2026-09-20.md` in the
+  Prospector monorepo).
+
+This work touched only the backup path, swap, scratch and the Pi/backup units;
+it did not modify Caddy, DNS, or the Prospector service. The domain migration is
+left to its owner.
