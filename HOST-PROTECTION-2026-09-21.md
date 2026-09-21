@@ -145,3 +145,34 @@ Applied to the real worker path, not just source:
 This work touched only the backup path, swap, scratch and the Pi/backup units;
 it did not modify Caddy, DNS, or the Prospector service. The domain migration is
 left to its owner.
+
+## Whole-system sweep after the changes
+
+Checked for anything these changes could have broken elsewhere:
+
+| Check | Result |
+| --- | --- |
+| Pi backup timer triggers since the fix | **0** — the 15/30-minute re-fire loop has stopped |
+| Backup service state | `failed` (settled), `Restart=no`, no further restarts |
+| VPS failed units | 0 |
+| `caddy`, `ubiquity-prospector`, `ai-ubq-fi`, `sshd`, `docker` | all active |
+| `ai.ubq.fi/health`, `app.prospector.sh`, `auth.prospector.sh` | 200 |
+| Root filesystem | `clean`, 0 ext4 errors this boot |
+
+### The live-root swapfile does not conflict with the restore contract
+
+This was the main risk in adding swap, so it was checked directly rather than
+assumed. The `/.swapfile` design belongs to the **oracle-root** role (the cold
+fallback volume on the staging disk), which already carries its own 4 GiB
+swapfile at `/mnt/.../.swapfile`, verified present on `ocivolume-root`.
+
+`recreateSwap` in `backblaze-machine-restore.ts` compares an existing file
+against the captured metadata and, on a match, verifies the `swap` signature and
+returns early. The file created here satisfies it exactly:
+
+    bytes=4294967296 mode=600 uid=0 gid=0   blkid TYPE=swap
+
+So a restore finds a matching, correctly-signed swapfile and proceeds — it is
+not a `swap:conflict`. Because `/.swapfile` is in `REQUIRED_EXCLUSIONS` for
+every capture role, the 4 GiB is excluded from all backups, so it also does not
+inflate archive size or alter a previously accepted generation.
