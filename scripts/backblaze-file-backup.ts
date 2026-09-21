@@ -1387,11 +1387,17 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
         // The "/" form lets systemd resolve the backing device, so it cannot
         // drift with /dev/sd* renaming.
         //
-        // Memory: MemoryHigh throttles before the hard limit; MemorySwapMax=0
-        // keeps this worker off the host swap so an OOM fails the backup
-        // instead of adding swap IO to the same root device.
+        // Memory: the hard MemoryMax bounds the worker and MemorySwapMax=0
+        // keeps it off the host swap, so an overrun fails the backup instead
+        // of adding swap IO to the same root device.
+        // MemoryHigh was set to 768M and had to be removed: the previous
+        // successful run peaked at 1,078 MB, so a 768M soft limit sits below
+        // this worker's natural peak. It throttled continuously (194,527
+        // "high" events in one run) and the upload stalled indefinitely instead
+        // of completing. The hard MemoryMax alone is the correct control: it
+        // still bounds the worker, and MemorySwapMax=0 keeps it off host swap
+        // so an overrun fails the backup rather than adding swap IO.
         "MemoryMax=1G",
-        "MemoryHigh=768M",
         "MemorySwapMax=0",
         "CPUQuota=100%",
         "CPUWeight=1",

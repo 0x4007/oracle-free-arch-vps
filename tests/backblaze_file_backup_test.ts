@@ -2337,6 +2337,12 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
   // IOSchedulingClass=idle is the enforceable disk control because the root
   // volume runs the "none" scheduler, making IOWeight/io.bfq.weight inert.
   assert(script.includes("CPUWeight=1"), script);
+  // MemoryHigh=768M was removed after it stalled a real upload: the worker's
+  // natural peak is ~1,078 MB, so a soft limit below that throttled it
+  // continuously (194,527 events) and it stopped making progress.
+  assert(!script.includes("MemoryHigh"), script);
+  assert(script.includes("MemoryMax=1G"), script);
+  assert(script.includes("MemorySwapMax=0"), script);
   assert(script.includes("Nice=19"), script);
   assert(script.includes("IOSchedulingClass=idle"), script);
   assert(script.includes("IOSchedulingPriority=7"), script);
