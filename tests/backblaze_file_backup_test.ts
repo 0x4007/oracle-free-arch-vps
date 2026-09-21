@@ -2331,6 +2331,16 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
   assert(script.includes("RuntimeMaxSec=12345"), script);
   assert(script.includes("MemoryMax=1G"));
   assert(script.includes("CPUQuota=100%"));
+  // The capture is a bulk background job on a shared 2-OCPU host: it must
+  // yield CPU under contention and issue disk IO only when the device is
+  // otherwise quiet. CPUWeight=1/Nice=19 are the floors (0 is invalid), and
+  // IOSchedulingClass=idle is the enforceable disk control because the root
+  // volume runs the "none" scheduler, making IOWeight/io.bfq.weight inert.
+  assert(script.includes("CPUWeight=1"), script);
+  assert(script.includes("Nice=19"), script);
+  assert(script.includes("IOSchedulingClass=idle"), script);
+  assert(script.includes("IOSchedulingPriority=7"), script);
+  assert(!script.includes("IOWeight=100"), script);
   assert(
     script.includes("WorkingDirectory=") &&
       script.includes(`${JOBS_RUNTIME_ROOT}/${fixture.jobId}`),

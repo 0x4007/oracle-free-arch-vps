@@ -15,5 +15,10 @@ WorkingDirectory=/home/pi/ops/weekly-backup-controller
 ExecStart=/usr/local/bin/safepi deno run --allow-read=.,.private --allow-write=.private --allow-run --allow-net scripts/backblaze-file-backup.ts
 UMask=0077
 TimeoutStartSec=7h
-Restart=on-failure
-RestartSec=30min
+# No systemd-level restart. The weekly timer already rechecks due work every
+# 15 minutes (UNATTENDED-BACKUP-CONTRACT.md), and the controller owns its own
+# durable exponential backoff (ONLINE_RETRY_POLICY). An additional
+# Restart=on-failure adds a second, backoff-blind schedule that looped this
+# unit 25 times around the 2026-09-20 failure and defeated the recorded
+# nextAttemptAtUtc. Leave a failed run failed; the timer will recheck it.
+Restart=no

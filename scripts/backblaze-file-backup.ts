@@ -1366,10 +1366,20 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
         "Type=exec",
         "RemainAfterExit=yes",
         `RuntimeMaxSec=${spec.remainingSec}`,
+        // The capture is a long, bulk workload that must never starve the
+        // production services sharing this 2-OCPU host. CPUQuota keeps it to
+        // one core; CPUWeight/Nice make it yield under contention while still
+        // running at full speed when the host is idle. IOSchedulingClass=idle
+        // is the enforceable disk control here: the root volume runs the
+        // "none" scheduler, so IOWeight/io.bfq.weight is inert and was
+        // replaced by an idle IO class that only issues IO when the device is
+        // otherwise quiet.
         "MemoryMax=1G",
         "CPUQuota=100%",
-        "Nice=10",
-        "IOWeight=100",
+        "CPUWeight=1",
+        "Nice=19",
+        "IOSchedulingClass=idle",
+        "IOSchedulingPriority=7",
         "UMask=0077",
         `WorkingDirectory=${runtimeDir}`,
       ].map((property) => `--property=${shellQuote(property)}`).join(" ");
