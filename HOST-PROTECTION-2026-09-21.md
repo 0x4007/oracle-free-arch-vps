@@ -176,3 +176,25 @@ So a restore finds a matching, correctly-signed swapfile and proceeds — it is
 not a `swap:conflict`. Because `/.swapfile` is in `REQUIRED_EXCLUSIONS` for
 every capture role, the 4 GiB is excluded from all backups, so it also does not
 inflate archive size or alter a previously accepted generation.
+
+## Observed timer behaviour after the fix
+
+The earlier "zero triggers" reading covered only a short window, so it was
+replaced with a direct observation across a real timer fire:
+
+| Time (EDT) | Event |
+| --- | --- |
+| 23:36:40 | `Scheduled restart job, restart counter is at 45` — the last systemd-driven restart, from the old configuration |
+| 23:52:00 | `Starting backblaze-file-backup.service` — a **timer** fire, per the contract-mandated 15-minute recheck |
+| 23:52:02 | `Main process exited, code=exited, status=1/FAILURE` |
+| *(after)* | **no** `Scheduled restart job` line |
+
+That absence is the proof: before the change every failure was followed by a
+`scheduled restart job, restart counter is at N` roughly 30 minutes later. After
+it, the unit fails once and stays failed. `NRestarts=0` (reset by the
+`daemon-reload`) and `Restart=no` are the effective values.
+
+The unit still fires on the contract-mandated 15-minute recheck and reports the
+existing `FAILED` job honestly until the next period — that is the documented
+scheduler behaviour, not the loop, and it produces no repeated Mac alerts
+because the watchdog deduplicates by stable status string.
