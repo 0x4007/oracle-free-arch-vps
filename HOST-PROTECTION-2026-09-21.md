@@ -25,6 +25,18 @@ Measured on the live host with `dd iflag=direct` against the root volume:
 
 So an idle I/O class does throttle, and it yields correctly under contention.
 
+**Correction 2026-09-22: that reading was wrong, and the row above overstates
+`IOSchedulingClass`.** Re-measured with `dd iflag=direct`, alternating
+best-effort-0 and idle over three passes against `/dev/sdb2`: best-effort-0 gave
+393, 56.0, 58.1 MB/s and idle gave 382, 59.3, 57.5 MB/s. Once the first
+page-cache-warm pass is excluded, the two classes are indistinguishable, and
+`ionice -p $$` confirmed the idle class really was applied. The earlier 0.33 s
+"baseline" was a cache-warm read, so the 1.81 s figure measured cache state, not
+I/O priority. Both block devices run the `none` scheduler, so no I/O scheduler
+is present to honour a priority class. Treat `IOSchedulingClass` and
+`IOWeight` as inert here; the cgroup bandwidth caps are the controls that
+actually bind. `Nice` and `CPUWeight` are unaffected and still work.
+
 Correction to the earlier receipt: the "2,800–9,300 MB/s" figures quoted there
 were an aggregation error and are not physically possible on this volume.
 Direct measurement gives ~63 MB/s read and ~70 MB/s write. The real load was
