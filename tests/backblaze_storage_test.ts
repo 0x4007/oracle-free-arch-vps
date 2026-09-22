@@ -13,6 +13,7 @@ import {
   DIRECT_PREFIX,
   MAX_CHUNK_BYTES,
 } from "../scripts/backblaze-storage.ts";
+import { isRetriableB2Error } from "../scripts/backblaze-source-worker.ts";
 
 const BUCKET_ID = "0000000000000001";
 const BUCKET_NAME = "pavlovcik-arch-vps-backups";
@@ -1041,6 +1042,127 @@ Deno.test("get redacts reader failures and still attempts cancellation", async (
     cancelState.attempted,
     "cancel must be attempted after a read failure",
   );
+});
+
+/** Replace the static `AbortSignal.timeout` with one controllable signal so a
+ * test can observe the requested delay and fire it without waiting. The
+ * original descriptor is restored in `finally`; the tests in this file run
+ * sequentially, so the global is never observed by another test. */
+async function withDeadlineControl(
+  run: (delays: number[], deadline: AbortController) => Promise<void>,
+): Promise<void> {
+  const original = Object.getOwnPropertyDescriptor(AbortSignal, "timeout");
+  if (original === undefined) {
+    throw new Error("AbortSignal.timeout is not an own property");
+  }
+  const deadline = new AbortController();
+  const delays: number[] = [];
+  Object.defineProperty(AbortSignal, "timeout", {
+    configurable: true,
+    writable: true,
+    value: (delayMs: number) => {
+      delays.push(delayMs);
+      return deadline.signal;
+    },
+  });
+  try {
+    await run(delays, deadline);
+  } finally {
+    Object.defineProperty(AbortSignal, "timeout", original);
+    if (!deadline.signal.aborted) deadline.abort();
+  }
+}
+
+Deno.test("the request deadline bounds a stalled transport", async () => {
+  await withDeadlineControl(async (delays, deadline) => {
+    let requestSignal: AbortSignal | undefined;
+    let markDownloadStarted: () => void = () => {};
+    const downloadStarted = new Promise<void>((resolve) => {
+      markDownloadStarted = resolve;
+    });
+    const { fetch } = fakeFetch((call) => {
+      if (call.url === AUTH_URL) return jsonResponse(authBody());
+      requestSignal = call.init.signal ?? undefined;
+      markDownloadStarted();
+      // A real transport ignores nothing: it rejects when the request signal
+      // aborts, and this fake mirrors that instead of resolving regardless.
+      return new Promise<Response>((_resolve, reject) => {
+        requestSignal?.addEventListener(
+          "abort",
+          () => reject(requestSignal?.reason),
+          { once: true },
+        );
+      });
+    });
+    const pending = new B2Store(settings(), fetch).get(chunkObject());
+    await downloadStarted;
+    assert(
+      delays.length === 2 && delays.every((delay) => delay === 120_000),
+      `every request must ask for the fixed deadline, got ${delays.join(",")}`,
+    );
+    assert(requestSignal instanceof AbortSignal, "fetch must get a signal");
+    assert(!requestSignal.aborted, "a live request must not be pre-aborted");
+    deadline.abort();
+    const error = await rejectWith(pending);
+    assert(
+      error.message === "b2_download_file_by_id failed (network error)",
+      error.message,
+    );
+    assert(
+      isRetriableB2Error(error),
+      "a stalled transport must stay retryable",
+    );
+  });
+});
+
+Deno.test("the request deadline bounds a stalled body read", async () => {
+  await withDeadlineControl(async (delays, deadline) => {
+    let requestSignal: AbortSignal | undefined;
+    let markReadStarted: () => void = () => {};
+    const readStarted = new Promise<void>((resolve) => {
+      markReadStarted = resolve;
+    });
+    const { fetch } = fakeFetch((call) => {
+      if (call.url === AUTH_URL) return jsonResponse(authBody());
+      requestSignal = call.init.signal ?? undefined;
+      const stream = new ReadableStream<Uint8Array>({
+        start(streamController) {
+          // Deno's fetch errors the response body when the request signal
+          // aborts; mirror that so the real body-read path is exercised.
+          requestSignal?.addEventListener(
+            "abort",
+            () => streamController.error(new Error("request aborted")),
+            { once: true },
+          );
+        },
+        pull() {
+          // Hold the body open until the deadline fires.
+          markReadStarted();
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-length": "3" },
+      });
+    });
+    const pending = new B2Store(settings(), fetch).get(chunkObject());
+    await readStarted;
+    assert(
+      delays[delays.length - 1] === 120_000,
+      `the download must ask for the fixed deadline, got ${delays.join(",")}`,
+    );
+    assert(requestSignal instanceof AbortSignal, "fetch must get a signal");
+    deadline.abort();
+    const error = await rejectWith(pending);
+    assert(
+      error.message === "b2_download_file_by_id failed: body read failed",
+      error.message,
+    );
+    assert(
+      isRetriableB2Error(error),
+      "an aborted body read must stay retryable",
+    );
+  });
 });
 
 Deno.test("get refuses unsafe objects before any network", async () => {

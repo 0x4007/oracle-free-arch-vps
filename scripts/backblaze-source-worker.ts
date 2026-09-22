@@ -53,7 +53,9 @@
  * at most three times with 30 minute spacing, heartbeat live, inside one
  * invocation and never past the deadline. Only exact B2 operation transport
  * failures are retried; identity/corruption/filesystem/scope/other 4xx
- * errors fail immediately.
+ * errors fail immediately. Every wait is announced on standard error with
+ * the fixed phase code, attempt counters, whitelisted operation/category and
+ * the wait and remaining window; no raw error text or credential is logged.
  *
  * Error surface: rejected inputs and incoherent saved state throw
  * SourceWorker rejected (CODE) without writing any status; failures during a
@@ -1290,35 +1292,54 @@ function isRetriableHttpStatus(status: number): boolean {
     (status >= 500 && status <= 599);
 }
 
-/**
- * Exact retriable B2 transport failure classification. Only the documented
+/** Sanitized identity of a retriable B2 transport failure: one whitelisted
+ * operation plus one fixed category. No other part of the error is ever
+ * derived here, so this is the only form safe to log. */
+interface B2FailureIdentity {
+  operation: string;
+  category: string;
+}
+
+/** Exact retriable B2 transport failure classification. Only the documented
  * storage-layer strings are retried for the five B2 operations: network
  * errors, HTTP 408/429/5xx (with optional unusable/invalid response body)
  * and a failed download body read. Scope/identity/corruption/other 4xx and
- * every non-B2 error return false.
- */
-export function isRetriableB2Error(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
+ * every non-B2 error return null. */
+function retriableB2Failure(error: unknown): B2FailureIdentity | null {
+  if (!(error instanceof Error)) return null;
   const message = error.message;
   const http =
     /^(.+) failed \(HTTP (\d{3})\)(: unreadable body|: invalid body)?$/
       .exec(message);
   if (http !== null) {
-    return RETRIABLE_B2_OPERATIONS.has(http[1]) &&
-      isRetriableHttpStatus(Number(http[2]));
+    if (
+      !RETRIABLE_B2_OPERATIONS.has(http[1]) ||
+      !isRetriableHttpStatus(Number(http[2]))
+    ) {
+      return null;
+    }
+    return { operation: http[1], category: `HTTP ${http[2]}` };
   }
   const networkSuffix = " failed (network error)";
   if (message.endsWith(networkSuffix)) {
-    return RETRIABLE_B2_OPERATIONS.has(
-      message.slice(0, -networkSuffix.length),
-    );
+    const operation = message.slice(0, -networkSuffix.length);
+    return RETRIABLE_B2_OPERATIONS.has(operation)
+      ? { operation, category: "network error" }
+      : null;
   }
   const bodyReadSuffix = " failed: body read failed";
   if (message.endsWith(bodyReadSuffix)) {
-    return message.slice(0, -bodyReadSuffix.length) ===
-      "b2_download_file_by_id";
+    const operation = message.slice(0, -bodyReadSuffix.length);
+    return operation === "b2_download_file_by_id"
+      ? { operation, category: "body read failed" }
+      : null;
   }
-  return false;
+  return null;
+}
+
+/** True only for the transports the bounded retry may repeat. */
+export function isRetriableB2Error(error: unknown): boolean {
+  return retriableB2Failure(error) !== null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,7 +1422,8 @@ async function runPhaseWithRetries<T>(
     } catch (error) {
       if (error instanceof WorkerPhaseError) throw error;
       lastError = error;
-      if (!isRetriableB2Error(error)) {
+      const failure = retriableB2Failure(error);
+      if (failure === null) {
         throw new WorkerPhaseError(code, error);
       }
       if (attempt >= MAX_PHASE_ATTEMPTS) {
@@ -1413,6 +1435,14 @@ async function runPhaseWithRetries<T>(
         throw new WorkerPhaseError("DEADLINE_EXCEEDED");
       }
       const wait = Math.min(RETRY_SPACING_MS, deadline - now);
+      // Stall/backoff visibility before the silent wait: only the fixed
+      // phase code, attempt counters, whitelisted operation/category and
+      // timing are logged. Raw error text, URLs, tokens and stacks are not.
+      console.error(
+        `[phase-retry] phase=${code} attempt=${attempt}/${MAX_PHASE_ATTEMPTS} ` +
+          `operation=${failure.operation} category=${failure.category} ` +
+          `waitMs=${wait} remainingMs=${deadline - now}`,
+      );
       await ctx.deps.sleep(wait);
       if (ctx.deps.now().getTime() > deadline) {
         throw new WorkerPhaseError("DEADLINE_EXCEEDED");

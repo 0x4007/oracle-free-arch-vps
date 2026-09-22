@@ -1764,6 +1764,54 @@ runtimeTest(
 );
 
 runtimeTest(
+  "retry: the wait announces only the sanitized failure and its window",
+  async () => {
+    await withTempBase(async (_base, canonicalBase) => {
+      const fixture = makeRunFixture(canonicalBase);
+      const lines: string[] = [];
+      let logsBeforeWait = -1;
+      let failures = 0;
+      const upload: SourceWorkerDependencies["upload"] = (captureResult) => {
+        fixture.probe.uploadCalls += 1;
+        failures += 1;
+        if (failures === 1) {
+          return Promise.reject(new Error("b2_upload_file failed (HTTP 503)"));
+        }
+        return Promise.resolve(makeUploadResult(captureResult));
+      };
+      fixture.probe.sleepHook = () => {
+        logsBeforeWait = lines.length;
+      };
+      const originalError = console.error;
+      console.error = (...args: unknown[]) => {
+        lines.push(args.map((value) => String(value)).join(" "));
+      };
+      try {
+        const terminal = await runSourceWorker(
+          fixture.inputs({ deps: { upload } }),
+        );
+        assert(terminal.state === "PENDING_VERIFIER");
+      } finally {
+        console.error = originalError;
+      }
+      assert(lines.length === 1, `exactly one retry line, got ${lines.length}`);
+      assert(logsBeforeWait === 1, "the retry line must precede the wait");
+      const line = lines[0];
+      assert(
+        line.startsWith(
+          `[phase-retry] phase=UPLOAD_FAILED attempt=1/${MAX_PHASE_ATTEMPTS} ` +
+            `operation=b2_upload_file category=HTTP 503 ` +
+            `waitMs=${RETRY_SPACING_MS} remainingMs=`,
+        ),
+        line,
+      );
+      const remaining = Number(/ remainingMs=(\d+)$/.exec(line)?.[1]);
+      assert(Number.isInteger(remaining) && remaining > 0, line);
+    });
+  },
+);
+
+runtimeTest(
   "retry: three retriable upload failures exhaust attempts with a FAILED terminal",
   async () => {
     await withTempBase(async (_base, canonicalBase) => {
