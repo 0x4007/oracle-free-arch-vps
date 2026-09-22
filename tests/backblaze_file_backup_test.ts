@@ -2356,6 +2356,35 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
       script.includes(`${JOBS_RUNTIME_ROOT}/${fixture.jobId}`),
   );
   assert(script.includes("entry-worker.ts"));
+  // The verifier's read-back passes cover the whole reconstruction, so the
+  // same builder must raise only its read budget; write/IOPS/deadline stay.
+  await seam.launchUnit({
+    unitName: verifyUnitName(fixture.generation),
+    runtimeDir: `${JOBS_RUNTIME_ROOT}/${fixture.jobId}`,
+    remainingSec: 12345,
+    args: [
+      "/usr/local/bin/deno",
+      "run",
+      "--allow-read",
+      "--allow-write",
+      "--allow-run",
+      "--allow-env",
+      "--allow-net",
+      "entry-verify.ts",
+    ],
+  });
+  const verifyScript = calls.at(-1)!.args.join(" ");
+  assert(
+    verifyScript.includes(`arch-vps-b2-verify-${uuidFor(14)}.service`),
+    verifyScript,
+  );
+  assert(verifyScript.includes("IOReadBandwidthMax=/ 30M"), verifyScript);
+  assert(!verifyScript.includes("IOReadBandwidthMax=/ 10M"), verifyScript);
+  assert(verifyScript.includes("IOWriteBandwidthMax=/ 10M"), verifyScript);
+  assert(verifyScript.includes("IOReadIOPSMax=/ 500"), verifyScript);
+  assert(verifyScript.includes("IOWriteIOPSMax=/ 200"), verifyScript);
+  assert(verifyScript.includes("RuntimeMaxSec=12345"), verifyScript);
+  assert(verifyScript.includes("entry-verify.ts"), verifyScript);
   await seam.installer({
     jobId: fixture.jobId,
     sourceRevision: REVISION,
