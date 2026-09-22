@@ -2337,6 +2337,10 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
   // IOSchedulingClass=idle is the enforceable disk control because the root
   // volume runs the "none" scheduler, making IOWeight/io.bfq.weight inert.
   assert(script.includes("CPUWeight=1"), script);
+  assert(script.includes("IOReadBandwidthMax=/ 10M"), script);
+  assert(script.includes("IOWriteBandwidthMax=/ 10M"), script);
+  // A 2M write cap was measured to blow the 6h capture deadline.
+  assert(!script.includes("IOWriteBandwidthMax=/ 2M"), script);
   // MemoryHigh=768M was removed after it stalled a real upload: the worker's
   // natural peak is ~1,078 MB, so a soft limit below that throttled it
   // continuously (194,527 events) and it stopped making progress.

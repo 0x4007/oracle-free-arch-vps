@@ -1406,7 +1406,14 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
         "IOSchedulingPriority=7",
         "IOAccounting=yes",
         "IOReadBandwidthMax=/ 10M",
-        "IOWriteBandwidthMax=/ 2M",
+        // 10M, not 2M. A 2M write cap was measured to stretch the capture to
+        // 3.72 h because capture writes both the plaintext archive and its
+        // ciphertext (~20.6 GB total), which pushed the whole capture+upload+
+        // verify cycle into GATE_DEADLINE_MS (6 h) and the run was killed
+        // mid-verify. 10M keeps the same order of protection - still ~1/7 of
+        // the volume's ~72 MB/s Balanced/10-VPU budget - while leaving the
+        // cycle comfortably inside the deadline.
+        "IOWriteBandwidthMax=/ 10M",
         "IOReadIOPSMax=/ 500",
         "IOWriteIOPSMax=/ 200",
         "OOMPolicy=kill",

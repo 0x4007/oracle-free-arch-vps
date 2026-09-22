@@ -97,6 +97,40 @@ Name the exact resource and OCID in each destructive approval request.
   privileged operation.
 - Do not use `root` over SSH.
 
+### Never leave an unmanaged heavy process on the host
+
+Incident 2026-09-21/22: two `tar | zstd` pipelines from a diagnostic test kept
+running for 12.5 hours after the shell that started them was killed. Killing a
+parent shell does not kill its pipeline children. They were reparented to init
+and landed in `user.slice/session-*.scope` instead of the backup worker's
+cgroup, so `CPUWeight=1` and the IO caps never applied to them. Each `zstd` held
+about 71% CPU and streamed the whole root disk continuously, degrading unrelated
+production work on the same host.
+
+**A cgroup limit only binds processes inside that cgroup.** A reparented or
+otherwise escaped process is unmanaged, and the protection is worth nothing for
+it. Never assume a limit is protecting production without checking which cgroup
+the running process is actually in.
+
+Rules for any backup-shaped or disk-reading workload:
+
+- Launch it in a transient unit (`systemd-run`) that carries the same limits the
+  real worker uses, and bound it with `RuntimeMaxSec`. Do not run an unmanaged
+  `tar | zstd` (or similar) pipeline on the production host.
+- Stop it with `systemctl stop <unit>`, never by killing a shell or a single
+  child. Stopping the unit kills the whole tree.
+- After stopping, verify the tree is actually gone before moving on. Check for
+  orphans whose parent is 1 and whose cgroup is a user session rather than a
+  managed slice:
+
+      ps -eo pid,ppid,etime,pcpu,args | awk '$2 == 1 && $3 ~ /-/'
+      for p in $(pgrep -f "tar -C /"); do cat /proc/$p/cgroup; done
+
+- Prefer a bounded test over a full-disk sweep. A diagnostic must not read the
+  entire 150 GB root volume or run for hours.
+- Reconcile leftovers after every diagnostic, including failure paths, before
+  starting unrelated work or handing off.
+
 ## Storage and boot invariants
 
 - The staging boot and Arch root volumes are one recovery unit.
@@ -160,3 +194,42 @@ Name the exact resource and OCID in each destructive approval request.
 - Keep external recovery copies client-side encrypted. Keep decryption keys off
   the VPS and out of this repository.
 - Distinguish `METADATA_PROVED` from `RESTORE_DRILL_PROVED`.
+
+## Throttle values must be validated against the whole cycle budget
+
+Incident 2026-09-22: a GPT Pro review recommended a 2 MB/s write cap, and it was
+applied without checking it against this repository's own deadline. It was wrong
+for this system:
+
+- Capture writes **both** the plaintext archive and its ciphertext, so a 10.3 GB
+  payload produces roughly 20.6 GB of writes, not 10.3 GB.
+- At 2 MB/s that measured 3.72 h for capture alone. Capture + upload + verify
+  then crossed `GATE_DEADLINE_MS` (6 h), and the verifier was killed at the
+  deadline with `ORPHANED_TERMINAL_PROOF_MISSING`. The upload had already
+  succeeded; the run still failed.
+- The same cap would have broken every subsequent weekly run.
+
+Before adopting any resource cap:
+
+- Estimate the whole cycle (capture + upload + verify), not one stage, and keep
+  it inside `GATE_DEADLINE_MS`.
+- Account for work that is written twice, read back, compressed, or encrypted
+  rather than only for the payload size.
+- Measure the real stage durations before choosing a value. Prefer a cap that
+  leaves clear headroom over one that only looks conservative.
+- An external recommendation is input, not authority. It does not know this
+  repository's deadlines, so validate it here before applying it.
+
+## Verify what a limit actually binds
+
+Before reporting that a limit protects production:
+
+- Confirm the running process is in the cgroup carrying that limit. A limit on a
+  unit does nothing for a process that escaped into a session scope.
+- Confirm the control is not inert on this host. The root volume runs the
+  `none` IO scheduler, so `IOWeight` and `IOSchedulingClass` do not arbitrate
+  anything here; cgroup bandwidth caps do. Measure rather than assume.
+- Distinguish a phase that is working from one that is stalled: check CPU
+  (`cpu.stat`), archive growth, and the process wait channel together. A file
+  that stops growing is still healthy when `zstd -t` or `zstd -dc` is consuming
+  CPU, and a process that is asleep in `ep_poll` with 0 ms CPU is not.
