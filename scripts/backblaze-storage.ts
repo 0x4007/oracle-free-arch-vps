@@ -25,6 +25,12 @@ export const DIRECT_PREFIX = "restic/direct-v1/";
 
 export const MAX_CHUNK_BYTES = 64 * 1024 * 1024;
 
+/** Per-request B2 deadline. It covers the fetch and the response body read,
+ * because the fetch signal stays live while the body is read; one 64 MiB
+ * chunk at the 4 MiB/s transfer pace plus network overhead fits inside it.
+ * Internal only: this is never a caller-visible option. */
+const B2_REQUEST_TIMEOUT_MS = 120_000;
+
 const BUCKET_NAME = "pavlovcik-arch-vps-backups";
 const AUTH_URL = "https://api.backblazeb2.com/b2api/v4/b2_authorize_account";
 const API_PATH = "/b2api/v3/";
@@ -255,14 +261,23 @@ async function failHttp(operation: string, response: Response): Promise<never> {
   throw new Error(`${operation} failed (HTTP ${response.status})`);
 }
 
+/** The deadline applies to every request, and a caller signal is composed with
+ * it rather than replacing it (`init.signal ?? deadline` would silently drop
+ * the deadline whenever a caller passes its own signal). The composed signal
+ * stays live after the headers arrive, so the same bound covers the later
+ * response body read. */
 async function sendRequest(
   fetcher: B2Fetcher,
   operation: string,
   url: string,
   init: RequestInit,
 ): Promise<Response> {
+  const deadline = AbortSignal.timeout(B2_REQUEST_TIMEOUT_MS);
+  const signal = init.signal === null || init.signal === undefined
+    ? deadline
+    : AbortSignal.any([init.signal, deadline]);
   try {
-    return await fetcher(url, { ...init, redirect: "error" });
+    return await fetcher(url, { ...init, signal, redirect: "error" });
   } catch {
     // The provider error, URL or token is never included in the message.
     throw new Error(`${operation} failed (network error)`);

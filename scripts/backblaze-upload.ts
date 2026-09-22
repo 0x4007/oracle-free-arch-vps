@@ -1164,6 +1164,8 @@ export async function uploadCapturedGeneration(
 ): Promise<UploadResult> {
   validateUploadCapture(capture);
   const stage = await assertStageDirectory(capture.stageDirectory);
+  // Stall-location checkpoint: fixed phase string only, no path or identity.
+  console.error("[upload-phase] planning");
   const plans: ArchivePlan[] = [];
   for (const role of UPLOAD_ROLE_ORDER) {
     const archive = capture.archives.find((candidate) =>
@@ -1183,6 +1185,8 @@ export async function uploadCapturedGeneration(
   for (const role of UPLOAD_ROLE_ORDER) {
     savedByRole.set(role, saved.filter((entry) => entry.role === role));
   }
+  // Stall-location checkpoint: fixed phase string only, no path or identity.
+  console.error("[upload-phase] inventory");
   const storeVersions = await store.versions();
   const byName = classifyInventory(storeVersions, capture.generation);
   const totalChunks = plans.reduce((sum, plan) => sum + plan.chunks.length, 0);
