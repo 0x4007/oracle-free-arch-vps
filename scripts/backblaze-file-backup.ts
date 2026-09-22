@@ -1362,6 +1362,12 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
       ) {
         throw new Error("Remaining deadline seconds must be positive");
       }
+      // The validated unit name already carries the existing worker/verifier
+      // kind: capture workers and prune units keep the 10M read budget, and
+      // only the verifier, which reads the whole reconstruction back, gets
+      // 30M. Every other control below stays shared by both kinds.
+      const unitKind = UNIT_NAME_PATTERN.exec(unitName)![1];
+      const readBandwidthMax = unitKind === "verify" ? "30M" : "10M";
       const properties = [
         "Type=exec",
         "RemainAfterExit=yes",
@@ -1405,7 +1411,15 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
         "IOSchedulingClass=idle",
         "IOSchedulingPriority=7",
         "IOAccounting=yes",
-        "IOReadBandwidthMax=/ 10M",
+        // The verifier streams ~64.9 GB of full-file read-back passes, not the
+        // 10.36 GB ciphertext payload capture wrote. At the capture's 10M read
+        // budget those passes need ~108 min and cannot fit inside the six-hour
+        // cycle; 30M read plus the shared 10M write brings them to ~47.5 min
+        // (capture 114 + planning/upload ~121 + reconstruct 17 + verify ~47.5
+        // is ~300 min, ~60 min of headroom for a normal cycle). Decimal M:
+        // 30M is 30,000,000 B/s. This bounds a normal cycle; it does not
+        // guarantee the gate deadline under every retry.
+        `IOReadBandwidthMax=/ ${readBandwidthMax}`,
         // 10M, not 2M. A 2M write cap was measured to stretch the capture to
         // 3.72 h because capture writes both the plaintext archive and its
         // ciphertext (~20.6 GB total), which pushed the whole capture+upload+
