@@ -30,9 +30,7 @@ tolerates tar's benign exit 1 (file changed while reading) while keeping exit 2
 and every other status fatal, and adds no tolerance to zstd or the inventory
 check.
 
-The **verifier downloaded and decrypted 5.7 GB back from Backblaze**, which is
-independent proof the cloud objects exist and are readable — not merely a local
-claim.
+The **verifier downloaded and decrypted the complete 10,301,567,391 B payload (about 9.59 GiB) back from Backblaze** — the `root` archive alone is 5,989,754,207 B — which is independent proof the cloud objects exist and are readable, not merely a local claim.
 
 Production stayed healthy throughout: load ~0.3–1.3 on a 2-OCPU host, 0 failed
 units, `caddy`/`ubiquity-prospector`/`ai-ubq-fi`/`sshd`/`docker` all active, root
