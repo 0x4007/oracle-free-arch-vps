@@ -605,6 +605,7 @@ interface Harness {
   clock: { current: Date };
   privateMap: Map<string, unknown | Uint8Array>;
   events: string[];
+  logs: string[];
   gate: { value: BackupControllerGate | null; orphaned: OrphanReason[] };
   store: MetadataStore & { versionsList: B2Object[]; removed: B2Object[] };
   launches: { unitName: string; runtimeDir: string; remainingSec: number }[];
@@ -654,6 +655,7 @@ function harness(options: HarnessOptions): Harness {
   });
   options.seedPrivate?.(privateMap);
   const events: string[] = [];
+  const logs: string[] = [];
   const gate = {
     value: options.gateValue ?? null,
     orphaned: [] as OrphanReason[],
@@ -844,7 +846,9 @@ function harness(options: HarnessOptions): Harness {
     tunnel,
     metadataStore: () => store,
     gate: gateSeam,
-    logger: () => {},
+    logger: (message) => {
+      logs.push(message);
+    },
     sleep: async () => {},
   };
   return {
@@ -852,6 +856,7 @@ function harness(options: HarnessOptions): Harness {
     clock,
     privateMap,
     events,
+    logs,
     gate,
     store,
     launches,
@@ -3351,6 +3356,88 @@ function failedTerminalObserved(
   return { props, status, lockFree: true, reachable: true };
 }
 
+/** The live expiry shape: the immutable deadline passed, systemd stopped the
+ * unit with Result=timeout, and the source status is preserved in a known
+ * nonterminal state with the original null finishedAtUtc. */
+function workerUploadingStatus(
+  fixture: GenerationFixture,
+  invocationId: string,
+): Record<string, unknown> {
+  const request = fixture.request;
+  const started = Date.parse(request.requestedAtUtc) + 1000;
+  const lastBeat = Date.parse(request.deadlineAtUtc) - 60_000;
+  return {
+    schemaVersion: 1,
+    jobId: request.jobId,
+    periodKey: request.periodKey,
+    generation: request.generation,
+    requestSha256: fixture.requestSha256,
+    requestedAtUtc: request.requestedAtUtc,
+    deadlineAtUtc: request.deadlineAtUtc,
+    invocationId,
+    state: "UPLOADING",
+    startedAtUtc: iso(started),
+    updatedAtUtc: iso(lastBeat),
+    heartbeatAtUtc: iso(lastBeat - 1_000),
+    finishedAtUtc: null,
+  };
+}
+
+/** Exact authoritative unit death: timed out, failed/failed, zero PIDs, an
+ * empty control group with unset tasks, and a free source lock. */
+function timeoutObserved(
+  invocationId: string,
+  overrides: Record<string, string> = {},
+): ObservedUnit {
+  const props = new Map<string, string>([
+    ["LoadState", "loaded"],
+    ["ActiveState", "failed"],
+    ["SubState", "failed"],
+    ["Result", "timeout"],
+    ["MainPID", "0"],
+    ["ControlPID", "0"],
+    ["ControlGroup", ""],
+    ["TasksCurrent", "[not set]"],
+    ["InvocationID", invocationId],
+  ]);
+  for (const [key, value] of Object.entries(overrides)) props.set(key, value);
+  return { props, status: null, lockFree: true, reachable: true };
+}
+
+function orphanedWorkerGate(
+  fixture: GenerationFixture,
+  reason: OrphanReason = "TERMINAL_PROOF_MISSING",
+): BackupControllerGate {
+  return {
+    ...deriveVerifierGate(fixture.request, fixture.requestSha256),
+    unitName: workerUnitName(fixture.generation),
+    unitInvocationId: INVOCATION_A,
+    state: "orphaned",
+    orphanReason: reason,
+  };
+}
+
+/** The durable FAILED state left behind after the deadline orphaning. */
+function failedDeadlineState(
+  fixture: GenerationFixture,
+  workerStatus: Record<string, unknown>,
+): ControllerState {
+  return validateControllerState({
+    schemaVersion: 1,
+    catalog: [],
+    job: {
+      ...stateWithJob(fixture, "FAILED", {
+        workerStatus,
+        workerInvocationId: INVOCATION_A,
+        failure: {
+          code: "ORPHANED_TERMINAL_PROOF_MISSING",
+          atUtc: iso(Date.parse(fixture.request.deadlineAtUtc) + 30_000),
+        },
+      }).job!,
+    },
+  });
+}
+
 Deno.test("orchestration: a surviving worker gate after the WORKER_TERMINAL persist is revalidated and cleared before the verifier launch", async () => {
   const fixture = generationFixture(40, WINDOW_START);
   const workerStatus = workerPendingStatus(fixture, INVOCATION_A);
@@ -3838,6 +3925,134 @@ Deno.test("orchestration: a failed terminal unit resume revalidates and clears i
   );
   assert(h.events.includes("gate:clear"));
   assert(h.launches.length === 0);
+});
+
+Deno.test("orchestration: an expired timeout orphaned gate reconciles with the preserved nonterminal status and no receipt", async () => {
+  const fixture = generationFixture(46, WINDOW_START);
+  const status = workerUploadingStatus(fixture, INVOCATION_A);
+  const now = new Date(Date.parse(fixture.request.deadlineAtUtc) + 60_000);
+  const state = failedDeadlineState(fixture, status);
+  const h = harness({
+    now,
+    gateValue: orphanedWorkerGate(fixture),
+    observed: () => timeoutObserved(INVOCATION_A),
+  });
+  const after = await stepBackupController(state, h.deps, h.deps.now());
+  assert(after.job!.phase === "FAILED", `phase=${after.job!.phase}`);
+  assert(
+    after.job!.failure!.code === "ORPHANED_TERMINAL_PROOF_MISSING",
+    `failure=${after.job!.failure!.code}`,
+  );
+  assert(
+    after.catalog.length === 0,
+    "reconciliation never invents an accepted receipt",
+  );
+  assert(h.gate.value === null, "the orphaned gate is reconciled and removed");
+  assert(h.events.includes("gate:clear"), h.events.join("|"));
+  assert(
+    h.logs.some((line) => line.includes("Reconciled expired-timeout gate")),
+    `the reconciliation is classified in the log: ${h.logs.join("|")}`,
+  );
+  assert(h.launches.length === 0, "reconciliation never launches a unit");
+  assert(h.store.removed.length === 0, "no cloud object is touched");
+  assert(
+    JSON.stringify(after.job!.workerStatus) === JSON.stringify(status),
+    "the original nonterminal source status is preserved verbatim",
+  );
+  assert(
+    after.job!.envelope.requestSha256 === state.job!.envelope.requestSha256 &&
+      after.job!.envelope.request.deadlineAtUtc ===
+        state.job!.envelope.request.deadlineAtUtc,
+    "the immutable request hash and deadline are preserved",
+  );
+});
+
+Deno.test("orchestration: expired reconciliation rejects signal, unreachable, foreign orphan, busy lock and running-unit shapes", async () => {
+  const fixture = generationFixture(47, WINDOW_START);
+  const status = workerUploadingStatus(fixture, INVOCATION_A);
+  const now = new Date(Date.parse(fixture.request.deadlineAtUtc) + 60_000);
+  const failed = (): ControllerState => failedDeadlineState(fixture, status);
+  const cases: {
+    name: string;
+    gate: BackupControllerGate;
+    observed: (unitName: string, jobId: string) => ObservedUnit;
+  }[] = [
+    {
+      name: "operator-kill signal result",
+      gate: orphanedWorkerGate(fixture),
+      observed: () => timeoutObserved(INVOCATION_A, { Result: "signal" }),
+    },
+    {
+      name: "unreachable unit",
+      gate: orphanedWorkerGate(fixture),
+      observed: () => ({
+        props: new Map(),
+        status: null,
+        lockFree: false,
+        reachable: false,
+      }),
+    },
+    {
+      name: "foreign orphan reason",
+      gate: orphanedWorkerGate(fixture, "UNIT_IDENTITY_MISMATCH"),
+      observed: () => timeoutObserved(INVOCATION_A),
+    },
+    {
+      name: "busy source lock",
+      gate: orphanedWorkerGate(fixture),
+      observed: () => ({ ...timeoutObserved(INVOCATION_A), lockFree: false }),
+    },
+    {
+      name: "still-running unit",
+      gate: orphanedWorkerGate(fixture),
+      observed: () =>
+        timeoutObserved(INVOCATION_A, {
+          ActiveState: "active",
+          SubState: "running",
+          Result: "success",
+        }),
+    },
+  ];
+  for (const entry of cases) {
+    const h = harness({
+      now,
+      gateValue: entry.gate,
+      observed: entry.observed,
+    });
+    const after = await stepBackupController(failed(), h.deps, h.deps.now());
+    assert(after.job!.phase === "FAILED", entry.name);
+    assert(h.gate.value !== null, `${entry.name}: the gate must survive`);
+    assert(
+      !h.events.includes("gate:clear"),
+      `${entry.name}: no clear may occur`,
+    );
+    assert(h.launches.length === 0, entry.name);
+  }
+  // A saved terminal status on an orphaned gate keeps the previous strict
+  // rejection; only the preserved-nonterminal expiry shape is reconcilable.
+  const terminalStatus = workerPendingStatus(fixture, INVOCATION_A);
+  const terminalState = validateControllerState({
+    schemaVersion: 1,
+    catalog: [],
+    job: {
+      ...stateWithJob(fixture, "FAILED", {
+        workerStatus: terminalStatus,
+        workerInvocationId: INVOCATION_A,
+        failure: {
+          code: "ORPHANED_TERMINAL_PROOF_MISSING",
+          atUtc: iso(now.getTime() - 30_000),
+        },
+      }).job!,
+    },
+  });
+  const terminal = harness({
+    now,
+    gateValue: orphanedWorkerGate(fixture),
+    observed: () => failedTerminalObserved(terminalStatus),
+  });
+  await stepBackupController(terminalState, terminal.deps, terminal.deps.now());
+  assert(terminal.gate.value !== null, "terminal-status orphan stays strict");
+  assert(!terminal.events.includes("gate:clear"));
 });
 
 Deno.test("orchestration: prior period closes allow a fresh next Sunday job", async () => {

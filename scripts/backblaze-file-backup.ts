@@ -2823,7 +2823,7 @@ export function buildClearProof(
   statusTimestamps: {
     updatedAtUtc: string;
     heartbeatAtUtc: string;
-    finishedAtUtc: string;
+    finishedAtUtc: string | null;
   },
 ): unknown {
   const props = observation.props;
@@ -2869,6 +2869,12 @@ export function buildClearProof(
     statusFinishedAtUtc: statusTimestamps.finishedAtUtc,
     sourceLockPath: GATE_SOURCE_LOCK_PATH,
     sourceLockFree: observation.lockFree as true,
+    // A preserved nonterminal status has no finish instant by schema, so its
+    // only honest basis is the deadline-expired reconciliation. A finish
+    // instant is never synthesized at the call site.
+    clearBasis: statusTimestamps.finishedAtUtc === null
+      ? "deadline-expired"
+      : "terminal",
   };
   validateGateClearProof(proof, gate, new Date(observation.checkedAtUtc));
   return proof;
@@ -3845,7 +3851,15 @@ async function observeProof(
  * launch or prune. A gate already absent is idempotently fine in those
  * durable phases; a foreign or identity-mismatched gate is never cleared
  * and throws, while a transiently unreachable or not-yet-terminal unit
- * keeps the gate and returns false so the poll pair retries. */
+ * keeps the gate and returns false so the poll pair retries.
+ *
+ * The one additional basis is the observed deadline gap: a gate orphaned
+ * with TERMINAL_PROOF_MISSING while the saved source status is still a known
+ * nonterminal state (finishedAtUtc null). The fresh proof must then show the
+ * exact timed-out, failed/failed, zero-process unit with a free source lock
+ * and an expired request deadline; the original nonterminal status is
+ * preserved verbatim and the reconciliation is logged. No other orphan
+ * reason, no terminal-status mismatch and no unknown state ever clears. */
 async function clearSurvivingTerminalGate(
   deps: PiDeps,
   job: ControllerJob,
@@ -3855,8 +3869,15 @@ async function clearSurvivingTerminalGate(
   const request = job.envelope.request;
   const gate = await deps.gate.read();
   if (gate === null) return true;
+  // Only the preserved-nonterminal status shape may use the orphaned gate:
+  // it is by schema the only one whose original finishedAtUtc is null, and
+  // the validator independently requires the expired deadline, timeout
+  // result and TERMINAL_PROOF_MISSING orphan reason.
+  const expiredOrphan = gate.state === "orphaned" &&
+    gate.orphanReason === "TERMINAL_PROOF_MISSING" &&
+    status.finishedAtUtc === null;
   if (
-    gate.state !== "active" ||
+    (gate.state !== "active" && !expiredOrphan) ||
     gate.jobId !== request.jobId ||
     gate.periodKey !== request.periodKey ||
     gate.generation !== request.generation ||
@@ -3887,9 +3908,16 @@ async function clearSurvivingTerminalGate(
   const proof = buildClearProof(observation, gate, status.state, {
     updatedAtUtc: status.updatedAtUtc,
     heartbeatAtUtc: status.heartbeatAtUtc,
-    finishedAtUtc: status.finishedAtUtc ?? deps.now().toISOString(),
+    finishedAtUtc: status.finishedAtUtc,
   });
   await deps.gate.clear(gate, proof);
+  if (expiredOrphan) {
+    // Classification only: the source status is untouched, no receipt or
+    // restore point is created, and the gate removal is the sole effect.
+    deps.logger(
+      `Reconciled expired-timeout gate for ${request.jobId}: Result=timeout failed/failed with zero processes, source lock free, status ${status.state} preserved with finishedAtUtc=null`,
+    );
+  }
   return true;
 }
 
@@ -4300,7 +4328,7 @@ export async function stepBackupController(
           {
             updatedAtUtc: status!.updatedAtUtc,
             heartbeatAtUtc: status!.heartbeatAtUtc,
-            finishedAtUtc: status!.finishedAtUtc ?? now.toISOString(),
+            finishedAtUtc: status!.finishedAtUtc,
           },
         );
       } catch (error) {
@@ -4638,7 +4666,7 @@ export async function stepBackupController(
           {
             updatedAtUtc: status!.updatedAtUtc,
             heartbeatAtUtc: status!.heartbeatAtUtc,
-            finishedAtUtc: status!.finishedAtUtc ?? now.toISOString(),
+            finishedAtUtc: status!.finishedAtUtc,
           },
         );
       } catch (error) {

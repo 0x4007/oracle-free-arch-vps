@@ -87,8 +87,36 @@ function proofFixture(
     statusFinishedAtUtc: "2026-09-06T10:00:05.000Z",
     sourceLockPath: "/var/tmp/arch-vps-file-backup/source.lock",
     sourceLockFree: true,
+    clearBasis: "terminal",
     ...overrides,
   };
+}
+
+/** The live expiry shape: orphaned TERMINAL_PROOF_MISSING gate whose
+ * immutable deadline passed, exact timed-out failed/failed unit with no
+ * processes, free source lock, and a preserved nonterminal status whose
+ * original finishedAtUtc is still null. */
+function expiredGate(overrides: Record<string, unknown> = {}) {
+  return validateGate(gateFixture({
+    state: "orphaned",
+    orphanReason: "TERMINAL_PROOF_MISSING",
+    unitInvocationId: INVOCATION,
+    ...overrides,
+  }));
+}
+
+function expiredProofFixture(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return proofFixture({
+    unitActiveState: "failed",
+    unitSubState: "failed",
+    unitResult: "timeout",
+    statusState: "UPLOADING",
+    statusFinishedAtUtc: null,
+    clearBasis: "deadline-expired",
+    ...overrides,
+  });
 }
 
 const CLEAR_NOW = new Date("2026-09-06T10:00:15.000Z");
@@ -315,6 +343,115 @@ Deno.test("failed systemd proof accepts known failure results with FAILED status
     );
     assertEquals(proof.unitResult, result);
   }
+});
+
+Deno.test("deadline-expired proof accepts the preserved nonterminal timeout shape", () => {
+  const gate = expiredGate();
+  const input = expiredProofFixture();
+  const proof = validateGateClearProof(input, gate, CLEAR_NOW);
+  assertEquals(proof, input);
+  assertEquals(proof.clearBasis, "deadline-expired");
+  assert(proof.statusFinishedAtUtc === null, "finishedAt is never synthesized");
+  assertEquals(proof.statusState, "UPLOADING");
+  // The derived field must not make the returned proof invalid against the
+  // same gate and comparison instant.
+  assertEquals(validateGateClearProof(proof, gate, CLEAR_NOW), proof);
+});
+
+Deno.test("terminal proof without clearBasis defaults to a revalidatable terminal basis", () => {
+  const gate = validateGate(boundGate());
+  const input = proofFixture();
+  delete input.clearBasis;
+  const proof = validateGateClearProof(input, gate, CLEAR_NOW);
+  assertEquals(proof.clearBasis, "terminal");
+  assertEquals(proof.statusFinishedAtUtc, "2026-09-06T10:00:05.000Z");
+  assertEquals(
+    validateGateClearProof(proof, gate, CLEAR_NOW).clearBasis,
+    "terminal",
+  );
+});
+
+Deno.test("deadline-expired proof rejects every unsupported condition", () => {
+  const gate = expiredGate();
+  const rejects = (
+    overrides: Record<string, unknown>,
+    candidate = gate,
+  ): void => {
+    assertThrows(() =>
+      validateGateClearProof(
+        expiredProofFixture(overrides),
+        candidate,
+        CLEAR_NOW,
+      )
+    );
+  };
+  // Only the orphaned TERMINAL_PROOF_MISSING gate is reconcilable.
+  rejects({}, validateGate(boundGate()));
+  rejects({}, expiredGate({ orphanReason: "UNIT_IDENTITY_MISMATCH" }));
+  rejects({}, expiredGate({ orphanReason: "STATUS_INVALID" }));
+  rejects(
+    {},
+    expiredGate({ orphanReason: "SOURCE_UNREACHABLE_AT_DEADLINE" }),
+  );
+  // The immutable request deadline has not passed.
+  rejects(
+    {},
+    expiredGate({
+      requestedAtUtc: "2026-09-06T04:00:20.000Z",
+      deadlineAtUtc: "2026-09-06T10:00:20.000Z",
+      createdAtUtc: "2026-09-06T04:00:21.000Z",
+      updatedAtUtc: "2026-09-06T04:00:22.000Z",
+    }),
+  );
+  // Only Result=timeout on the exact failed/failed unit.
+  rejects({ unitResult: "exit-code" });
+  rejects({ unitResult: "signal" });
+  rejects({
+    unitResult: "success",
+    unitActiveState: "active",
+    unitSubState: "exited",
+  });
+  rejects({ unitActiveState: "active", unitSubState: "exited" });
+  rejects({ unitActiveState: "failed", unitSubState: "exited" });
+  // Unit, status and gate invocation identities must all match.
+  rejects({ unitName: `arch-vps-b2-verify-${UUID}.service` });
+  rejects({ unitInvocationId: "b".repeat(32) });
+  rejects({ statusInvocationId: "b".repeat(32) });
+  rejects({
+    statusJobId: `job-${"0".repeat(8)}-${"0".repeat(4)}-${"0".repeat(4)}-${
+      "0".repeat(4)
+    }-${"0".repeat(12)}`,
+  });
+  rejects({ statusRequestSha256: "cd".repeat(32) });
+  // Live processes or an unproven cgroup.
+  rejects({ mainPid: 1 });
+  rejects({ controlPid: 1 });
+  rejects({ controlGroup: "", tasksCurrent: 0 });
+  rejects({
+    controlGroup: `/system.slice/arch-vps-b2-worker-${UUID}.service`,
+    tasksCurrent: 1,
+  });
+  rejects({
+    controlGroup: `/system.slice/arch-vps-b2-worker-${UUID}.service`,
+    tasksCurrent: null,
+  });
+  // Busy source lock.
+  rejects({ sourceLockFree: false });
+  // Unknown or terminal status states are never preserved as nonterminal.
+  rejects({ statusState: "PENDING_VERIFIER" });
+  rejects({ statusState: "FAILED" });
+  rejects({ statusState: "SLEEPING" });
+  // A non-null finish instant is never accepted in the expired basis.
+  rejects({ statusFinishedAtUtc: "2026-09-06T10:00:05.000Z" });
+  // Stale, future or incoherent timestamp evidence.
+  rejects({ checkedAtUtc: "2026-09-06T10:00:46.000Z" });
+  rejects({ checkedAtUtc: "2026-09-06T10:00:20.000Z" });
+  rejects({ statusHeartbeatAtUtc: "2026-09-06T10:00:06.000Z" });
+  rejects({ statusUpdatedAtUtc: "2026-09-06T10:00:20.000Z" });
+  rejects({ statusUpdatedAtUtc: "2026-09-06T03:59:59.000Z" });
+  rejects({ statusHeartbeatAtUtc: "2026-09-06T03:59:59.000Z" });
+  // An unknown basis is never accepted.
+  rejects({ clearBasis: "guess" });
 });
 
 Deno.test("terminal proof rejects running or mismatched combinations", () => {

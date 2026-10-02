@@ -44,7 +44,23 @@ export type GateClearProofState =
   | "ACCEPTED"
   | "COMPLETE"
   | "FAILED";
+/** Every source status state that is still in flight and therefore carries
+ * `finishedAtUtc: null` by the existing worker/verifier schemas. These are the
+ * only states the deadline-expired basis may preserve verbatim. */
+export type GateClearNonterminalState =
+  | "REQUESTED"
+  | "CAPTURING"
+  | "CAPTURED"
+  | "UPLOADING"
+  | "UPLOAD_VERIFIED"
+  | "INDEXING"
+  | "VERIFYING";
 export type GateUnitResult = "success" | "exit-code" | "timeout" | "signal";
+/** Which observation basis authorized a clear. "terminal" is the existing
+ * strict terminal proof; "deadline-expired" is the reconciliation of an
+ * orphaned TERMINAL_PROOF_MISSING gate whose timed-out unit is authoritatively
+ * dead while its source status is still a preserved nonterminal state. */
+export type GateClearBasis = "terminal" | "deadline-expired";
 
 /** One immutable detached worker/verify/prune launch identity. */
 export interface BackupControllerGate {
@@ -111,7 +127,7 @@ export interface GateClearProof {
   controlGroup: string;
   tasksCurrent: null | 0;
   statusPath: string;
-  statusState: GateClearProofState;
+  statusState: GateClearProofState | GateClearNonterminalState;
   statusJobId: string;
   statusPeriodKey: string;
   statusGeneration: string;
@@ -119,9 +135,17 @@ export interface GateClearProof {
   statusInvocationId: string;
   statusUpdatedAtUtc: string;
   statusHeartbeatAtUtc: string;
-  statusFinishedAtUtc: string;
+  /**
+   * Canonical finish instant for the terminal basis. Always the original
+   * null for the deadline-expired basis: a finish instant is never
+   * synthesized and a preserved nonterminal status has none.
+   */
+  statusFinishedAtUtc: string | null;
   sourceLockPath: typeof GATE_SOURCE_LOCK_PATH;
   sourceLockFree: true;
+  /** The derived basis, echoed in the validated result so revalidation of a
+   * returned proof is accepted instead of rejected as an unknown key. */
+  clearBasis: GateClearBasis;
 }
 
 const JOB_ID_PATTERN =
@@ -144,6 +168,15 @@ const STATUS_STATES: readonly GateClearProofState[] = [
   "ACCEPTED",
   "COMPLETE",
   "FAILED",
+];
+const NONTERMINAL_STATUS_STATES: readonly GateClearNonterminalState[] = [
+  "REQUESTED",
+  "CAPTURING",
+  "CAPTURED",
+  "UPLOADING",
+  "UPLOAD_VERIFIED",
+  "INDEXING",
+  "VERIFYING",
 ];
 const FAILED_UNIT_RESULTS: readonly GateUnitResult[] = [
   "exit-code",
@@ -192,6 +225,7 @@ const PROOF_KEYS = new Set([
   "statusFinishedAtUtc",
   "sourceLockPath",
   "sourceLockFree",
+  "clearBasis",
 ]);
 const SOURCE_KEYS = [
   "instanceId",
@@ -390,6 +424,14 @@ export function gateIdentityEqual(
  * failed/failed unit with exit-code|timeout|signal and FAILED status.
  * PENDING_VERIFIER clears only because the worker process is gone; this
  * proof never accepts or prunes a restore point.
+ *
+ * The deadline-expired basis is accepted only for an orphaned
+ * TERMINAL_PROOF_MISSING gate whose immutable deadline has passed, with the
+ * exact failed/failed unit reporting Result=timeout, zero PIDs and no
+ * processes left, a free source lock, and a known nonterminal source status
+ * whose original finishedAtUtc is still null. It preserves that source status
+ * verbatim (never FAILED, never a synthesized finish instant) and its only
+ * effect is to authorize removing the orphaned gate.
  */
 export function validateGateClearProof(
   input: unknown,
@@ -475,9 +517,25 @@ export function validateGateClearProof(
       "Clear proof status path does not bind the gate job identity",
     );
   }
+  const clearBasis = input.clearBasis === undefined
+    ? "terminal"
+    : input.clearBasis;
+  if (clearBasis !== "terminal" && clearBasis !== "deadline-expired") {
+    throw new Error("Clear proof clearBasis is unsupported");
+  }
   const statusState = input.statusState;
-  if (!(STATUS_STATES as readonly string[]).includes(String(statusState))) {
-    throw new Error("Clear proof statusState is not terminal");
+  if (clearBasis === "terminal") {
+    if (!(STATUS_STATES as readonly string[]).includes(String(statusState))) {
+      throw new Error("Clear proof statusState is not terminal");
+    }
+  } else if (
+    !(NONTERMINAL_STATUS_STATES as readonly string[]).includes(
+      String(statusState),
+    )
+  ) {
+    throw new Error(
+      "Deadline-expired proof requires a known nonterminal statusState",
+    );
   }
   if (
     input.statusJobId !== bound.jobId ||
@@ -496,16 +554,26 @@ export function validateGateClearProof(
     input.statusHeartbeatAtUtc,
     "statusHeartbeatAtUtc",
   );
-  const statusFinishedAtUtc = canonicalUtcMillis(
-    input.statusFinishedAtUtc,
-    "statusFinishedAtUtc",
-  );
+  let statusFinishedAtUtc: number | null = null;
+  if (clearBasis === "terminal") {
+    statusFinishedAtUtc = canonicalUtcMillis(
+      input.statusFinishedAtUtc,
+      "statusFinishedAtUtc",
+    );
+  } else if (input.statusFinishedAtUtc !== null) {
+    throw new Error(
+      "Deadline-expired proof requires the original null statusFinishedAtUtc",
+    );
+  }
   const requested = Date.parse(bound.requestedAtUtc);
+  const finishedInWindow = statusFinishedAtUtc === null ||
+    (statusFinishedAtUtc >= requested && statusFinishedAtUtc <= checkedAtUtc);
   if (
-    statusFinishedAtUtc < requested || statusFinishedAtUtc > checkedAtUtc ||
+    !finishedInWindow ||
     statusHeartbeatAtUtc < requested || statusHeartbeatAtUtc > checkedAtUtc ||
     statusUpdatedAtUtc < requested || statusUpdatedAtUtc > checkedAtUtc ||
-    statusUpdatedAtUtc < statusFinishedAtUtc ||
+    (statusFinishedAtUtc !== null &&
+      statusUpdatedAtUtc < statusFinishedAtUtc) ||
     statusHeartbeatAtUtc > statusUpdatedAtUtc
   ) {
     throw new Error(
@@ -528,7 +596,17 @@ export function validateGateClearProof(
     (FAILED_UNIT_RESULTS as readonly string[]).includes(
       String(unitResult),
     );
-  if (!successTerminal && !failedTerminal) {
+  const expiredTimeoutTerminal = clearBasis === "deadline-expired" &&
+    bound.state === "orphaned" &&
+    bound.orphanReason === "TERMINAL_PROOF_MISSING" &&
+    Date.parse(bound.deadlineAtUtc) <= checkedAtUtc &&
+    unitResult === "timeout" &&
+    unitActiveState === "failed" &&
+    unitSubState === "failed";
+  const terminalProved = clearBasis === "terminal"
+    ? successTerminal || failedTerminal
+    : expiredTimeoutTerminal;
+  if (!terminalProved) {
     throw new Error(
       "Terminal proof mismatch: running, nonterminal or unproven states are never proof",
     );
@@ -546,7 +624,9 @@ export function validateGateClearProof(
     controlGroup,
     tasksCurrent: tasksCurrent as null | 0,
     statusPath: input.statusPath as string,
-    statusState: statusState as GateClearProofState,
+    statusState: statusState as
+      | GateClearProofState
+      | GateClearNonterminalState,
     statusJobId: input.statusJobId as string,
     statusPeriodKey: input.statusPeriodKey as string,
     statusGeneration: input.statusGeneration as string,
@@ -554,9 +634,12 @@ export function validateGateClearProof(
     statusInvocationId: unitInvocationId,
     statusUpdatedAtUtc: input.statusUpdatedAtUtc as string,
     statusHeartbeatAtUtc: input.statusHeartbeatAtUtc as string,
-    statusFinishedAtUtc: input.statusFinishedAtUtc as string,
+    statusFinishedAtUtc: clearBasis === "terminal"
+      ? input.statusFinishedAtUtc as string
+      : null,
     sourceLockPath: GATE_SOURCE_LOCK_PATH,
     sourceLockFree: true,
+    clearBasis: clearBasis as GateClearBasis,
   };
 }
 

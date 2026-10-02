@@ -133,8 +133,35 @@ function proofFixture(
     statusFinishedAtUtc: iso(finishedAt),
     sourceLockPath: "/var/tmp/arch-vps-file-backup/source.lock",
     sourceLockFree: true,
+    clearBasis: "terminal",
     ...overrides,
   };
+}
+
+/** Gate identity whose immutable deadline already passed at the real test
+ * time: requested = now-11h, deadline = now-5h. */
+function expiredGateFixture(
+  overrides: Record<string, unknown> = {},
+): BackupControllerGate {
+  return gateFixture(overrides, Date.now() - 9 * 3_600_000);
+}
+
+/** The live expiry proof shape: exact timed-out failed/failed unit, zero
+ * processes, free lock and a preserved nonterminal status with the original
+ * null finishedAtUtc, all fresh at the real test time. */
+function expiredProofFixture(
+  overrides: Record<string, unknown> = {},
+  nowMs: number = Date.now(),
+): Record<string, unknown> {
+  return proofFixture({
+    unitActiveState: "failed",
+    unitSubState: "failed",
+    unitResult: "timeout",
+    statusState: "UPLOADING",
+    statusFinishedAtUtc: null,
+    clearBasis: "deadline-expired",
+    ...overrides,
+  }, nowMs);
 }
 
 async function newGateDir(): Promise<string> {
@@ -465,6 +492,114 @@ runtimeTest(
         "status identity does not match",
       );
       assertEquals(await readGate(path), bound);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+);
+
+runtimeTest(
+  "clear reconciles an orphaned TERMINAL_PROOF_MISSING gate with an expired timeout proof",
+  async () => {
+    const dir = await newGateDir();
+    try {
+      const path = `${dir}/.private/backup-controller-gate.json`;
+      await writeActiveGate(expiredGateFixture(), path);
+      const gate = await readGate(path);
+      assert(gate !== null);
+      const bound = await bindInvocation(gate, INVOCATION, path);
+      const orphaned = await markOrphaned(
+        bound,
+        "TERMINAL_PROOF_MISSING",
+        path,
+      );
+      await clearGateAfterProof(
+        orphaned,
+        expiredProofFixture(),
+        path,
+        new Date(),
+      );
+      assertEquals(await readGate(path), null);
+      assertEquals(await listedNames(dir), []);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+);
+
+runtimeTest(
+  "clear refuses an expired proof against an active gate and keeps it",
+  async () => {
+    const dir = await newGateDir();
+    try {
+      const path = `${dir}/.private/backup-controller-gate.json`;
+      await writeActiveGate(expiredGateFixture(), path);
+      const gate = await readGate(path);
+      assert(gate !== null);
+      const bound = await bindInvocation(gate, INVOCATION, path);
+      await assertThrowsAsync(() =>
+        clearGateAfterProof(bound, expiredProofFixture(), path, new Date())
+      );
+      assertEquals(await readGate(path), bound);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+);
+
+runtimeTest(
+  "clear refuses an expired proof on another orphan reason and keeps it",
+  async () => {
+    const dir = await newGateDir();
+    try {
+      const path = `${dir}/.private/backup-controller-gate.json`;
+      await writeActiveGate(expiredGateFixture(), path);
+      const gate = await readGate(path);
+      assert(gate !== null);
+      const bound = await bindInvocation(gate, INVOCATION, path);
+      const orphaned = await markOrphaned(
+        bound,
+        "UNIT_IDENTITY_MISMATCH",
+        path,
+      );
+      await assertThrowsAsync(() =>
+        clearGateAfterProof(orphaned, expiredProofFixture(), path, new Date())
+      );
+      assertEquals(await readGate(path), orphaned);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+);
+
+runtimeTest(
+  "clear refuses a stale expired proof and keeps the orphaned gate",
+  async () => {
+    const dir = await newGateDir();
+    try {
+      const path = `${dir}/.private/backup-controller-gate.json`;
+      await writeActiveGate(expiredGateFixture(), path);
+      const gate = await readGate(path);
+      assert(gate !== null);
+      const bound = await bindInvocation(gate, INVOCATION, path);
+      const orphaned = await markOrphaned(
+        bound,
+        "TERMINAL_PROOF_MISSING",
+        path,
+      );
+      const proof = expiredProofFixture();
+      const checkedAt = Date.parse(proof.checkedAtUtc as string);
+      await assertThrowsAsync(
+        () =>
+          clearGateAfterProof(
+            orphaned,
+            proof,
+            path,
+            new Date(checkedAt + 31_000),
+          ),
+        "stale or was checked in the future",
+      );
+      assertEquals(await readGate(path), orphaned);
     } finally {
       await Deno.remove(dir, { recursive: true });
     }
