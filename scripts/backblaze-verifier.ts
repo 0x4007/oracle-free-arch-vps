@@ -7,15 +7,21 @@
  * SCOPE AND LIMITS: this module proves (1) that each reconstructed
  * ciphertext archive is byte-identical to the validated index descriptor
  * (owner-only 0600, one hardlink, canonical path), (2) that its GPG
- * plaintext is a complete, positive-size zstd stream and that the zstd frame
- * integrity test (`zstd -t`) passes, (3) that the six filesystem archives
+ * plaintext is a complete, positive-size zstd stream whose decompression
+ * reaches EOF with a zero zstd producer status (the checked filesystem
+ * listing enforces that status for the six tar archives and the bounded
+ * metadata decompression for the recovery archive) while the plaintext
+ * SHA-256 is hashed from the same decrypt stream that writes the file,
+ * (3) that the six filesystem archives
  * are complete, nonempty tar members (root:
  * ./etc/os-release,./boot/Image,./boot/initramfs-linux.img; staging-boot:
  * ./arch-vmlinuz,./arch-initrd.img; every selected boot member occurs
  * exactly once; every other filesystem role has a complete successful
  * nonempty listing), and (4) that four boot files restored with
  * `tar --extract --to-stdout` are byte-identical to the four captured boot
- * hashes in the recovery metadata (root/staging kernel parity included). It
+ * hashes in the recovery metadata (root/staging kernel parity included);
+ * both members of a role are extracted by two literal-member readers fed
+ * from one decompression pass. It
  * never extracts a directory tree, never writes paths taken from tar
  * headers or from the metadata, never touches a source filesystem, never
  * checks database consistency and never boots a machine: the returned
@@ -53,10 +59,14 @@
  * DECRYPT: the caller supplies the exactly-typed decryption capability
  * DecryptArchive `(ciphertextPath, destination) => Promise<
  * {integrityChecked: true}>`. The library creates and binds the destination
- * handle (0600, owner, one link), calls the callback which writes the
- * compressed plaintext to that handle and must NOT close it; a callback
+ * handle (0600, owner, one link), passes the callback a write-only sink
+ * that forwards every accepted write to that handle while streaming the
+ * plaintext SHA-256 over exactly the accepted bytes, and calls the callback
+ * which writes the compressed plaintext through that sink and must NOT
+ * close anything; a callback
  * error or a missing integrityChecked fails visibly, and the library then
- * fsyncs, re-checks handle and pathname identity, closes and continues. The
+ * fsyncs, re-checks handle and pathname identity, and requires the hashed
+ * byte count to equal the bound file size before continuing. The
  * library never receives a private key, agent socket, passphrase or
  * credential; the production caller must provide real GPG integrity-checked
  * decryption only after authorization. Synthetic tests inject synthetic
@@ -172,11 +182,20 @@ const BOOT_SAMPLES: readonly {
   },
 ];
 
+/** Minimal destination capability handed to the caller-supplied decrypt
+ * callback: the library owns the bound handle, forwards accepted writes to
+ * it and hashes exactly those bytes, so the callback never receives (and
+ * can never close) the file handle itself. Production GPG decryption only
+ * calls `write`, so this stays wire-compatible with the stream decryptor. */
+export interface ArchiveSink {
+  write(bytes: Uint8Array): Promise<number>;
+}
+
 /** Caller-supplied decryption capability: writes the compressed plaintext
- * to the bound handle and must not close it. */
+ * through the sink and must not close anything. */
 export type DecryptArchive = (
   ciphertextPath: string,
-  destination: Deno.FsFile,
+  destination: ArchiveSink,
 ) => Promise<{ integrityChecked: true }>;
 
 /** One verified archive of the generation, in canonical index order. */
@@ -600,43 +619,9 @@ async function readBounded(
   return out;
 }
 
-/** Run one bounded command and return its status plus capped stdout. Raw
- * diagnostics are bounded and never propagated to callers. */
-async function runTool(
-  argv: string[],
-  label: string,
-): Promise<{ code: number; stdout: Uint8Array }> {
-  const child = new Deno.Command(argv[0], {
-    args: argv.slice(1),
-    stdin: "null",
-    stdout: "piped",
-    stderr: "piped",
-  }).spawn();
-  const stdoutP = readBounded(
-    child.stdout,
-    TOOL_STDOUT_CAP,
-    `${label}:stdout`,
-    child,
-  );
-  const stderrP = readBounded(
-    child.stderr,
-    TOOL_STDERR_CAP,
-    `${label}:stderr`,
-    child,
-  );
-  const [stdout] = await Promise.all([stdoutP, stderrP]);
-  const status = await child.status;
-  return { code: status.code, stdout };
-}
-
-/** Complete zstd frame integrity test of a compressed plaintext file. */
-async function assertZstdIntegrity(path: string): Promise<void> {
-  const result = await runTool(["zstd", "-t", path], "zstd");
-  if (result.code !== 0) fail("zstd:integrity");
-}
-
 /** Complete zstd decompression of the recovery metadata, hard-bounded to
- * MAX_METADATA_BYTES; returns the plaintext bytes. */
+ * MAX_METADATA_BYTES; returns the plaintext bytes. Its checked exit status
+ * is the recovery archive's complete-stream integrity proof. */
 async function decompressMetadata(path: string): Promise<Uint8Array> {
   const child = new Deno.Command("zstd", {
     args: ["-dc", path],
@@ -706,10 +691,16 @@ const INVENTORY_PRODUCERS = [
   { label: "inventory-awk", variable: "ia", exitCode: 75 },
 ];
 
+/** Bash exit code emitted when the inventory zstd producer failed. */
+const INVENTORY_ZSTD_EXIT = INVENTORY_PRODUCERS[0].exitCode;
+
 /** Full zstd decompression and GNU tar listing to completion with checked
  * producer statuses; requires a nonempty archive, every required member and
  * exactly one occurrence of each selected boot member. Returns the complete
- * entry count (bounded); no listing bytes are held in memory. */
+ * entry count (bounded); no listing bytes are held in memory. The zstd
+ * producer status is checked first and is the complete-stream integrity
+ * proof for this archive (a failure is reported as `zstd:integrity`), so
+ * the separate `zstd -t` pass is not needed. */
 async function inventoryArchive(
   compressedPath: string,
   required: readonly string[],
@@ -729,7 +720,10 @@ async function inventoryArchive(
   const stderrP = readBounded(child.stderr, TOOL_STDERR_CAP, "listing", child);
   const [stdout] = await Promise.all([stdoutP, stderrP]);
   const status = await child.status;
-  if (status.code !== 0) fail("listing:producer");
+  if (status.code !== 0) {
+    if (status.code === INVENTORY_ZSTD_EXIT) fail("zstd:integrity");
+    fail("listing:producer");
+  }
   const line = new TextDecoder().decode(stdout).trim();
   const match = /^entries=(\d+)$/.exec(line);
   if (match === null) fail("listing:summary");
@@ -966,81 +960,18 @@ async function writeProgress(
   }
 }
 
-/** Stream-hash the closed partial with bounded reads; its bound identity
- * must be unchanged before and after the read. */
-async function hashPartial(
-  partialPath: string,
-  binding: FileBinding,
-  expectedSize: number,
-): Promise<string> {
-  let file: Deno.FsFile;
-  try {
-    file = await Deno.open(partialPath, { read: true });
-  } catch {
-    fail("partial:read");
-  }
-  try {
-    let openInfo: Deno.FileInfo;
-    try {
-      openInfo = await file.stat();
-    } catch {
-      fail("partial:read");
-    }
-    if (!openInfo.isFile) fail("partial:identity");
-    if (openInfo.dev !== binding.dev || openInfo.ino !== binding.ino) {
-      fail("partial:identity");
-    }
-    const hasher = createHash("sha256");
-    const buffer = new Uint8Array(READ_BUFFER_BYTES);
-    let total = 0;
-    while (true) {
-      let n: number | null;
-      try {
-        n = await file.read(buffer);
-      } catch {
-        fail("partial:read");
-      }
-      if (n === null) break;
-      if (n === 0) fail("partial:read");
-      total += n;
-      if (total > expectedSize) fail("partial:length");
-      hasher.update(buffer.subarray(0, n));
-    }
-    if (total !== expectedSize) fail("partial:length");
-    let afterPath: Deno.FileInfo;
-    try {
-      afterPath = await Deno.lstat(partialPath);
-    } catch {
-      fail("partial:drift");
-    }
-    if (
-      afterPath.isSymlink || !afterPath.isFile ||
-      afterPath.dev !== binding.dev ||
-      afterPath.ino !== binding.ino ||
-      afterPath.uid !== binding.uid ||
-      afterPath.mode === null ||
-      (afterPath.mode & 0o777) !== binding.mode ||
-      afterPath.nlink !== 1 ||
-      afterPath.size !== expectedSize
-    ) {
-      fail("partial:drift");
-    }
-    return hasher.digest("hex");
-  } finally {
-    file.close();
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Decrypt one archive into its compressed plaintext partial
 // ---------------------------------------------------------------------------
 
 /** Decrypt one ciphertext archive into a fresh createNew 0600 partial,
- * require positive bytes and a bound handle/path/owner/size, then check
- * complete zstd integrity and stream-hash the partial. The callback may
- * fail (decrypt) or omit the integrity proof (decrypt:integrity). The
- * partial is NOT published here; the caller publishes it only after every
- * archive check passed, so a failure always preserves the partial. */
+ * require positive bytes and a bound handle/path/owner/size, and stream the
+ * plaintext SHA-256 from the same writes the callback makes. The callback
+ * may fail (decrypt) or omit the integrity proof (decrypt:integrity). The
+ * hashed byte count must equal the bound file size, so the recorded hash is
+ * exactly the plaintext file content. The partial is NOT published here;
+ * the caller publishes it only after every archive check passed, so a
+ * failure always preserves the partial. */
 async function decryptArchivePartial(params: {
   archive: IndexArchiveRecord;
   ciphertextPath: string;
@@ -1077,10 +1008,25 @@ async function decryptArchivePartial(params: {
     throw error;
   }
   let size = 0;
+  let hashedBytes = 0;
+  const hasher = createHash("sha256");
+  const sink: ArchiveSink = {
+    write: async (bytes: Uint8Array): Promise<number> => {
+      const written = await file.write(bytes);
+      if (
+        Number.isSafeInteger(written) && written > 0 &&
+        written <= bytes.byteLength
+      ) {
+        hasher.update(bytes.subarray(0, written));
+        hashedBytes += written;
+      }
+      return written;
+    },
+  };
   try {
     let result: { integrityChecked: boolean };
     try {
-      result = await decrypt(ciphertextPath, file);
+      result = await decrypt(ciphertextPath, sink);
     } catch {
       fail("decrypt");
     }
@@ -1111,6 +1057,7 @@ async function decryptArchivePartial(params: {
     if (openInfo.nlink !== 1) fail("partial:hardlink");
     if (openInfo.size <= 0) fail("partial:length");
     size = openInfo.size;
+    if (hashedBytes !== size) fail("partial:length");
     await assertHandleBound(file, binding, size, "partial");
     await assertPathBound(partialPath, binding, 1, size, "partial");
   } catch (error) {
@@ -1126,8 +1073,7 @@ async function decryptArchivePartial(params: {
     fail("partial:identity");
   }
   file.close();
-  await assertZstdIntegrity(partialPath);
-  const sha256 = await hashPartial(partialPath, binding, size);
+  const sha256 = hasher.digest("hex");
   return {
     partialPath,
     finalPath,
@@ -1138,104 +1084,53 @@ async function decryptArchivePartial(params: {
 }
 
 // ---------------------------------------------------------------------------
-// Restore one boot member
+// Restore both boot members of one role in one decompression pass
 // ---------------------------------------------------------------------------
 
-/** Consume the complete `tar --to-stdout` stream into the bound handle
- * while hashing; both producer statuses must be zero (never suppress
- * tar/zstd failures). The restored byte count must be positive. */
-async function restoreMemberToHandle(params: {
-  compressedPath: string;
+/** One requested boot member: literal member name, fixed sample final name
+ * and the captured metadata hash the restored bytes must match. */
+interface BootSampleRequest {
   member: string;
-  file: Deno.FsFile;
-  hasher: Hash;
-}): Promise<number> {
-  const zstd = new Deno.Command("zstd", {
-    args: ["-dc", params.compressedPath],
-    stdin: "null",
-    stdout: "piped",
-    stderr: "piped",
-  }).spawn();
-  const tar = new Deno.Command("tar", {
-    args: ["--extract", "--to-stdout", "--file=-", params.member],
-    stdin: "piped",
-    stdout: "piped",
-    stderr: "piped",
-  }).spawn();
-  let consumed = 0;
-  const settled = await Promise.allSettled([
-    pumpZstdToTar(zstd.stdout, tar.stdin),
-    consumeTarStdout(tar.stdout, params.file, params.hasher).then((count) => {
-      consumed = count;
-    }),
-    readBounded(zstd.stderr, TOOL_STDERR_CAP, "restore", zstd),
-    readBounded(tar.stderr, TOOL_STDERR_CAP, "restore", tar),
-  ]);
-  const rejected = settled.find((entry) => entry.status === "rejected");
-  if (rejected !== undefined) {
-    try {
-      zstd.kill("SIGKILL");
-    } catch {
-      // already exited
-    }
-    try {
-      tar.kill("SIGKILL");
-    } catch {
-      // already exited
-    }
-    await zstd.status;
-    await tar.status;
-    const reason = (rejected as PromiseRejectedResult).reason;
-    // Only bounded module errors may escape; a raw stream error is mapped.
-    if (reason instanceof Error && reason.message.startsWith(FAIL_PREFIX)) {
-      throw reason;
-    }
-    fail("restore");
-  }
-  const zstdStatus = await zstd.status;
-  const tarStatus = await tar.status;
-  if (
-    zstdStatus.code !== 0 ||
-    tarStatus.code !== 0 ||
-    (settled[0] as PromiseFulfilledResult<boolean>).value === false
-  ) {
-    fail("restore:pipeline");
-  }
-  if (consumed <= 0) fail("restore:empty");
-  return consumed;
+  sampleFile: string;
+  expectedSha256: string;
 }
 
-/** Forward every zstd byte to tar and always drain the source to EOF; a
- * write failure (tar exited early) is reported as false, never as a raw
- * error, so the caller's producer-status checks are authoritative. */
-async function pumpZstdToTar(
+/** Forward every zstd byte to every tar destination and always drain the
+ * source to EOF; a write failure to one destination (that tar exited early)
+ * is reported as false, never as a raw error, while the remaining
+ * destinations keep receiving bytes, so the caller's producer-status checks
+ * stay authoritative. */
+async function pumpZstdToTars(
   source: ReadableStream<Uint8Array>,
-  destination: WritableStream<Uint8Array>,
+  destinations: readonly WritableStream<Uint8Array>[],
 ): Promise<boolean> {
   const reader = source.getReader();
-  const writer = destination.getWriter();
-  let failed = false;
+  const writers = destinations.map((destination) => destination.getWriter());
+  const failed = writers.map(() => false);
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (!failed) {
+      for (let index = 0; index < writers.length; index += 1) {
+        if (failed[index]) continue;
         try {
-          await writer.write(value);
+          await writers[index].write(value);
         } catch {
-          failed = true;
+          failed[index] = true;
         }
       }
     }
   } finally {
     reader.releaseLock();
-    try {
-      await writer.close();
-    } catch {
-      // destination already closed by the tar process
+    for (const writer of writers) {
+      try {
+        await writer.close();
+      } catch {
+        // destination already closed by the tar process
+      }
     }
   }
-  return !failed;
+  return failed.every((entry) => !entry);
 }
 
 /** Consume the complete restored stream: bounded chunks, hashed inline and
@@ -1267,92 +1162,193 @@ async function consumeTarStdout(
   return total;
 }
 
-/** Restore one literal fixed tar member into its fixed owned sample final
- * (createNew 0600) and return the exact byte count, SHA-256 and the
- * published final identity record. */
-async function restoreBootSample(params: {
+/** Restore every requested member of one role from a single decompression
+ * pass: one zstd reader feeds one literal-member `tar --extract --to-stdout`
+ * reader per member (GNU tar has one stdout stream and no member separator,
+ * so a single tar invocation cannot deliver two independently bound and
+ * independently hashed sample streams). Each member is still extracted by
+ * name only, written into its own createNew 0600 bound partial and hashed
+ * inline, and every zstd/tar producer status must be zero with a complete
+ * positive-size stream, so the safe member/output checks are unchanged.
+ * Every target is bound and flushed before any hash comparison, matched
+ * hash and publication. */
+async function restoreRoleBootSamples(params: {
   compressedPath: string;
   role: "root" | "staging-boot";
-  member: string;
-  sampleFile: string;
+  requests: readonly BootSampleRequest[];
   outputDirectory: string;
   directory: DirectoryIdentity;
-  expectedSha256: string;
-}): Promise<{
-  descriptor: BootSampleDescriptor;
-  record: FileIdentityRecord;
-}> {
-  const {
-    compressedPath,
-    role,
-    member,
-    sampleFile,
-    outputDirectory,
-    directory,
-    expectedSha256,
-  } = params;
-  const partialPath = `${outputDirectory}/${sampleFile}.partial`;
-  const finalPath = `${outputDirectory}/${sampleFile}`;
-  let file: Deno.FsFile;
-  try {
-    file = await Deno.open(partialPath, {
-      write: true,
-      createNew: true,
-      mode: 0o600,
-    });
-  } catch (error) {
-    if (error instanceof Deno.errors.AlreadyExists) fail("partial:exists");
-    fail("write");
-  }
-  let binding: FileBinding;
-  try {
-    binding = await bindCreatedFile(file, directory.uid, "partial");
-  } catch (error) {
-    file.close();
-    throw error;
-  }
-  const hasher = createHash("sha256");
-  let bytes: number;
-  try {
-    bytes = await restoreMemberToHandle({
-      compressedPath,
-      member,
-      file,
-      hasher,
-    });
-    try {
-      await file.sync();
-    } catch {
-      fail("write");
+}): Promise<
+  { descriptor: BootSampleDescriptor; record: FileIdentityRecord }[]
+> {
+  const targets: {
+    request: BootSampleRequest;
+    partialPath: string;
+    finalPath: string;
+    file: Deno.FsFile;
+    binding: FileBinding;
+    hasher: Hash;
+    bytes: number;
+  }[] = [];
+  const closeTargets = () => {
+    for (const target of targets) {
+      try {
+        target.file.close();
+      } catch {
+        // Already closed; a bounded failure below must not be masked.
+      }
     }
-    await assertHandleBound(file, binding, bytes, "partial");
-    await assertPathBound(partialPath, binding, 1, bytes, "partial");
-  } catch (error) {
-    try {
-      file.close();
-    } catch {
-      // Already closed; the bounded failure below must not be masked.
+  };
+  try {
+    for (const request of params.requests) {
+      const partialPath =
+        `${params.outputDirectory}/${request.sampleFile}.partial`;
+      const finalPath = `${params.outputDirectory}/${request.sampleFile}`;
+      let file: Deno.FsFile;
+      try {
+        file = await Deno.open(partialPath, {
+          write: true,
+          createNew: true,
+          mode: 0o600,
+        });
+      } catch (error) {
+        if (error instanceof Deno.errors.AlreadyExists) fail("partial:exists");
+        fail("write");
+      }
+      let binding: FileBinding;
+      try {
+        binding = await bindCreatedFile(file, params.directory.uid, "partial");
+      } catch (error) {
+        file.close();
+        throw error;
+      }
+      targets.push({
+        request,
+        partialPath,
+        finalPath,
+        file,
+        binding,
+        hasher: createHash("sha256"),
+        bytes: 0,
+      });
     }
+    const zstd = new Deno.Command("zstd", {
+      args: ["-dc", params.compressedPath],
+      stdin: "null",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    const tars = targets.map((target) =>
+      new Deno.Command("tar", {
+        args: ["--extract", "--to-stdout", "--file=-", target.request.member],
+        stdin: "piped",
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn()
+    );
+    let pumped = false;
+    const settled = await Promise.allSettled([
+      pumpZstdToTars(zstd.stdout, tars.map((tar) => tar.stdin)).then((ok) => {
+        pumped = ok;
+      }),
+      ...tars.map((tar, index) =>
+        consumeTarStdout(tar.stdout, targets[index].file, targets[index].hasher)
+          .then((count) => {
+            targets[index].bytes = count;
+          })
+      ),
+      readBounded(zstd.stderr, TOOL_STDERR_CAP, "restore", zstd),
+      ...tars.map((tar) =>
+        readBounded(tar.stderr, TOOL_STDERR_CAP, "restore", tar)
+      ),
+    ]);
+    const rejected = settled.find((entry) => entry.status === "rejected");
+    if (rejected !== undefined) {
+      try {
+        zstd.kill("SIGKILL");
+      } catch {
+        // already exited
+      }
+      for (const tar of tars) {
+        try {
+          tar.kill("SIGKILL");
+        } catch {
+          // already exited
+        }
+      }
+      await zstd.status;
+      for (const tar of tars) await tar.status;
+      const reason = (rejected as PromiseRejectedResult).reason;
+      // Only bounded module errors may escape; a raw stream error is mapped.
+      if (reason instanceof Error && reason.message.startsWith(FAIL_PREFIX)) {
+        throw reason;
+      }
+      fail("restore");
+    }
+    const zstdStatus = await zstd.status;
+    const tarStatuses = await Promise.all(tars.map((tar) => tar.status));
+    if (
+      zstdStatus.code !== 0 ||
+      !pumped ||
+      tarStatuses.some((status) => status.code !== 0)
+    ) {
+      fail("restore:pipeline");
+    }
+    for (const target of targets) {
+      if (target.bytes <= 0) fail("restore:empty");
+      try {
+        await target.file.sync();
+      } catch {
+        fail("write");
+      }
+      await assertHandleBound(
+        target.file,
+        target.binding,
+        target.bytes,
+        "partial",
+      );
+      await assertPathBound(
+        target.partialPath,
+        target.binding,
+        1,
+        target.bytes,
+        "partial",
+      );
+    }
+  } catch (error) {
+    closeTargets();
     if (error instanceof Error && error.message.startsWith(FAIL_PREFIX)) {
       throw error;
     }
     fail("partial:identity");
   }
-  file.close();
-  const sha256 = hasher.digest("hex");
-  if (sha256 !== expectedSha256) fail("sample:hash");
-  const record = await publishPartial(
-    partialPath,
-    finalPath,
-    binding,
-    bytes,
-    outputDirectory,
-    directory,
-  );
-  return {
-    descriptor: { role, member, bytes, sha256 },
-    record,
-  };
+  closeTargets();
+  const restored: {
+    descriptor: BootSampleDescriptor;
+    record: FileIdentityRecord;
+  }[] = [];
+  for (const target of targets) {
+    const sha256 = target.hasher.digest("hex");
+    if (sha256 !== target.request.expectedSha256) fail("sample:hash");
+    const record = await publishPartial(
+      target.partialPath,
+      target.finalPath,
+      target.binding,
+      target.bytes,
+      params.outputDirectory,
+      params.directory,
+    );
+    restored.push({
+      descriptor: {
+        role: params.role,
+        member: target.request.member,
+        bytes: target.bytes,
+        sha256,
+      },
+      record,
+    });
+  }
+  return restored;
 }
 
 // ---------------------------------------------------------------------------
@@ -1815,23 +1811,29 @@ export async function verifyDecryptedGeneration(
       exact,
     );
     if (archive.role === "root" || archive.role === "staging-boot") {
-      for (const sample of BOOT_SAMPLES) {
-        if (sample.role !== archive.role) continue;
-        const expectedSha256 = metadataView![
-          sample.captured === "kernel" ? "kernelSha256" : "initramfsSha256"
-        ];
-        const restored = await restoreBootSample({
-          compressedPath: decrypted.partialPath,
-          role: sample.role,
+      const requests: BootSampleRequest[] = BOOT_SAMPLES
+        .filter((sample) => sample.role === archive.role)
+        .map((sample) => ({
           member: sample.member,
           sampleFile: sample.file,
-          outputDirectory,
-          directory,
-          expectedSha256,
-        });
-        samples.push(restored.descriptor);
-        retained.set(`${outputDirectory}/${sample.file}`, restored.record);
-        published.add(sample.file);
+          expectedSha256: metadataView![
+            sample.captured === "kernel" ? "kernelSha256" : "initramfsSha256"
+          ],
+        }));
+      const restored = await restoreRoleBootSamples({
+        compressedPath: decrypted.partialPath,
+        role: archive.role,
+        requests,
+        outputDirectory,
+        directory,
+      });
+      for (let index = 0; index < restored.length; index += 1) {
+        samples.push(restored[index].descriptor);
+        retained.set(
+          `${outputDirectory}/${requests[index].sampleFile}`,
+          restored[index].record,
+        );
+        published.add(requests[index].sampleFile);
       }
     }
     retained.set(

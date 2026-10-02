@@ -2,7 +2,8 @@
  * Focused m08-verifier tests: synthetic fixtures and unique temporary
  * directories only. Nothing reaches the network, no credential is read, no
  * real GPG key or source capture/upload stage file is used - the synthetic
- * `decrypt` callback writes in-memory zstd fixtures into the bound handles
+ * `decrypt` callback writes in-memory zstd fixtures through the library
+ * write-only sink into the bound handles
  * and is NOT live restore acceptance. Runtime cases (fixtures built through
  * the installed zstd/tar tools and filesystem guards) need read, write and
  * run permissions and are explicitly ignored in the default permissionless
@@ -25,6 +26,7 @@ import {
   UPLOAD_ROLE_ORDER,
 } from "../scripts/backblaze-upload.ts";
 import {
+  type ArchiveSink,
   type DecryptArchive,
   type DecryptedVerification,
   validateRecoveryMetadata,
@@ -857,6 +859,9 @@ Deno.test("validateRecoveryMetadata rejects identity and consistency mismatches"
 
 /** Synthetic decrypt callback writing registered compressed plaintext per
  * ciphertext path and recording every invocation. */
+/** Synthetic decrypt that writes each role's fixture plaintext through the
+ * library sink exactly like a real decryptor: only write is used, so the
+ * library-owned handle stays the sole writer. */
 function syntheticDecrypt(
   compressed: Map<string, Uint8Array>,
   pathByRole: Map<string, string>,
@@ -866,7 +871,7 @@ function syntheticDecrypt(
   for (const [role, path] of pathByRole) byPath.set(path, role);
   return {
     calls,
-    decrypt: async (ciphertextPath: string, destination: Deno.FsFile) => {
+    decrypt: async (ciphertextPath: string, destination: ArchiveSink) => {
       calls.push(ciphertextPath);
       const role = byPath.get(ciphertextPath);
       assert(role !== undefined, "unknown ciphertext path");
@@ -1017,7 +1022,7 @@ runtimeTest(
       const calls: string[] = [];
       const failing: DecryptArchive = async (
         ciphertextPath: string,
-        destination: Deno.FsFile,
+        destination: ArchiveSink,
       ) => {
         calls.push(ciphertextPath);
         await destination.write(fixture.compressed.get("recovery")!);
@@ -1090,16 +1095,20 @@ runtimeTest(
 );
 
 runtimeTest(
-  "callback that closes the destination handle fails bounded",
+  "callback that reaches outside the sink contract fails bounded",
   async () => {
     const fixture = await buildFixture();
     try {
+      // The library hands the callback a write-only sink over the bound
+      // handle; a callback that calls a handle method outside that contract
+      // must fail with a bounded module error, never leak a raw runtime
+      // error and never leave a published final.
       const callback = (async (
         _ciphertextPath: string,
-        destination: Deno.FsFile,
+        destination: ArchiveSink,
       ) => {
         await destination.write(fixture.compressed.get("recovery")!);
-        destination.close();
+        (destination as unknown as { close(): void }).close();
         return { integrityChecked: true };
       }) as unknown as DecryptArchive;
       const error = await rejectWith(
@@ -1300,6 +1309,196 @@ runtimeTest("duplicate selected boot member fails the listing", async () => {
     await removeBestEffort(fixture.outputDirectory);
   }
 });
+
+runtimeTest(
+  "missing second boot member still refuses the merged listing",
+  async () => {
+    // The second root member is the extra member the shared one-pass restore
+    // reads; its absence must still fail the checked listing before any
+    // extraction or publication.
+    const fixture = await buildFixture({
+      customizeRoot: async (root) => {
+        await Deno.remove(`${root}/boot/initramfs-linux.img`);
+      },
+    });
+    try {
+      const { decrypt } = syntheticDecrypt(
+        fixture.compressed,
+        fixture.pathByRole,
+      );
+      const error = await rejectWith(
+        verifyDecryptedGeneration(
+          fixture.index,
+          fixture.reconstruction,
+          fixture.outputDirectory,
+          decrypt,
+        ),
+      );
+      assert(
+        error.message === "Verifier failed (listing:producer)",
+        error.message,
+      );
+      assert(
+        await fileExists(`${fixture.outputDirectory}/root.tar.zst.partial`),
+        "root partial must be preserved",
+      );
+      assert(!(await fileExists(`${fixture.outputDirectory}/root.tar.zst`)));
+      assert(
+        !(await fileExists(
+          `${fixture.outputDirectory}/sample.root.initramfs-linux.img`,
+        )),
+      );
+    } finally {
+      await removeBestEffort(fixture.recoveryDirectory);
+      await removeBestEffort(fixture.outputDirectory);
+    }
+  },
+);
+
+runtimeTest(
+  "symlinked boot member is refused before any sample is published",
+  async () => {
+    // A symlink entry lists under the exact required member name but has no
+    // regular-file content; extraction must yield an empty stream and the
+    // refuse path must preserve the partials without publishing a final.
+    const fixture = await buildFixture({
+      customizeRoot: async (root) => {
+        await Deno.remove(`${root}/boot/Image`);
+        await Deno.symlink("initramfs-linux.img", `${root}/boot/Image`);
+      },
+    });
+    try {
+      const { decrypt } = syntheticDecrypt(
+        fixture.compressed,
+        fixture.pathByRole,
+      );
+      const error = await rejectWith(
+        verifyDecryptedGeneration(
+          fixture.index,
+          fixture.reconstruction,
+          fixture.outputDirectory,
+          decrypt,
+        ),
+      );
+      assert(
+        error.message === "Verifier failed (restore:empty)",
+        error.message,
+      );
+      assert(
+        await fileExists(
+          `${fixture.outputDirectory}/sample.root.Image.partial`,
+        ),
+        "sample partial must be preserved",
+      );
+      assert(
+        !(await fileExists(`${fixture.outputDirectory}/sample.root.Image`)),
+      );
+    } finally {
+      await removeBestEffort(fixture.recoveryDirectory);
+      await removeBestEffort(fixture.outputDirectory);
+    }
+  },
+);
+
+runtimeTest(
+  "swapped boot member content fails the shared-pass sample hash",
+  async () => {
+    // Both members exist exactly once and both extract a positive stream;
+    // the per-member hash binding must still reject content that was
+    // assigned to the wrong member.
+    const fixture = await buildFixture({
+      customizeRoot: async (root) => {
+        await Deno.writeFile(`${root}/boot/Image`, INITRAMFS_BYTES);
+        await Deno.writeFile(
+          `${root}/boot/initramfs-linux.img`,
+          KERNEL_BYTES,
+        );
+      },
+    });
+    try {
+      const { decrypt, calls } = syntheticDecrypt(
+        fixture.compressed,
+        fixture.pathByRole,
+      );
+      const error = await rejectWith(
+        verifyDecryptedGeneration(
+          fixture.index,
+          fixture.reconstruction,
+          fixture.outputDirectory,
+          decrypt,
+        ),
+      );
+      assert(error.message === "Verifier failed (sample:hash)", error.message);
+      assert(calls.length === 2, "recovery plus root callback expected");
+      for (
+        const name of [
+          "sample.root.Image.partial",
+          "sample.root.initramfs-linux.img.partial",
+        ]
+      ) {
+        assert(
+          await fileExists(`${fixture.outputDirectory}/${name}`),
+          `${name} must be preserved`,
+        );
+      }
+      assert(
+        !(await fileExists(`${fixture.outputDirectory}/sample.root.Image`)),
+      );
+      assert(
+        !(await fileExists(
+          `${fixture.outputDirectory}/sample.root.initramfs-linux.img`,
+        )),
+      );
+    } finally {
+      await removeBestEffort(fixture.recoveryDirectory);
+      await removeBestEffort(fixture.outputDirectory);
+    }
+  },
+);
+
+runtimeTest(
+  "plaintext hash is streamed over every accepted decrypt write",
+  async () => {
+    const fixture = await buildFixture();
+    try {
+      const byPath = new Map<string, string>();
+      for (const [role, path] of fixture.pathByRole) byPath.set(path, role);
+      const calls: string[] = [];
+      const chunked: DecryptArchive = async (
+        ciphertextPath: string,
+        destination: ArchiveSink,
+      ) => {
+        calls.push(ciphertextPath);
+        const role = byPath.get(ciphertextPath)!;
+        const bytes = fixture.compressed.get(role)!;
+        let offset = 0;
+        while (offset < bytes.byteLength) {
+          const written = await destination.write(
+            bytes.subarray(offset, Math.min(offset + 11, bytes.byteLength)),
+          );
+          assert(written > 0, "chunked decrypt write made no progress");
+          offset += written;
+        }
+        return { integrityChecked: true };
+      };
+      const receipt = await verifyDecryptedGeneration(
+        fixture.index,
+        fixture.reconstruction,
+        fixture.outputDirectory,
+        chunked,
+      ) as DecryptedVerification;
+      assert(calls.length === 7);
+      for (const archive of receipt.archives) {
+        const compressed = fixture.compressed.get(archive.role)!;
+        assert(archive.compressedBytes === compressed.byteLength);
+        assert(archive.compressedSha256 === sha256Hex(compressed));
+      }
+    } finally {
+      await removeBestEffort(fixture.recoveryDirectory);
+      await removeBestEffort(fixture.outputDirectory);
+    }
+  },
+);
 
 runtimeTest(
   "metadata identity mismatch fails before any final is published",
