@@ -1,4 +1,5 @@
 import {
+  assessHourlyProgress,
   assessOracleBootDrillEvidence,
   assessOracleRetry,
 } from "../scripts/backup-watchdog.ts";
@@ -158,5 +159,42 @@ Deno.test("Oracle watchdog rejects substituted group/member bindings and incompl
       rejected = true;
     }
     if (!rejected) throw Error("Invalid Oracle proof accepted");
+  }
+});
+
+Deno.test("hourly progress alarms require a fresh matching source invocation", () => {
+  const observed = new Date("2026-10-02T22:00:00.000Z");
+  const report = {
+    schemaVersion: 1,
+    jobId: "job-current",
+    observedAtUtc: observed.toISOString(),
+    state: "STALLED",
+    detail: "No observed progress",
+    sample: { invocationId: "current" },
+  };
+  const alarm = assessHourlyProgress(
+    report,
+    "job-current",
+    "current",
+    observed,
+  );
+  if (
+    alarm?.healthy !== false ||
+    alarm?.status !== "B2_PROGRESS_STALLED:job-current"
+  ) {
+    throw new Error("Expected matching stall alarm");
+  }
+  for (
+    const candidate of [
+      { ...report, state: "PROGRESSING" },
+      { ...report, jobId: "job-previous" },
+      { ...report, sample: { invocationId: "previous" } },
+      { ...report, observedAtUtc: "2026-10-02T20:00:00.000Z" },
+      { ...report, observedAtUtc: "2026-10-02T23:00:00.000Z" },
+    ]
+  ) {
+    if (assessHourlyProgress(candidate, "job-current", "current", observed)) {
+      throw new Error("Unbound or stale progress must not alert");
+    }
   }
 });

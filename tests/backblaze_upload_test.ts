@@ -1324,32 +1324,45 @@ Deno.test("transfer pacer defaults to the documented 4 MiB/s ceiling", () => {
 });
 
 Deno.test("transfer pacer allows one chunk of burst then paces the average", async () => {
-  // Deterministic clock: no real waiting, so the test is fast and stable.
-  // Counters live in an object so TypeScript cannot narrow the array shape
-  // between the two assertions.
   const clock = { now: 0 };
   const waits: number[] = [];
   const pace = createTransferPacer(
-    1000, // 1000 bytes/s keeps the arithmetic trivial
+    TRANSFER_BYTES_PER_SECOND,
     () => clock.now,
     (ms) => {
       waits.push(ms);
-      clock.now += ms; // the wait advances the virtual clock
+      clock.now += ms;
       return Promise.resolve();
     },
   );
-  // First transfer fits inside the one-second burst allowance.
-  await pace(1000);
-  const afterFirst = waits.length;
-  assert(afterFirst === 0, `unexpected wait after first: ${afterFirst}`);
-  // A second identical transfer must now be throttled by ~1000 ms.
-  await pace(1000);
-  const afterSecond = waits.length;
-  assert(afterSecond === 1, `expected one pace wait, got ${afterSecond}`);
-  const firstWait = waits[0];
+  await pace(MAX_CHUNK_BYTES);
+  assert(waits.length === 0, "first chunk should use the bounded burst");
+  await pace(MAX_CHUNK_BYTES);
+  assert(waits[0] === 16_000, `unexpected wait: ${waits[0]}`);
+  await pace(MAX_CHUNK_BYTES);
+  assert(waits[1] === 16_000, `unexpected wait: ${waits[1]}`);
+});
+
+Deno.test("transfer pacer credits elapsed slow upload and readback time", async () => {
+  const clock = { now: 0 };
+  const waits: number[] = [];
+  const pace = createTransferPacer(
+    TRANSFER_BYTES_PER_SECOND,
+    () => clock.now,
+    (ms) => {
+      waits.push(ms);
+      clock.now += ms;
+      return Promise.resolve();
+    },
+  );
+  await pace(MAX_CHUNK_BYTES);
+  for (let transfer = 0; transfer < 4; transfer++) {
+    clock.now += 20_000;
+    await pace(MAX_CHUNK_BYTES);
+  }
   assert(
-    firstWait >= 900 && firstWait <= 1000,
-    `wait was ${firstWait} ms`,
+    waits.length === 0,
+    "slow transfers must not pay an extra pacing delay",
   );
 });
 

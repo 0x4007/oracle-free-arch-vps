@@ -273,7 +273,7 @@ export function createTransferPacer(
     fail("pacer:rate");
   }
   // One chunk of burst: the loop cannot pre-pay more than a single transfer.
-  const burstBytes = bytesPerSecond;
+  const burstBytes = MAX_CHUNK_BYTES;
   let allowance = burstBytes;
   let last = now();
   return async (bytes: number): Promise<void> => {

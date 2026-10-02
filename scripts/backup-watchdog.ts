@@ -26,6 +26,34 @@ export const B2_REPORT_PATH = ".private/reports/backblaze-file-backup.json";
 export const ORACLE_REPORT_PATH = ".private/reports/backup-watchdog.json";
 export const B2_STATE_PATH = ".private/file-backup/controller.json";
 
+/** Only fresh alarms for the currently observed source invocation affect alerts. */
+export function assessHourlyProgress(
+  value: unknown,
+  jobId: string,
+  invocationId: string | null,
+  now: Date,
+): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const report = value as Record<string, unknown>;
+  const sample = report.sample as Record<string, unknown> | undefined;
+  const observed = Date.parse(String(report.observedAtUtc));
+  if (
+    report.schemaVersion !== 1 || report.jobId !== jobId ||
+    !invocationId || sample?.invocationId !== invocationId ||
+    !Number.isFinite(observed) || observed > now.getTime() ||
+    now.getTime() - observed > 75 * 60_000 ||
+    !["STALLED", "BEHIND_SCHEDULE"].includes(String(report.state))
+  ) return undefined;
+  return {
+    status: `B2_PROGRESS_${String(report.state)}:${jobId}`,
+    healthy: false,
+    progress: report,
+    detail: report.detail,
+  };
+}
+
 /** Retry is an unresolved backup failure, even when automatic recovery is due.
  * Keep its deadline and prior usable capture visible to the operator. */
 export function assessOracleRetry(
@@ -262,6 +290,32 @@ export async function main(): Promise<void> {
       notificationSent: false,
       detail: error instanceof Error ? error.message : String(error),
     };
+  }
+  // Read only the small hourly report; this never restarts or recaptures a job.
+  if (b2Report.healthy === true) {
+    try {
+      const state = await readPrivateJson<ControllerState>(B2_STATE_PATH);
+      if (state.job) {
+        const observed = await realRemoteSeam(realRemoteRunner).root(
+          "cat /var/lib/arch-vps-backup-progress/report.json",
+        );
+        if (observed.code === 0 && observed.stdout.length <= 64 * 1024) {
+          const report = JSON.parse(observed.stdout);
+          const job = state.job;
+          const invocationId = job.verifierInvocationId ??
+            job.workerInvocationId;
+          const alarm = assessHourlyProgress(
+            report,
+            job.envelope.request.jobId,
+            invocationId,
+            now,
+          );
+          if (alarm) Object.assign(b2Report, alarm);
+        }
+      }
+    } catch {
+      // Existing live source/gate checks still own missing-source failures.
+    }
   }
   await writePrivateJson(ORACLE_REPORT_PATH, oracleReport);
   await writePrivateJson(B2_REPORT_PATH, b2Report);

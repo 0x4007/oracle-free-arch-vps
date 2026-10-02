@@ -1,0 +1,16 @@
+[Unit]
+Description=Observe current Arch VPS backup progress
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/deno run --allow-read=/var/tmp/arch-vps-file-backup,/var/lib/arch-vps-backup-progress --allow-run=/usr/bin/cat --allow-write=/var/lib/arch-vps-backup-progress /usr/local/lib/arch-vps-backup-progress/backup-progress.ts
+StateDirectory=arch-vps-backup-progress
+StateDirectoryMode=0700
+UMask=0077
+TimeoutStartSec=60
+CPUWeight=1
+CPUQuota=10%
+MemoryMax=128M
+MemorySwapMax=0
+NoNewPrivileges=yes
+PrivateTmp=no
