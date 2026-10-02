@@ -1,6 +1,7 @@
 import {
   assertBackblazeLaunchAllowed,
   type BackupControllerGate,
+  GATE_DEADLINE_MS,
   validateGate,
 } from "../scripts/backblaze-controller-contract.ts";
 import {
@@ -100,7 +101,7 @@ function gateFixture(
     generation: `generation-${UUID}`,
     requestSha256: "ab".repeat(32),
     requestedAtUtc: iso(requestedAt),
-    deadlineAtUtc: iso(requestedAt + 6 * 3_600_000),
+    deadlineAtUtc: iso(requestedAt + GATE_DEADLINE_MS),
     createdAtUtc: iso(createdAt),
     updatedAtUtc: iso(createdAt + 1_000),
     remoteHost: "codex@vps.pavlovcik.com",

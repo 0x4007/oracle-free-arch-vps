@@ -30,7 +30,9 @@ export const GATE_OWNER = "backblaze-direct";
 export const GATE_REMOTE_HOST = "codex@vps.pavlovcik.com";
 export const GATE_SOURCE_LOCK_PATH =
   "/var/tmp/arch-vps-file-backup/source.lock";
-export const GATE_DEADLINE_MS = 6 * 3_600_000;
+/** Future-request runtime budget: 12 hours from the request instant. */
+export const GATE_DEADLINE_HOURS = 12;
+export const GATE_DEADLINE_MS = GATE_DEADLINE_HOURS * 3_600_000;
 export const UNIT_INVOCATION_PATTERN = /^[0-9a-f]{32}$/;
 
 export type GateState = "active" | "orphaned";
@@ -76,7 +78,7 @@ export interface BackupControllerGate {
   /** SHA-256 of the immutable request body (64 lower-case hex characters). */
   requestSha256: string;
   requestedAtUtc: string;
-  /** Exactly requestedAtUtc + 6 hours. */
+  /** Exactly requestedAtUtc + GATE_DEADLINE_MS. */
   deadlineAtUtc: string;
   createdAtUtc: string;
   updatedAtUtc: string;
@@ -345,7 +347,7 @@ export function validateGate(input: unknown): BackupControllerGate {
   );
   if (deadlineAtUtc !== requestedAtUtc + GATE_DEADLINE_MS) {
     throw new Error(
-      "deadlineAtUtc must be exactly requestedAtUtc plus 6 hours",
+      `deadlineAtUtc must be exactly requestedAtUtc plus ${GATE_DEADLINE_HOURS} hours`,
     );
   }
   const createdAtUtc = canonicalUtcMillis(input.createdAtUtc, "createdAtUtc");

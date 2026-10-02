@@ -25,9 +25,11 @@ import {
   UPLOAD_RESULT_FILE,
   workerUnitName,
 } from "../scripts/backblaze-source-worker.ts";
-import type {
-  BackupControllerGate,
-  OrphanReason,
+import {
+  type BackupControllerGate,
+  GATE_DEADLINE_HOURS,
+  GATE_DEADLINE_MS,
+  type OrphanReason,
 } from "../scripts/backblaze-controller-contract.ts";
 import type { CaptureResult } from "../scripts/backblaze-capture.ts";
 import type { UploadResult } from "../scripts/backblaze-upload.ts";
@@ -918,35 +920,38 @@ Deno.test("period: Sunday window and DST boundaries", () => {
   );
 });
 
-Deno.test("request: immutable envelope with a fixed six-hour deadline", () => {
-  const parts = {
-    jobUuid: uuidFor(1),
-    periodKey: "2026-09-06",
-    requestedAtUtc: iso(WINDOW_START),
-    recipientSha256: RECIPIENT_SHA256,
-    recipientFingerprint: RECIPIENT_FINGERPRINT,
-    sourceRevision: REVISION,
-    sourceConfigSha256: SOURCE_CONFIG_SHA256,
-  };
-  const first = buildRequestEnvelope(parts);
-  const second = buildRequestEnvelope(parts);
-  assert(first.requestSha256 === second.requestSha256);
-  assert(
-    Date.parse(first.request.deadlineAtUtc) -
-        Date.parse(first.request.requestedAtUtc) === 6 * 3_600_000,
-  );
-  assert(
-    first.request.generation.slice("generation-".length) ===
-      first.request.jobId.slice("job-".length),
-  );
-  let threw = false;
-  try {
-    buildRequestEnvelope({ ...parts, periodKey: "2026-09-07" });
-  } catch {
-    threw = true;
-  }
-  assert(threw, "A non-Sunday period key must be rejected");
-});
+Deno.test(
+  `request: immutable envelope with a fixed ${GATE_DEADLINE_HOURS}-hour deadline`,
+  () => {
+    const parts = {
+      jobUuid: uuidFor(1),
+      periodKey: "2026-09-06",
+      requestedAtUtc: iso(WINDOW_START),
+      recipientSha256: RECIPIENT_SHA256,
+      recipientFingerprint: RECIPIENT_FINGERPRINT,
+      sourceRevision: REVISION,
+      sourceConfigSha256: SOURCE_CONFIG_SHA256,
+    };
+    const first = buildRequestEnvelope(parts);
+    const second = buildRequestEnvelope(parts);
+    assert(first.requestSha256 === second.requestSha256);
+    assert(
+      Date.parse(first.request.deadlineAtUtc) -
+          Date.parse(first.request.requestedAtUtc) === GATE_DEADLINE_MS,
+    );
+    assert(
+      first.request.generation.slice("generation-".length) ===
+        first.request.jobId.slice("job-".length),
+    );
+    let threw = false;
+    try {
+      buildRequestEnvelope({ ...parts, periodKey: "2026-09-07" });
+    } catch {
+      threw = true;
+    }
+    assert(threw, "A non-Sunday period key must be rejected");
+  },
+);
 
 // ---------------------------------------------------------------------------
 // Settings, release manifest, wrappers
@@ -1647,39 +1652,43 @@ Deno.test("orchestration: days missed coalesce into one job for the latest Sunda
   );
 });
 
-Deno.test("orchestration: a Monday launch carries the prior Sunday period with a fresh six-hour deadline", async () => {
-  const monday = Date.parse("2026-09-07T14:00:00.000Z");
-  const h = harness({
-    now: new Date(monday),
-    seedPrivate: (map) => {
-      map.set(".private/backup-runtime.json", ORACLE_STATE_FIXTURE);
-      map.set(
-        ".private/backup-scheduled-window.json",
-        SCHEDULED_CLAIM_FIXTURE,
-      );
-    },
-  });
-  const report = await runBackblazeCycle(h.deps, 4);
-  const persisted = h.privateMap.get(CONTROLLER_STATE_PATH) as ControllerState;
-  const job = persisted.job!;
-  assert(
-    job.envelope.request.periodKey === "2026-09-06",
-    `period=${job.envelope.request.periodKey}`,
-  );
-  assert(Date.parse(job.envelope.request.requestedAtUtc) === monday);
-  assert(
-    Date.parse(job.envelope.request.deadlineAtUtc) -
-        Date.parse(job.envelope.request.requestedAtUtc) ===
-      6 * 3_600_000,
-    "the per-job request deadline stays six hours from the request",
-  );
-  assert(h.launches.length === 1, `launches=${h.launches.length}`);
-  assert(
-    h.launches[0].remainingSec === 6 * 3_600,
-    `remainingSec=${h.launches[0].remainingSec}`,
-  );
-  assert(!report.status.startsWith("B2_BACKUP_FAILED"), report.status);
-});
+Deno.test(
+  `orchestration: a Monday launch carries the prior Sunday period with a fresh ${GATE_DEADLINE_HOURS}-hour deadline`,
+  async () => {
+    const monday = Date.parse("2026-09-07T14:00:00.000Z");
+    const h = harness({
+      now: new Date(monday),
+      seedPrivate: (map) => {
+        map.set(".private/backup-runtime.json", ORACLE_STATE_FIXTURE);
+        map.set(
+          ".private/backup-scheduled-window.json",
+          SCHEDULED_CLAIM_FIXTURE,
+        );
+      },
+    });
+    const report = await runBackblazeCycle(h.deps, 4);
+    const persisted = h.privateMap.get(
+      CONTROLLER_STATE_PATH,
+    ) as ControllerState;
+    const job = persisted.job!;
+    assert(
+      job.envelope.request.periodKey === "2026-09-06",
+      `period=${job.envelope.request.periodKey}`,
+    );
+    assert(Date.parse(job.envelope.request.requestedAtUtc) === monday);
+    assert(
+      Date.parse(job.envelope.request.deadlineAtUtc) -
+          Date.parse(job.envelope.request.requestedAtUtc) === GATE_DEADLINE_MS,
+      `the per-job request deadline stays ${GATE_DEADLINE_HOURS} hours from the request`,
+    );
+    assert(h.launches.length === 1, `launches=${h.launches.length}`);
+    assert(
+      h.launches[0].remainingSec === GATE_DEADLINE_MS / 1000,
+      `remainingSec=${h.launches[0].remainingSec}`,
+    );
+    assert(!report.status.startsWith("B2_BACKUP_FAILED"), report.status);
+  },
+);
 
 Deno.test("orchestration: Oracle runtime is required before new work", async () => {
   const h = harness({ now: new Date(WINDOW_START + 1000) });
@@ -2335,16 +2344,19 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
   assert(script.includes("RemainAfterExit=yes"));
   assert(script.includes("RuntimeMaxSec=12345"), script);
   assert(script.includes("MemoryMax=1G"));
-  assert(script.includes("CPUQuota=100%"));
+  assert(script.includes("CPUQuota=20%"));
+  assert(!script.includes("CPUQuota=100%"), script);
   // The capture is a bulk background job on a shared 2-OCPU host: it must
   // yield CPU under contention and issue disk IO only when the device is
-  // otherwise quiet. CPUWeight=1/Nice=19 are the floors (0 is invalid), and
-  // IOSchedulingClass=idle is the enforceable disk control because the root
-  // volume runs the "none" scheduler, making IOWeight/io.bfq.weight inert.
+  // otherwise quiet. CPUQuota=20% is the owner-approved cap shared by the
+  // worker and verifier; CPUWeight=1/Nice=19 are the floors (0 is invalid),
+  // and IOSchedulingClass=idle is the enforceable disk control because the
+  // root volume runs the "none" scheduler, making IOWeight/io.bfq.weight
+  // inert.
   assert(script.includes("CPUWeight=1"), script);
   assert(script.includes("IOReadBandwidthMax=/ 10M"), script);
   assert(script.includes("IOWriteBandwidthMax=/ 10M"), script);
-  // A 2M write cap was measured to blow the 6h capture deadline.
+  // A 2M write cap was measured to blow the then-6h capture deadline.
   assert(!script.includes("IOWriteBandwidthMax=/ 2M"), script);
   // MemoryHigh=768M was removed after it stalled a real upload: the worker's
   // natural peak is ~1,078 MB, so a soft limit below that throttled it
@@ -5394,7 +5406,7 @@ Deno.test("cycle: the default step budget follows the request deadline past 400 
   });
   let verifierPolls = 0;
   const h = harness({
-    // Beyond the old 400 * 30s default (200 min) but before the 6 h
+    // Beyond the old 400 * 30s default (200 min) but before the 12 h
     // immutable deadline: the default lifetime must keep polling.
     now: new Date(WINDOW_START + 3.5 * 3_600_000),
     gateValue: {

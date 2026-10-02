@@ -7,6 +7,7 @@ import {
 } from "../scripts/backblaze-controller-gate.ts";
 import {
   type BackupControllerGate,
+  GATE_DEADLINE_MS,
   type OrphanReason,
   validateGate,
 } from "../scripts/backblaze-controller-contract.ts";
@@ -92,7 +93,7 @@ function gateFixture(
     generation: `generation-${UUID}`,
     requestSha256: REQUEST_SHA,
     requestedAtUtc: iso(requestedAt),
-    deadlineAtUtc: iso(requestedAt + 6 * 3_600_000),
+    deadlineAtUtc: iso(requestedAt + GATE_DEADLINE_MS),
     createdAtUtc: iso(createdAt),
     updatedAtUtc: iso(createdAt + 1_000),
     remoteHost: "codex@vps.pavlovcik.com",

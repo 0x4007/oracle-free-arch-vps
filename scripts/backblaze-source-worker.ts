@@ -96,6 +96,7 @@ import {
 import {
   type BackupControllerGate,
   canonicalUtcMillis,
+  GATE_DEADLINE_HOURS,
   GATE_DEADLINE_MS,
   GATE_OWNER,
   GATE_REMOTE_HOST,
@@ -239,7 +240,7 @@ export interface WorkerRequest {
   periodKey: string;
   generation: string;
   requestedAtUtc: string;
-  /** Exactly requestedAtUtc + 6 hours. */
+  /** Exactly requestedAtUtc + WORKER_DEADLINE_MS. */
   deadlineAtUtc: string;
   recipientSha256: string;
   recipientFingerprint: string;
@@ -367,7 +368,7 @@ export function validateRequest(input: unknown): WorkerRequest {
   );
   if (deadlineAtUtc !== requestedAtUtc + WORKER_DEADLINE_MS) {
     throw new Error(
-      "deadlineAtUtc must be exactly requestedAtUtc plus 6 hours",
+      `deadlineAtUtc must be exactly requestedAtUtc plus ${GATE_DEADLINE_HOURS} hours`,
     );
   }
   const recipientSha256 = input.recipientSha256;
@@ -557,7 +558,7 @@ export function validateStatus(input: unknown): WorkerStatus {
   );
   if (deadlineAtUtc !== requestedAtUtc + WORKER_DEADLINE_MS) {
     throw new Error(
-      "Status deadlineAtUtc must be exactly requestedAtUtc plus 6 hours",
+      `Status deadlineAtUtc must be exactly requestedAtUtc plus ${GATE_DEADLINE_HOURS} hours`,
     );
   }
   const invocationId = validateUnitInvocationId(input.invocationId);

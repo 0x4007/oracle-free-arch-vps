@@ -88,7 +88,7 @@ The controller schedules Sundays at 00:05 America/New_York. Each period's
 catch-up window runs from its Sunday 00:05 to the next Sunday 00:05, so a
 delayed or missed trigger coalesces into one fresh request for the latest
 Sunday period instead of being lost; a per-job request keeps its immutable
-six-hour source deadline from the request instant. A shared lock serializes
+twelve-hour source deadline from the request instant. A shared lock serializes
 it with the Oracle backup cycle. It accepts a generation only after complete
 archive verification and terminal source-process evidence. Retention keeps
 the newest four accepted generations and removes older exact object versions

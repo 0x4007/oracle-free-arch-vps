@@ -2,6 +2,8 @@ import {
   assertBackblazeLaunchAllowed,
   assertOracleMutationAllowed,
   canonicalUtcMillis,
+  GATE_DEADLINE_HOURS,
+  GATE_DEADLINE_MS,
   type GateClearProofState,
   validateGate,
   validateGateClearProof,
@@ -10,6 +12,7 @@ import {
 const UUID = "681c4067-aec2-45d5-9afb-77ee530e3a97";
 const INVOCATION = "a7064f4b7f524c3baa3725acc88f73ed";
 const REQUEST_SHA = "ab".repeat(32);
+const REQUESTED_AT = "2026-09-06T04:00:00.000Z";
 
 function assert(value: unknown, message?: string): asserts value {
   if (!value) throw new Error(message ?? "Assertion failed");
@@ -44,8 +47,8 @@ function gateFixture(
     periodKey: "2026-09-06",
     generation: `generation-${UUID}`,
     requestSha256: REQUEST_SHA,
-    requestedAtUtc: "2026-09-06T04:00:00.000Z",
-    deadlineAtUtc: "2026-09-06T10:00:00.000Z",
+    requestedAtUtc: REQUESTED_AT,
+    deadlineAtUtc: iso(Date.parse(REQUESTED_AT) + GATE_DEADLINE_MS),
     createdAtUtc: "2026-09-06T04:00:01.000Z",
     updatedAtUtc: "2026-09-06T04:00:02.000Z",
     remoteHost: "codex@vps.pavlovcik.com",
@@ -216,14 +219,18 @@ Deno.test("validateGate accepts only valid Sunday period keys", () => {
   );
 });
 
-Deno.test("validateGate binds deadline to requested plus six hours exactly", () => {
-  assertThrows(() =>
-    validateGate(gateFixture({ deadlineAtUtc: "2026-09-06T10:00:01.000Z" }))
-  );
-  assertThrows(() =>
-    validateGate(gateFixture({ deadlineAtUtc: "2026-09-06T09:59:59.000Z" }))
-  );
-});
+Deno.test(
+  `validateGate binds deadline to requested plus ${GATE_DEADLINE_HOURS} hours exactly`,
+  () => {
+    const deadline = Date.parse(REQUESTED_AT) + GATE_DEADLINE_MS;
+    assertThrows(() =>
+      validateGate(gateFixture({ deadlineAtUtc: iso(deadline + 1_000) }))
+    );
+    assertThrows(() =>
+      validateGate(gateFixture({ deadlineAtUtc: iso(deadline - 1_000) }))
+    );
+  },
+);
 
 Deno.test("validateGate rejects noncanonical or disordered timestamps", () => {
   assertThrows(() =>
@@ -282,15 +289,17 @@ Deno.test("validateGate rejects orphanReason state mismatches", () => {
 });
 
 Deno.test("an expired gate is still a valid gate and still blocks mutation", () => {
+  const requestedAtUtc = "2026-09-05T04:00:00.000Z";
+  const deadlineAtUtc = iso(Date.parse(requestedAtUtc) + GATE_DEADLINE_MS);
   const gate = validateGate(
     gateFixture({
-      requestedAtUtc: "2026-09-05T04:00:00.000Z",
-      deadlineAtUtc: "2026-09-05T10:00:00.000Z",
+      requestedAtUtc,
+      deadlineAtUtc,
       createdAtUtc: "2026-09-05T04:00:01.000Z",
       updatedAtUtc: "2026-09-05T04:00:02.000Z",
     }),
   );
-  assertEquals(gate.deadlineAtUtc, "2026-09-05T10:00:00.000Z");
+  assertEquals(gate.deadlineAtUtc, deadlineAtUtc);
   assertThrows(() => assertOracleMutationAllowed(gate));
 });
 
