@@ -28,6 +28,7 @@
 import {
   assertBackblazeLaunchAllowed,
   type BackupControllerGate,
+  GATE_DEADLINE_HOURS,
   GATE_DEADLINE_MS,
   GATE_OWNER,
   GATE_REMOTE_HOST,
@@ -423,7 +424,8 @@ export interface RequestParts {
   sourceConfigSha256: string;
 }
 
-/** The immutable per-period request; deadline is request instant + 6h. */
+/** The immutable per-period request; deadline is requestedAtUtc +
+ * GATE_DEADLINE_MS. */
 export function buildRequestEnvelope(parts: RequestParts): {
   request: WorkerRequest;
   requestSha256: string;
@@ -573,7 +575,7 @@ export function validateVerifierStatus(input: unknown): VerifierStatus {
     Date.parse(deadlineAtUtc) !== Date.parse(requestedAtUtc) + GATE_DEADLINE_MS
   ) {
     throw new Error(
-      "Verifier status deadlineAtUtc must be exactly requestedAtUtc plus 6 hours",
+      `Verifier status deadlineAtUtc must be exactly requestedAtUtc plus ${GATE_DEADLINE_HOURS} hours`,
     );
   }
   const invocationId = validateUnitInvocationId(input.invocationId);
@@ -1377,10 +1379,11 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
         // twice under load. Each control below is chosen to actually bind on
         // this host, verified by measurement rather than assumption.
         //
-        // CPU: CPUQuota pins it to one core; CPUWeight/Nice are floors so it
-        // yields under contention and still runs at full speed when idle.
-        // Measured under forced single-core contention: the default-weight
-        // competitor took 99.0% of CPU and this worker 1.0%.
+        // CPU: CPUQuota caps each worker/verifier unit at 20% of one core, the
+        // owner-approved share; CPUWeight/Nice remain floors so it yields
+        // under contention and uses spare capacity when idle. Measured under
+        // forced single-core contention: the default-weight competitor took
+        // 99.0% of CPU and this worker 1.0%.
         //
         // Disk: the root volume runs the "none" IO scheduler, so neither
         // IOWeight nor IOSchedulingClass=idle arbitrates anything (measured:
@@ -1405,28 +1408,29 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
         // so an overrun fails the backup rather than adding swap IO.
         "MemoryMax=1G",
         "MemorySwapMax=0",
-        "CPUQuota=100%",
+        "CPUQuota=20%",
         "CPUWeight=1",
         "Nice=19",
         "IOSchedulingClass=idle",
         "IOSchedulingPriority=7",
         "IOAccounting=yes",
-        // The verifier streams ~64.9 GB of full-file read-back passes, not the
-        // 10.36 GB ciphertext payload capture wrote. At the capture's 10M read
-        // budget those passes need ~108 min and cannot fit inside the six-hour
-        // cycle; 30M read plus the shared 10M write brings them to ~47.5 min
-        // (capture 114 + planning/upload ~121 + reconstruct 17 + verify ~47.5
-        // is ~300 min, ~60 min of headroom for a normal cycle). Decimal M:
-        // 30M is 30,000,000 B/s. This bounds a normal cycle; it does not
-        // guarantee the gate deadline under every retry.
+        // The verifier reads the whole reconstruction back rather than only
+        // the ciphertext payload capture wrote, so it gets the higher read
+        // budget; the shared 10M write cap still applies. The 30M value rests
+        // on dated 2026-09-22 measurements (~64.9 GB of full-file read-back
+        // passes: ~108 min at a 10M read cap, ~47.5 min at 30M) taken before
+        // 563db0f reduced redundant verification passes. Those timings are
+        // historical, not a current cycle estimate, and they are not a
+        // guarantee that a future cycle fits the deadline. Decimal M: 30M is
+        // 30,000,000 B/s.
         `IOReadBandwidthMax=/ ${readBandwidthMax}`,
-        // 10M, not 2M. A 2M write cap was measured to stretch the capture to
-        // 3.72 h because capture writes both the plaintext archive and its
-        // ciphertext (~20.6 GB total), which pushed the whole capture+upload+
-        // verify cycle into GATE_DEADLINE_MS (6 h) and the run was killed
-        // mid-verify. 10M keeps the same order of protection - still ~1/7 of
-        // the volume's ~72 MB/s Balanced/10-VPU budget - while leaving the
-        // cycle comfortably inside the deadline.
+        // 10M, not 2M. A 2M write cap was measured on 2026-09-22 to stretch the
+        // capture to 3.72 h because capture writes both the plaintext archive
+        // and its ciphertext (~20.6 GB total), which pushed the whole
+        // capture+upload+verify cycle past the then-6 h `GATE_DEADLINE_MS` and
+        // the run was killed mid-verify. 10M keeps the same order of
+        // protection - still ~1/7 of the volume's ~72 MB/s Balanced/10-VPU
+        // budget - and remains the configured per-phase write cap.
         "IOWriteBandwidthMax=/ 10M",
         "IOReadIOPSMax=/ 500",
         "IOWriteIOPSMax=/ 200",

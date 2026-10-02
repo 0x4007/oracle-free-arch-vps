@@ -59,6 +59,7 @@ import {
   validateRequest,
   validateRequestEnvelope,
   validateStatus,
+  WORKER_DEADLINE_MS,
   WorkerRejection,
   type WorkerRequest,
   type WorkerRequestEnvelope,
@@ -152,7 +153,9 @@ const GENERATION = `generation-${UUID}`;
 const JOB_ID = `job-${UUID}`;
 const PERIOD_KEY = "2026-09-06";
 const REQUESTED_AT = "2026-09-06T04:00:00.000Z";
-const DEADLINE_AT = "2026-09-06T10:00:00.000Z";
+const DEADLINE_AT = new Date(
+  Date.parse(REQUESTED_AT) + WORKER_DEADLINE_MS,
+).toISOString();
 const CAPTURE_STARTED = "2026-09-06T04:05:00.000Z";
 const CAPTURE_FINISHED = "2026-09-06T04:06:00.000Z";
 const UPLOAD_STARTED = "2026-09-06T04:06:30.000Z";
@@ -755,7 +758,7 @@ Deno.test("validateRequest rejects every malformed identity deviation", () => {
         ...base(),
         deadlineAtUtc: "2026-09-06T09:00:00.000Z",
       }),
-    "6 hours",
+    "12 hours",
   );
   assertThrowsSync(
     () => validateRequest({ ...base(), sourceRevision: "a".repeat(39) }),
