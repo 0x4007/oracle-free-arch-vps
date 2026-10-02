@@ -140,11 +140,12 @@ function proofFixture(
 }
 
 /** Gate identity whose immutable deadline already passed at the real test
- * time: requested = now-11h, deadline = now-5h. */
+ * time: requested = now - GATE_DEADLINE_MS - 1h, deadline = now - 1h, for any
+ * configured duration. */
 function expiredGateFixture(
   overrides: Record<string, unknown> = {},
 ): BackupControllerGate {
-  return gateFixture(overrides, Date.now() - 9 * 3_600_000);
+  return gateFixture(overrides, Date.now() - GATE_DEADLINE_MS + 3_600_000);
 }
 
 /** The live expiry proof shape: exact timed-out failed/failed unit, zero

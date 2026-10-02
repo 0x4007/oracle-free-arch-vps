@@ -108,14 +108,36 @@ function expiredGate(overrides: Record<string, unknown> = {}) {
   }));
 }
 
+const REQUESTED_MS = Date.parse(REQUESTED_AT);
+const DEADLINE_AT = iso(REQUESTED_MS + GATE_DEADLINE_MS);
+// Proof checked one second after the immutable deadline, compared 4 seconds
+// later: expired and still inside the 30 s freshness bound for any duration.
+const EXPIRED_CHECKED_AT_MS = Date.parse(DEADLINE_AT) + 1_000;
+const EXPIRED_NOW = new Date(EXPIRED_CHECKED_AT_MS + 4_000);
+const EXPIRED_UPDATED_AT = iso(Date.parse(DEADLINE_AT) - 60_000);
+const EXPIRED_HEARTBEAT_AT = iso(Date.parse(DEADLINE_AT) - 61_000);
+// A valid-duration gate whose request is one hour later, so its own deadline
+// is still in the future at the same proof instant: the unexpired negative
+// must fail on the deadline guard, never on a malformed gate.
+const UNEXPIRED_REQUESTED_AT = iso(REQUESTED_MS + 3_600_000);
+const UNEXPIRED_GATE_TIMES = {
+  requestedAtUtc: UNEXPIRED_REQUESTED_AT,
+  deadlineAtUtc: iso(Date.parse(UNEXPIRED_REQUESTED_AT) + GATE_DEADLINE_MS),
+  createdAtUtc: iso(Date.parse(UNEXPIRED_REQUESTED_AT) + 1_000),
+  updatedAtUtc: iso(Date.parse(UNEXPIRED_REQUESTED_AT) + 2_000),
+};
+
 function expiredProofFixture(
   overrides: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return proofFixture({
+    checkedAtUtc: iso(EXPIRED_CHECKED_AT_MS),
     unitActiveState: "failed",
     unitSubState: "failed",
     unitResult: "timeout",
     statusState: "UPLOADING",
+    statusUpdatedAtUtc: EXPIRED_UPDATED_AT,
+    statusHeartbeatAtUtc: EXPIRED_HEARTBEAT_AT,
     statusFinishedAtUtc: null,
     clearBasis: "deadline-expired",
     ...overrides,
@@ -357,14 +379,14 @@ Deno.test("failed systemd proof accepts known failure results with FAILED status
 Deno.test("deadline-expired proof accepts the preserved nonterminal timeout shape", () => {
   const gate = expiredGate();
   const input = expiredProofFixture();
-  const proof = validateGateClearProof(input, gate, CLEAR_NOW);
+  const proof = validateGateClearProof(input, gate, EXPIRED_NOW);
   assertEquals(proof, input);
   assertEquals(proof.clearBasis, "deadline-expired");
   assert(proof.statusFinishedAtUtc === null, "finishedAt is never synthesized");
   assertEquals(proof.statusState, "UPLOADING");
   // The derived field must not make the returned proof invalid against the
   // same gate and comparison instant.
-  assertEquals(validateGateClearProof(proof, gate, CLEAR_NOW), proof);
+  assertEquals(validateGateClearProof(proof, gate, EXPIRED_NOW), proof);
 });
 
 Deno.test("terminal proof without clearBasis defaults to a revalidatable terminal basis", () => {
@@ -385,12 +407,13 @@ Deno.test("deadline-expired proof rejects every unsupported condition", () => {
   const rejects = (
     overrides: Record<string, unknown>,
     candidate = gate,
+    comparison = EXPIRED_NOW,
   ): void => {
     assertThrows(() =>
       validateGateClearProof(
         expiredProofFixture(overrides),
         candidate,
-        CLEAR_NOW,
+        comparison,
       )
     );
   };
@@ -402,16 +425,8 @@ Deno.test("deadline-expired proof rejects every unsupported condition", () => {
     {},
     expiredGate({ orphanReason: "SOURCE_UNREACHABLE_AT_DEADLINE" }),
   );
-  // The immutable request deadline has not passed.
-  rejects(
-    {},
-    expiredGate({
-      requestedAtUtc: "2026-09-06T04:00:20.000Z",
-      deadlineAtUtc: "2026-09-06T10:00:20.000Z",
-      createdAtUtc: "2026-09-06T04:00:21.000Z",
-      updatedAtUtc: "2026-09-06T04:00:22.000Z",
-    }),
-  );
+  // The immutable request deadline has not passed (valid later-dated gate).
+  rejects({}, expiredGate(UNEXPIRED_GATE_TIMES));
   // Only Result=timeout on the exact failed/failed unit.
   rejects({ unitResult: "exit-code" });
   rejects({ unitResult: "signal" });
@@ -451,14 +466,15 @@ Deno.test("deadline-expired proof rejects every unsupported condition", () => {
   rejects({ statusState: "FAILED" });
   rejects({ statusState: "SLEEPING" });
   // A non-null finish instant is never accepted in the expired basis.
-  rejects({ statusFinishedAtUtc: "2026-09-06T10:00:05.000Z" });
-  // Stale, future or incoherent timestamp evidence.
-  rejects({ checkedAtUtc: "2026-09-06T10:00:46.000Z" });
-  rejects({ checkedAtUtc: "2026-09-06T10:00:20.000Z" });
-  rejects({ statusHeartbeatAtUtc: "2026-09-06T10:00:06.000Z" });
-  rejects({ statusUpdatedAtUtc: "2026-09-06T10:00:20.000Z" });
-  rejects({ statusUpdatedAtUtc: "2026-09-06T03:59:59.000Z" });
-  rejects({ statusHeartbeatAtUtc: "2026-09-06T03:59:59.000Z" });
+  rejects({ statusFinishedAtUtc: iso(EXPIRED_CHECKED_AT_MS) });
+  // Stale (comparison 31 s after the check) and future check instants.
+  rejects({}, gate, new Date(EXPIRED_CHECKED_AT_MS + 31_000));
+  rejects({}, gate, new Date(EXPIRED_CHECKED_AT_MS - 1_000));
+  // Incoherent heartbeat/updated timestamps inside the window.
+  rejects({ statusHeartbeatAtUtc: iso(Date.parse(DEADLINE_AT) - 59_000) });
+  rejects({ statusUpdatedAtUtc: iso(EXPIRED_CHECKED_AT_MS + 2_000) });
+  rejects({ statusUpdatedAtUtc: iso(REQUESTED_MS - 1_000) });
+  rejects({ statusHeartbeatAtUtc: iso(REQUESTED_MS - 1_000) });
   // An unknown basis is never accepted.
   rejects({ clearBasis: "guess" });
 });
