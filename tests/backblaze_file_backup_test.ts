@@ -2343,12 +2343,12 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
   assert(script.includes("Type=exec"));
   assert(script.includes("RemainAfterExit=yes"));
   assert(script.includes("RuntimeMaxSec=12345"), script);
-  assert(script.includes("MemoryMax=1G"));
-  assert(script.includes("CPUQuota=20%"));
+  assert(script.includes("MemoryMax=1536M"));
+  assert(script.includes("CPUQuota=25%"));
   assert(!script.includes("CPUQuota=100%"), script);
   // The capture is a bulk background job on a shared 2-OCPU host: it must
   // yield CPU under contention and issue disk IO only when the device is
-  // otherwise quiet. CPUQuota=20% is the owner-approved cap shared by the
+  // otherwise quiet. CPUQuota=25% is the owner-approved cap shared by the
   // worker and verifier; CPUWeight=1/Nice=19 are the floors (0 is invalid),
   // and IOSchedulingClass=idle is the enforceable disk control because the
   // root volume runs the "none" scheduler, making IOWeight/io.bfq.weight
@@ -2362,7 +2362,7 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
   // natural peak is ~1,078 MB, so a soft limit below that throttled it
   // continuously (194,527 events) and it stopped making progress.
   assert(!script.includes("MemoryHigh"), script);
-  assert(script.includes("MemoryMax=1G"), script);
+  assert(script.includes("MemoryMax=1536M"), script);
   assert(script.includes("MemorySwapMax=0"), script);
   assert(script.includes("Nice=19"), script);
   assert(script.includes("IOSchedulingClass=idle"), script);

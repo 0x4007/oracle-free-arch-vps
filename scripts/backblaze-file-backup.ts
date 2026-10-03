@@ -1379,7 +1379,7 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
         // twice under load. Each control below is chosen to actually bind on
         // this host, verified by measurement rather than assumption.
         //
-        // CPU: CPUQuota caps each worker/verifier unit at 20% of one core, the
+        // CPU: CPUQuota caps each worker/verifier unit at 25% of one core, the
         // owner-approved share; CPUWeight/Nice remain floors so it yields
         // under contention and uses spare capacity when idle. Measured under
         // forced single-core contention: the default-weight competitor took
@@ -1406,9 +1406,9 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
         // of completing. The hard MemoryMax alone is the correct control: it
         // still bounds the worker, and MemorySwapMax=0 keeps it off host swap
         // so an overrun fails the backup rather than adding swap IO.
-        "MemoryMax=1G",
+        "MemoryMax=1536M",
         "MemorySwapMax=0",
-        "CPUQuota=20%",
+        "CPUQuota=25%",
         "CPUWeight=1",
         "Nice=19",
         "IOSchedulingClass=idle",
