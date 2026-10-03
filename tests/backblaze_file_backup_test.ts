@@ -2346,22 +2346,22 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
   assert(script.includes("MemoryMax=6255601664"));
   assert(script.includes("CPUQuota=100%"));
   assert(!script.includes("CPUQuota=25%"), script);
-  // Half of the two-core host is one full core. IO budgets split the
-  // volume's half allowance between read and write directions.
+  // Half of the two-core host is one full core. IO budgets apply the
+  // volume's half maximum independently to read and write directions.
   assert(script.includes("CPUWeight=1"), script);
-  assert(script.includes("IOReadBandwidthMax=/ 18M"), script);
-  assert(script.includes("IOWriteBandwidthMax=/ 18M"), script);
-  assert(script.includes("IOReadIOPSMax=/ 2250"), script);
-  assert(script.includes("IOWriteIOPSMax=/ 2250"), script);
+  assert(script.includes("IOReadBandwidthMax=/ 36M"), script);
+  assert(script.includes("IOWriteBandwidthMax=/ 36M"), script);
+  assert(script.includes("IOReadIOPSMax=/ 4500"), script);
+  assert(script.includes("IOWriteIOPSMax=/ 4500"), script);
   assert(
     script.includes(
-      "IOReadBandwidthMax=/dev/disk/by-id/scsi-3608cae23d6ea4b84be48c40d288c890e 6M",
+      "IOReadBandwidthMax=/dev/disk/by-id/scsi-3608cae23d6ea4b84be48c40d288c890e 12M",
     ),
     script,
   );
   assert(
     script.includes(
-      "IOWriteIOPSMax=/dev/disk/by-id/scsi-3608cae23d6ea4b84be48c40d288c890e 750",
+      "IOWriteIOPSMax=/dev/disk/by-id/scsi-3608cae23d6ea4b84be48c40d288c890e 1500",
     ),
     script,
   );
@@ -2403,11 +2403,11 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
     verifyScript.includes(`arch-vps-b2-verify-${uuidFor(14)}.service`),
     verifyScript,
   );
-  assert(verifyScript.includes("IOReadBandwidthMax=/ 18M"), verifyScript);
+  assert(verifyScript.includes("IOReadBandwidthMax=/ 36M"), verifyScript);
   assert(!verifyScript.includes("IOReadBandwidthMax=/ 30M"), verifyScript);
-  assert(verifyScript.includes("IOWriteBandwidthMax=/ 18M"), verifyScript);
-  assert(verifyScript.includes("IOReadIOPSMax=/ 2250"), verifyScript);
-  assert(verifyScript.includes("IOWriteIOPSMax=/ 2250"), verifyScript);
+  assert(verifyScript.includes("IOWriteBandwidthMax=/ 36M"), verifyScript);
+  assert(verifyScript.includes("IOReadIOPSMax=/ 4500"), verifyScript);
+  assert(verifyScript.includes("IOWriteIOPSMax=/ 4500"), verifyScript);
   assert(verifyScript.includes("RuntimeMaxSec=12345"), verifyScript);
   assert(verifyScript.includes("entry-verify.ts"), verifyScript);
   await seam.installer({

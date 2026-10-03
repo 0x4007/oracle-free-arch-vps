@@ -1369,8 +1369,8 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
         throw new Error("Remaining deadline seconds must be positive");
       }
       // The owner authorized half of the measured two-core / 12 GB host.
-      // Balanced root: 72 MB/s and 9,000 IOPS; divide its half budget
-      // equally between reads and writes, so combined IO stays below half.
+      // Balanced root: 72 MB/s and 9,000 IOPS; each direction gets
+      // half of that maximum, without splitting the allowance again.
       // The 50 GB staging boot volume has 24 MB/s and 3,000 IOPS.
       const stagingDevice =
         "/dev/disk/by-id/scsi-3608cae23d6ea4b84be48c40d288c890e";
@@ -1390,14 +1390,14 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
         "IOSchedulingClass=idle",
         "IOSchedulingPriority=7",
         "IOAccounting=yes",
-        "IOReadBandwidthMax=/ 18M",
-        "IOWriteBandwidthMax=/ 18M",
-        "IOReadIOPSMax=/ 2250",
-        "IOWriteIOPSMax=/ 2250",
-        `IOReadBandwidthMax=${stagingDevice} 6M`,
-        `IOWriteBandwidthMax=${stagingDevice} 6M`,
-        `IOReadIOPSMax=${stagingDevice} 750`,
-        `IOWriteIOPSMax=${stagingDevice} 750`,
+        "IOReadBandwidthMax=/ 36M",
+        "IOWriteBandwidthMax=/ 36M",
+        "IOReadIOPSMax=/ 4500",
+        "IOWriteIOPSMax=/ 4500",
+        `IOReadBandwidthMax=${stagingDevice} 12M`,
+        `IOWriteBandwidthMax=${stagingDevice} 12M`,
+        `IOReadIOPSMax=${stagingDevice} 1500`,
+        `IOWriteIOPSMax=${stagingDevice} 1500`,
         "OOMPolicy=kill",
         "UMask=0077",
         `WorkingDirectory=${runtimeDir}`,
