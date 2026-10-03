@@ -3,9 +3,9 @@
  * read. Runtime checks (real temp fixtures and journal files) need read and
  * write permissions and are explicitly ignored in the default permissionless
  * mode; the same cases must run with zero skips under
- * `deno test --allow-read --allow-write`. The single module seam
- * (planReadTestSeam) only forces short nonfinal reads inside the real
- * planning pipeline and is restored by the test. */
+ * `deno test --allow-read --allow-write`. Planning reads and pure chunk
+ * uploads use narrow test seams; the latter injects retry delays without
+ * local archives or network access. */
 import { createHash } from "node:crypto";
 import type { CaptureResult } from "../scripts/backblaze-capture.ts";
 import {
@@ -13,6 +13,7 @@ import {
   MAX_CHUNK_BYTES,
 } from "../scripts/backblaze-storage.ts";
 import {
+  chunkUploadTestSeam,
   createTransferPacer,
   generationChunkName,
   getExactObjectWithRetry,
@@ -1530,4 +1531,156 @@ Deno.test("exact-object readback retry stops immediately on integrity failure af
   assert(calls === 2);
   assert(waits.length === 1 && waits[0] === 1000);
   assert(store.putCalls === 0);
+});
+
+function pureChunkUpload(store: FakeStore, waits: number[]) {
+  const bytes = new Uint8Array([1, 2, 3]);
+  return chunkUploadTestSeam.process(
+    {
+      role: "root",
+      index: 6,
+      name: generationChunkName(GENERATION, "root", 6),
+      size: bytes.byteLength,
+      sha256: sha256Hex(bytes),
+      sha1: sha1Hex(bytes),
+    },
+    bytes,
+    null,
+    {
+      store,
+      generation: GENERATION,
+      byName: new Map<string, B2Object[]>(),
+      pace: () => Promise.resolve(),
+    },
+    (ms) => {
+      waits.push(ms);
+      return Promise.resolve();
+    },
+  );
+}
+
+Deno.test("chunk PUT retry reconciles absent HTTP 503 before retrying the same bytes", async () => {
+  const store = new FakeStore();
+  const waits: number[] = [];
+  const names: string[] = [];
+  store.putHandler = (name) => {
+    names.push(name);
+    return store.putCalls === 1
+      ? { error: new Error("b2_upload_file failed (HTTP 503)"), store: false }
+      : undefined;
+  };
+  const result = await pureChunkUpload(store, waits);
+  assert(store.putCalls === 2);
+  assert(store.versionsCalls === 1, "failure must reconcile before retry");
+  assert(names.every((name) => name === result.chunk.name));
+  assert(waits.length === 1 && waits[0] === 1000);
+  assert(result.chunk.reused === false);
+  assert(result.chunk.sha256 === sha256Hex(new Uint8Array([1, 2, 3])));
+  assertBytes(result.readback, new Uint8Array([1, 2, 3]));
+  assert(store.countVersions(result.chunk.name) === 1);
+  assert(store.getCalls.length === 1);
+  assert(store.removeCalls === 0);
+});
+
+Deno.test("chunk PUT retry verifies a committed object after response failure without another PUT", async () => {
+  for (
+    const message of [
+      "b2_upload_file failed (HTTP 503)",
+      "b2_upload_file failed: body read failed",
+      "b2_upload_file failed (network error)",
+    ]
+  ) {
+    const store = new FakeStore();
+    const waits: number[] = [];
+    store.putHandler = () => ({ error: new Error(message), store: true });
+    const result = await pureChunkUpload(store, waits);
+    assert(store.putCalls === 1, message);
+    assert(store.versionsCalls === 1);
+    assert(store.getCalls.length === 1);
+    assert(result.chunk.reused === true);
+    assert(result.chunk.versions.length === 1);
+    assert(result.chunk.fileId === store.getCalls[0]);
+    assertBytes(result.readback, new Uint8Array([1, 2, 3]));
+    assert(waits.length === 0);
+    assert(store.removeCalls === 0);
+  }
+});
+
+Deno.test("chunk PUT retry rejects conflicting content after a failed PUT", async () => {
+  const store = new FakeStore();
+  const waits: number[] = [];
+  store.putHandler = (name) => {
+    store.seed(name, new Uint8Array([9, 9, 9]));
+    return {
+      error: new Error("b2_upload_file failed (HTTP 503)"),
+      store: false,
+    };
+  };
+  const error = await rejectWith(pureChunkUpload(store, waits));
+  assert(error.message === "Upload failed (chunk:conflict)");
+  assert(store.putCalls === 1 && store.versionsCalls === 1);
+  assert(store.getCalls.length === 0 && waits.length === 0);
+  assert(store.removeCalls === 0);
+});
+
+Deno.test("chunk PUT retry rejects hide and start markers during reconciliation", async () => {
+  for (const action of ["hide", "start"] as const) {
+    const store = new FakeStore();
+    const waits: number[] = [];
+    store.putHandler = (name) => {
+      store.seed(name, new Uint8Array(0), {
+        action,
+        contentSha1: action === "hide" ? "0".repeat(40) : "",
+      });
+      return {
+        error: new Error("b2_upload_file failed (HTTP 503)"),
+        store: false,
+      };
+    };
+    const error = await rejectWith(pureChunkUpload(store, waits));
+    assert(error.message === "Upload failed (inventory:action)");
+    assert(store.putCalls === 1 && store.versionsCalls === 1);
+    assert(store.getCalls.length === 0 && waits.length === 0);
+    assert(store.removeCalls === 0);
+  }
+});
+
+Deno.test("chunk PUT retry fails closed for absent ambiguous and unrecognized failures", async () => {
+  for (
+    const message of [
+      "b2_upload_file failed (network error)",
+      "b2_upload_file failed: body read failed",
+      "b2_upload_file failed (HTTP 503): invalid body",
+      "b2_upload_file failed (HTTP 401)",
+      "b2_upload_file failed (HTTP 403)",
+      "b2_upload_file failed (HTTP 404)",
+      "b2_upload_file failed (HTTP 408)",
+      "unexpected failure",
+    ]
+  ) {
+    const store = new FakeStore();
+    const original = new Error(message);
+    const waits: number[] = [];
+    store.putHandler = () => ({ error: original, store: false });
+    const error = await rejectWith(pureChunkUpload(store, waits));
+    assert(error === original, message);
+    assert(store.putCalls === 1 && store.versionsCalls === 1, message);
+    assert(store.getCalls.length === 0 && waits.length === 0);
+    assert(store.totalVersionCount() === 0 && store.removeCalls === 0);
+  }
+});
+
+Deno.test("chunk PUT retry stops after three definite HTTP failures and reconciles the final attempt", async () => {
+  for (const status of [429, 500, 503, 599]) {
+    const store = new FakeStore();
+    const original = new Error(`b2_upload_file failed (HTTP ${status})`);
+    const waits: number[] = [];
+    store.putHandler = () => ({ error: original, store: false });
+    const error = await rejectWith(pureChunkUpload(store, waits));
+    assert(error === original);
+    assert(store.putCalls === 3 && store.versionsCalls === 3);
+    assert(waits.length === 2 && waits[0] === 1000 && waits[1] === 2000);
+    assert(store.getCalls.length === 0);
+    assert(store.totalVersionCount() === 0 && store.removeCalls === 0);
+  }
 });

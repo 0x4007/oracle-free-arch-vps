@@ -30,9 +30,9 @@ import {
  * and never independently readback-verified here, so they are not recovery
  * members on their own. Conflicting content or a start/hide marker inside
  * the generation fails closed. A lost put response refreshes the inventory
- * exactly once and reconciles the same expected object; an absent object
- * rethrows the original failure and is never blindly re-uploaded. There are
- * no PUT retries; transient exact-version GET failures have at most three
+ * after every failure and reconciles the same expected object. Confirmed
+ * absence permits at most three PUT attempts only for exact HTTP 429/5xx
+ * failures; ambiguous failures rethrow without another PUT. Transient exact-version GET failures have at most three
  * attempts with one- and two-second delays. Remove is not part of this module's store
  * dependency, so no version is ever deleted or hidden here (duplicate
  * identical versions are preserved and listed in the receipt for later
@@ -188,6 +188,17 @@ function transientReadbackCategory(error: unknown): string | null {
   if (
     /^b2_download_file_by_id failed \(HTTP 5[0-9]{2}\)$/.test(error.message)
   ) {
+    return "http_5xx";
+  }
+  return null;
+}
+
+function transientPutCategory(error: unknown): string | null {
+  if (!(error instanceof Error)) return null;
+  if (error.message === "b2_upload_file failed (HTTP 429)") {
+    return "http_429";
+  }
+  if (/^b2_upload_file failed \(HTTP 5[0-9]{2}\)$/.test(error.message)) {
     return "http_5xx";
   }
   return null;
@@ -1041,9 +1052,9 @@ function verifiedChunk(
 /**
  * Verify one chunk: when identical versions already exist, reuse the exact
  * one after SHA-256 readback of the selected primary; otherwise upload and
- * verify by readback. A lost put response triggers exactly one inventory
- * refresh and reconciles the same expected object — an absent object
- * rethrows the original failure, a conflicting one fails closed. Saved
+ * verify by readback. Every failed PUT refreshes inventory and reconciles
+ * the same expected object. Confirmed absence permits a bounded retry only
+ * for definite HTTP 429/5xx failures; ambiguity or conflict fails closed. Saved
  * chunks prefer their journaled version id; a saved object missing from the
  * inventory may be put again after that reconciliation (and an ambiguous
  * re-put is reconciled the same way instead of being blindly retried).
@@ -1055,7 +1066,9 @@ async function processChunk(
   chunk: PlannedChunk,
   buffer: Uint8Array<ArrayBuffer>,
   saved: JournalChunk | null,
-  ctx: UploadContext,
+  ctx: Pick<UploadContext, "store" | "generation" | "byName" | "pace">,
+  sleep: (ms: number) => Promise<void> = (ms) =>
+    new Promise((resolve) => setTimeout(resolve, ms)),
 ): Promise<{ chunk: UploadedChunk; readback: Uint8Array }> {
   const localSha256 = sha256Hex(buffer);
   const localSha1 = sha1Hex(buffer);
@@ -1093,35 +1106,47 @@ async function processChunk(
     };
   }
   let put: B2Object;
-  try {
-    put = await ctx.store.put(chunk.name, buffer);
-    await ctx.pace(buffer.byteLength);
-  } catch (error) {
-    const refreshed = classifyInventory(
-      await ctx.store.versions(),
-      ctx.generation,
-    );
-    const reconciled = refreshed.get(chunk.name) ?? [];
-    if (reconciled.length === 0) throw error;
-    assertIdentical(reconciled, chunk);
-    const versions = reusableVersions(reconciled);
-    const primary = versions[0];
-    const readback = await getExactObjectWithRetry(
-      ctx.store,
-      identityToObject(primary, chunk),
-      {
-        phase: "upload",
-        role: chunk.role,
-        chunkIndex: chunk.index,
-        reused: true,
-      },
-    );
-    assertReadback(chunk, readback);
-    return {
-      chunk: verifiedChunk(chunk, primary, true, versions),
-      readback,
-    };
+  for (let attempt = 1;; attempt += 1) {
+    try {
+      put = await ctx.store.put(chunk.name, buffer);
+      break;
+    } catch (error) {
+      const refreshed = classifyInventory(
+        await ctx.store.versions(),
+        ctx.generation,
+      );
+      const reconciled = refreshed.get(chunk.name) ?? [];
+      if (reconciled.length > 0) {
+        assertIdentical(reconciled, chunk);
+        const versions = reusableVersions(reconciled);
+        const primary = versions[0];
+        const readback = await getExactObjectWithRetry(
+          ctx.store,
+          identityToObject(primary, chunk),
+          {
+            phase: "upload",
+            role: chunk.role,
+            chunkIndex: chunk.index,
+            reused: true,
+          },
+        );
+        await ctx.pace(readback.byteLength);
+        assertReadback(chunk, readback);
+        return {
+          chunk: verifiedChunk(chunk, primary, true, versions),
+          readback,
+        };
+      }
+      const category = transientPutCategory(error);
+      if (category === null || attempt === 3) throw error;
+      console.error(
+        "[upload-retry]",
+        JSON.stringify({ role: chunk.role, chunkIndex: chunk.index, category }),
+      );
+      await sleep(1000 * 2 ** (attempt - 1));
+    }
   }
+  await ctx.pace(buffer.byteLength);
   const readback = await getExactObjectWithRetry(
     ctx.store,
     put,
@@ -1142,6 +1167,9 @@ async function processChunk(
     readback,
   };
 }
+
+/** Pure fake-store access to the real chunk path; no product configuration. */
+export const chunkUploadTestSeam = { process: processChunk };
 
 function identityToObject(
   identity: UploadVersionIdentity,
