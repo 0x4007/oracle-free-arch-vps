@@ -712,12 +712,16 @@ export async function clearGateAfterProof(
   proof: unknown,
   path: string = DEFAULT_GATE_PATH,
   now: Date = new Date(),
+  operator?: import("./backblaze-controller-contract.ts").OperatorProofBinding,
 ): Promise<BackupControllerGate> {
   // The expected gate, proof and comparison time are all snapshotted before
   // the first await; caller mutation cannot change authorization while the
   // gate is being re-read.
   const expectedSnapshot = validateGate(expected);
   const proofSnapshot = structuredClone(proof);
+  const operatorSnapshot = operator === undefined
+    ? undefined
+    : structuredClone(operator);
   const nowSnapshot = now.getTime();
   const read = await readGateInternal(path);
   if (!read) throw new Error("Gate is absent; nothing to clear");
@@ -726,7 +730,12 @@ export async function clearGateAfterProof(
       "Gate changed since it was read; re-read it under the shared controller lock",
     );
   }
-  void validateGateClearProof(proofSnapshot, read.gate, new Date(nowSnapshot));
+  void validateGateClearProof(
+    proofSnapshot,
+    read.gate,
+    new Date(nowSnapshot),
+    operatorSnapshot,
+  );
   const parent = await resolveParent(path);
   assertSameParent(parent, read.parent, "before mutation");
   await recheckFinal(parent, read.file);

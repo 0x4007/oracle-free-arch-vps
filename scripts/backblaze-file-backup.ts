@@ -25,6 +25,7 @@
  * m02/m03/m04/m05/m08 modules; gate identity/proof semantics are the
  * integrated m06 contract.
  */
+import { createHash } from "node:crypto";
 import {
   assertBackblazeLaunchAllowed,
   type BackupControllerGate,
@@ -1970,6 +1971,13 @@ export interface CatalogEntry {
 }
 
 export interface ControllerJob {
+  operatorRecovery?: {
+    provenanceSha256: string;
+    invocationId: string;
+    receiptSha256: string;
+    indexSha256: string;
+    acceptedAtUtc: string;
+  };
   envelope: WorkerRequestEnvelope;
   phase: ControllerPhase;
   updatedAtUtc: string;
@@ -2098,6 +2106,7 @@ export function validateCatalogEntry(input: unknown): CatalogEntry {
 
 const CONTROLLER_STATE_KEYS = new Set(["schemaVersion", "job", "catalog"]);
 const JOB_KEYS = new Set([
+  "operatorRecovery",
   "envelope",
   "phase",
   "updatedAtUtc",
@@ -2284,7 +2293,59 @@ export function validateControllerState(input: unknown): ControllerState {
           : {}),
       };
     })();
+    const operatorRecovery = input.job.operatorRecovery === undefined
+      ? undefined
+      : (() => {
+        const recovery = input.job.operatorRecovery;
+        if (!isRecord(recovery) || Object.keys(recovery).length !== 5) {
+          throw new Error("Operator recovery is malformed");
+        }
+        for (
+          const key of ["provenanceSha256", "receiptSha256", "indexSha256"]
+        ) {
+          if (
+            typeof recovery[key] !== "string" ||
+            !SHA256_PATTERN.test(recovery[key])
+          ) throw new Error("Operator recovery hash is invalid");
+        }
+        const invocationId = validateUnitInvocationId(recovery.invocationId);
+        const acceptedAtUtc = canonicalUtc(
+          recovery.acceptedAtUtc,
+          "operator acceptedAtUtc",
+        );
+        const entry = catalog.find((value) =>
+          value.index.generation === envelope.request.generation
+        );
+        if (
+          phase !== "FAILED" || workerStatus?.state !== "FAILED" ||
+          invocationId === workerStatus.invocationId || !entry ||
+          entry.publishedIndex.indexSha256 !== recovery.indexSha256 ||
+          entry.acceptedAtUtc !== acceptedAtUtc
+        ) {
+          throw new Error(
+            "Operator recovery does not bind a recovered failed generation",
+          );
+        }
+        const receiptSha256 = createHash("sha256").update(
+          new TextEncoder().encode(
+            `${JSON.stringify(entry.receipt, null, 2)}\n`,
+          ),
+        ).digest("hex");
+        if (receiptSha256 !== recovery.receiptSha256) {
+          throw new Error(
+            "Operator recovery receipt hash differs from catalog",
+          );
+        }
+        return {
+          provenanceSha256: recovery.provenanceSha256 as string,
+          receiptSha256: recovery.receiptSha256 as string,
+          indexSha256: recovery.indexSha256 as string,
+          invocationId,
+          acceptedAtUtc,
+        };
+      })();
     job = {
+      ...(operatorRecovery === undefined ? {} : { operatorRecovery }),
       envelope,
       phase: phase as ControllerPhase,
       updatedAtUtc,
@@ -2576,6 +2637,16 @@ export function assessBackblazeWatchdog(
   const idleStale = now.getTime() - Date.parse(job.heartbeatAtUtc) >
     STALE_AFTER_MS;
   const jobId = job.envelope.request.jobId;
+  if (job.operatorRecovery !== undefined) {
+    const checked = validateControllerState(state);
+    const recovered = checked.job!.operatorRecovery!;
+    const window = weekWindow(now);
+    if (
+      Date.parse(recovered.acceptedAtUtc) >= Date.parse(window.startAtUtc) &&
+      Date.parse(recovered.acceptedAtUtc) <= now.getTime()
+    ) return { status: `B2_BACKUP_CURRENT:${jobId}`, healthy: true };
+    return { status: `B2_PERIOD_MISSED:${window.periodKey}`, healthy: false };
+  }
   if (job.failure !== undefined) {
     return {
       status: `B2_BACKUP_FAILED:${jobId}`,
@@ -2905,7 +2976,7 @@ function requireInvocationId(): string {
   }
 }
 
-async function loadRuntimeSettings(): Promise<{
+export async function loadRuntimeSettings(): Promise<{
   settings: TransportSettings;
   runtimeDir: string;
   recipientBytes: Uint8Array;
@@ -3157,7 +3228,7 @@ export function makeStreamDecryptArchive(publicHome: string) {
   };
 }
 
-async function importRecipient(
+export async function importRecipient(
   publicHome: string,
   recipientBytes: Uint8Array,
 ): Promise<void> {
@@ -3195,7 +3266,7 @@ async function importRecipient(
   if (!output.success) throw new Error("Public recipient import failed");
 }
 
-async function ensurePublicHome(publicHome: string): Promise<void> {
+export async function ensurePublicHome(publicHome: string): Promise<void> {
   try {
     const info = await Deno.lstat(publicHome);
     if (info.isSymlink || !info.isDirectory) {

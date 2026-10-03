@@ -117,6 +117,7 @@ export interface BackupControllerGate {
  *   terminal proof, and no journal or reboot fallback exists.
  */
 export interface GateClearProof {
+  operatorProvenanceSha256?: string;
   checkedAtUtc: string;
   unitName: string;
   unitInvocationId: string;
@@ -204,6 +205,7 @@ const GATE_KEYS = new Set([
   "orphanReason",
 ]);
 const PROOF_KEYS = new Set([
+  "operatorProvenanceSha256",
   "checkedAtUtc",
   "unitName",
   "unitInvocationId",
@@ -439,6 +441,7 @@ export function validateGateClearProof(
   input: unknown,
   gate: BackupControllerGate,
   now: Date = new Date(),
+  operator?: OperatorProofBinding,
 ): GateClearProof {
   const bound = validateGate(gate);
   if (!isRecord(input)) {
@@ -511,9 +514,27 @@ export function validateGateClearProof(
       "No-process proof requires an empty control group with unset tasks or the canonical unit cgroup with zero tasks",
     );
   }
-  if (
-    input.statusPath !==
-      `/var/tmp/arch-vps-file-backup/jobs/${bound.jobId}/status.json`
+  const normalPath =
+    `/var/tmp/arch-vps-file-backup/jobs/${bound.jobId}/status.json`;
+  const operatorPath =
+    `/var/tmp/arch-vps-file-backup/jobs/${bound.jobId}/operator-status.json`;
+  const operatorProof = input.statusPath === operatorPath;
+  if (operatorProof) {
+    if (
+      operator === undefined ||
+      !SHA256_PATTERN.test(operator.provenanceSha256) ||
+      input.operatorProvenanceSha256 !== operator.provenanceSha256 ||
+      operator.jobId !== bound.jobId ||
+      operator.requestSha256 !== bound.requestSha256 ||
+      operator.invocationId !== bound.unitInvocationId ||
+      !bound.unitName.startsWith("arch-vps-b2-verify-")
+    ) {
+      throw new Error(
+        "Operator proof requires independently validated immutable provenance",
+      );
+    }
+  } else if (
+    input.statusPath !== normalPath || "operatorProvenanceSha256" in input
   ) {
     throw new Error(
       "Clear proof status path does not bind the gate job identity",
@@ -614,6 +635,9 @@ export function validateGateClearProof(
     );
   }
   return {
+    ...(operatorProof
+      ? { operatorProvenanceSha256: operator!.provenanceSha256 }
+      : {}),
     checkedAtUtc: input.checkedAtUtc as string,
     unitName: unitName as string,
     unitInvocationId,
@@ -643,6 +667,15 @@ export function validateGateClearProof(
     sourceLockFree: true,
     clearBasis: clearBasis as GateClearBasis,
   };
+}
+
+/** Supplied only after root provenance bytes and actual source identity have
+ * been independently checked. Ordinary proofs cannot select this path. */
+export interface OperatorProofBinding {
+  provenanceSha256: string;
+  jobId: string;
+  requestSha256: string;
+  invocationId: string;
 }
 
 /**
