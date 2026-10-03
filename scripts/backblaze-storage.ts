@@ -30,6 +30,7 @@ export const MAX_CHUNK_BYTES = 64 * 1024 * 1024;
  * chunk at the 4 MiB/s transfer pace plus network overhead fits inside it.
  * Internal only: this is never a caller-visible option. */
 const B2_REQUEST_TIMEOUT_MS = 120_000;
+const REQUEST_SIGNALS = new WeakMap<Response, AbortSignal>();
 
 const BUCKET_NAME = "pavlovcik-arch-vps-backups";
 const AUTH_URL = "https://api.backblazeb2.com/b2api/v4/b2_authorize_account";
@@ -277,7 +278,9 @@ async function sendRequest(
     ? deadline
     : AbortSignal.any([init.signal, deadline]);
   try {
-    return await fetcher(url, { ...init, signal, redirect: "error" });
+    const response = await fetcher(url, { ...init, signal, redirect: "error" });
+    REQUEST_SIGNALS.set(response, signal);
+    return response;
   } catch {
     // The provider error, URL or token is never included in the message.
     throw new Error(`${operation} failed (network error)`);
@@ -656,6 +659,7 @@ export class B2Store {
     const url = `${scope.downloadUrl}${API_PATH}b2_download_file_by_id?fileId=${
       encodeURIComponent(object.fileId)
     }`;
+    const requestStarted = performance.now();
     const response = await sendRequest(this.#fetch, operation, url, {
       headers: { authorization: scope.token },
     });
@@ -678,9 +682,27 @@ export class B2Store {
         let next: ReadableStreamReadResult<Uint8Array>;
         try {
           next = await reader.read();
-        } catch {
-          // A provider stream error may embed tokens, URLs or response
-          // bodies; surface only the fixed operation error.
+        } catch (error) {
+          // Never log provider messages, URLs, tokens, file ids or stacks.
+          const safeName = (value: unknown): string => {
+            const name = value instanceof Error ? value.name : "";
+            return ["TimeoutError", "AbortError", "TypeError"].includes(name)
+              ? name
+              : "Other";
+          };
+          const signal = REQUEST_SIGNALS.get(response);
+          console.error(`[readback-failure] ${
+            JSON.stringify({
+              operation,
+              category: "body read failed",
+              elapsedMs: Math.round(performance.now() - requestStarted),
+              receivedBytes: total,
+              expectedBytes: object.contentLength,
+              signalAborted: signal?.aborted ?? null,
+              abortReason: signal?.aborted ? safeName(signal.reason) : null,
+              exceptionName: safeName(error),
+            })
+          }`);
           throw operationError(operation, "body read failed");
         }
         if (next.done) break;

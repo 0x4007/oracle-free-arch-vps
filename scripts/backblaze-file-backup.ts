@@ -83,7 +83,11 @@ import {
   B2Store,
 } from "./backblaze-storage.ts";
 import type { UploadResult } from "./backblaze-upload.ts";
-import { createTransferPacer, UPLOAD_ROLE_ORDER } from "./backblaze-upload.ts";
+import {
+  createTransferPacer,
+  getExactObjectWithRetry,
+  UPLOAD_ROLE_ORDER,
+} from "./backblaze-upload.ts";
 import type {
   DecryptArchive,
   DecryptedVerification,
@@ -2875,7 +2879,9 @@ const SOURCE_VERIFY_DEPS: SourceVerifyDependencies = {
     const pace = createTransferPacer();
     return {
       async get(object) {
-        const bytes = await store.get(object);
+        const bytes = await getExactObjectWithRetry(store, object, {
+          phase: "verify",
+        });
         await pace(bytes.byteLength);
         return bytes;
       },

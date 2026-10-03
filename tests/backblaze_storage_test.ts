@@ -1029,9 +1029,29 @@ Deno.test("get redacts reader failures and still attempts cancellation", async (
       headers: { "content-length": "3" },
     });
   });
-  const error = await rejectWith(
-    new B2Store(settings(), fetch).get(chunkObject()),
+  const recorded: unknown[][] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => recorded.push(args);
+  let error: Error;
+  try {
+    error = await rejectWith(new B2Store(settings(), fetch).get(chunkObject()));
+  } finally {
+    console.error = originalError;
+  }
+  assert(recorded.length === 1, "Expected one sanitized failure diagnostic");
+  const diagnostic = String(recorded[0][0]);
+  assert(!diagnostic.includes(secret), "Provider secrets must not enter logs");
+  assert(
+    !diagnostic.includes(ACCOUNT_TOKEN),
+    "Authorization must not enter logs",
   );
+  const details = JSON.parse(diagnostic.slice("[readback-failure] ".length));
+  assert(details.receivedBytes === 3, "Received-byte evidence was lost");
+  assert(details.expectedBytes === 3);
+  assert(details.elapsedMs >= 0);
+  assert(details.signalAborted === false);
+  assert(details.exceptionName === "Other");
+  assert(!("fileId" in details) && !("url" in details));
   assert(
     error.message === "b2_download_file_by_id failed: body read failed",
     error.message,

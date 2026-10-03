@@ -32,7 +32,8 @@ import {
  * the generation fails closed. A lost put response refreshes the inventory
  * exactly once and reconciles the same expected object; an absent object
  * rethrows the original failure and is never blindly re-uploaded. There are
- * no timed retries and remove is not part of this module's store
+ * no PUT retries; transient exact-version GET failures have at most three
+ * attempts with one- and two-second delays. Remove is not part of this module's store
  * dependency, so no version is ever deleted or hidden here (duplicate
  * identical versions are preserved and listed in the receipt for later
  * accounting/pruning). The receipt's version lists contain only identities
@@ -161,6 +162,73 @@ export interface UploadProgressRecord {
 /** Bounded store dependency: upload, exact-version download, version list.
  * Deliberately omits remove and every other storage operation. */
 export type UploadStore = Pick<B2Store, "put" | "get" | "versions">;
+
+/** Safe readback checkpoint context; never contains object names or ids. */
+export interface ReadbackRetryContext {
+  phase: "upload" | "verify";
+  role?: UploadRole;
+  chunkIndex?: number;
+  reused?: boolean;
+}
+
+function transientReadbackCategory(error: unknown): string | null {
+  if (!(error instanceof Error)) return null;
+  if (error.message === "b2_download_file_by_id failed: body read failed") {
+    return "body_read";
+  }
+  if (
+    error.message === "b2_download_file_by_id failed (network error)" ||
+    error.message === "b2_download_file_by_id failed: fetch failed"
+  ) {
+    return "network";
+  }
+  if (error.message === "b2_download_file_by_id failed (HTTP 429)") {
+    return "http_429";
+  }
+  if (
+    /^b2_download_file_by_id failed \(HTTP 5[0-9]{2}\)$/.test(error.message)
+  ) {
+    return "http_5xx";
+  }
+  return null;
+}
+
+/** Retry only recognized download transport failures for this exact version.
+ * Integrity checks remain in store.get and the caller; neither is relaxed.
+ * Three 120-second requests plus 3 seconds of delay remain bounded by the
+ * enclosing unit's existing absolute deadline. No PUT or inventory refresh
+ * is available through this dependency. */
+export async function getExactObjectWithRetry(
+  store: Pick<B2Store, "get">,
+  object: B2Object,
+  context?: ReadbackRetryContext,
+  sleep: (ms: number) => Promise<void> = (ms) =>
+    new Promise((resolve) => setTimeout(resolve, ms)),
+): Promise<Uint8Array> {
+  for (let attempt = 1;; attempt += 1) {
+    try {
+      return await store.get(object);
+    } catch (error) {
+      const category = transientReadbackCategory(error);
+      if (category === null || attempt === 3) throw error;
+      const delayMs = 1000 * 2 ** (attempt - 1);
+      console.error(
+        "[readback-retry]",
+        JSON.stringify({
+          phase: context?.phase ?? "readback",
+          category,
+          attempt,
+          nextAttempt: attempt + 1,
+          delayMs,
+          role: context?.role,
+          chunkIndex: context?.chunkIndex,
+          reused: context?.reused,
+        }),
+      );
+      await sleep(delayMs);
+    }
+  }
+}
 
 interface PlannedChunk {
   role: UploadRole;
@@ -1007,7 +1075,16 @@ async function processChunk(
       // not listed: versions report only currently inventoried identities.
       if (journaled !== undefined) primary = journaled;
     }
-    const readback = await ctx.store.get(identityToObject(primary, chunk));
+    const readback = await getExactObjectWithRetry(
+      ctx.store,
+      identityToObject(primary, chunk),
+      {
+        phase: "upload",
+        role: chunk.role,
+        chunkIndex: chunk.index,
+        reused: true,
+      },
+    );
     await ctx.pace(readback.byteLength);
     assertReadback(chunk, readback);
     return {
@@ -1029,14 +1106,32 @@ async function processChunk(
     assertIdentical(reconciled, chunk);
     const versions = reusableVersions(reconciled);
     const primary = versions[0];
-    const readback = await ctx.store.get(identityToObject(primary, chunk));
+    const readback = await getExactObjectWithRetry(
+      ctx.store,
+      identityToObject(primary, chunk),
+      {
+        phase: "upload",
+        role: chunk.role,
+        chunkIndex: chunk.index,
+        reused: true,
+      },
+    );
     assertReadback(chunk, readback);
     return {
       chunk: verifiedChunk(chunk, primary, true, versions),
       readback,
     };
   }
-  const readback = await ctx.store.get(put);
+  const readback = await getExactObjectWithRetry(
+    ctx.store,
+    put,
+    {
+      phase: "upload",
+      role: chunk.role,
+      chunkIndex: chunk.index,
+      reused: false,
+    },
+  );
   await ctx.pace(readback.byteLength);
   assertReadback(chunk, readback);
   // The saved journal identity is absent from the snapshot inventory (no

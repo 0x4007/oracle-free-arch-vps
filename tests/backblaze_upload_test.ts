@@ -15,6 +15,7 @@ import {
 import {
   createTransferPacer,
   generationChunkName,
+  getExactObjectWithRetry,
   planReadTestSeam,
   TRANSFER_BYTES_PER_SECOND,
   UPLOAD_ROLE_ORDER,
@@ -1376,4 +1377,157 @@ Deno.test("transfer pacer rejects an invalid rate", () => {
   assertThrows(() => createTransferPacer(0));
   assertThrows(() => createTransferPacer(-1));
   assertThrows(() => createTransferPacer(1.5));
+});
+
+Deno.test("exact-object readback retry recovers transient failures without PUT", async () => {
+  const failures = [
+    "b2_download_file_by_id failed: body read failed",
+    "b2_download_file_by_id failed (network error)",
+    "b2_download_file_by_id failed: fetch failed",
+    "b2_download_file_by_id failed (HTTP 429)",
+    "b2_download_file_by_id failed (HTTP 500)",
+    "b2_download_file_by_id failed (HTTP 503)",
+    "b2_download_file_by_id failed (HTTP 599)",
+  ];
+  for (const message of failures) {
+    const store = new FakeStore();
+    const bytes = new Uint8Array([1, 2, 3]);
+    const object = store.seed(
+      generationChunkName(GENERATION, "root", 6),
+      bytes,
+    );
+    const received: B2Object[] = [];
+    const waits: number[] = [];
+    const readback = await getExactObjectWithRetry(
+      {
+        get: (requested) => {
+          received.push(requested);
+          if (received.length < 3) return Promise.reject(new Error(message));
+          return store.get(requested);
+        },
+      },
+      object,
+      { phase: "upload", role: "root", chunkIndex: 6, reused: true },
+      (ms) => {
+        waits.push(ms);
+        return Promise.resolve();
+      },
+    );
+    assertBytes(readback, bytes);
+    assert(received.length === 3, message);
+    assert(
+      received.every((requested) => requested === object),
+      "version changed",
+    );
+    assert(waits.length === 2 && waits[0] === 1000 && waits[1] === 2000);
+    assert(store.putCalls === 0, "readback retry must never PUT");
+    assert(store.versionsCalls === 0, "readback retry must never relist");
+    assert(store.removeCalls === 0, "readback retry must never remove");
+  }
+});
+
+Deno.test("exact-object readback retry stops after three attempts with original error", async () => {
+  const store = new FakeStore();
+  const object = store.seed(
+    generationChunkName(GENERATION, "root", 6),
+    new Uint8Array([1]),
+  );
+  const original = new Error("b2_download_file_by_id failed: body read failed");
+  const received: B2Object[] = [];
+  const waits: number[] = [];
+  const error = await rejectWith(getExactObjectWithRetry(
+    {
+      get: (requested) => {
+        received.push(requested);
+        return Promise.reject(original);
+      },
+    },
+    object,
+    { phase: "verify" },
+    (ms) => {
+      waits.push(ms);
+      return Promise.resolve();
+    },
+  ));
+  assert(error === original, "original error must be preserved");
+  assert(received.length === 3);
+  assert(received.every((requested) => requested === object));
+  assert(waits.length === 2 && waits[0] === 1000 && waits[1] === 2000);
+  assert(store.putCalls === 0);
+});
+
+Deno.test("exact-object readback retry fails closed for integrity auth and unknown errors", async () => {
+  const failures = [
+    "b2_download_file_by_id failed: content length mismatch",
+    "b2_download_file_by_id failed: content sha1 mismatch",
+    "Upload failed (chunk:sha256)",
+    "Upload failed (chunk:conflict)",
+    "b2_download_file_by_id failed: body exceeds chunk limit",
+    "b2_download_file_by_id failed (HTTP 401)",
+    "b2_download_file_by_id failed (HTTP 403)",
+    "b2_download_file_by_id failed (HTTP 404)",
+    "b2_download_file_by_id failed (HTTP 408)",
+    "b2_download_file_by_id failed (HTTP 503): invalid body",
+    "b2_download_file_by_id failed: body read failed: private detail",
+    "b2_upload_file failed (HTTP 503)",
+    "unexpected failure",
+  ];
+  for (const message of failures) {
+    const store = new FakeStore();
+    const object = store.seed(
+      generationChunkName(GENERATION, "root", 6),
+      new Uint8Array([1]),
+    );
+    const original = new Error(message);
+    let calls = 0;
+    const error = await rejectWith(getExactObjectWithRetry(
+      {
+        get: () => {
+          calls += 1;
+          return Promise.reject(original);
+        },
+      },
+      object,
+      undefined,
+      () => {
+        throw new Error("nontransient failure must never sleep");
+      },
+    ));
+    assert(error === original, message);
+    assert(calls === 1, message);
+    assert(store.putCalls === 0);
+  }
+});
+
+Deno.test("exact-object readback retry stops immediately on integrity failure after a transient", async () => {
+  const store = new FakeStore();
+  const object = store.seed(
+    generationChunkName(GENERATION, "root", 6),
+    new Uint8Array([1]),
+  );
+  const transient = new Error("b2_download_file_by_id failed (HTTP 503)");
+  const integrity = new Error(
+    "b2_download_file_by_id failed: content sha1 mismatch",
+  );
+  let calls = 0;
+  const waits: number[] = [];
+  const error = await rejectWith(getExactObjectWithRetry(
+    {
+      get: (requested) => {
+        assert(requested === object);
+        calls += 1;
+        return Promise.reject(calls === 1 ? transient : integrity);
+      },
+    },
+    object,
+    undefined,
+    (ms) => {
+      waits.push(ms);
+      return Promise.resolve();
+    },
+  ));
+  assert(error === integrity);
+  assert(calls === 2);
+  assert(waits.length === 1 && waits[0] === 1000);
+  assert(store.putCalls === 0);
 });
