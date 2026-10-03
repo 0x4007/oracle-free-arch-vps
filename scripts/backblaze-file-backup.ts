@@ -83,7 +83,7 @@ import {
   B2Store,
 } from "./backblaze-storage.ts";
 import type { UploadResult } from "./backblaze-upload.ts";
-import { UPLOAD_ROLE_ORDER } from "./backblaze-upload.ts";
+import { createTransferPacer, UPLOAD_ROLE_ORDER } from "./backblaze-upload.ts";
 import type {
   DecryptArchive,
   DecryptedVerification,
@@ -1364,76 +1364,36 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
       ) {
         throw new Error("Remaining deadline seconds must be positive");
       }
-      // The validated unit name already carries the existing worker/verifier
-      // kind: capture workers and prune units keep the 10M read budget, and
-      // only the verifier, which reads the whole reconstruction back, gets
-      // 30M. Every other control below stays shared by both kinds.
-      const unitKind = UNIT_NAME_PATTERN.exec(unitName)![1];
-      const readBandwidthMax = unitKind === "verify" ? "30M" : "10M";
+      // The owner authorized half of the measured two-core / 12 GB host.
+      // Balanced root: 72 MB/s and 9,000 IOPS; divide its half budget
+      // equally between reads and writes, so combined IO stays below half.
+      // The 50 GB staging boot volume has 24 MB/s and 3,000 IOPS.
+      const stagingDevice =
+        "/dev/disk/by-id/scsi-3608cae23d6ea4b84be48c40d288c890e";
       const properties = [
         "Type=exec",
         "RemainAfterExit=yes",
         `RuntimeMaxSec=${spec.remainingSec}`,
-        // This capture is a long bulk workload on a 2-OCPU host that also
-        // serves customer traffic, and whose root ext4 journal has aborted
-        // twice under load. Each control below is chosen to actually bind on
-        // this host, verified by measurement rather than assumption.
-        //
-        // CPU: CPUQuota caps each worker/verifier unit at 25% of one core, the
-        // owner-approved share; CPUWeight/Nice remain floors so it yields
-        // under contention and uses spare capacity when idle. Measured under
-        // forced single-core contention: the default-weight competitor took
-        // 99.0% of CPU and this worker 1.0%.
-        //
-        // Disk: the root volume runs the "none" IO scheduler, so neither
-        // IOWeight nor IOSchedulingClass=idle arbitrates anything (measured:
-        // idle-class reads 3.61-3.67s vs 3.63s default, statistically equal).
-        // cgroup bandwidth caps DO bind here (measured: 2.12s uncapped vs
-        // 13.87s at a 20 MB/s cap). Caps are therefore the disk protection,
-        // sized well below the volume's ~72 MB/s Balanced/10-VPU budget.
-        // Writes are capped harder than reads because archive staging is
-        // avoidable write pressure on the very filesystem under scrutiny.
-        // The "/" form lets systemd resolve the backing device, so it cannot
-        // drift with /dev/sd* renaming.
-        //
-        // Memory: the hard MemoryMax bounds the worker and MemorySwapMax=0
-        // keeps it off the host swap, so an overrun fails the backup instead
-        // of adding swap IO to the same root device.
-        // MemoryHigh was set to 768M and had to be removed: the previous
-        // successful run peaked at 1,078 MB, so a 768M soft limit sits below
-        // this worker's natural peak. It throttled continuously (194,527
-        // "high" events in one run) and the upload stalled indefinitely instead
-        // of completing. The hard MemoryMax alone is the correct control: it
-        // still bounds the worker, and MemorySwapMax=0 keeps it off host swap
-        // so an overrun fails the backup rather than adding swap IO.
-        "MemoryMax=1536M",
+        // One core is half of this two-core host; low scheduling priority
+        // still yields to production under contention. The hard RAM cap is
+        // half of observed MemTotal (12,511,203,328 bytes), not a reservation.
+        // No soft memory ceiling and no backup swap traffic.
+        "MemoryMax=6255601664",
         "MemorySwapMax=0",
-        "CPUQuota=25%",
+        "CPUQuota=100%",
         "CPUWeight=1",
         "Nice=19",
         "IOSchedulingClass=idle",
         "IOSchedulingPriority=7",
         "IOAccounting=yes",
-        // The verifier reads the whole reconstruction back rather than only
-        // the ciphertext payload capture wrote, so it gets the higher read
-        // budget; the shared 10M write cap still applies. The 30M value rests
-        // on dated 2026-09-22 measurements (~64.9 GB of full-file read-back
-        // passes: ~108 min at a 10M read cap, ~47.5 min at 30M) taken before
-        // 563db0f reduced redundant verification passes. Those timings are
-        // historical, not a current cycle estimate, and they are not a
-        // guarantee that a future cycle fits the deadline. Decimal M: 30M is
-        // 30,000,000 B/s.
-        `IOReadBandwidthMax=/ ${readBandwidthMax}`,
-        // 10M, not 2M. A 2M write cap was measured on 2026-09-22 to stretch the
-        // capture to 3.72 h because capture writes both the plaintext archive
-        // and its ciphertext (~20.6 GB total), which pushed the whole
-        // capture+upload+verify cycle past the then-6 h `GATE_DEADLINE_MS` and
-        // the run was killed mid-verify. 10M keeps the same order of
-        // protection - still ~1/7 of the volume's ~72 MB/s Balanced/10-VPU
-        // budget - and remains the configured per-phase write cap.
-        "IOWriteBandwidthMax=/ 10M",
-        "IOReadIOPSMax=/ 500",
-        "IOWriteIOPSMax=/ 200",
+        "IOReadBandwidthMax=/ 18M",
+        "IOWriteBandwidthMax=/ 18M",
+        "IOReadIOPSMax=/ 2250",
+        "IOWriteIOPSMax=/ 2250",
+        `IOReadBandwidthMax=${stagingDevice} 6M`,
+        `IOWriteBandwidthMax=${stagingDevice} 6M`,
+        `IOReadIOPSMax=${stagingDevice} 750`,
+        `IOWriteIOPSMax=${stagingDevice} 750`,
         "OOMPolicy=kill",
         "UMask=0077",
         `WorkingDirectory=${runtimeDir}`,
@@ -2910,7 +2870,18 @@ const SOURCE_VERIFY_DEPS: SourceVerifyDependencies = {
   basePath: BACKUP_BASE,
   now: () => new Date(),
   lock: withBackupLock,
-  storeFor: (settings) => new B2Store(settings),
+  storeFor: (settings) => {
+    const store = new B2Store(settings);
+    const pace = createTransferPacer();
+    return {
+      async get(object) {
+        const bytes = await store.get(object);
+        await pace(bytes.byteLength);
+        return bytes;
+      },
+      versions: () => store.versions(),
+    };
+  },
   verify: verifyDecryptedGeneration,
   reconstruct: reconstructGeneration,
 };

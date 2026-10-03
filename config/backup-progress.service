@@ -3,7 +3,7 @@ Description=Observe current Arch VPS backup progress
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/deno run --allow-read=/var/tmp/arch-vps-file-backup,/var/lib/arch-vps-backup-progress --allow-run=/usr/bin/cat --allow-write=/var/lib/arch-vps-backup-progress /usr/local/lib/arch-vps-backup-progress/backup-progress.ts
+ExecStart=/usr/local/bin/deno run --allow-read=/var/tmp/arch-vps-file-backup,/var/tmp/arch-vps-file-backup-runtime/releases,/var/lib/arch-vps-backup-progress --allow-run=/usr/bin/cat --allow-write=/var/lib/arch-vps-backup-progress /usr/local/lib/arch-vps-backup-progress/backup-progress.ts
 StateDirectory=arch-vps-backup-progress
 StateDirectoryMode=0700
 UMask=0077

@@ -2343,26 +2343,35 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
   assert(script.includes("Type=exec"));
   assert(script.includes("RemainAfterExit=yes"));
   assert(script.includes("RuntimeMaxSec=12345"), script);
-  assert(script.includes("MemoryMax=1536M"));
-  assert(script.includes("CPUQuota=25%"));
-  assert(!script.includes("CPUQuota=100%"), script);
-  // The capture is a bulk background job on a shared 2-OCPU host: it must
-  // yield CPU under contention and issue disk IO only when the device is
-  // otherwise quiet. CPUQuota=25% is the owner-approved cap shared by the
-  // worker and verifier; CPUWeight=1/Nice=19 are the floors (0 is invalid),
-  // and IOSchedulingClass=idle is the enforceable disk control because the
-  // root volume runs the "none" scheduler, making IOWeight/io.bfq.weight
-  // inert.
+  assert(script.includes("MemoryMax=6255601664"));
+  assert(script.includes("CPUQuota=100%"));
+  assert(!script.includes("CPUQuota=25%"), script);
+  // Half of the two-core host is one full core. IO budgets split the
+  // volume's half allowance between read and write directions.
   assert(script.includes("CPUWeight=1"), script);
-  assert(script.includes("IOReadBandwidthMax=/ 10M"), script);
-  assert(script.includes("IOWriteBandwidthMax=/ 10M"), script);
+  assert(script.includes("IOReadBandwidthMax=/ 18M"), script);
+  assert(script.includes("IOWriteBandwidthMax=/ 18M"), script);
+  assert(script.includes("IOReadIOPSMax=/ 2250"), script);
+  assert(script.includes("IOWriteIOPSMax=/ 2250"), script);
+  assert(
+    script.includes(
+      "IOReadBandwidthMax=/dev/disk/by-id/scsi-3608cae23d6ea4b84be48c40d288c890e 6M",
+    ),
+    script,
+  );
+  assert(
+    script.includes(
+      "IOWriteIOPSMax=/dev/disk/by-id/scsi-3608cae23d6ea4b84be48c40d288c890e 750",
+    ),
+    script,
+  );
   // A 2M write cap was measured to blow the then-6h capture deadline.
   assert(!script.includes("IOWriteBandwidthMax=/ 2M"), script);
   // MemoryHigh=768M was removed after it stalled a real upload: the worker's
   // natural peak is ~1,078 MB, so a soft limit below that throttled it
   // continuously (194,527 events) and it stopped making progress.
   assert(!script.includes("MemoryHigh"), script);
-  assert(script.includes("MemoryMax=1536M"), script);
+  assert(script.includes("MemoryMax=6255601664"), script);
   assert(script.includes("MemorySwapMax=0"), script);
   assert(script.includes("Nice=19"), script);
   assert(script.includes("IOSchedulingClass=idle"), script);
@@ -2373,8 +2382,7 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
       script.includes(`${JOBS_RUNTIME_ROOT}/${fixture.jobId}`),
   );
   assert(script.includes("entry-worker.ts"));
-  // The verifier's read-back passes cover the whole reconstruction, so the
-  // same builder must raise only its read budget; write/IOPS/deadline stay.
+  // Worker and verifier use the same owner-approved half-resource budget.
   await seam.launchUnit({
     unitName: verifyUnitName(fixture.generation),
     runtimeDir: `${JOBS_RUNTIME_ROOT}/${fixture.jobId}`,
@@ -2395,11 +2403,11 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
     verifyScript.includes(`arch-vps-b2-verify-${uuidFor(14)}.service`),
     verifyScript,
   );
-  assert(verifyScript.includes("IOReadBandwidthMax=/ 30M"), verifyScript);
-  assert(!verifyScript.includes("IOReadBandwidthMax=/ 10M"), verifyScript);
-  assert(verifyScript.includes("IOWriteBandwidthMax=/ 10M"), verifyScript);
-  assert(verifyScript.includes("IOReadIOPSMax=/ 500"), verifyScript);
-  assert(verifyScript.includes("IOWriteIOPSMax=/ 200"), verifyScript);
+  assert(verifyScript.includes("IOReadBandwidthMax=/ 18M"), verifyScript);
+  assert(!verifyScript.includes("IOReadBandwidthMax=/ 30M"), verifyScript);
+  assert(verifyScript.includes("IOWriteBandwidthMax=/ 18M"), verifyScript);
+  assert(verifyScript.includes("IOReadIOPSMax=/ 2250"), verifyScript);
+  assert(verifyScript.includes("IOWriteIOPSMax=/ 2250"), verifyScript);
   assert(verifyScript.includes("RuntimeMaxSec=12345"), verifyScript);
   assert(verifyScript.includes("entry-verify.ts"), verifyScript);
   await seam.installer({

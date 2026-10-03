@@ -1319,8 +1319,8 @@ runtimeTest("stage and archive hardening rejects unsafe fixtures", async () => {
   }
 });
 
-Deno.test("transfer pacer defaults to the documented 4 MiB/s ceiling", () => {
-  assert(TRANSFER_BYTES_PER_SECOND === 4 * 1024 * 1024);
+Deno.test("transfer pacer defaults to half the 2 Gbps link", () => {
+  assert(TRANSFER_BYTES_PER_SECOND === 125_000_000);
 });
 
 Deno.test("transfer pacer allows one chunk of burst then paces the average", async () => {
@@ -1338,9 +1338,15 @@ Deno.test("transfer pacer allows one chunk of burst then paces the average", asy
   await pace(MAX_CHUNK_BYTES);
   assert(waits.length === 0, "first chunk should use the bounded burst");
   await pace(MAX_CHUNK_BYTES);
-  assert(waits[0] === 16_000, `unexpected wait: ${waits[0]}`);
+  assert(
+    waits[0] === Math.ceil(MAX_CHUNK_BYTES / TRANSFER_BYTES_PER_SECOND * 1000),
+    `unexpected wait: ${waits[0]}`,
+  );
   await pace(MAX_CHUNK_BYTES);
-  assert(waits[1] === 16_000, `unexpected wait: ${waits[1]}`);
+  assert(
+    waits[1] === Math.ceil(MAX_CHUNK_BYTES / TRANSFER_BYTES_PER_SECOND * 1000),
+    `unexpected wait: ${waits[1]}`,
+  );
 });
 
 Deno.test("transfer pacer credits elapsed slow upload and readback time", async () => {

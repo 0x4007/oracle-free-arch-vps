@@ -241,17 +241,10 @@ const JOURNAL_VERSION = 1;
 const JOURNAL_NAME = "upload-journal.json";
 const MAX_JOURNAL_BYTES = 64 * 1024 * 1024;
 
-/** Sustained transfer ceiling for B2 upload and readback, in bytes/second.
- *
- * This worker shares a 2-OCPU host with customer-facing services, so the ~10 GB
- * upload must not be allowed to saturate the link. The transfer loop is already
- * sequential with one object in flight, but a single connection is not a rate
- * limit on its own, so the loop is additionally paced to this ceiling.
- *
- * 4 MiB/s (~33.6 Mbit/s) is a deliberately conservative starting budget against
- * the shape's nominal 2 Gbit/s ceiling; it is an engineering budget, not a
- * measured threshold below which this host cannot degrade. */
-export const TRANSFER_BYTES_PER_SECOND = 4 * 1024 * 1024;
+/** The owner authorized half of the live OCI 2 Gbps network allocation.
+ * PUT and exact-version GET readback share this 1 Gbps sustained budget.
+ * The pacer retains one bounded 64 MiB burst and credits elapsed transfers. */
+export const TRANSFER_BYTES_PER_SECOND = 125_000_000;
 
 function fail(label: string): never {
   throw new Error(`${FAIL_PREFIX}${label})`);
