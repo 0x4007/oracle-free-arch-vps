@@ -337,20 +337,24 @@ Deno.test({
       throw Error("Copied-root release ID guard is absent");
     }
     const id = new RegExp(source.slice(open + 2, close), "m");
-    for (const os of [
-      "ID=arch\n",
-      'ID="arch"\n',
-      "ID=archarm\n",
-      'ID="archarm"\n',
-    ]) {
+    for (
+      const os of [
+        "ID=arch\n",
+        'ID="arch"\n',
+        "ID=archarm\n",
+        'ID="archarm"\n',
+      ]
+    ) {
       assert(id.test(os));
     }
-    for (const os of [
-      "ID=ubuntu\n",
-      "ID=archarm-extra\n",
-      'NAME="Arch Linux ARM"\n',
-      "ID_LIKE=arch\n",
-    ]) {
+    for (
+      const os of [
+        "ID=ubuntu\n",
+        "ID=archarm-extra\n",
+        'NAME="Arch Linux ARM"\n',
+        "ID_LIKE=arch\n",
+      ]
+    ) {
       assert(!id.test(os));
     }
   },

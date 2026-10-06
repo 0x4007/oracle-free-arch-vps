@@ -587,8 +587,7 @@ async function applyInspectedIsolation(
     "-f",
     key,
   ]);
-  const sshPublicKeyLine =
-    /^ssh-ed25519 ([A-Za-z0-9+/]+={0,2})(?: [^\r\n]+)?$/;
+  const sshPublicKeyLine = /^ssh-ed25519 ([A-Za-z0-9+/]+={0,2})(?: [^\r\n]+)?$/;
   const publicKey = (await Deno.readTextFile(key + ".pub")).trim();
   const publicMatch = sshPublicKeyLine.exec(publicKey);
   if (!publicMatch) {
