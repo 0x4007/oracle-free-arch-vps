@@ -4588,6 +4588,7 @@ Deno.test("cleanup: allowed names derive from the output contracts and reject fo
     assert(cleanupAllowedName(`${role}.${format}`, false), role);
     assert(cleanupAllowedName(`${role}.${format}.partial`, false), role);
     assert(cleanupAllowedName(`${role}.du.txt`, false), role);
+    assert(cleanupAllowedName(`capture-${role}.stderr.log`, false), role);
     assert(cleanupAllowedName(`space-${role}.stderr.log`, false), role);
     assert(cleanupAllowedName(`encrypt-${role}.stderr.log`, false), role);
     assert(cleanupAllowedName(`hash-${role}.stderr.log`, false), role);
@@ -4721,6 +4722,7 @@ Deno.test("cleanup: script rejects mounts at/below, symlinks and unknown descend
   assert(script.includes("gpg-public-home"));
   assert(script.includes("index-public-home"));
   assert(script.includes("root.tar.zst.gpg"));
+  assert(script.includes("capture-root.stderr.log"));
   assert(script.includes("sample.root.Image"));
   assert(!script.includes("jobs/"), "only generation directories are removed");
   assert(script.includes("NOT_0700_BASE"));

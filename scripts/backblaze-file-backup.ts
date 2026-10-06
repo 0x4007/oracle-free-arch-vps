@@ -5364,6 +5364,11 @@ export function cleanupAllowedNames(): {
     files.add(`${role}.${format}.gpg`);
     files.add(`${role}.${format}.gpg.partial`);
     files.add(`${role}.du.txt`);
+    // The capture step's stderr sink exists only when that step fails
+    // (runCommand persists stderr only for a nonzero exit), so a failed
+    // capture's leftover directory carries it; it is an exact producer
+    // output and must stay acceptable to the scratch cleanup and sweep.
+    files.add(`capture-${role}.stderr.log`);
     files.add(`space-${role}.stderr.log`);
     files.add(`encrypt-${role}.stderr.log`);
     files.add(`hash-${role}.stderr.log`);
