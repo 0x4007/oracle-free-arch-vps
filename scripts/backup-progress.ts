@@ -514,6 +514,7 @@ async function writeReport(report: ProgressReport): Promise<void> {
   }
   await historical.sync();
   const temporary = `${directory}/.report-${crypto.randomUUID()}.tmp`;
+  let removalFailure: unknown;
   try {
     using file = await Deno.open(temporary, {
       createNew: true,
@@ -535,9 +536,12 @@ async function writeReport(report: ProgressReport): Promise<void> {
     try {
       await Deno.remove(temporary);
     } catch (error) {
-      if (!(error instanceof Deno.errors.NotFound)) throw error;
+      // Deno lint forbids control flow from a finally block: record the
+      // cleanup failure and raise it after the primary result settles.
+      if (!(error instanceof Deno.errors.NotFound)) removalFailure = error;
     }
   }
+  if (removalFailure !== undefined) throw removalFailure;
 }
 
 if (import.meta.main) {
