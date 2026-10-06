@@ -4221,6 +4221,30 @@ export async function stepBackupController(
           "SOURCE_UNREACHABLE_AT_DEADLINE",
         );
       }
+      // Reclaim stale generation scratch BEFORE the worker computes its
+      // staging-space requirement: a failed or interrupted cycle otherwise
+      // leaks its working copies forever, and those bytes sit on the exact
+      // filesystem the next capture needs. Best-effort only; the capture's
+      // own staging-space check remains the gate.
+      try {
+        const sweep = await deps.remote.root(
+          buildScratchSweepScript(generation),
+        );
+        for (
+          const line of sweep.stdout.split("\n").filter((line) =>
+            line.startsWith("SWEPT ") || line.startsWith("SWEEP_SKIP ")
+          )
+        ) {
+          deps.logger(`Scratch sweep ${line}`);
+        }
+        if (sweep.code !== 0) {
+          deps.logger(`Scratch sweep exited ${sweep.code}`);
+        }
+      } catch {
+        // Transient transport failure before any gate or launch: stay
+        // REQUESTED; the poll pair retries the same immutable request.
+        return await beat(deps, state, "REQUESTED");
+      }
       try {
         await installTransportRuntime(deps, job, config);
       } catch {
@@ -5371,11 +5395,17 @@ export function cleanupGpgHomeAllowedName(name: string): boolean {
  * non-regular or unexpected descendants, permits only the known public-only
  * gpg home entries without private keys, and only then removes the exact
  * generation directory with `rm -rf --one-file-system`. */
-export function buildCleanupScript(generation: string): string {
-  const gen = validateGeneration(generation);
+/** Exact capture/upload/index/verifier producer outputs as one shell case
+ * pattern. Shared by the per-generation cleanup and the stale-generation
+ * sweep so both accept exactly the same contract. */
+function cleanupOutputFilePattern(): string {
   const allowed = cleanupAllowedNames();
-  const filePatterns = [...allowed.files].sort().join("|");
-  const gpgNames = [
+  return [...allowed.files].sort().join("|");
+}
+
+/** Public-only gpg home entries as one shell case pattern. */
+function cleanupPublicHomeNamePattern(): string {
+  return [
     "pubring.kbx",
     "pubring.kbx.lock",
     "pubring.gpg",
@@ -5390,17 +5420,27 @@ export function buildCleanupScript(generation: string): string {
     "S.gpg-agent.lock",
     "S.gpg-agent.bak",
   ].sort().join("|");
-  // Atomic temp convention of the upload journal and index publisher:
-  // exact prefix + v4 UUID + .tmp, each class hexed one by one so the case
-  // pattern never matches a broader name.
+}
+
+/** Atomic temp convention of the upload journal and index publisher:
+ * exact prefix + v4 UUID + .tmp, each class hexed one by one so the case
+ * pattern never matches a broader name. */
+function cleanupAtomicTempNamePattern(): string {
   const hexClass = "[0-9a-f]";
   const group = (n: number): string => Array(n).fill(hexClass).join("");
   const uuidGlob = `${group(8)}-${group(4)}-4${group(3)}-[89ab]${group(3)}-${
     group(12)
   }`;
-  const tempPatterns = CLEANUP_ATOMIC_TEMP_PREFIXES.map((prefix) =>
+  return CLEANUP_ATOMIC_TEMP_PREFIXES.map((prefix) =>
     `${prefix}.${uuidGlob}.tmp`
   ).sort().join("|");
+}
+
+export function buildCleanupScript(generation: string): string {
+  const gen = validateGeneration(generation);
+  const filePatterns = cleanupOutputFilePattern();
+  const gpgNames = cleanupPublicHomeNamePattern();
+  const tempPatterns = cleanupAtomicTempNamePattern();
   return [
     "set -eu",
     `exec 9<>${shellQuote(SOURCE_LOCK_PATH)}`,
@@ -5477,6 +5517,124 @@ export function buildCleanupScript(generation: string): string {
     "}",
     ...CLEANUP_BASES.map((base) => `cleanup_generation ${shellQuote(base)}`),
     "echo CLEANUP_OK",
+  ].join("\n");
+}
+
+/** Grace before an abandoned generation scratch directory may be reclaimed.
+ * The request deadline is 12 h and every retry or resume of that request
+ * happens inside it, so two days can never race an active attempt; the
+ * weekly cadence still guarantees a failed cycle's leftovers are reclaimed
+ * before the next capture measures its staging-space requirement. */
+export const SCRATCH_SWEEP_MIN_AGE_SECONDS = 2 * 24 * 60 * 60;
+
+/** Best-effort pre-capture sweep of abandoned generation scratch.
+ *
+ * Nothing except the current generation's own post-completion cleanup ever
+ * removes a generation directory, so a failed or interrupted cycle leaks
+ * its working copies forever; enough leaks consume the same filesystem the
+ * next capture needs, and then every later staging-space check fails (the
+ * 2026-10-04 weekly run died exactly that way on month-old leftovers). The
+ * sweep runs under the source lock (never racing an active unit), re-checks
+ * every canonical root-owned 0700 base and generation directory, rejects
+ * mounts at or below a target, validates the same producer-output whitelist
+ * as the cleanup, keeps the active generation and anything younger than the
+ * grace period, and skips (never fails) anything it cannot prove. Removal
+ * is still one exact `rm -rf --one-file-system` per validated directory,
+ * and the script otherwise exits 0 so maintenance can never block a
+ * capture: the capture's own staging-space check stays the gate. */
+export function buildScratchSweepScript(activeGeneration: string): string {
+  const active = validateGeneration(activeGeneration);
+  const filePatterns = cleanupOutputFilePattern();
+  const tempPatterns = cleanupAtomicTempNamePattern();
+  const gpgNames = cleanupPublicHomeNamePattern();
+  const generationPattern =
+    "^generation-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+  return [
+    "set -eu",
+    `exec 9<>${shellQuote(SOURCE_LOCK_PATH)}`,
+    // The source lock is the active-unit signal everywhere in this
+    // controller; a busy lock means a worker/verifier/prune is using the
+    // scratch and the sweep must not race it.
+    "if ! flock -n 9; then echo 'SWEEP_SKIP lock-busy'; echo 'SWEEP_DONE'; exit 0; fi",
+    `active=${shellQuote(active)}`,
+    `printf '%s' "$active" | grep -Eq '${generationPattern}' || exit 4`,
+    `cutoff=$(( $(date -u +%s) - ${SCRATCH_SWEEP_MIN_AGE_SECONDS} ))`,
+    "sweep_generation() {",
+    "  base=$1",
+    "  dir=$2",
+    "  name=${dir##*/}",
+    `  printf '%s' "$name" | grep -Eq '${generationPattern}' || { echo "SWEEP_SKIP_NAME $dir"; return 0; }`,
+    '  if test "$name" = "$active"; then return 0; fi',
+    '  mt=$(stat -c %Y "$dir") || { echo "SWEEP_SKIP_STAT $dir"; return 0; }',
+    '  if test "$mt" -ge "$cutoff"; then return 0; fi',
+    '  test -d "$dir" || { echo "SWEEP_SKIP_NOT_DIRECTORY $dir"; return 0; }',
+    '  test "$(readlink -e "$dir")" = "$dir" || { echo "SWEEP_SKIP_NONCANONICAL $dir"; return 0; }',
+    '  test "$(stat -c %u "$dir")" = 0 || { echo "SWEEP_SKIP_NOT_ROOT $dir"; return 0; }',
+    '  test "$(stat -c %a "$dir")" = 700 || { echo "SWEEP_SKIP_NOT_0700 $dir"; return 0; }',
+    // Any mount at or below the target is rejected, including same-device
+    // bind mounts that `--one-file-system` would otherwise not cross.
+    '  if awk -v p="$dir" \'$2 == p || substr($2, 1, length(p) + 1) == p "/" {print}\' /proc/self/mounts | grep -q .; then',
+    '    echo "SWEEP_SKIP_MOUNT $dir"; return 0;',
+    "  fi",
+    // Only DIRECT children are validated, against the same producer-output
+    // whitelist as the cleanup; unknown contents are preserved.
+    "  while IFS= read -r -d '' entry; do",
+    "    kind=${entry:0:1}",
+    "    name=${entry:2}",
+    '    case "$kind" in',
+    "      f)",
+    `        case "$name" in ${filePatterns}|${tempPatterns}) ;; *) echo "SWEEP_SKIP_UNEXPECTED $dir $name"; return 0 ;; esac`,
+    "        ;;",
+    "      d)",
+    '        test "$name" = gpg-public-home -o "$name" = index-public-home || { echo "SWEEP_SKIP_UNEXPECTED $dir $name"; return 0; }',
+    "        ;;",
+    "      l)",
+    '        echo "SWEEP_SKIP_SYMLINK $dir $name"; return 0 ;;',
+    '      *) echo "SWEEP_SKIP_UNEXPECTED $dir $name"; return 0 ;;',
+    "    esac",
+    '  done < <(find "$dir" -mindepth 1 -maxdepth 1 -printf "%y %P\\0")',
+    "  for publicName in gpg-public-home index-public-home; do",
+    '    home="$dir/$publicName"',
+    '    if test -d "$home"; then',
+    "      while IFS= read -r -d '' entry; do",
+    "        kind=${entry:0:1}",
+    "        name=${entry:2}",
+    '        case "$kind" in',
+    "          f)",
+    `            case "$name" in ${gpgNames}) ;; *) echo "SWEEP_SKIP_UNEXPECTED $dir $name"; return 0 ;; esac`,
+    "            ;;",
+    "          d)",
+    '            test "$name" = private-keys-v1.d || { echo "SWEEP_SKIP_UNEXPECTED $dir $name"; return 0; }',
+    '            test -z "$(find "$home/$name" -mindepth 1 -print -quit)" || { echo "SWEEP_SKIP_PRIVATE_KEYS $dir"; return 0; }',
+    "            ;;",
+    "          s)",
+    '            test "$name" = S.gpg-agent -o "$name" = S.gpg-agent.extra || { echo "SWEEP_SKIP_UNEXPECTED $dir $name"; return 0; }',
+    "            ;;",
+    "          l)",
+    '            echo "SWEEP_SKIP_GPG_SYMLINK $dir $name"; return 0 ;;',
+    '          *) echo "SWEEP_SKIP_UNEXPECTED $dir $name"; return 0 ;;',
+    "        esac",
+    '      done < <(find "$home" -mindepth 1 -maxdepth 1 -printf "%y %P\\0")',
+    "    fi",
+    "  done",
+    '  if rm -rf --one-file-system -- "$dir"; then',
+    '    echo "SWEPT $dir"',
+    "  else",
+    '    echo "SWEEP_SKIP_RM_FAILED $dir"',
+    "  fi",
+    "}",
+    "sweep_base() {",
+    "  base=$1",
+    '  test -e "$base" || return 0',
+    '  test "$(readlink -e "$base")" = "$base" || { echo "SWEEP_SKIP_BASE $base"; return 0; }',
+    '  test "$(stat -c %u "$base")" = 0 || { echo "SWEEP_SKIP_BASE $base"; return 0; }',
+    '  test "$(stat -c %a "$base")" = 700 || { echo "SWEEP_SKIP_BASE $base"; return 0; }',
+    "  while IFS= read -r -d '' dir; do",
+    '    sweep_generation "$base" "$dir"',
+    '  done < <(find "$base" -mindepth 1 -maxdepth 1 -type d -name "generation-*" -print0)',
+    "}",
+    ...CLEANUP_BASES.map((base) => `sweep_base ${shellQuote(base)}`),
+    "echo 'SWEEP_DONE'",
   ].join("\n");
 }
 

@@ -53,6 +53,7 @@ import {
   buildCleanupScript,
   buildClearProof,
   buildRequestEnvelope,
+  buildScratchSweepScript,
   type CatalogEntry,
   cleanupAllowedName,
   cleanupGpgHomeAllowedName,
@@ -85,6 +86,7 @@ import {
   retainedIdsPresent,
   revalidatePruneDeletions,
   runBackblazeCycle,
+  SCRATCH_SWEEP_MIN_AGE_SECONDS,
   selectPruneCandidates,
   SOURCE_HOST,
   stepBackupController,
@@ -110,6 +112,13 @@ import { shellQuote } from "../scripts/backup-guest.ts";
 
 function assert(value: unknown, message?: string): asserts value {
   if (!value) throw new Error(message ?? "Assertion failed");
+}
+
+/** Whether an injected fake remote script is the stale-scratch sweep. Its
+ * embedded producer whitelist contains `result.json`/`receipt.json`, so
+ * responders that dispatch on those substrings must skip it. */
+function isSweepScript(script: string): boolean {
+  return script.includes("SWEEP_DONE");
 }
 
 function sha256HexSync(bytes: Uint8Array): string {
@@ -1756,6 +1765,58 @@ Deno.test("orchestration: transient installer failure stays REQUESTED and retrie
   }
 });
 
+Deno.test("orchestration: the REQUESTED launch sweeps stale scratch before installing and launching", async () => {
+  const fixture = generationFixture(52, WINDOW_START);
+  const state = stateWithJob(fixture, "REQUESTED");
+  const h = harness({
+    now: new Date(WINDOW_START + 60_000),
+    rootResponder: (script) =>
+      script.includes("SWEEP_DONE")
+        ? {
+          code: 0,
+          stdout: "SWEPT /var/tmp/x\nSWEEP_DONE\n",
+          stderr: "",
+        }
+        : undefined,
+  });
+  const stepped = await stepBackupController(state, h.deps, h.deps.now());
+  assert(stepped.job!.phase === "WORKER_LAUNCHED");
+  const rootIndex = h.events.findIndex((event) => event.startsWith("root:"));
+  const launchIndex = h.events.findIndex((event) =>
+    event.startsWith("launch:")
+  );
+  assert(rootIndex >= 0, "the sweep root script ran");
+  assert(launchIndex > rootIndex, "the sweep ran before the launch");
+  assert(h.installs.length === 1, "the transport runtime was installed");
+  assert(
+    h.logs.some((line) => line.includes("Scratch sweep SWEPT /var/tmp/x")),
+    "reclaimed directories are reported",
+  );
+});
+
+Deno.test("orchestration: a transient sweep transport failure stays REQUESTED and retries the same request", async () => {
+  const fixture = generationFixture(53, WINDOW_START);
+  const state = stateWithJob(fixture, "REQUESTED");
+  const h = harness({ now: new Date(WINDOW_START + 60_000) });
+  const originalRoot = h.deps.remote.root.bind(h.deps.remote);
+  let failed = true;
+  h.deps.remote.root = (script) => {
+    if (failed) {
+      failed = false;
+      throw new Error("ssh transport lost");
+    }
+    return originalRoot(script);
+  };
+  const first = await stepBackupController(state, h.deps, h.deps.now());
+  assert(first.job!.phase === "REQUESTED", `phase=${first.job!.phase}`);
+  const launchCount = (): number => h.launches.length;
+  assert(launchCount() === 0, "no launch before the sweep succeeds");
+  assert(h.gate.value === null, "no gate was created by the failed sweep");
+  const second = await stepBackupController(first, h.deps, h.deps.now());
+  assert(second.job!.phase === "WORKER_LAUNCHED");
+  assert(launchCount() === 1, "the retry launches after the sweep retry");
+});
+
 Deno.test("orchestration: launch loss after gate creation resumes without replacement or FAILED", async () => {
   const fixture = generationFixture(27, WINDOW_START);
   const state = stateWithJob(fixture, "REQUESTED");
@@ -2045,7 +2106,7 @@ Deno.test("orchestration: corrupt verifier receipt is never accepted or pruned",
     gateValue: gate,
     observed: () => terminalObserved(status),
     rootResponder: (script) =>
-      script.includes("receipt.json")
+      !isSweepScript(script) && script.includes("receipt.json")
         ? { code: 0, stdout: corruptReceipt, stderr: "" }
         : undefined,
     seedPrivate: (map) => {
@@ -2650,6 +2711,7 @@ Deno.test("orchestration: end-to-end weekly generation is accepted then pruned",
       ? terminalObserved(script.workerStatus!)
       : terminalObserved(script.verifierStatus!);
   options.rootResponder = (remoteScript) => {
+    if (isSweepScript(remoteScript)) return undefined;
     if (remoteScript.includes("result.json")) {
       return { code: 0, stdout: script.resultText!, stderr: "" };
     }
@@ -3339,7 +3401,7 @@ Deno.test("acceptance: idempotent replay keeps one catalog entry and the accepte
     gateValue: gate,
     observed: () => terminalObserved(status),
     rootResponder: (script) =>
-      script.includes("receipt.json")
+      !isSweepScript(script) && script.includes("receipt.json")
         ? { code: 0, stdout: receiptText, stderr: "" }
         : undefined,
     seedPrivate: (map) => {
@@ -4261,6 +4323,7 @@ Deno.test("cycle: a closed previous-week job must not cut the fresh next-Sunday 
         ));
       },
       rootResponder: (script) => {
+        if (isSweepScript(script)) return undefined;
         if (script.includes("result.json")) {
           return { code: 0, stdout: resultText!, stderr: "" };
         }
@@ -4772,6 +4835,206 @@ Deno.test("cleanup: a normal capture/upload/index directory is accepted; foreign
     script.includes('test -z "$(find "$home/$name" -mindepth 1'),
     "nonempty private-keys-v1.d must stay rejected",
   );
+});
+
+Deno.test("cleanup: stale scratch sweep targets other generations under the source lock with the cleanup whitelist", () => {
+  const fixture = generationFixture(47, WINDOW_START);
+  const script = buildScratchSweepScript(fixture.generation);
+  // Serialized against any active unit through the source lock.
+  assert(script.includes("flock -n 9"));
+  assert(script.includes("SWEEP_SKIP lock-busy"));
+  // Only the three canonical bases, and only generation directories.
+  for (
+    const base of [
+      "/var/tmp/arch-vps-file-backup",
+      "/var/tmp/arch-vps-file-recovery",
+      "/var/tmp/arch-vps-file-verification",
+    ]
+  ) {
+    assert(script.includes(base), `base ${base}`);
+  }
+  assert(
+    script.includes(
+      'find "$base" -mindepth 1 -maxdepth 1 -type d -name "generation-*" -print0',
+    ),
+  );
+  // The active generation and anything inside the grace period stay.
+  assert(script.includes('if test "$name" = "$active"; then return 0; fi'));
+  assert(script.includes(`${SCRATCH_SWEEP_MIN_AGE_SECONDS}`));
+  assert(
+    script.includes('if test "$mt" -ge "$cutoff"; then return 0; fi'),
+  );
+  // Guarded removal: canonical root-owned 0700 checks, no mounts, the
+  // producer whitelist, then one exact directory removal.
+  assert(script.includes("SWEEP_SKIP_NOT_0700"));
+  assert(script.includes("SWEEP_SKIP_NONCANONICAL"));
+  assert(script.includes("SWEEP_SKIP_MOUNT"));
+  assert(script.includes("SWEEP_SKIP_UNEXPECTED"));
+  assert(script.includes('rm -rf --one-file-system -- "$dir"'));
+  assert(script.includes("root.tar.zst.gpg"));
+  assert(script.includes("upload-journal.json"));
+  assert(script.includes("SWEPT "));
+  assert(script.includes("SWEEP_DONE"));
+  // Unknown or malformed active generations never produce a script.
+  let threw = false;
+  try {
+    buildScratchSweepScript("not-a-generation");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "a malformed active generation is rejected");
+});
+
+Deno.test("cleanup: the emitted stale sweep reclaims only old non-active generations and skips unexpected content", async () => {
+  if (!(await fsPermissionsGranted())) {
+    console.log("stale sweep: skipped without write/run permissions");
+    return;
+  }
+  const fixture = generationFixture(48, WINDOW_START);
+  const stale = generationFixture(49, WINDOW_START);
+  const fresh = generationFixture(50, WINDOW_START);
+  const unexpected = generationFixture(51, WINDOW_START);
+  const dir = await Deno.makeTempDir({ prefix: "m09-stale-sweep-" });
+  const stubDir = `${dir}/stubs`;
+  const base = `${dir}/base-backup`;
+  await Deno.mkdir(stubDir, { recursive: true });
+  await Deno.mkdir(`${base}/${stale.generation}`, { recursive: true });
+  await Deno.mkdir(`${base}/${fresh.generation}`, { recursive: true });
+  await Deno.mkdir(`${base}/${unexpected.generation}`, { recursive: true });
+  await Deno.mkdir(`${base}/${fixture.generation}`, { recursive: true });
+  const genPaths = `${dir}/gen.paths`;
+  const normalRecords = `${dir}/normal.records`;
+  const unexpectedRecords = `${dir}/unexpected.records`;
+  const rmLog = `${dir}/rm.log`;
+  try {
+    await Deno.writeFile(
+      genPaths,
+      encodeNulRecords([
+        `${base}/${stale.generation}`,
+        `${base}/${fresh.generation}`,
+        `${base}/${unexpected.generation}`,
+        `${base}/${fixture.generation}`,
+      ]),
+    );
+    await Deno.writeFile(
+      normalRecords,
+      encodeNulRecords(["f exclusions.txt"]),
+    );
+    await Deno.writeFile(
+      unexpectedRecords,
+      encodeNulRecords(["f id_rsa"]),
+    );
+    // The parser under test is the EXACT emitted sweep; only the
+    // hardcoded deployment bases are redirected into the sandbox, and
+    // find/stat/readlink/flock/rm are stubs so synthetic records drive
+    // the enumeration and the deletion is observed instead of executed.
+    const sandboxed = buildScratchSweepScript(fixture.generation)
+      .replaceAll("/var/tmp/arch-vps-file-backup", base)
+      .replaceAll("/var/tmp/arch-vps-file-recovery", `${dir}/base-recovery`)
+      .replaceAll(
+        "/var/tmp/arch-vps-file-verification",
+        `${dir}/base-verification`,
+      );
+    await Deno.writeTextFile(
+      `${stubDir}/stat`,
+      [
+        "#!/bin/sh",
+        'case "$2" in',
+        "  %u) echo 0 ;;",
+        "  %a) echo 700 ;;",
+        "  %Y)",
+        '    case "$3" in',
+        `      *${stale.generation}*) echo 1 ;;`,
+        `      *${unexpected.generation}*) echo 1 ;;`,
+        "      *) echo 9999999999 ;;",
+        "    esac ;;",
+        "  *) exit 1 ;;",
+        "esac",
+      ].join("\n"),
+    );
+    await Deno.writeTextFile(
+      `${stubDir}/readlink`,
+      ["#!/bin/sh", 'echo "$2"'].join("\n"),
+    );
+    await Deno.writeTextFile(
+      `${stubDir}/flock`,
+      ["#!/bin/sh", "exit 0"].join("\n"),
+    );
+    await Deno.writeTextFile(
+      `${stubDir}/find`,
+      [
+        "#!/bin/sh",
+        'mode=""',
+        'for arg in "$@"; do',
+        '  case "$arg" in',
+        "    -print0) mode=print0 ;;",
+        "    -printf) mode=printf ;;",
+        "  esac",
+        "done",
+        'if [ "$mode" = "print0" ]; then',
+        `  cat ${shellQuote(genPaths)}`,
+        "  exit 0",
+        "fi",
+        'if [ "$mode" = "printf" ]; then',
+        '  case "$1" in',
+        `    *${unexpected.generation}*) cat ${
+          shellQuote(unexpectedRecords)
+        } ;;`,
+        `    *) cat ${shellQuote(normalRecords)} ;;`,
+        "  esac",
+        "  exit 0",
+        "fi",
+        "exit 0",
+      ].join("\n"),
+    );
+    await Deno.writeTextFile(
+      `${stubDir}/rm`,
+      ["#!/bin/sh", `printf '%s\\n' "$*" >> ${shellQuote(rmLog)}`].join(
+        "\n",
+      ),
+    );
+    await Deno.remove(rmLog).catch(() => {});
+    for (const name of ["stat", "readlink", "flock", "find", "rm"]) {
+      await Deno.chmod(`${stubDir}/${name}`, 0o755);
+    }
+    await Deno.writeTextFile(`${dir}/sweep.sh`, sandboxed);
+    const child = new Deno.Command("/bin/bash", {
+      args: ["sweep.sh"],
+      cwd: dir,
+      env: { PATH: `${stubDir}:/usr/bin:/bin` },
+      stdout: "piped",
+      stderr: "piped",
+    });
+    const output = await child.output();
+    const stdout = new TextDecoder().decode(output.stdout);
+    const stderr = new TextDecoder().decode(output.stderr);
+    assert(output.code === 0, `sweep exit ${output.code}: ${stderr}`);
+    assert(
+      stdout.includes(`SWEPT ${base}/${stale.generation}`),
+      "the old generation was reclaimed",
+    );
+    assert(
+      stdout.includes(
+        `SWEEP_SKIP_UNEXPECTED ${base}/${unexpected.generation} id_rsa`,
+      ),
+      "unexpected contents are preserved",
+    );
+    assert(!stdout.includes(fresh.generation), "recent scratch stays");
+    assert(!stdout.includes(fixture.generation), "the active generation stays");
+    assert(stdout.includes("SWEEP_DONE"));
+    let rmLogText = "";
+    try {
+      rmLogText = await Deno.readTextFile(rmLog);
+    } catch {
+      // No removal was attempted.
+    }
+    assert(rmLogText.includes(stale.generation));
+    assert(!rmLogText.includes(fresh.generation));
+    assert(!rmLogText.includes(unexpected.generation));
+    assert(!rmLogText.includes(fixture.generation));
+  } finally {
+    await Deno.remove(dir, { recursive: true }).catch(() => {});
+  }
 });
 
 /** NUL-separated synthetic `find -printf "%y %P\0"` records. */
@@ -5436,7 +5699,7 @@ Deno.test("cycle: the default step budget follows the request deadline past 400 
       };
     },
     rootResponder: (script) =>
-      script.includes("receipt.json")
+      !isSweepScript(script) && script.includes("receipt.json")
         ? { code: 0, stdout: receiptText, stderr: "" }
         : undefined,
     seedPrivate: (map) => {
