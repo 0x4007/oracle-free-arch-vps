@@ -2599,6 +2599,25 @@ function parseObservedSource(
   return parsed;
 }
 
+function acceptedCaptureInWindow(
+  state: ControllerState | undefined,
+  generation: string,
+  window: WeekWindow,
+  now: Date,
+): boolean {
+  const start = Date.parse(window.startAtUtc);
+  return (state?.catalog ?? []).some((entry) => {
+    const captured = Date.parse(entry.index.captureFinishedAtUtc);
+    const verified = Date.parse(entry.receipt.verifiedAtUtc);
+    const accepted = Date.parse(entry.acceptedAtUtc);
+    return entry.index.generation === generation &&
+      entry.receipt.generation === generation &&
+      entry.receipt.decryptedRestoreProved === true &&
+      captured >= start && captured <= verified && verified <= now.getTime() &&
+      accepted <= now.getTime();
+  });
+}
+
 export function assessBackblazeWatchdog(
   state: ControllerState | undefined,
   gate: BackupControllerGate | null,
@@ -2639,12 +2658,17 @@ export function assessBackblazeWatchdog(
   const jobId = job.envelope.request.jobId;
   if (job.operatorRecovery !== undefined) {
     const checked = validateControllerState(state);
-    const recovered = checked.job!.operatorRecovery!;
     const window = weekWindow(now);
     if (
-      Date.parse(recovered.acceptedAtUtc) >= Date.parse(window.startAtUtc) &&
-      Date.parse(recovered.acceptedAtUtc) <= now.getTime()
-    ) return { status: `B2_BACKUP_CURRENT:${jobId}`, healthy: true };
+      acceptedCaptureInWindow(
+        checked,
+        job.envelope.request.generation,
+        window,
+        now,
+      )
+    ) {
+      return { status: `B2_BACKUP_CURRENT:${jobId}`, healthy: true };
+    }
     return { status: `B2_PERIOD_MISSED:${window.periodKey}`, healthy: false };
   }
   if (job.failure !== undefined) {
@@ -2811,20 +2835,16 @@ export function assessBackblazeWatchdog(
       return { status: `B2_BACKUP_CURRENT:${jobId}`, healthy: true };
     }
     // A previous-period job that completed may still be the current recovery
-    // point when its exact catalog generation carries a proved restore receipt
-    // and an acceptance both inside this window. Completion alone, or an
-    // unrelated catalog generation, never counts.
-    const windowStartMs = Date.parse(window.startAtUtc);
-    const nowMs = now.getTime();
-    const acceptedInWindow = (state?.catalog ?? []).some((entry) =>
-      entry.index.generation === job.envelope.request.generation &&
-      entry.receipt.decryptedRestoreProved === true &&
-      Date.parse(entry.receipt.verifiedAtUtc) >= windowStartMs &&
-      Date.parse(entry.receipt.verifiedAtUtc) <= nowMs &&
-      Date.parse(entry.acceptedAtUtc) >= windowStartMs &&
-      Date.parse(entry.acceptedAtUtc) <= nowMs
-    );
-    if (acceptedInWindow) {
+    // point when its exact accepted generation was captured in this window.
+    // Later verification of an older capture does not satisfy a new period.
+    if (
+      acceptedCaptureInWindow(
+        state,
+        job.envelope.request.generation,
+        window,
+        now,
+      )
+    ) {
       return { status: `B2_BACKUP_CURRENT:${jobId}`, healthy: true };
     }
     return {
@@ -4183,6 +4203,16 @@ export async function stepBackupController(
     ) {
       const gate = await deps.gate.read();
       if (gate === null) {
+        if (
+          acceptedCaptureInWindow(
+            state,
+            job.envelope.request.generation,
+            window,
+            now,
+          )
+        ) {
+          return state;
+        }
         return await requestNewJob(state, window);
       }
       // The next due period is blocked by the surviving active/orphaned
@@ -4771,7 +4801,6 @@ export async function stepBackupController(
         state,
         job,
         status!,
-        now,
       );
       // Catalog membership and the ACCEPTED phase are persisted in ONE
       // recoverable write before the gate is removed: there is no
@@ -4854,7 +4883,6 @@ async function acceptCatalogEntry(
   state: ControllerState,
   job: ControllerJob,
   status: VerifierStatus,
-  now: Date,
 ): Promise<ControllerState> {
   const request = job.envelope.request;
   const receiptBytes = await fetchBoundedFile(
@@ -4912,7 +4940,7 @@ async function acceptCatalogEntry(
     index: saved.index,
     publishedIndex: saved.publishedIndex,
     receipt,
-    acceptedAtUtc: now.toISOString(),
+    acceptedAtUtc: deps.now().toISOString(),
   });
   // No durable write here: the ACCEPTED phase and the catalog entry are
   // persisted together by the caller in one recoverable state, so a crash
@@ -5713,6 +5741,10 @@ export async function runBackblazeCycle(
     detail: message,
   });
   let deadlineExpired = false;
+  let cycleFailed = false;
+  let cycleError: unknown;
+  let tunnelFailed = false;
+  let completedReport: BackblazeRunReport | undefined;
   try {
     for (let step = 0; step < maxSteps; step += 1) {
       const before = state.job?.phase ?? "none";
@@ -5769,7 +5801,8 @@ export async function runBackblazeCycle(
         }
         const base = durable ?? state;
         if (base.job === undefined) {
-          return skip(`B2_SKIPPED:${message}`, message);
+          completedReport = skip(`B2_SKIPPED:${message}`, message);
+          break;
         }
         // Job creation for the next due period can fail (Oracle authority
         // or scheduled claim blocked, transport/validation) while the
@@ -5781,7 +5814,8 @@ export async function runBackblazeCycle(
           base.job.envelope.request.periodKey !==
             weekWindow(deps.now()).periodKey
         ) {
-          return skip(`B2_SKIPPED:${message}`, message);
+          completedReport = skip(`B2_SKIPPED:${message}`, message);
+          break;
         }
         const failed = await failJob(
           deps,
@@ -5789,7 +5823,8 @@ export async function runBackblazeCycle(
           "CONTROLLER_STEP_FAILED",
           message,
         );
-        return failReport(failed, message);
+        completedReport = failReport(failed, message);
+        break;
       }
       const after = next.job?.phase ?? "none";
       if (after !== before && after !== "none") {
@@ -5807,24 +5842,33 @@ export async function runBackblazeCycle(
           ...assessBackblazeWatchdog(next, await deps.gate.read(), deps.now()),
           observedAtUtc: deps.now().toISOString(),
         });
-        return reportValue;
+        completedReport = reportValue;
+        break;
       }
       if (after === "FAILED") {
+        const assessment = assessBackblazeWatchdog(
+          next,
+          await deps.gate.read(),
+          deps.now(),
+        );
         const reportValue = {
-          status: `B2_BACKUP_FAILED:${next.job!.envelope.request.jobId}`,
+          status: assessment.healthy
+            ? assessment.status
+            : `B2_BACKUP_FAILED:${next.job!.envelope.request.jobId}`,
           observedAtUtc: deps.now().toISOString(),
           jobId: next.job!.envelope.request.jobId,
           generation: next.job!.envelope.request.generation,
-          healthy: false,
-          ...(next.job!.failure === undefined
+          healthy: assessment.healthy,
+          ...(assessment.healthy || next.job!.failure === undefined
             ? {}
             : { detail: next.job!.failure.code }),
         };
         await deps.private.write(B2_REPORT_PATH, {
-          ...assessBackblazeWatchdog(next, await deps.gate.read(), deps.now()),
+          ...assessment,
           observedAtUtc: deps.now().toISOString(),
         });
-        return reportValue;
+        completedReport = reportValue;
+        break;
       }
       state = next;
       // The immutable request deadline bounds the default lifetime; it is
@@ -5845,21 +5889,31 @@ export async function runBackblazeCycle(
       }
       await deps.sleep(POLL_INTERVAL_MS);
     }
-  } finally {
-    // The process-local task tunnel is closed only after terminal proof,
-    // receipt or controller exit; the decrypt path stays alive for every
-    // verifier poll step. Cleanup failures are never silently swallowed:
-    // they are reported so the operator sees the missing cleanup.
-    try {
-      await deps.tunnel.close();
-    } catch (error) {
-      deps.logger(
-        `Tunnel close failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
+  } catch (error) {
+    cycleFailed = true;
+    cycleError = error;
   }
+  // The process-local task tunnel is closed only after terminal proof,
+  // receipt or controller exit; the decrypt path stays alive for every
+  // verifier poll step. Cleanup failures are never silently swallowed:
+  // they are reported so the operator sees the missing cleanup.
+  try {
+    await deps.tunnel.close();
+  } catch {
+    tunnelFailed = true;
+    deps.logger("Task tunnel closure could not be proved");
+    await deps.private.write(B2_REPORT_PATH, {
+      status: "B2_TUNNEL_CLOSE_FAILED",
+      observedAtUtc: deps.now().toISOString(),
+      healthy: false,
+      detail: "Task tunnel closure could not be proved",
+    }).catch(() =>
+      deps.logger("Tunnel closure failure report could not be saved")
+    );
+  }
+  if (cycleFailed) throw cycleError;
+  if (tunnelFailed) throw new Error("Task tunnel closure could not be proved");
+  if (completedReport !== undefined) return completedReport;
   const reportValue = {
     status: `B2_BACKUP_INCOMPLETE:${
       state.job?.envelope.request.jobId ?? "none"

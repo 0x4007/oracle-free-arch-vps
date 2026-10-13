@@ -419,6 +419,28 @@ function catalogEntry(
   };
 }
 
+function priorPeriodFixture(
+  seed: number,
+  requestedAtMs: number,
+): GenerationFixture {
+  const fixture = generationFixture(seed, requestedAtMs);
+  const envelope = buildRequestEnvelope({
+    jobUuid: fixture.generation.slice("generation-".length),
+    periodKey: "2026-08-30",
+    requestedAtUtc: fixture.request.requestedAtUtc,
+    recipientSha256: RECIPIENT_SHA256,
+    recipientFingerprint: RECIPIENT_FINGERPRINT,
+    sourceRevision: REVISION,
+    sourceConfigSha256: SOURCE_CONFIG_SHA256,
+  });
+  return {
+    ...fixture,
+    request: envelope.request,
+    requestSha256: envelope.requestSha256,
+    workerResult: { ...fixture.workerResult, envelope },
+  };
+}
+
 function objectForChunk(fixture: GenerationFixture, role: string): B2Object {
   const archive = fixture.upload.archives.find((entry) => entry.role === role)!;
   const chunk = archive.chunks[0];
@@ -1460,11 +1482,10 @@ Deno.test("watchdog: active/stale/orphan/pending/missed/complete", () => {
 Deno.test(
   "watchdog: previous-period complete is current only with its exact catalog proof",
   () => {
-    // The previous-period job completed, but its verification and acceptance
-    // both happened inside the current Sunday window.
+    // A late catch-up capture completed inside the current Sunday window.
     const now = new Date(WINDOW_START + 2 * 3_600_000);
     const acceptedAt = WINDOW_START + 3_600_000;
-    const fixture = generationFixture(23, WINDOW_START - 8 * 3_600_000);
+    const fixture = generationFixture(23, WINDOW_START - 30 * 60_000);
     const complete = stateWithJob(fixture, "COMPLETE");
     const previousPeriod = {
       ...complete,
@@ -1496,13 +1517,30 @@ Deno.test(
       assert(!assessment.healthy);
       assert(assessment.status.startsWith("B2_PERIOD_MISSED"));
     };
-    // An acceptance from before the current window is not a current point.
+    // A cached Pi poll time does not override the completed capture's period.
+    assert(
+      assessBackblazeWatchdog(
+        {
+          ...previousPeriod,
+          catalog: [{
+            ...entry,
+            receipt: { ...entry.receipt, verifiedAtUtc: iso(acceptedAt) },
+            acceptedAtUtc: iso(WINDOW_START - 3_600_000),
+          }],
+        } as ControllerState,
+        null,
+        now,
+      ).healthy,
+    );
+    // Current verification of a capture from before this period is insufficient.
     missed({
-      ...previousPeriod,
+      ...proved,
       catalog: [{
-        ...entry,
-        receipt: { ...entry.receipt, verifiedAtUtc: iso(acceptedAt) },
-        acceptedAtUtc: iso(WINDOW_START - 3_600_000),
+        ...proved.catalog[0],
+        index: {
+          ...proved.catalog[0].index,
+          captureFinishedAtUtc: iso(WINDOW_START - 1000),
+        },
       }],
     } as ControllerState);
     // An unrelated (newer) catalog generation never satisfies the old job.
@@ -3281,7 +3319,7 @@ Deno.test("tunnel: readiness precedes launch and the handle survives poll steps"
   assert(h.tunnels.length === 1, "one tunnel for the same verifier invocation");
 });
 
-Deno.test("tunnel: controller exit closes the handle in the outer finally", async () => {
+Deno.test("tunnel: controller exit closes the handle before returning", async () => {
   const fixture = generationFixture(18, WINDOW_START);
   const state = stateWithJob(fixture, "FAILED", {
     failure: { code: "X", atUtc: iso(WINDOW_START + 1000) },
@@ -3294,6 +3332,65 @@ Deno.test("tunnel: controller exit closes the handle in the outer finally", asyn
   assert(report.status.startsWith("B2_BACKUP_FAILED"));
   assert(h.tunnelCloses() === 1, "exactly one final close");
   assert(!h.tunnelOpen());
+});
+
+Deno.test("tunnel: controller cleanup failure rejects a healthy completed run", async () => {
+  const fixture = generationFixture(19, WINDOW_START);
+  const state = {
+    ...stateWithJob(fixture, "COMPLETE"),
+    catalog: [catalogEntry(fixture, WINDOW_START + 1000)],
+  };
+  const h = harness({ now: new Date(WINDOW_START + 60_000) });
+  await h.deps.private.write(CONTROLLER_STATE_PATH, state);
+  const before = JSON.stringify(state);
+  const closeError = new Error("ssh failure with SECRET_TUNNEL_DETAIL");
+  h.deps.tunnel.close = () => Promise.reject(closeError);
+  let thrown: unknown;
+  try {
+    await runBackblazeCycle(h.deps, 1);
+  } catch (error) {
+    thrown = error;
+  }
+  assert(
+    thrown instanceof Error &&
+      thrown.message === "Task tunnel closure could not be proved",
+    "cleanup failure must reach the CLI boundary without raw SSH details",
+  );
+  const report = h.privateMap.get(
+    ".private/reports/backblaze-file-backup.json",
+  ) as WatchdogAssessment;
+  assert(
+    report.healthy === false,
+    "cleanup failure must replace healthy status",
+  );
+  assert(report.status.includes("TUNNEL_CLOSE_FAILED"), report.status);
+  assert(
+    JSON.stringify(h.privateMap.get(CONTROLLER_STATE_PATH)) === before,
+    "the accepted job and receipt catalog must remain unchanged",
+  );
+  assert(h.launches.length === 0 && h.store.removed.length === 0);
+  assert(!h.logs.some((message) => message.includes("SECRET_TUNNEL_DETAIL")));
+});
+
+Deno.test("tunnel: controller cleanup failure preserves an existing cycle error", async () => {
+  const fixture = generationFixture(20, WINDOW_START);
+  const state = stateWithJob(fixture, "COMPLETE");
+  const h = harness({ now: new Date(WINDOW_START + 60_000) });
+  await h.deps.private.write(CONTROLLER_STATE_PATH, state);
+  const cycleError = new Error("primary report write failure");
+  h.deps.private.write = () => Promise.reject(cycleError);
+  h.deps.tunnel.close = () => Promise.reject(new Error("SECRET_TUNNEL_DETAIL"));
+  let thrown: unknown;
+  try {
+    await runBackblazeCycle(h.deps, 1);
+  } catch (error) {
+    thrown = error;
+  }
+  assert(
+    thrown === cycleError,
+    "the cleanup error must not mask the cycle error",
+  );
+  assert(!h.logs.some((message) => message.includes("SECRET_TUNNEL_DETAIL")));
 });
 
 Deno.test("cycle: a step error after a durable bind resumes instead of failing", async () => {
@@ -4135,6 +4232,166 @@ Deno.test("orchestration: expired reconciliation rejects signal, unreachable, fo
   await stepBackupController(terminalState, terminal.deps, terminal.deps.now());
   assert(terminal.gate.value !== null, "terminal-status orphan stays strict");
   assert(!terminal.events.includes("gate:clear"));
+});
+
+Deno.test("orchestration: current-period accepted catch-up capture prevents another job", async () => {
+  const fixture = generationFixture(24, WINDOW_START - 30 * 60_000);
+  const closed = validateControllerState({
+    schemaVersion: 1,
+    catalog: [catalogEntry(fixture, WINDOW_START + 3_600_000)],
+    job: {
+      ...stateWithJob(fixture, "COMPLETE").job!,
+      envelope: buildRequestEnvelope({
+        jobUuid: fixture.generation.slice("generation-".length),
+        periodKey: "2026-08-30",
+        requestedAtUtc: fixture.request.requestedAtUtc,
+        recipientSha256: RECIPIENT_SHA256,
+        recipientFingerprint: RECIPIENT_FINGERPRINT,
+        sourceRevision: REVISION,
+        sourceConfigSha256: SOURCE_CONFIG_SHA256,
+      }),
+    },
+  });
+  const h = harness({
+    now: new Date(WINDOW_START + 2 * 3_600_000),
+    seedPrivate: (map) => {
+      map.set(".private/backup-runtime.json", ORACLE_STATE_FIXTURE);
+      map.set(".private/backup-scheduled-window.json", SCHEDULED_CLAIM_FIXTURE);
+    },
+  });
+  assert(assessBackblazeWatchdog(closed, null, h.deps.now()).healthy);
+  const next = await stepBackupController(closed, h.deps, h.deps.now());
+  assert(
+    next.job!.phase === "COMPLETE",
+    "a capture completed in this period is enough",
+  );
+  assert(next.job!.envelope.request.jobId === fixture.jobId);
+  assert(h.launches.length === 0 && h.installs.length === 0);
+  assert(
+    !h.privateMap.has(CONTROLLER_STATE_PATH),
+    "no new identity is persisted",
+  );
+});
+
+Deno.test("cycle proof: recovered current capture preserves failed history and reports healthy", async () => {
+  const fixture = priorPeriodFixture(81, WINDOW_START - 30 * 60_000);
+  fixture.receipt.verifiedAtUtc = iso(WINDOW_START + 3 * 3_600_000);
+  const entry = catalogEntry(fixture, WINDOW_START + 4 * 3_600_000);
+  const { resultSha256: _unused, ...pending } = workerPendingStatus(
+    fixture,
+    INVOCATION_A,
+  );
+  const failureAt = iso(WINDOW_START + 2 * 3_600_000);
+  const state = validateControllerState({
+    schemaVersion: 1,
+    catalog: [entry],
+    job: {
+      ...stateWithJob(fixture, "FAILED").job!,
+      workerStatus: {
+        ...pending,
+        state: "FAILED",
+        errorCode: "UPLOAD_FAILED",
+        updatedAtUtc: failureAt,
+        heartbeatAtUtc: failureAt,
+        finishedAtUtc: failureAt,
+      },
+      failure: { code: "UPLOAD_FAILED", atUtc: failureAt },
+      operatorRecovery: {
+        provenanceSha256: "aa".repeat(32),
+        invocationId: INVOCATION_B,
+        receiptSha256: sha256HexSync(
+          new TextEncoder().encode(
+            `${JSON.stringify(fixture.receipt, null, 2)}\n`,
+          ),
+        ),
+        indexSha256: fixture.publishedIndex.indexSha256,
+        acceptedAtUtc: entry.acceptedAtUtc,
+      },
+    },
+  });
+  const h = harness({ now: new Date(WINDOW_START + 5 * 3_600_000) });
+  await h.deps.private.write(CONTROLLER_STATE_PATH, state);
+  const before = JSON.stringify(state);
+  const report = await runBackblazeCycle(h.deps, 1);
+  assert(
+    report.healthy && report.status === `B2_BACKUP_CURRENT:${fixture.jobId}`,
+  );
+  assert(JSON.stringify(h.privateMap.get(CONTROLLER_STATE_PATH)) === before);
+  assert(h.launches.length === 0 && h.store.removed.length === 0);
+});
+
+Deno.test("cycle proof: verifier completion during observation uses fresh acceptance time", async () => {
+  const fixture = priorPeriodFixture(82, WINDOW_START - 30 * 60_000);
+  const stepNow = WINDOW_START + 2 * 3_600_000;
+  const finish = stepNow + 1000;
+  fixture.receipt.verifiedAtUtc = iso(finish);
+  const receiptText = JSON.stringify(fixture.receipt);
+  const receiptSha256 = sha256HexSync(new TextEncoder().encode(receiptText));
+  const status = {
+    ...verifierAcceptedStatus(fixture, INVOCATION_B, receiptSha256),
+    startedAtUtc: iso(WINDOW_START + 3_600_000),
+    updatedAtUtc: iso(finish),
+    heartbeatAtUtc: iso(finish),
+    finishedAtUtc: iso(finish),
+  };
+  const state = stateWithJob(fixture, "VERIFIER_RUNNING", {
+    verifierInvocationId: INVOCATION_B,
+  });
+  const gate = {
+    ...deriveVerifierGate(fixture.request, fixture.requestSha256),
+    unitName: verifyUnitName(fixture.generation),
+    unitInvocationId: INVOCATION_B,
+  };
+  const h = harness({
+    now: new Date(stepNow),
+    gateValue: gate,
+    observed: () => {
+      h.clock.current = new Date(stepNow + 2000);
+      return terminalObserved(status);
+    },
+    rootResponder: (script) =>
+      !isSweepScript(script) && script.includes("receipt.json")
+        ? { code: 0, stdout: receiptText, stderr: "" }
+        : undefined,
+    seedPrivate: (map) =>
+      map.set(
+        `${PIP_JOB_EVIDENCE_PATH}/${fixture.jobId}/result.json`,
+        new TextEncoder().encode(JSON.stringify(fixture.workerResult)),
+      ),
+  });
+  const accepted = await stepBackupController(state, h.deps, h.deps.now());
+  assert(accepted.job!.phase === "ACCEPTED");
+  assert(
+    Date.parse(accepted.catalog[0].acceptedAtUtc) >= finish,
+    "acceptance is sampled after receipt validation",
+  );
+  const complete = validateControllerState({
+    ...accepted,
+    job: { ...accepted.job!, phase: "COMPLETE" },
+  });
+  assert(assessBackblazeWatchdog(complete, null, h.deps.now()).healthy);
+  const next = await stepBackupController(complete, h.deps, h.deps.now());
+  assert(
+    next.job!.phase === "COMPLETE" &&
+      next.job!.envelope.request.jobId === fixture.jobId,
+  );
+});
+
+Deno.test("cycle proof: cached acceptance before the boundary still credits the completed capture", async () => {
+  const fixture = priorPeriodFixture(83, WINDOW_START - 3_600_000 - 119_000);
+  const state = validateControllerState({
+    schemaVersion: 1,
+    catalog: [catalogEntry(fixture, WINDOW_START - 1000)],
+    job: stateWithJob(fixture, "COMPLETE").job,
+  });
+  const h = harness({ now: new Date(WINDOW_START + 3 * 60_000) });
+  assert(assessBackblazeWatchdog(state, null, h.deps.now()).healthy);
+  const next = await stepBackupController(state, h.deps, h.deps.now());
+  assert(
+    next.job!.phase === "COMPLETE" &&
+      next.job!.envelope.request.jobId === fixture.jobId,
+  );
+  assert(!h.privateMap.has(CONTROLLER_STATE_PATH));
 });
 
 Deno.test("orchestration: prior period closes allow a fresh next Sunday job", async () => {

@@ -50,8 +50,8 @@
  *
  * Bounded upload/publish retries: the whole existing uploader/publisher
  * module call (journal and ambiguous-put reconciliation included) is retried
- * at most three times with 30 minute spacing, heartbeat live, inside one
- * invocation and never past the deadline. Only exact B2 operation transport
+ * with 30 minute spacing inside the immutable request budget, heartbeat live,
+ * within one invocation and never past the deadline. Only exact B2 transport
  * failures are retried; identity/corruption/filesystem/scope/other 4xx
  * errors fail immediately. Every wait is announced on standard error with
  * the fixed phase code, attempt counters, whitelisted operation/category and
@@ -114,10 +114,12 @@ import { withBackupLock } from "./backup-lock.ts";
 export const WORKER_DEADLINE_MS = GATE_DEADLINE_MS;
 export const PRODUCTION_BASE_PATH = "/var/tmp/arch-vps-file-backup";
 export const HEARTBEAT_INTERVAL_MS = 30_000;
-/** Bounded retries of one upload/publish module call: 3 attempts total. */
-export const MAX_PHASE_ATTEMPTS = 3;
 /** Fixed spacing between bounded retries. */
 export const RETRY_SPACING_MS = 30 * 60_000;
+/** Finite ceiling even if the wall clock stops advancing; the exact deadline
+ * usually leaves fewer attempts because capture/upload have already used time. */
+export const MAX_PHASE_ATTEMPTS =
+  Math.ceil(WORKER_DEADLINE_MS / RETRY_SPACING_MS) + 1;
 
 export const CAPTURE_RESULT_FILE = "capture-result.json";
 export const UPLOAD_RESULT_FILE = "upload-result.json";
@@ -1324,7 +1326,10 @@ function retriableB2Failure(error: unknown): B2FailureIdentity | null {
   const networkSuffix = " failed (network error)";
   if (message.endsWith(networkSuffix)) {
     const operation = message.slice(0, -networkSuffix.length);
-    return RETRIABLE_B2_OPERATIONS.has(operation)
+    // A lost PUT response has no definite commit outcome. It must not restart
+    // the whole module after its own exact-version reconciliation refused it.
+    return operation !== "b2_upload_file" &&
+        RETRIABLE_B2_OPERATIONS.has(operation)
       ? { operation, category: "network error" }
       : null;
   }
@@ -1402,9 +1407,9 @@ async function phaseStep<T>(
 }
 
 /**
- * Retry the whole upload/publish module call inside this invocation: at most
- * three attempts, 30 minute spacing, deadline checked before every attempt
- * and after every wait (the wait is capped so it never passes the deadline).
+ * Retry the whole upload/publish module call inside this invocation with a
+ * finite deadline-derived ceiling and 30 minute spacing. Check the deadline
+ * before each attempt and after each wait; waits cannot pass that deadline.
  * Only exact B2 transport failures are retried; every other failure is
  * immediate. The retried call receives the identical capture/upload/store,
  * so the module's own journal and ambiguous-put reconciliation govern each
@@ -1417,7 +1422,9 @@ async function runPhaseWithRetries<T>(
 ): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= MAX_PHASE_ATTEMPTS; attempt += 1) {
-    assertInWindow(ctx);
+    if (ctx.deps.now().getTime() >= deadlineMs(ctx)) {
+      throw new WorkerPhaseError("DEADLINE_EXCEEDED");
+    }
     try {
       return await run();
     } catch (error) {
