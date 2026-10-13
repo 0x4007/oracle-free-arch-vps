@@ -920,7 +920,8 @@ Deno.test("isRetriableB2Error accepts only exact B2 transport failures", () => {
   ];
   for (const operation of operations) {
     assert(
-      isRetriableB2Error(new Error(`${operation} failed (network error)`)),
+      isRetriableB2Error(new Error(`${operation} failed (network error)`)) ===
+        (operation !== "b2_upload_file"),
     );
     assert(isRetriableB2Error(new Error(`${operation} failed (HTTP 408)`)));
     assert(isRetriableB2Error(new Error(`${operation} failed (HTTP 429)`)));
@@ -1705,7 +1706,7 @@ runtimeTest(
 );
 
 runtimeTest(
-  "retry: a retriable upload transport failure retries the whole module and recovers",
+  "retry: transient upload failures recover beyond three attempts",
   async () => {
     await withTempBase(async (_base, canonicalBase) => {
       const fixture = makeRunFixture(canonicalBase);
@@ -1715,7 +1716,7 @@ runtimeTest(
         fixture.probe.uploadCalls += 1;
         fixture.probe.uploadArgs.push(captureResult);
         failures += 1;
-        if (failures === 1) {
+        if (failures <= 4) {
           return Promise.reject(
             new Error("b2_upload_file failed (HTTP 503)"),
           );
@@ -1742,17 +1743,22 @@ runtimeTest(
         fixture.inputs({ deps: { upload } }),
       );
       assert(terminal.state === "PENDING_VERIFIER");
-      assert(fixture.probe.uploadCalls === 2, "exactly two upload attempts");
+      assert(
+        fixture.probe.uploadCalls === 5,
+        "four failures then a successful upload",
+      );
       assert(fixture.probe.captureCalls === 1, "capture never reruns");
-      assert(fixture.probe.sleepCalls.length === 1);
-      assert(fixture.probe.sleepCalls[0] === RETRY_SPACING_MS);
-      assert(heartbeatDuringSleep.length === 1);
+      assert(fixture.probe.sleepCalls.length === 4);
+      assert(fixture.probe.sleepCalls.every((ms) => ms === RETRY_SPACING_MS));
+      assert(heartbeatDuringSleep.length === 4);
       assert(
         heartbeatDuringSleep[0] === "UPLOADING",
         "the heartbeat must stay alive during the retry wait",
       );
       assert(
-        fixture.probe.uploadArgs[0] === fixture.probe.uploadArgs[1],
+        fixture.probe.uploadArgs.every((capture) =>
+          capture === fixture.probe.uploadArgs[0]
+        ),
         "every attempt receives the identical capture result",
       );
       const status = await readJsonStatus(fixture.statusPath);
@@ -1815,7 +1821,7 @@ runtimeTest(
 );
 
 runtimeTest(
-  "retry: three retriable upload failures exhaust attempts with a FAILED terminal",
+  "retry: persistent transient failures exhaust the immutable deadline",
   async () => {
     await withTempBase(async (_base, canonicalBase) => {
       const fixture = makeRunFixture(canonicalBase);
@@ -1829,12 +1835,17 @@ runtimeTest(
         fixture.inputs({ deps: { upload } }),
       );
       assert(terminal.state === "FAILED");
-      assert(terminal.errorCode === "UPLOAD_FAILED");
-      assert(fixture.probe.uploadCalls === MAX_PHASE_ATTEMPTS);
-      assert(fixture.probe.captureCalls === 1);
-      assert(fixture.probe.sleepCalls.length === MAX_PHASE_ATTEMPTS - 1);
+      assert(terminal.errorCode === "DEADLINE_EXCEEDED");
       assert(
-        fixture.probe.sleepCalls.every((ms) => ms === RETRY_SPACING_MS),
+        fixture.probe.uploadCalls > 3 &&
+          fixture.probe.uploadCalls < MAX_PHASE_ATTEMPTS,
+      );
+      assert(fixture.probe.captureCalls === 1);
+      assert(fixture.probe.sleepCalls.length === fixture.probe.uploadCalls);
+      assert(
+        fixture.probe.sleepCalls.every((ms) =>
+          ms > 0 && ms <= RETRY_SPACING_MS
+        ),
       );
       const statusText = new TextDecoder().decode(
         await Deno.readFile(fixture.statusPath),
@@ -1845,7 +1856,9 @@ runtimeTest(
       );
       const status = await readJsonStatus(fixture.statusPath);
       assert(status.state === "FAILED");
-      assert(status.errorCode === "UPLOAD_FAILED");
+      assert(status.errorCode === "DEADLINE_EXCEEDED");
+      assert(fixture.clock.now().getTime() === Date.parse(DEADLINE_AT));
+      assert(fixture.probe.publishCalls === 0, "no phase begins after expiry");
     });
   },
 );
@@ -1863,7 +1876,7 @@ runtimeTest(
           fixture.clock.set(Date.parse(DEADLINE_AT) - 10 * 60_000);
         }
         return Promise.reject(
-          new Error("b2_upload_file failed (network error)"),
+          new Error("b2_list_file_versions failed (network error)"),
         );
       };
       const terminal = await runSourceWorker(
@@ -1872,8 +1885,8 @@ runtimeTest(
       assert(terminal.state === "FAILED");
       assert(terminal.errorCode === "DEADLINE_EXCEEDED");
       assert(
-        fixture.probe.uploadCalls === 2,
-        "the second attempt starts exactly at the deadline and expires",
+        fixture.probe.uploadCalls === 1,
+        "no further attempt begins at the exact deadline",
       );
       assert(fixture.probe.sleepCalls.length === 1);
       assert(
@@ -1924,28 +1937,38 @@ runtimeTest(
 );
 
 runtimeTest(
-  "retry: fatal non-B2 scope failures never retry",
+  "retry: rejected and ambiguous failures stop without another attempt",
   async () => {
-    await withTempBase(async (_base, canonicalBase) => {
-      const fixture = makeRunFixture(canonicalBase);
-      const upload: SourceWorkerDependencies["upload"] = () => {
-        fixture.probe.uploadCalls += 1;
-        return Promise.reject(new Error("b2_upload_file failed (HTTP 401)"));
-      };
-      const terminal = await runSourceWorker(
-        fixture.inputs({ deps: { upload } }),
-      );
-      assert(terminal.state === "FAILED");
-      assert(terminal.errorCode === "UPLOAD_FAILED");
-      assert(fixture.probe.uploadCalls === 1);
-      assert(fixture.probe.sleepCalls.length === 0);
-      assert(fixture.probe.captureCalls === 1);
-    });
+    for (
+      const message of [
+        "b2_upload_file failed (HTTP 401)",
+        "b2_download_file_by_id failed (HTTP 404)",
+        "Upload failed (archive:hash)",
+        "b2_upload_file failed (network error)",
+        "Index failed (publish:readback)",
+      ]
+    ) {
+      await withTempBase(async (_base, canonicalBase) => {
+        const fixture = makeRunFixture(canonicalBase);
+        const upload: SourceWorkerDependencies["upload"] = () => {
+          fixture.probe.uploadCalls += 1;
+          return Promise.reject(new Error(message));
+        };
+        const terminal = await runSourceWorker(
+          fixture.inputs({ deps: { upload } }),
+        );
+        assert(terminal.state === "FAILED");
+        assert(terminal.errorCode === "UPLOAD_FAILED");
+        assert(fixture.probe.uploadCalls === 1);
+        assert(fixture.probe.sleepCalls.length === 0);
+        assert(fixture.probe.captureCalls === 1);
+      });
+    }
   },
 );
 
 runtimeTest(
-  "retry: publish retries the whole publisher and then succeeds",
+  "retry: transient publish failures recover beyond three attempts",
   async () => {
     await withTempBase(async (_base, canonicalBase) => {
       const fixture = makeRunFixture(canonicalBase);
@@ -1960,7 +1983,7 @@ runtimeTest(
           { capture: captureResult, upload: uploadResult, recipient },
         );
         failures += 1;
-        if (failures === 1) {
+        if (failures <= 4) {
           return Promise.reject(
             new Error("b2_download_file_by_id failed: body read failed"),
           );
@@ -1974,11 +1997,14 @@ runtimeTest(
       );
       assert(terminal.state === "PENDING_VERIFIER");
       assert(terminal.resultSha256 !== undefined);
-      assert(fixture.probe.publishCalls === 2, "exactly two publish attempts");
+      assert(
+        fixture.probe.publishCalls === 5,
+        "four read failures then successful publication",
+      );
       assert(fixture.probe.uploadCalls === 1);
       assert(fixture.probe.captureCalls === 1);
-      assert(fixture.probe.sleepCalls.length === 1);
-      assert(fixture.probe.sleepCalls[0] === RETRY_SPACING_MS);
+      assert(fixture.probe.sleepCalls.length === 4);
+      assert(fixture.probe.sleepCalls.every((ms) => ms === RETRY_SPACING_MS));
       assert(
         fixture.probe.publishArgs[0].capture ===
             fixture.probe.publishArgs[1].capture &&
