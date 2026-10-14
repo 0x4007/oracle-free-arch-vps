@@ -1,5 +1,6 @@
 import {
   assessProgress,
+  isBackupCgroupControlPath,
   parseResourceLimits,
   parseTransferBudget,
   type ProgressSample,
@@ -269,4 +270,30 @@ Deno.test("resource changes reset throughput comparisons without losing counter 
   equal(after.uploadBytesPerSecond, null);
   equal(after.sample?.uploadedBytes, 200);
   equal(after.sample?.resourceLimits?.cpuQuotaCores, 1);
+});
+
+Deno.test("control reader permits only exact backup units in approved slices", () => {
+  const unit =
+    "arch-vps-b2-worker-374d86e2-f4b1-4268-bcca-d5e052304f7b.service";
+  for (const parent of ["system.slice", "weekly.slice/weekly-backup.slice"]) {
+    for (
+      const control of ["cgroup.events", "memory.max", "cpu.stat", "io.max"]
+    ) {
+      equal(
+        isBackupCgroupControlPath(
+          `/sys/fs/cgroup/${parent}/${unit}/${control}`,
+        ),
+        true,
+      );
+    }
+  }
+  for (
+    const path of [
+      `/sys/fs/cgroup/other.slice/${unit}/memory.max`,
+      `/sys/fs/cgroup/weekly.slice/weekly-backup.slice/${unit}/memory.stat`,
+      `/sys/fs/cgroup/weekly.slice/weekly-backup.slice/${unit}/../memory.max`,
+      `/sys/fs/cgroup/system.slice/sshd.service/memory.max`,
+      "/proc/self/environ",
+    ]
+  ) equal(isBackupCgroupControlPath(path), false);
 });

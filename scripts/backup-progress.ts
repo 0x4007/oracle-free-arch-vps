@@ -310,14 +310,17 @@ async function json(path: string): Promise<Record<string, unknown> | null> {
   }
 }
 
+/** Permit only named backup units and a fixed set of cgroup controls. */
+export function isBackupCgroupControlPath(path: string): boolean {
+  return /^\/sys\/fs\/cgroup\/(?:system\.slice|weekly\.slice\/weekly-backup\.slice)\/arch-vps-b2-(worker|verify)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.service\/(cgroup\.events|cpu\.stat|io\.stat|cpu\.max|cpu\.weight|memory\.max|memory\.high|memory\.swap\.max|io\.max)$/
+    .test(path);
+}
+
 async function text(path: string): Promise<string | null> {
   try {
     // Deno treats /sys as all-access. Grant only this fixed control reader
     // rather than granting the observer unrestricted Deno permissions.
-    if (
-      /^\/sys\/fs\/cgroup\/system\.slice\/arch-vps-b2-(worker|verify)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.service\/(cpu\.stat|io\.stat|cpu\.max|cpu\.weight|memory\.max|memory\.high|memory\.swap\.max|io\.max)$/
-        .test(path)
-    ) {
+    if (isBackupCgroupControlPath(path)) {
       const result = await new Deno.Command("/usr/bin/cat", {
         args: ["--", path],
         clearEnv: true,
@@ -386,14 +389,9 @@ export async function sampleLatest(now: Date): Promise<ProgressSample | null> {
   );
   let group = groups[0];
   for (const candidate of groups) {
-    try {
-      const info = await Deno.lstat(candidate);
-      if (info.isDirectory && !info.isSymlink) {
-        group = candidate;
-        break;
-      }
-    } catch (error) {
-      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    if (await text(`${candidate}/cgroup.events`) !== null) {
+      group = candidate;
+      break;
     }
   }
   const controlNames = [
