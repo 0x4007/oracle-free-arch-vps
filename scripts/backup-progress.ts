@@ -1,3 +1,4 @@
+import { backupUnitCgroupPaths } from "./backblaze-controller-contract.ts";
 /** Observation only: never controls a backup or copies archive contents. */
 const BACKUP = "/var/tmp/arch-vps-file-backup";
 const REPORT = "/var/lib/arch-vps-backup-progress/report.json";
@@ -380,7 +381,21 @@ export async function sampleLatest(now: Date): Promise<ProgressSample | null> {
   const unitName = `arch-vps-b2-${
     phase === "VERIFYING" || phase === "ACCEPTED" ? "verify" : "worker"
   }-${jobId.slice(4)}.service`;
-  const group = `/sys/fs/cgroup/system.slice/${unitName}`;
+  const groups = backupUnitCgroupPaths(unitName).map((path) =>
+    `/sys/fs/cgroup${path}`
+  );
+  let group = groups[0];
+  for (const candidate of groups) {
+    try {
+      const info = await Deno.lstat(candidate);
+      if (info.isDirectory && !info.isSymlink) {
+        group = candidate;
+        break;
+      }
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    }
+  }
   const controlNames = [
     "cpu.max",
     "cpu.weight",

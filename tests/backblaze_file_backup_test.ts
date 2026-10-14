@@ -2442,7 +2442,7 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
   assert(script.includes("Type=exec"));
   assert(script.includes("RemainAfterExit=yes"));
   assert(script.includes("RuntimeMaxSec=12345"), script);
-  assert(script.includes("MemoryMax=6255601664"));
+  assert(script.includes("MemoryMax=6G"));
   assert(script.includes("CPUQuota=100%"));
   assert(!script.includes("CPUQuota=25%"), script);
   // Half of the two-core host is one full core. IO budgets apply the
@@ -2469,8 +2469,10 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
   // MemoryHigh=768M was removed after it stalled a real upload: the worker's
   // natural peak is ~1,078 MB, so a soft limit below that throttled it
   // continuously (194,527 events) and it stopped making progress.
-  assert(!script.includes("MemoryHigh"), script);
-  assert(script.includes("MemoryMax=6255601664"), script);
+  assert(script.includes("MemoryHigh=infinity"), script);
+  assert(!script.includes("MemoryHigh=768M"), script);
+  assert(script.includes("Slice=weekly-backup.slice"), script);
+  assert(script.includes("MemoryMax=6G"), script);
   assert(script.includes("MemorySwapMax=0"), script);
   assert(script.includes("Nice=19"), script);
   assert(script.includes("IOSchedulingClass=idle"), script);
@@ -2481,7 +2483,7 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
       script.includes(`${JOBS_RUNTIME_ROOT}/${fixture.jobId}`),
   );
   assert(script.includes("entry-worker.ts"));
-  // Worker and verifier use the same owner-approved half-resource budget.
+  // Worker and verifier share the same dedicated backup resource budget.
   await seam.launchUnit({
     unitName: verifyUnitName(fixture.generation),
     runtimeDir: `${JOBS_RUNTIME_ROOT}/${fixture.jobId}`,

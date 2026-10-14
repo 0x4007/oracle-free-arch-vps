@@ -29,6 +29,7 @@ import { createHash } from "node:crypto";
 import {
   assertBackblazeLaunchAllowed,
   type BackupControllerGate,
+  GATE_BACKUP_SLICE,
   GATE_DEADLINE_HOURS,
   GATE_DEADLINE_MS,
   GATE_OWNER,
@@ -1369,7 +1370,7 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
       ) {
         throw new Error("Remaining deadline seconds must be positive");
       }
-      // The owner authorized half of the measured two-core / 12 GB host.
+      // Owner-approved weekly budget: 6 GiB and one core on the two-core host.
       // Balanced root: 72 MB/s and 9,000 IOPS; each direction gets
       // half of that maximum, without splitting the allowance again.
       // The 50 GB staging boot volume has 24 MB/s and 3,000 IOPS.
@@ -1379,11 +1380,13 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
         "Type=exec",
         "RemainAfterExit=yes",
         `RuntimeMaxSec=${spec.remainingSec}`,
-        // One core is half of this two-core host; low scheduling priority
-        // still yields to production under contention. The hard RAM cap is
-        // half of observed MemTotal (12,511,203,328 bytes), not a reservation.
-        // No soft memory ceiling and no backup swap traffic.
-        "MemoryMax=6255601664",
+        // Worker and verifier share a backup-only slice so retained cache
+        // and overlapping processes cannot multiply the approved budget.
+        // The October 11 accepted run peaked near 5.83 GiB including cache;
+        // 6 GiB preserves that successful envelope without a soft ceiling.
+        `Slice=${GATE_BACKUP_SLICE}`,
+        "MemoryHigh=infinity",
+        "MemoryMax=6G",
         "MemorySwapMax=0",
         "CPUQuota=100%",
         "CPUWeight=1",

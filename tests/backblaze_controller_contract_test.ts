@@ -681,6 +681,40 @@ Deno.test("clear proof accepts the canonical nonempty cgroup with zero tasks", (
   assertEquals(proof.tasksCurrent, 0);
 });
 
+Deno.test("clear proof binds the exact backup-slice unit without accepting siblings", () => {
+  const gate = validateGate(boundGate());
+  const group =
+    `/weekly.slice/weekly-backup.slice/arch-vps-b2-worker-${UUID}.service`;
+  const proof = validateGateClearProof(
+    proofFixture({ controlGroup: group, tasksCurrent: 0 }),
+    gate,
+    CLEAR_NOW,
+  );
+  assertEquals(proof.controlGroup, group);
+  for (
+    const overrides of [
+      { controlGroup: group, tasksCurrent: 1 },
+      { controlGroup: group, tasksCurrent: null },
+      { controlGroup: `${group}/child`, tasksCurrent: 0 },
+      {
+        controlGroup: group.replace(
+          "arch-vps-b2-worker-",
+          "arch-vps-b2-verify-",
+        ),
+        tasksCurrent: 0,
+      },
+      {
+        controlGroup: group.replace("weekly-backup.slice", "other.slice"),
+        tasksCurrent: 0,
+      },
+    ]
+  ) {
+    assertThrows(() =>
+      validateGateClearProof(proofFixture(overrides), gate, CLEAR_NOW)
+    );
+  }
+});
+
 Deno.test("clear proof rejects unknown keys and nonterminal statuses", () => {
   const gate = validateGate(boundGate());
   assertThrows(() =>
