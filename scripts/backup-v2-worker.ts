@@ -22,6 +22,7 @@ import {
   BACKUP_V2_ROLES,
   type BackupV2ManifestRef,
   type BackupV2ObjectRef,
+  type BackupV2PutIntent,
   type BackupV2Progress,
   type BackupV2Receipt,
   type BackupV2RoleManifest,
@@ -57,6 +58,7 @@ import type { BackupV2UploadIdentity } from "./backup-v2-upload.ts";
 import type { BackupV2UploadRetryEpisode } from "./backup-v2-upload.ts";
 import {
   createBackupV2UploadPacer,
+  BackupV2UploadJournal,
   openBackupV2UploadJournal,
 } from "./backup-v2-upload.ts";
 import {
@@ -97,6 +99,8 @@ import {
 } from "./backup-v2-kernel.ts";
 import {
   type BackupV2ProtectionDescriptor,
+  type BackupV2PruneInput,
+  type BackupV2PruneResult,
   BACKUP_V2_PROTECTION_SOURCE_BASE,
   backupV2ProtectionPageName,
   backupV2ProtectionSourceDirectory,
@@ -111,7 +115,10 @@ import {
   PUBLIC_HOME_BASE,
   RELEASES_ROOT,
   validateReleaseManifest,
+  validateCatalogEntry,
 } from "./backblaze-file-backup.ts";
+import { runBackupV2SourcePruner } from "./backup-v2-source-pruner.ts";
+import { createBackupV2PruneRuntime } from "./backup-v2-prune-runtime.ts";
 
 export const BACKUP_V2_STATUS_FILE = "status.json";
 export const BACKUP_V2_RESULT_FILE = "result.json";
@@ -561,6 +568,10 @@ export class BackupV2WorkerProgress {
   verifiedObject(): void {
     this.#values.verifiedChunks++;
   }
+  retention(inventoryMembers: number): void {
+    this.phase = "PRUNING";
+    this.#values.inventoryMembers += this.#advance("retention",inventoryMembers);
+  }
   snapshot(observedMonotonicMs: number): BackupV2Progress {
     return { phase: this.phase, observedMonotonicMs, ...this.#values };
   }
@@ -621,6 +632,27 @@ export async function discoverBackupV2SourceGates(): Promise<BackupV2Gate[]> {
     if (!(e instanceof Deno.errors.NotFound)) throw e;
   }
   return gates;
+}
+/** Read-only intent census. No failed or missing receipt erases a durable PUT. */
+export async function discoverBackupV2UnresolvedPuts(): Promise<BackupV2PutIntent[]> {
+  const intents = new Map<string,BackupV2PutIntent>();
+  let total = 0;
+  for (const gate of await discoverBackupV2SourceGates()) {
+    const path = `${backupV2GateDirectory(gate)}/journal/upload-journal.ndjson`;
+    let bytes: Uint8Array;
+    try {bytes = await rootRead(path,BACKUP_V2_LIMITS.journalBytes);}
+    catch (error) {if (error instanceof Deno.errors.NotFound) continue;throw error;}
+    total += bytes.length;
+    if (total > BACKUP_V2_LIMITS.journalBytes) fail();
+    const text = new TextDecoder("utf-8",{fatal:true}).decode(bytes);
+    if (text && !text.endsWith("\n")) fail();
+    const records = text ? text.slice(0,-1).split("\n").map((line) => JSON.parse(line)) : [];
+    const journal = new BackupV2UploadJournal(gate.envelope.request.captureId, () => Promise.reject(new Error("Read-only journal")), records);
+    const reclaimed = new Set(journal.snapshot().filter((entry) => entry.type === "reclaimed").map((entry) => entry.name));
+    for (const record of journal.snapshot()) if (record.type === "intent" && !reclaimed.has(record.intent.name)) intents.set(record.intent.name,record.intent);
+    if (backupV2ArtifactBytes([...intents.values()]).length > BACKUP_V2_LIMITS.controlResponseBytes) fail();
+  }
+  return [...intents.values()];
 }
 async function rootRead(
   path: string,
@@ -886,7 +918,7 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
  * Heavy children are always inside the caller's proved finite managed unit. */
 export async function runBackupV2RemoteWorker(
   jobId: string,
-  kind: "worker" | "verify",
+  kind: "worker" | "verify" | "prune",
 ): Promise<BackupV2Status> {
   if (!/^job-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(jobId)) fail();
   const runtime = `${JOBS_RUNTIME_ROOT}/${jobId}`;
@@ -915,10 +947,26 @@ export async function runBackupV2RemoteWorker(
         entry.sha256
     ) fail();
   }
+  let prunePath: string | undefined;
+  if (kind === "prune") {
+    prunePath = `${runtime}/prune-execute-request.json`;
+    try { await rootRead(prunePath); }
+    catch (error) { if (!(error instanceof Deno.errors.NotFound)) throw error; prunePath = `${runtime}/prune-plan-request.json`; }
+  }
+  const readPrune = async (): Promise<BackupV2PruneInput> => {
+    if (!prunePath) fail();
+    const input = JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(await rootRead(prunePath))) as BackupV2PruneInput;
+    const expected = validateBackupV2Gate(input.gate);
+    if (expected.kind !== "prune") fail();
+    same(expected.envelope, settings.envelope);
+    return {...input, gate: await ownExecution(expected)};
+  };
+  let pruneInput = kind === "prune" ? await readPrune() : null;
   const gate = await ownExecution(
-      kind === "worker" ? settings.workerGate : settings.verifierGate,
+      pruneInput ? pruneInput.gate : kind === "worker" ? settings.workerGate : settings.verifierGate,
     ),
     directory = backupV2GateDirectory(gate);
+  if (pruneInput) pruneInput = {...pruneInput,gate};
   await rootDirectory(BACKUP_BASE);
   await rootDirectory(`${BACKUP_BASE}/${request.captureId}`);
   await rootDirectory(`${BACKUP_BASE}/${request.captureId}/v2-${gate.gateId}`);
@@ -1209,8 +1257,8 @@ export async function runBackupV2RemoteWorker(
         }
       }
       const run = createBackupV2MetadataRunner(stage, native);
-      await prepareRecipient(settings.captureSettings, stage, run);
-      let result: BackupV2Result | BackupV2VerifiedResult;
+      if (kind !== "prune") await prepareRecipient(settings.captureSettings, stage, run);
+      let result: BackupV2Result | BackupV2VerifiedResult | BackupV2PruneResult;
       if (kind === "worker") {
         const checkpoints = await previousSealedRoles(
           settings,
@@ -1264,7 +1312,7 @@ export async function runBackupV2RemoteWorker(
           progress: (value, active) => work.capture(value, active),
           now: () => new Date(),
         });
-      } else {
+      } else if (kind === "verify") {
         if (!verifyInput) fail();
         const publicHome = `${PUBLIC_HOME_BASE}/${request.captureId}`;
         await ensurePublicHome(publicHome, run);
@@ -1376,16 +1424,28 @@ export async function runBackupV2RemoteWorker(
             workerResultBytes: new Uint8Array(verifyInput.workerResultBytes),
           },
         );
+      } else {
+        if (!pruneInput) fail();
+        const caps = await createBackupV2PruneRuntime(pruneInput, {
+          exactStore: store,
+          async observeFresh() { await native.assertManaged(); return await readPrune(); },
+          validateLegacy: validateCatalogEntry,
+          async progress(value) {work.retention(value.inventoryMembers); await supervise();},
+          now: () => new Date(), signal: supervisor.signal,
+        });
+        result = await runBackupV2SourcePruner(pruneInput,caps);
       }
-      for (const record of journal.snapshot()) if (record.type === "selected") remember(record.object);
-      const graph = buildBackupV2Protection(result.selectedRoot.reference, [...protectedObjects.values()]);
-      await rootDirectory(BACKUP_V2_PROTECTION_SOURCE_BASE);
-      const graphDirectory = backupV2ProtectionSourceDirectory(graph.descriptor.manifestSha256);
-      await rootDirectory(graphDirectory);
-      for (const page of graph.pages) await atomicArtifact(graphDirectory, backupV2ProtectionPageName(page.value.pageIndex), page.value, true);
-      await atomicArtifact(graphDirectory, "manifest.json", graph.manifest, true);
-      await atomicArtifact(graphDirectory, "descriptor.json", graph.descriptor, true);
-      result = {...result, protectedGraph: graph.descriptor};
+      if ("selectedRoot" in result) {
+        for (const record of journal.snapshot()) if (record.type === "selected") remember(record.object);
+        const graph = buildBackupV2Protection(result.selectedRoot.reference, [...protectedObjects.values()]);
+        await rootDirectory(BACKUP_V2_PROTECTION_SOURCE_BASE);
+        const graphDirectory = backupV2ProtectionSourceDirectory(graph.descriptor.manifestSha256);
+        await rootDirectory(graphDirectory);
+        for (const page of graph.pages) await atomicArtifact(graphDirectory, backupV2ProtectionPageName(page.value.pageIndex), page.value, true);
+        await atomicArtifact(graphDirectory, "manifest.json", graph.manifest, true);
+        await atomicArtifact(graphDirectory, "descriptor.json", graph.descriptor, true);
+        result = {...result, protectedGraph: graph.descriptor};
+      }
       terminal = true;
       loopAbort.abort();
       await monitor;
@@ -1395,15 +1455,16 @@ export async function runBackupV2RemoteWorker(
         nativeFacts = await nativeCustody.flush();
       }
       if (nativeFacts.children.some(child => child.exit === null) || nativeFacts.unresolvedNamespaceLeaders.length) fail();
-      result={...result,nativeCustodySha256:nativeFacts.sha256};
+      const completedResult={...result,nativeCustodySha256:nativeFacts.sha256};
       const resultSha256 = await atomicArtifact(
         directory,
         BACKUP_V2_RESULT_FILE,
-        result,
+        completedResult,
         true,
       );
-      work.phase = kind === "worker" ? "CLOUD_COMPLETE" : "ACCEPTED";
-      const status = await writeStatus(new Date().toISOString(), resultSha256);
+      const partial = "state" in result && result.state === "PARTIAL";
+      work.phase = kind === "worker" ? "CLOUD_COMPLETE" : kind === "verify" ? "ACCEPTED" : partial ? "FAILED" : "CLEANED";
+      const status = await writeStatus(new Date().toISOString(), partial ? null : resultSha256);
       journal.close();
       await nativeCustody.close();
       notifier.close(); // No STOPPING: retain active/exited custody.
@@ -1412,4 +1473,12 @@ export async function runBackupV2RemoteWorker(
       return await cancel(error);
     }
   });
+}
+
+export type BackupV2PruneWorkerResult = BackupV2PruneResult & {nativeCustodySha256: string};
+
+// Maintenance uses the existing private JSON convention and no new CLI flag.
+if (import.meta.main) {
+  const status = await runBackupV2RemoteWorker(Deno.cwd().split("/").at(-1)!, "prune");
+  if (status.phase === "FAILED" || status.phase === "CANCELLATION_BLOCKED") Deno.exitCode = 1;
 }

@@ -25,6 +25,11 @@ import {
   validateCatalogEntry,
   validateControllerState,
   validateReleaseManifest,
+  generationPrefixes,
+  type PrunePlanEntry,
+  revalidatePruneDeletions,
+  retainedIdsPresent,
+  selectPruneCandidates,
   verifyUnitName,
   weekWindow,
   withinCatchUp,
@@ -52,6 +57,7 @@ import {
   type BackupV2WorkerSettings,
   validateBackupV2VerifiedResult,
   validateBackupV2WorkerSettings,
+  type BackupV2PruneWorkerResult,
 } from "./backup-v2-worker.ts";
 import {
   type BackupV2SupervisorIdentity,
@@ -59,7 +65,7 @@ import {
   type BackupV2TreeObservation,
   settleBackupV2Cancellation,
 } from "./backup-v2-supervisor.ts";
-import { BACKUP_V2_LIMITS, BACKUP_V2_PROFILE_ID } from "./backup-v2-profile.ts";
+import { BACKUP_V2_LIMITS, BACKUP_V2_PROFILE_ID, BACKUP_V2_NAMESPACE } from "./backup-v2-profile.ts";
 import { type CaptureSettings } from "./backblaze-capture.ts";
 import { backupV2SourceConfigSha256 } from "./backup-v2-metadata.ts";
 import {
@@ -77,7 +83,9 @@ import { validateBackupV2ObjectRef } from "./backup-v2-contract.ts";
 import type { BackupV2KernelObservationOptions, BackupV2KernelObservation } from "./backup-v2-kernel.ts";
 import {
   type BackupV2ProtectionDescriptor,
+  type BackupV2PruneInput,
   BACKUP_V2_PROTECTION_SOURCE_BASE,
+  BACKUP_V2_PROTECTION_CONTROL_BASE,
   backupV2ProtectionControlDirectory,
   backupV2ProtectionPageName,
   backupV2ProtectionSourceDirectory,
@@ -939,11 +947,14 @@ export function backupV2Entrypoint(
 }
 export function backupV2LaunchArguments(
   settings: BackupV2WorkerSettings,
-  kind: "worker" | "verify",
+  kind: "worker" | "verify" | "prune",
+  pruneGate?: BackupV2Gate,
 ): string[] {
   validateBackupV2WorkerSettings(settings);
   const request = settings.envelope.request,
-    gate = kind === "worker" ? settings.workerGate : settings.verifierGate;
+    gate = kind === "prune" ? validateBackupV2Gate(pruneGate) : kind === "worker" ? settings.workerGate : settings.verifierGate;
+  if (gate.kind !== kind) fail();
+  same(gate.envelope, settings.envelope);
   const runtime = `${JOBS_RUNTIME_ROOT}/${request.jobId}`,
     publicHome = `${PUBLIC_HOME_BASE}/${request.captureId}`;
   const stagingDevice =
@@ -991,7 +1002,7 @@ export function backupV2LaunchArguments(
     "--allow-env=INVOCATION_ID,NOTIFY_SOCKET",
     "--allow-ffi=/usr/lib/libsystemd.so.0",
     "--allow-run=/usr/bin/bash,/usr/bin/unshare,/usr/bin/gpg,/usr/bin/zstd,/usr/bin/tar,/usr/bin/mkfifo,/usr/bin/curl,/usr/bin/sudo,/usr/bin/cat,/usr/bin/chown,/usr/bin/find,/usr/bin/stat,/usr/bin/readlink",
-    `${runtime}/entry-${kind}.ts`,
+    kind === "prune" ? `${RELEASES_ROOT}/${request.sourceRevision}/scripts/backup-v2-worker.ts` : `${runtime}/entry-${kind}.ts`,
   ];
 }
 
@@ -1411,6 +1422,161 @@ test "$(systemctl show --value --property=InvocationID ${
   };
 }
 
+export interface BackupV2RetentionControl {
+  schemaVersion: 2;
+  format: "backup-v2-retention-controller";
+  input: BackupV2PruneInput;
+  gate: BackupV2Gate;
+  phase: "REQUESTED" | "RUNNING" | "SETTLED" | "COMPLETE" | "PARTIAL" | "CANCELLATION_BLOCKED";
+  result: BackupV2PruneWorkerResult | null;
+  legacyPlan?: PrunePlanEntry[];
+}
+export function validateBackupV2PruneWorkerResult(value: unknown, gate: BackupV2Gate, input: BackupV2PruneInput): BackupV2PruneWorkerResult {
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail();
+  const r = value as BackupV2PruneWorkerResult;
+  const keys = ["schemaVersion","format","gate","transactionId","stage","state","plan","retainedCaptureIds","obsoleteLegacyCaptureIds","finishedAtUtc","nativeCustodySha256"];
+  if (Object.keys(r).length !== keys.length || keys.some((key) => !Object.hasOwn(r,key)) || r.schemaVersion !== 2 || r.format !== "backup-v2-prune-result" || r.transactionId !== input.transactionId || r.stage !== input.stage || !/^[a-f0-9]{64}$/.test(r.nativeCustodySha256) || !["PLAN_PROVED","COMPLETE","PARTIAL"].includes(r.state) || (r.stage === "PLAN") !== (r.state === "PLAN_PROVED") || new Date(r.finishedAtUtc).toISOString() !== r.finishedAtUtc) fail();
+  const actual = validateBackupV2Gate(r.gate);
+  same({...actual,updatedAtUtc:gate.updatedAtUtc},gate);
+  if (!r.plan || !/^[a-f0-9]{64}$/.test(r.plan.sha256) || !/^[a-f0-9]{64}$/.test(r.plan.digest) || !Number.isSafeInteger(r.plan.bytes) || r.plan.bytes < 1 || r.plan.bytes > BACKUP_V2_LIMITS.journalBytes) fail();
+  if (input.stage === "EXECUTE") same(r.plan,input.plan);
+  if (!Array.isArray(r.retainedCaptureIds) || r.retainedCaptureIds.length !== 4 || new Set(r.retainedCaptureIds).size !== 4 || !Array.isArray(r.obsoleteLegacyCaptureIds)) fail();
+  const ids = input.snapshot.catalog.map((entry) => entry.format === "backup-v1" ? entry.entry.index.generation : entry.envelope.request.captureId);
+  if (r.retainedCaptureIds.some((id) => !ids.includes(id)) || r.obsoleteLegacyCaptureIds.some((id) => r.retainedCaptureIds.includes(id) || !input.snapshot.catalog.some((entry) => entry.format === "backup-v1" && entry.entry.index.generation === id))) fail();
+  return structuredClone(r);
+}
+
+/** Each call only reconciles one managed stage. A saved plan precedes execution;
+ * no detached deletion or fixed whole-job deadline is introduced. */
+export async function runBackupV2RetentionCycle(state: BackupV2ControllerState, deps: PiDeps, caps: BackupV2ControllerCapabilities): Promise<BackblazeRunReport | null> {
+  const job = state.job;
+  if (!job || job.phase !== "COMPLETE" || !job.verified?.protectedGraph || state.catalog.length < 4) return null;
+  const settings = job.settings, path = `.private/file-backup/retention/${settings.envelope.request.jobId}.json`;
+  let control = await deps.private.read<BackupV2RetentionControl>(path);
+  const save = () => deps.private.write(path,control);
+  const report = (healthy = false): BackblazeRunReport => ({status:`B2_RETENTION_${control!.input.stage}_${control!.phase}`,observedAtUtc:deps.now().toISOString(),healthy,jobId:settings.envelope.request.jobId,generation:settings.envelope.request.captureId,detail:control!.phase === "COMPLETE" ? "Four complete recovery points retained" : "Backup accepted; reference-safe retention is separately in progress"});
+  const gate = (sourceBootId: string) => {
+    const id = crypto.randomUUID(), now = deps.now().toISOString();
+    return validateBackupV2Gate({...settings.verifierGate,kind:"prune",gateId:id,sourceBootId,unitName:`arch-vps-b2-v2-prune-${settings.envelope.request.captureId.slice("generation-".length)}-${id}.service`,state:"PENDING",custody:null,createdAtUtc:now,updatedAtUtc:now});
+  };
+  if (!control) {
+    if (await caps.gate.read() !== null) fail();
+    await caps.admit(state.legacy);
+    const result = await deps.remote.root(remoteProgram(`const {discoverBackupV2UnresolvedPuts}=await import(${JSON.stringify(`${RELEASES_ROOT}/${settings.envelope.request.sourceRevision}/scripts/backup-v2-worker.ts`)});const boot=await new Deno.Command("/usr/bin/cat",{args:["/proc/sys/kernel/random/boot_id"],clearEnv:true,env:{PATH:"/usr/bin:/bin"},stdout:"piped",stderr:"piped"}).output();if(!boot.success)throw Error("Source boot unavailable");console.log(JSON.stringify({sourceBootId:new TextDecoder().decode(boot.stdout).trim(),unresolvedPuts:await discoverBackupV2UnresolvedPuts()}));`));
+    if (result.code !== 0 || result.stdout.length > BACKUP_V2_LIMITS.controlResponseBytes) fail();
+    const observed = JSON.parse(result.stdout), graphs: BackupV2ProtectionDescriptor[] = [];
+    for (const entry of state.catalog) if (entry.format === "backup-v2") {
+      const bytes = await deps.private.readBytes(`${BACKUP_V2_PROTECTION_CONTROL_BASE}/roots/${entry.selectedRoot.reference.plaintextSha256}.json`,BACKUP_V2_LIMITS.controlResponseBytes);
+      if (!bytes) fail();
+      const descriptor = validateBackupV2ProtectionDescriptor(JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(bytes)));
+      same(descriptor.root,entry.selectedRoot.reference); graphs.push(descriptor);
+    }
+    const retained = [...state.catalog].sort((a,b) => Date.parse(b.format === "backup-v1" ? b.entry.acceptedAtUtc : b.acceptedAtUtc) - Date.parse(a.format === "backup-v1" ? a.entry.acceptedAtUtc : a.acceptedAtUtc)).slice(0,4);
+    const pending = gate(observed.sourceBootId);
+    control = {schemaVersion:2,format:"backup-v2-retention-controller",phase:"REQUESTED",gate:pending,result:null,input:{schemaVersion:2,format:"backup-v2-prune",gate:pending,transactionId:crypto.randomUUID(),stage:"PLAN",plan:null,graphs,snapshot:{catalog:state.catalog,custody:{lockId:GATE_SOURCE_LOCK_PATH,sourceBootId:observed.sourceBootId,sourceSettled:true},receipts:retained.flatMap((entry) => entry.format === "backup-v2" ? [entry.receiptReference] : []),protection:{acceptedRoots:[],activeObjects:[],sealedRoleManifests:[],unresolvedPuts:observed.unresolvedPuts}}}};
+    await save();
+  }
+  if (control.schemaVersion !== 2 || control.format !== "backup-v2-retention-controller" || control.gate.kind !== "prune") fail();
+  same(control.gate.envelope,settings.envelope);
+  if (control.phase === "COMPLETE") return null;
+  if (["PARTIAL","CANCELLATION_BLOCKED"].includes(control.phase)) return report();
+  if (control.phase === "REQUESTED") {
+    if (await caps.gate.read() !== null) fail();
+    const before = await caps.observe(control.gate);
+    if (before.unit !== "ABSENT" || before.sourceBootId !== control.gate.sourceBootId) fail();
+    await installBackupV2Artifact(deps,`${JOBS_RUNTIME_ROOT}/${settings.envelope.request.jobId}/prune-${control.input.stage === "PLAN" ? "plan" : "execute"}-request.json`,control.input);
+    await caps.gate.replace(null,control.gate);
+    control.phase = "RUNNING"; await save();
+    if ((await deps.remote.root(backupV2LaunchArguments(settings,"prune",control.gate).map(shellQuote).join(" "))).code !== 0) throw new Error("Prune launch outcome unproved");
+    return report(true);
+  }
+  if (control.phase === "RUNNING") {
+    const observed = await caps.observe(control.gate);
+    if (!observed.identity) return report();
+    if (!control.gate.custody) {
+      const bound = validateBackupV2Gate({...control.gate,state:"ACTIVE",custody:observed.identity,updatedAtUtc:deps.now().toISOString()});
+      await caps.gate.replace(control.gate,bound);control.gate=bound;await save();
+    }
+    await caps.acknowledge(control.gate);
+    if (!observed.status) return report(true);
+    const status = validateBackupV2Status(observed.status,control.gate);
+    if (status.phase === "CANCELLATION_BLOCKED") {control.phase="CANCELLATION_BLOCKED";await save();return report();}
+    if (status.finishedAtUtc === null) {
+      const fresh = Math.abs(deps.now().getTime()-Date.parse(status.updatedAtUtc)) <= 60_000;
+      const leased = Math.max(status.lease.usefulProgressExpiresAtMs,status.lease.retryEpisode?.expiresAtMs ?? 0,status.lease.transferEpisode?.expiresAtMs ?? 0) > status.lease.observedMonotonicMs;
+      return report(fresh && leased);
+    }
+    if (["RUNNING","STARTING"].includes(observed.unit)) return report(true);
+    if (!observed.resultBytes || !observed.nativeCustodySha256 || status.phase === "CLEANED" && status.resultSha256 !== backupV2ArtifactSha256(observed.resultBytes)) fail();
+    const result = validateBackupV2PruneWorkerResult(JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(observed.resultBytes)),control.gate,control.input);
+    if (result.nativeCustodySha256 !== observed.nativeCustodySha256) fail();
+    if (!backupV2ProcessesSettled(control.gate,observed)) {
+      if (result.state !== "PARTIAL" || await caps.cancel(control.gate) !== "SETTLED") {control.phase="CANCELLATION_BLOCKED";await save();return report();}
+    }
+    control.result=result;control.phase="SETTLED";await save();
+    return report(true);
+  }
+  if (!control.result) fail();
+  const result = control.result;
+  const live = await caps.gate.read();
+  if (live !== null) {
+    same(validateBackupV2Gate(live),control.gate);
+    const observed = await caps.observe(control.gate);
+    if (observed.unit !== "ABSENT") {
+      if (!observed.resultBytes) fail();
+      await caps.stop(control.gate,{resultSha256:backupV2ArtifactSha256(observed.resultBytes),nativeCustodySha256:result.nativeCustodySha256});
+    }
+    await caps.gate.replace(control.gate,null);
+  } else if (!await caps.gate.cleared(control.gate)) fail();
+  if (result.state === "PARTIAL") {control.phase="PARTIAL";await save();return report();}
+  if (control.input.stage === "PLAN") {
+    await deps.private.write(`${path}.plan-proved.json`,control);
+    const next = gate(control.gate.sourceBootId);
+    control={...control,phase:"REQUESTED",gate:next,result:null,input:{...control.input,gate:next,stage:"EXECUTE",plan:result.plan}};
+    await save();return report(true);
+  }
+  const retained = state.catalog.filter((entry) => result.retainedCaptureIds.includes(entry.format === "backup-v1" ? entry.entry.index.generation : entry.envelope.request.captureId));
+  if (retained.length !== 4) fail();
+  const store = deps.metadataStore((await loadSourceConfig(deps)).b2);
+  const retainedLegacy = retained.filter((entry) => entry.format === "backup-v1");
+  const freshInventory = async () => (await Promise.all([store.versions(),store.versions(BACKUP_V2_NAMESPACE)])).flat();
+  let inventory = await freshInventory();
+  const selection = selectPruneCandidates(inventory,state.legacy.catalog,retainedLegacy.length);
+  same([...selection.toPrune].sort(),[...result.obsoleteLegacyCaptureIds].sort());
+  const protectedIds = new Set(selection.retainedFileIds);
+  for (const entry of retained) if (entry.format === "backup-v2") {
+    const descriptor = control.input.graphs.find((graph) => graph.root.plaintextSha256 === entry.selectedRoot.reference.plaintextSha256);
+    if (!descriptor) fail();
+    const base = backupV2ProtectionControlDirectory(descriptor.manifestSha256), bytes = await deps.private.readBytes(`${base}/manifest.json`,BACKUP_V2_LIMITS.controlResponseBytes);
+    if (!bytes) fail();
+    const manifest = parseBackupV2ProtectionManifest(bytes,descriptor);
+    for (const page of manifest.pages) {
+      const raw = await deps.private.readBytes(`${base}/${backupV2ProtectionPageName(page.pageIndex)}`,BACKUP_V2_LIMITS.controlResponseBytes);
+      if (!raw) fail();
+      for (const object of parseBackupV2ProtectionPage(raw,manifest,page.pageIndex).objects) protectedIds.add(object.fileId);
+    }
+  }
+  if (!control.legacyPlan) {
+    control.legacyPlan = selection.toPrune.map((generation) => ({generation,fileIds:selection.toDelete.filter((object) => generationPrefixes(generation).some((prefix) => object.fileName.startsWith(prefix))).map((object) => object.fileId)}));
+    await save();
+  }
+  for (const entry of control.legacyPlan) for (const id of entry.fileIds) {
+    inventory = await freshInventory();
+    if (!retainedIdsPresent(inventory,[...protectedIds])) fail();
+    const check = revalidatePruneDeletions(inventory,control.legacyPlan,selection.toPrune,[...protectedIds]);
+    if (check.violation) fail();
+    const object = check.pending.find((item) => item.fileId === id);
+    if (object) await store.remove(object);
+  }
+  inventory = await freshInventory();
+  const final = revalidatePruneDeletions(inventory,control.legacyPlan,selection.toPrune,[...protectedIds]);
+  if (final.violation || final.pending.length || !retainedIdsPresent(inventory,[...protectedIds])) fail();
+  await deps.private.write(`${path}.before-catalog-trim.json`,state);
+  state.catalog=retained;state.legacy.catalog=retainedLegacy.map((entry) => entry.entry);
+  await deps.private.write(CONTROLLER_STATE_PATH,validateBackupV2ControllerState(state));
+  control.phase="COMPLETE";await save();return null;
+}
+
 export async function runBackupV2ControllerCycle(
   deps: PiDeps,
   bridge: BackupV2ControllerCapabilities["bridge"],
@@ -1435,7 +1601,15 @@ export async function runBackupV2ControllerCycle(
     if (["WORKER", "VERIFY"].includes(job.phase) && status !== null) break;
     if (["WORKER", "VERIFY"].includes(job.phase)) await deps.sleep(1000);
   } while (performance.now() < deadline);
-  const report = backupV2ControllerReport(state!, deps.now());
+  let retention: BackblazeRunReport | null = null;
+  do {
+    retention = await runBackupV2RetentionCycle(state!,deps,caps);
+    if (!retention || !retention.healthy) break;
+    const current = await deps.private.read<BackupV2RetentionControl>(`.private/file-backup/retention/${state!.job!.settings.envelope.request.jobId}.json`);
+    if (current?.phase === "RUNNING" && current.gate.custody && current.result === null) break;
+    await deps.sleep(1000);
+  } while (performance.now() < deadline);
+  const report = retention ?? backupV2ControllerReport(state!, deps.now());
   await deps.private.write(B2_REPORT_PATH, report);
   return report;
 }
