@@ -3,50 +3,110 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { lstat, stat, statfs } from "node:fs/promises";
-import { type CaptureSettings, gpgArgs, prepareRecipient, recordToolVersions, validateCaptureSettings } from "./backblaze-capture.ts";
+import {
+  type CaptureSettings,
+  gpgArgs,
+  prepareRecipient,
+  recordToolVersions,
+  validateCaptureSettings,
+} from "./backblaze-capture.ts";
 import { type B2Settings, validateB2Settings } from "./backblaze-storage.ts";
 import {
-  type BackupV2CaptureContext, type BackupV2CapturedRole, type BackupV2CaptureProgress,
-  captureBackupV2Generation, createBackupV2RoleProducer,
+  type BackupV2CaptureContext,
+  type BackupV2CapturedRole,
+  type BackupV2CaptureProgress,
+  captureBackupV2Generation,
+  createBackupV2RoleProducer,
 } from "./backup-v2-capture.ts";
 import {
-  type BackupV2ManifestRef, type BackupV2Progress, type BackupV2Receipt,
-  type BackupV2RoleManifest, type BackupV2Root, BACKUP_V2_ROLES,
-  validateBackupV2RoleManifest, validateBackupV2Root, validateBackupV2Receipt,
+  BACKUP_V2_ROLES,
+  type BackupV2ManifestRef,
+  type BackupV2Progress,
+  type BackupV2Receipt,
+  type BackupV2RoleManifest,
+  type BackupV2TransferEpisode,
+  backupV2TransferWindowMs,
   validateBackupV2ManifestRef,
+  validateBackupV2Receipt,
+  validateBackupV2RoleManifest,
+  validateBackupV2Root,
 } from "./backup-v2-contract.ts";
 import { BackupV2DocumentPublisher } from "./backup-v2-index.ts";
 import { backupV2SourceConfigSha256 } from "./backup-v2-metadata.ts";
+import type { BackupV2ReusedRole } from "./backup-v2-metadata.ts";
 import {
-  type BackupV2ReaderCapabilities, type BackupV2RootVerification,
-  createBackupV2Reader, verifyBackupV2Root,
+  type BackupV2ReaderCapabilities,
+  type BackupV2RootVerification,
+  createBackupV2Reader,
+  verifyBackupV2Root,
 } from "./backup-v2-recovery.ts";
 import {
-  type BackupV2Execution, type BackupV2Gate, type BackupV2RequestEnvelope,
-  type BackupV2Result, type BackupV2SelectedRoot, type BackupV2Status,
-  validateBackupV2Gate, validateBackupV2RequestEnvelope, validateBackupV2Result,
+  type BackupV2Execution,
+  type BackupV2Gate,
+  type BackupV2RequestEnvelope,
+  type BackupV2Result,
+  type BackupV2SelectedRoot,
+  type BackupV2Status,
+  validateBackupV2Gate,
+  validateBackupV2RequestEnvelope,
+  validateBackupV2Result,
 } from "./backup-v2-runtime-contract.ts";
 import type { BackupV2UploadIdentity } from "./backup-v2-upload.ts";
-import { createBackupV2UploadPacer, openBackupV2UploadJournal } from "./backup-v2-upload.ts";
-import { BackupV2Spool, createBackupV2FileSpoolStorage, assertBackupV2Directory } from "./backup-v2-spool.ts";
+import type { BackupV2UploadRetryEpisode } from "./backup-v2-upload.ts";
+import {
+  createBackupV2UploadPacer,
+  openBackupV2UploadJournal,
+} from "./backup-v2-upload.ts";
+import {
+  assertBackupV2Directory,
+  BackupV2Spool,
+  createBackupV2FileSpoolStorage,
+} from "./backup-v2-spool.ts";
 import { BACKUP_V2_LIMITS } from "./backup-v2-profile.ts";
 import { BackupV2Store, BackupV2TransportError } from "./backup-v2-store.ts";
 import { createBackupV2FileObjectReader } from "./backup-v2-recovery.ts";
-import { BackupV2Supervisor, createBackupV2Notifier, type BackupV2CapacityObservation } from "./backup-v2-supervisor.ts";
-import { assertBackupV2StatusTransition, validateBackupV2Status } from "./backup-v2-runtime-contract.ts";
-import { GATE_BACKUP_CGROUP_ROOT, GATE_SOURCE_LOCK_PATH } from "./backblaze-controller-contract.ts";
+import {
+  type BackupV2CapacityObservation,
+  BackupV2Supervisor,
+  createBackupV2Notifier,
+} from "./backup-v2-supervisor.ts";
+import {
+  assertBackupV2StatusTransition,
+  validateBackupV2Status,
+} from "./backup-v2-runtime-contract.ts";
+import {
+  GATE_BACKUP_CGROUP_ROOT,
+  GATE_SOURCE_LOCK_PATH,
+} from "./backblaze-controller-contract.ts";
 import { withBackupLock } from "./backup-lock.ts";
 import { createBackupV2MetadataRunner } from "./backup-v2-metadata.ts";
-import { BACKUP_BASE, JOBS_RUNTIME_ROOT, PUBLIC_HOME_BASE, RELEASES_ROOT, backupChildProcessOptions, ensurePublicHome, importRecipient, makeStreamDecryptArchive, validateReleaseManifest } from "./backblaze-file-backup.ts";
+import {
+  BACKUP_BASE,
+  backupChildProcessOptions,
+  ensurePublicHome,
+  importRecipient,
+  JOBS_RUNTIME_ROOT,
+  makeStreamDecryptArchive,
+  PUBLIC_HOME_BASE,
+  RELEASES_ROOT,
+  validateReleaseManifest,
+} from "./backblaze-file-backup.ts";
 
 export const BACKUP_V2_STATUS_FILE = "status.json";
 export const BACKUP_V2_RESULT_FILE = "result.json";
 export const BACKUP_V2_CHECKPOINT_FILE = "sealed-roles.json";
+export const BACKUP_V2_GATE_FILE = "gate.json";
 const encoder = new TextEncoder();
-export const backupV2ArtifactBytes = (value: unknown) => encoder.encode(JSON.stringify(value) + "\n");
-export const backupV2ArtifactSha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
-function fail(): never { throw new Error("Backup v2 worker input or custody invalid"); }
-function same(a: unknown, b: unknown): void { if (!isDeepStrictEqual(a,b)) fail(); }
+export const backupV2ArtifactBytes = (value: unknown) =>
+  encoder.encode(JSON.stringify(value) + "\n");
+export const backupV2ArtifactSha256 = (bytes: Uint8Array) =>
+  createHash("sha256").update(bytes).digest("hex");
+function fail(): never {
+  throw new Error("Backup v2 worker input or custody invalid");
+}
+function same(a: unknown, b: unknown): void {
+  if (!isDeepStrictEqual(a, b)) fail();
+}
 
 export interface BackupV2WorkerSettings {
   schemaVersion: 2;
@@ -58,19 +118,58 @@ export interface BackupV2WorkerSettings {
   verifierGate: BackupV2Gate;
   publicationAttemptId: string;
 }
-export function validateBackupV2WorkerSettings(value: unknown): BackupV2WorkerSettings {
+export function validateBackupV2WorkerSettings(
+  value: unknown,
+): BackupV2WorkerSettings {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail();
   const r = value as Record<string, unknown>;
-  const fields = ["schemaVersion", "format", "envelope", "captureSettings", "B2Settings", "workerGate", "verifierGate", "publicationAttemptId"];
-  if (Object.keys(r).length !== fields.length || fields.some((key) => !Object.hasOwn(r, key)) || r.schemaVersion !== 2 || r.format !== "backup-v2") fail();
-  const envelope = validateBackupV2RequestEnvelope(r.envelope), workerGate = validateBackupV2Gate(r.workerGate), verifierGate = validateBackupV2Gate(r.verifierGate);
+  const fields = [
+    "schemaVersion",
+    "format",
+    "envelope",
+    "captureSettings",
+    "B2Settings",
+    "workerGate",
+    "verifierGate",
+    "publicationAttemptId",
+  ];
+  if (
+    Object.keys(r).length !== fields.length ||
+    fields.some((key) => !Object.hasOwn(r, key)) || r.schemaVersion !== 2 ||
+    r.format !== "backup-v2"
+  ) fail();
+  const envelope = validateBackupV2RequestEnvelope(r.envelope),
+    workerGate = validateBackupV2Gate(r.workerGate),
+    verifierGate = validateBackupV2Gate(r.verifierGate);
   const captureSettings = structuredClone(r.captureSettings) as CaptureSettings;
-  validateCaptureSettings(captureSettings); validateB2Settings(r.B2Settings as B2Settings);
+  validateCaptureSettings(captureSettings);
+  validateB2Settings(r.B2Settings as B2Settings);
   for (const gate of [workerGate, verifierGate]) same(gate.envelope, envelope);
-  if (workerGate.kind !== "worker" || verifierGate.kind !== "verify" || workerGate.gateId === verifierGate.gateId || workerGate.sourceBootId !== verifierGate.sourceBootId ||
-    captureSettings.generation !== envelope.request.captureId || captureSettings.recipientSha256 !== envelope.request.recipientSha256 || captureSettings.recipientFingerprint !== envelope.request.recipientFingerprint ||
-    backupV2SourceConfigSha256(captureSettings) !== envelope.request.sourceConfigSha256 || typeof r.publicationAttemptId !== "string" || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(r.publicationAttemptId)) fail();
-  return { schemaVersion: 2, format: "backup-v2", envelope, captureSettings, B2Settings: structuredClone(r.B2Settings) as B2Settings, workerGate, verifierGate, publicationAttemptId: r.publicationAttemptId };
+  if (
+    workerGate.kind !== "worker" || verifierGate.kind !== "verify" ||
+    workerGate.gateId === verifierGate.gateId ||
+    workerGate.sourceBootId !== verifierGate.sourceBootId ||
+    captureSettings.generation !== envelope.request.captureId ||
+    captureSettings.recipientSha256 !== envelope.request.recipientSha256 ||
+    captureSettings.recipientFingerprint !==
+      envelope.request.recipientFingerprint ||
+    backupV2SourceConfigSha256(captureSettings) !==
+      envelope.request.sourceConfigSha256 ||
+    typeof r.publicationAttemptId !== "string" ||
+    !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(
+      r.publicationAttemptId,
+    )
+  ) fail();
+  return {
+    schemaVersion: 2,
+    format: "backup-v2",
+    envelope,
+    captureSettings,
+    B2Settings: structuredClone(r.B2Settings) as B2Settings,
+    workerGate,
+    verifierGate,
+    publicationAttemptId: r.publicationAttemptId,
+  };
 }
 export interface BackupV2SealedRoleCheckpoint {
   capture: BackupV2CapturedRole;
@@ -83,65 +182,175 @@ export interface BackupV2CaptureWorkerDependencies {
   context: BackupV2CaptureContext;
   publisher(identity: BackupV2UploadIdentity): BackupV2DocumentPublisher;
   checkpoint(value: BackupV2SealedRoleCheckpoint): Promise<void>;
-  progress(value: BackupV2CaptureProgress, active: BackupV2Status["activeRoleAttempt"]): void | Promise<void>;
+  progress(
+    value: BackupV2CaptureProgress,
+    active: BackupV2Status["activeRoleAttempt"],
+  ): void | Promise<void>;
   capture?: typeof captureBackupV2Generation;
+  reused?: readonly BackupV2SealedRoleCheckpoint[];
   now(): Date;
 }
 function execution(gate: BackupV2Gate): BackupV2Execution {
   if (gate.state !== "ACTIVE" || !gate.custody) fail();
-  return { gateId: gate.gateId, sourceBootId: gate.sourceBootId, custody: gate.custody };
+  return {
+    gateId: gate.gateId,
+    sourceBootId: gate.sourceBootId,
+    custody: gate.custody,
+  };
 }
-function roleManifest(value: BackupV2CapturedRole, pages: BackupV2RoleManifest["pages"]): BackupV2RoleManifest {
+function roleManifest(
+  value: BackupV2CapturedRole,
+  pages: BackupV2RoleManifest["pages"],
+): BackupV2RoleManifest {
   return validateBackupV2RoleManifest({
-    schemaVersion: 2, captureId: value.captureId, attemptId: value.attemptId, role: value.role, format: value.format,
-    ciphertextBytes: value.ciphertextBytes, ciphertextSha256: value.ciphertextSha256,
-    sourceConfigSha256: value.sourceConfigSha256, compatibilitySha256: value.compatibilitySha256,
-    recipientSha256: value.recipientSha256, recipientFingerprint: value.recipientFingerprint,
-    captureStartedAtUtc: value.captureStartedAtUtc, captureFinishedAtUtc: value.captureFinishedAtUtc,
-    uploadStartedAtUtc: value.uploadStartedAtUtc, uploadFinishedAtUtc: value.uploadFinishedAtUtc,
-    pages, inventory: value.inventory, producer: value.producer, metadata: [],
+    schemaVersion: 2,
+    captureId: value.captureId,
+    attemptId: value.attemptId,
+    role: value.role,
+    format: value.format,
+    ciphertextBytes: value.ciphertextBytes,
+    ciphertextSha256: value.ciphertextSha256,
+    sourceConfigSha256: value.sourceConfigSha256,
+    compatibilitySha256: value.compatibilitySha256,
+    recipientSha256: value.recipientSha256,
+    recipientFingerprint: value.recipientFingerprint,
+    captureStartedAtUtc: value.captureStartedAtUtc,
+    captureFinishedAtUtc: value.captureFinishedAtUtc,
+    uploadStartedAtUtc: value.uploadStartedAtUtc,
+    uploadFinishedAtUtc: value.uploadFinishedAtUtc,
+    pages,
+    inventory: value.inventory,
+    producer: value.producer,
+    metadata: [],
   });
 }
 
 /** Actual M05 -> M04 -> M02 capture and M06 publication. Test injection stays
  * at the component boundary; production callers use the fixed M05 default. */
-export async function captureBackupV2Worker(settingsInput: BackupV2WorkerSettings, gateInput: BackupV2Gate, deps: BackupV2CaptureWorkerDependencies): Promise<BackupV2Result> {
-  const settings = validateBackupV2WorkerSettings(settingsInput), gate = validateBackupV2Gate(gateInput);
+export async function captureBackupV2Worker(
+  settingsInput: BackupV2WorkerSettings,
+  gateInput: BackupV2Gate,
+  deps: BackupV2CaptureWorkerDependencies,
+): Promise<BackupV2Result> {
+  const settings = validateBackupV2WorkerSettings(settingsInput),
+    gate = validateBackupV2Gate(gateInput);
   same(gate.envelope, settings.envelope);
-  if (gate.kind !== "worker" || gate.gateId !== settings.workerGate.gateId) fail();
-  const owned = execution(gate), sealed = new Map<BackupV2CapturedRole["role"], BackupV2SealedRoleCheckpoint>();
+  if (gate.kind !== "worker" || gate.gateId !== settings.workerGate.gateId) {
+    fail();
+  }
+  const owned = execution(gate),
+    sealed = new Map<
+      BackupV2CapturedRole["role"],
+      BackupV2SealedRoleCheckpoint
+    >();
+  for (const value of deps.reused ?? []) {
+    const manifest = validateBackupV2RoleManifest(value.manifest),
+      reference = validateBackupV2ManifestRef(value.reference);
+    if (
+      sealed.has(manifest.role) ||
+      value.capture.captureId !== settings.envelope.request.captureId ||
+      manifest.captureId !== value.capture.captureId ||
+      manifest.role !== value.capture.role ||
+      manifest.attemptId !== value.capture.attemptId ||
+      manifest.sourceConfigSha256 !==
+        settings.envelope.request.sourceConfigSha256 ||
+      manifest.recipientSha256 !== settings.envelope.request.recipientSha256
+    ) fail();
+    same(manifest.captureStartedAtUtc, value.capture.captureStartedAtUtc);
+    same(manifest.captureFinishedAtUtc, value.capture.captureFinishedAtUtc);
+    sealed.set(manifest.role, { ...value, manifest, reference });
+  }
   let active: BackupV2Status["activeRoleAttempt"] = null;
-  const createProducer = deps.context.createProducer ?? createBackupV2RoleProducer;
-  const captured = await (deps.capture ?? captureBackupV2Generation)(settings.captureSettings, {
-    ...deps.context,
-    createProducer(params) { active = { role: params.role, attemptId: params.attemptId }; return createProducer(params); },
-    progress: (value) => deps.progress(value, active),
-    onRole: async (value, recovery?: unknown) => {
-      active = { role: value.role, attemptId: value.attemptId };
-      const publisher = deps.publisher({ captureId: value.captureId, attemptId: value.attemptId, role: value.role, kind: "manifest" });
-      const manifest = roleManifest(value, await publisher.publishChunkPages(value.chunks));
-      const reference = await publisher.publishRole(manifest), checkpoint = { capture: value, manifest, reference, recovery };
-      await deps.checkpoint(checkpoint);
-      sealed.set(value.role, checkpoint);
+  const createProducer = deps.context.createProducer ??
+    createBackupV2RoleProducer;
+  const captured = await (deps.capture ?? captureBackupV2Generation)(
+    settings.captureSettings,
+    {
+      ...deps.context,
+      reusedRoles: [...sealed.values()].map((
+        { capture, recovery },
+      ) => ({ capture, recovery } as BackupV2ReusedRole)),
+      createProducer(params) {
+        active = { role: params.role, attemptId: params.attemptId };
+        return createProducer(params);
+      },
+      progress: (value) => deps.progress(value, active),
+      onRole: async (value, recovery?: unknown) => {
+        active = { role: value.role, attemptId: value.attemptId };
+        const publisher = deps.publisher({
+          captureId: value.captureId,
+          attemptId: value.attemptId,
+          role: value.role,
+          kind: "manifest",
+        });
+        const manifest = roleManifest(
+          value,
+          await publisher.publishChunkPages(value.chunks),
+        );
+        const reference = await publisher.publishRole(manifest),
+          checkpoint = { capture: value, manifest, reference, recovery };
+        await deps.checkpoint(checkpoint);
+        sealed.set(value.role, checkpoint);
+      },
     },
-  });
-  if (sealed.size !== BACKUP_V2_ROLES.length || captured.roles.length !== BACKUP_V2_ROLES.length) fail();
-  const publication = { captureId: settings.envelope.request.captureId, attemptId: settings.publicationAttemptId, role: "recovery" as const };
-  const metadataReference = await deps.publisher({ ...publication, kind: "metadata" }).publishVerificationMetadata({
-    schemaVersion: 2, format: "backup-v2-verification-metadata", captureId: settings.envelope.request.captureId,
+  );
+  if (
+    sealed.size !== BACKUP_V2_ROLES.length ||
+    captured.roles.length !== BACKUP_V2_ROLES.length
+  ) fail();
+  const publication = {
+    captureId: settings.envelope.request.captureId,
+    attemptId: settings.publicationAttemptId,
+    role: "recovery" as const,
+  };
+  const metadataReference = await deps.publisher({
+    ...publication,
+    kind: "metadata",
+  }).publishVerificationMetadata({
+    schemaVersion: 2,
+    format: "backup-v2-verification-metadata",
+    captureId: settings.envelope.request.captureId,
     metadataSha256: captured.recovery.sha256,
-    bootSamples: captured.recovery.bootSamples.map((sample) => ({ role: sample.role, member: new TextDecoder("utf-8", { fatal: true }).decode(sample.member), bytes: sample.bytes, sha256: sample.sha256 })),
+    bootSamples: captured.recovery.bootSamples.map((sample) => ({
+      role: sample.role,
+      member: new TextDecoder("utf-8", { fatal: true }).decode(sample.member),
+      bytes: sample.bytes,
+      sha256: sample.sha256,
+    })),
   });
   const request = settings.envelope.request;
   const root = validateBackupV2Root({
-    schemaVersion: 2, format: "backup-v2", profile: request.profile, captureId: request.captureId,
-    periodKey: request.periodKey, sourceRevision: request.sourceRevision, sourceConfigSha256: request.sourceConfigSha256,
-    recipientSha256: request.recipientSha256, recipientFingerprint: request.recipientFingerprint,
-    roles: BACKUP_V2_ROLES.map((role) => { const value = sealed.get(role)!; return { role, attemptId: value.capture.attemptId, manifest: value.reference, captureStartedAtUtc: value.capture.captureStartedAtUtc, captureFinishedAtUtc: value.capture.captureFinishedAtUtc }; }),
+    schemaVersion: 2,
+    format: "backup-v2",
+    profile: request.profile,
+    captureId: request.captureId,
+    periodKey: request.periodKey,
+    sourceRevision: request.sourceRevision,
+    sourceConfigSha256: request.sourceConfigSha256,
+    recipientSha256: request.recipientSha256,
+    recipientFingerprint: request.recipientFingerprint,
+    roles: BACKUP_V2_ROLES.map((role) => {
+      const value = sealed.get(role)!;
+      return {
+        role,
+        attemptId: value.capture.attemptId,
+        manifest: value.reference,
+        captureStartedAtUtc: value.capture.captureStartedAtUtc,
+        captureFinishedAtUtc: value.capture.captureFinishedAtUtc,
+      };
+    }),
     metadata: [metadataReference.object],
   });
-  const reference = await deps.publisher({ ...publication, kind: "manifest" }).publishRoot(root);
-  return validateBackupV2Result({ schemaVersion: 2, format: "backup-v2", envelope: settings.envelope, ...owned, finishedAtUtc: deps.now().toISOString(), selectedRoot: { reference, root } }, gate);
+  const reference = await deps.publisher({ ...publication, kind: "manifest" })
+    .publishRoot(root);
+  return validateBackupV2Result({
+    schemaVersion: 2,
+    format: "backup-v2",
+    envelope: settings.envelope,
+    ...owned,
+    finishedAtUtc: deps.now().toISOString(),
+    selectedRoot: { reference, root },
+  }, gate);
 }
 
 export interface BackupV2VerifiedResult extends BackupV2Execution {
@@ -159,33 +368,108 @@ export async function verifyBackupV2Worker(
   gateInput: BackupV2Gate,
   workerResultInput: BackupV2Result,
   workerGateInput: BackupV2Gate,
-  deps: { reader: BackupV2ReaderCapabilities; verification: BackupV2RootVerification; publisher: BackupV2DocumentPublisher; workerResultBytes: Uint8Array },
+  deps: {
+    reader: BackupV2ReaderCapabilities;
+    verification: BackupV2RootVerification;
+    publisher: BackupV2DocumentPublisher;
+    workerResultBytes: Uint8Array;
+  },
 ): Promise<BackupV2VerifiedResult> {
-  const settings = validateBackupV2WorkerSettings(settingsInput), gate = validateBackupV2Gate(gateInput);
-  const workerGate = validateBackupV2Gate(workerGateInput), workerResult = validateBackupV2Result(workerResultInput, workerGate);
-  same(gate.envelope, settings.envelope); same(workerResult.envelope, settings.envelope);
-  if (gate.kind !== "verify" || gate.gateId !== settings.verifierGate.gateId || workerGate.gateId !== settings.workerGate.gateId) fail();
-  same(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(deps.workerResultBytes)), workerResult);
-  const reader = await createBackupV2Reader(workerResult.selectedRoot.reference, deps.reader);
+  const settings = validateBackupV2WorkerSettings(settingsInput),
+    gate = validateBackupV2Gate(gateInput);
+  const workerGate = validateBackupV2Gate(workerGateInput),
+    workerResult = validateBackupV2Result(workerResultInput, workerGate);
+  same(gate.envelope, settings.envelope);
+  same(workerResult.envelope, settings.envelope);
+  if (
+    gate.kind !== "verify" || gate.gateId !== settings.verifierGate.gateId ||
+    workerGate.gateId !== settings.workerGate.gateId
+  ) fail();
+  same(
+    JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(deps.workerResultBytes),
+    ),
+    workerResult,
+  );
+  const reader = await createBackupV2Reader(
+    workerResult.selectedRoot.reference,
+    deps.reader,
+  );
   same(reader.root, workerResult.selectedRoot.root);
   const receipt = await verifyBackupV2Root(reader, deps.verification);
   const receiptReference = await deps.publisher.publishReceipt(receipt);
-  return { schemaVersion: 2, format: "backup-v2-verified", envelope: settings.envelope, ...execution(gate), workerResultSha256: backupV2ArtifactSha256(deps.workerResultBytes), selectedRoot: workerResult.selectedRoot, receipt, receiptReference, finishedAtUtc: deps.verification.now().toISOString() };
+  return {
+    schemaVersion: 2,
+    format: "backup-v2-verified",
+    envelope: settings.envelope,
+    ...execution(gate),
+    workerResultSha256: backupV2ArtifactSha256(deps.workerResultBytes),
+    selectedRoot: workerResult.selectedRoot,
+    receipt,
+    receiptReference,
+    finishedAtUtc: deps.verification.now().toISOString(),
+  };
 }
 
 /** Kernel-bound controller parses this only together with its saved gate. */
-export function validateBackupV2VerifiedResult(value: unknown, gate: BackupV2Gate, worker: BackupV2Result, workerResultSha256: string): BackupV2VerifiedResult {
+export function validateBackupV2VerifiedResult(
+  value: unknown,
+  gate: BackupV2Gate,
+  worker: BackupV2Result,
+  workerResultSha256: string,
+): BackupV2VerifiedResult {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail();
-  const r = value as Record<string, unknown>, fields = ["schemaVersion", "format", "envelope", "gateId", "sourceBootId", "custody", "workerResultSha256", "selectedRoot", "receipt", "receiptReference", "finishedAtUtc"];
-  if (Object.keys(r).length !== fields.length || fields.some((key) => !Object.hasOwn(r, key)) || r.schemaVersion !== 2 || r.format !== "backup-v2-verified" || gate.kind !== "verify") fail();
-  const checkedGate = validateBackupV2Gate(gate), receipt = validateBackupV2Receipt(r.receipt);
-  same(r.envelope, checkedGate.envelope); same(r.selectedRoot, worker.selectedRoot); same(r.workerResultSha256, workerResultSha256);
-  same({ gateId: r.gateId, sourceBootId: r.sourceBootId, custody: r.custody }, execution(checkedGate));
+  const r = value as Record<string, unknown>,
+    fields = [
+      "schemaVersion",
+      "format",
+      "envelope",
+      "gateId",
+      "sourceBootId",
+      "custody",
+      "workerResultSha256",
+      "selectedRoot",
+      "receipt",
+      "receiptReference",
+      "finishedAtUtc",
+    ];
+  if (
+    Object.keys(r).length !== fields.length ||
+    fields.some((key) => !Object.hasOwn(r, key)) || r.schemaVersion !== 2 ||
+    r.format !== "backup-v2-verified" ||
+    gate.kind !== "verify"
+  ) fail();
+  const checkedGate = validateBackupV2Gate(gate),
+    receipt = validateBackupV2Receipt(r.receipt);
+  same(r.envelope, checkedGate.envelope);
+  same(r.selectedRoot, worker.selectedRoot);
+  same(r.workerResultSha256, workerResultSha256);
+  same(
+    { gateId: r.gateId, sourceBootId: r.sourceBootId, custody: r.custody },
+    execution(checkedGate),
+  );
   same(receipt.root, worker.selectedRoot.reference);
-  if (receipt.captureId !== checkedGate.envelope.request.captureId || receipt.recipientSha256 !== checkedGate.envelope.request.recipientSha256 || receipt.recipientFingerprint !== checkedGate.envelope.request.recipientFingerprint ||
-    typeof r.finishedAtUtc !== "string" || !Number.isFinite(Date.parse(r.finishedAtUtc)) || r.finishedAtUtc < receipt.verifiedAtUtc) fail();
+  if (
+    receipt.captureId !== checkedGate.envelope.request.captureId ||
+    receipt.recipientSha256 !== checkedGate.envelope.request.recipientSha256 ||
+    receipt.recipientFingerprint !==
+      checkedGate.envelope.request.recipientFingerprint ||
+    typeof r.finishedAtUtc !== "string" ||
+    !Number.isFinite(Date.parse(r.finishedAtUtc)) ||
+    r.finishedAtUtc < receipt.verifiedAtUtc
+  ) fail();
   const receiptReference = validateBackupV2ManifestRef(r.receiptReference);
-  return { schemaVersion: 2, format: "backup-v2-verified", envelope: checkedGate.envelope, ...execution(checkedGate), workerResultSha256, selectedRoot: worker.selectedRoot, receipt, receiptReference, finishedAtUtc: r.finishedAtUtc };
+  return {
+    schemaVersion: 2,
+    format: "backup-v2-verified",
+    envelope: checkedGate.envelope,
+    ...execution(checkedGate),
+    workerResultSha256,
+    selectedRoot: worker.selectedRoot,
+    receipt,
+    receiptReference,
+    finishedAtUtc: r.finishedAtUtc,
+  };
 }
 
 /** Cumulative counters originate in actual pipe/journal callbacks, never a
@@ -193,26 +477,63 @@ export function validateBackupV2VerifiedResult(value: unknown, gate: BackupV2Gat
 export class BackupV2WorkerProgress {
   phase: BackupV2Progress["phase"] = "PREFLIGHT";
   activeRoleAttempt: BackupV2Status["activeRoleAttempt"] = null;
-  readonly #values = { sourceBytes: 0, compressionInputBytes: 0, verifiedChunks: 0, decryptedBytes: 0, inventoryMembers: 0 };
+  readonly #values = {
+    sourceBytes: 0,
+    compressionInputBytes: 0,
+    verifiedChunks: 0,
+    decryptedBytes: 0,
+    inventoryMembers: 0,
+  };
   readonly #observed = new Map<string, number>();
   #advance(key: string, value: number): number {
-    if (!Number.isSafeInteger(value) || value < (this.#observed.get(key) ?? 0)) fail();
-    const delta = value - (this.#observed.get(key) ?? 0); this.#observed.set(key, value); return delta;
+    if (
+      !Number.isSafeInteger(value) || value < (this.#observed.get(key) ?? 0)
+    ) fail();
+    const delta = value - (this.#observed.get(key) ?? 0);
+    this.#observed.set(key, value);
+    return delta;
   }
-  capture(value: BackupV2CaptureProgress, active: BackupV2Status["activeRoleAttempt"]): void {
+  capture(
+    value: BackupV2CaptureProgress,
+    active: BackupV2Status["activeRoleAttempt"],
+  ): void {
     if (!active || active.role !== value.role) fail();
-    this.phase = "CAPTURING_AND_UPLOADING"; this.activeRoleAttempt = active;
-    if (value.kind === "source") { const delta = this.#advance(`${active.attemptId}/source`, value.bytes); this.#values.sourceBytes += delta; this.#values.compressionInputBytes += delta; }
-    if (value.kind === "inventory") this.#values.inventoryMembers += this.#advance(`${active.attemptId}/members`, value.members);
-    if (value.kind === "verified") { this.#advance(`${active.attemptId}/verified`, value.bytes); this.#values.verifiedChunks++; }
+    this.phase = "CAPTURING_AND_UPLOADING";
+    this.activeRoleAttempt = active;
+    if (value.kind === "source") {
+      const delta = this.#advance(`${active.attemptId}/source`, value.bytes);
+      this.#values.sourceBytes += delta;
+      this.#values.compressionInputBytes += delta;
+    }
+    if (value.kind === "inventory") {
+      this.#values.inventoryMembers += this.#advance(
+        `${active.attemptId}/members`,
+        value.members,
+      );
+    }
+    if (value.kind === "verified") {
+      this.#advance(`${active.attemptId}/verified`, value.bytes);
+      this.#values.verifiedChunks++;
+    }
   }
-  verification(value: { role: string; pass: number; kind: string; bytes: number }): void {
+  verification(
+    value: { role: string; pass: number; kind: string; bytes: number },
+  ): void {
     this.phase = "VERIFYING";
-    const delta = this.#advance(`${value.role}/${value.pass}/${value.kind}`, value.bytes);
-    if (value.kind === "compressedPlaintext") this.#values.decryptedBytes += delta;
+    const delta = this.#advance(
+      `${value.role}/${value.pass}/${value.kind}`,
+      value.bytes,
+    );
+    if (value.kind === "compressedPlaintext") {
+      this.#values.decryptedBytes += delta;
+    }
   }
-  verifiedObject(): void { this.#values.verifiedChunks++; }
-  snapshot(observedMonotonicMs: number): BackupV2Progress { return { phase: this.phase, observedMonotonicMs, ...this.#values }; }
+  verifiedObject(): void {
+    this.#values.verifiedChunks++;
+  }
+  snapshot(observedMonotonicMs: number): BackupV2Progress {
+    return { phase: this.phase, observedMonotonicMs, ...this.#values };
+  }
 }
 
 export function backupV2GateDirectory(gateInput: BackupV2Gate): string {
@@ -220,200 +541,797 @@ export function backupV2GateDirectory(gateInput: BackupV2Gate): string {
   if (!gate.custody) fail();
   return `${BACKUP_BASE}/${gate.envelope.request.captureId}/v2-${gate.gateId}/${gate.custody.invocationId}`;
 }
-async function rootRead(path: string, maximum = BACKUP_V2_LIMITS.controlResponseBytes): Promise<Uint8Array> {
+/** Bounded public control discovery on the VPS. No B2 settings or recipient
+ * contents are read; old invocation artifacts remain intact for attribution. */
+export async function discoverBackupV2SourceGates(): Promise<BackupV2Gate[]> {
+  const gates: BackupV2Gate[] = [];
+  let entries = 0;
+  try {
+    for await (const generation of Deno.readDir(BACKUP_BASE)) {
+      if (++entries > BACKUP_V2_LIMITS.logicalObjects) fail();
+      if (
+        !generation.isDirectory ||
+        !/^generation-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(
+          generation.name,
+        )
+      ) continue;
+      const base = `${BACKUP_BASE}/${generation.name}`;
+      await assertBackupV2Directory(base);
+      for await (const phase of Deno.readDir(base)) {
+        if (
+          !phase.isDirectory ||
+          !/^v2-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(phase.name)
+        ) continue;
+        const parent = `${base}/${phase.name}`;
+        await assertBackupV2Directory(parent);
+        for await (const invocation of Deno.readDir(parent)) {
+          if (
+            !invocation.isDirectory || !/^[a-f0-9]{32}$/.test(invocation.name)
+          ) fail();
+          const directory = `${parent}/${invocation.name}`;
+          await assertBackupV2Directory(directory);
+          try {
+            const gate = validateBackupV2Gate(
+              JSON.parse(
+                new TextDecoder("utf-8", { fatal: true }).decode(
+                  await rootRead(`${directory}/${BACKUP_V2_GATE_FILE}`),
+                ),
+              ),
+            );
+            if (backupV2GateDirectory(gate) !== directory) fail();
+            gates.push(gate);
+            if (gates.length > 256) fail();
+          } catch (e) {
+            if (!(e instanceof Deno.errors.NotFound)) throw e;
+          }
+        }
+      }
+    }
+  } catch (e) {
+    if (!(e instanceof Deno.errors.NotFound)) throw e;
+  }
+  return gates;
+}
+async function rootRead(
+  path: string,
+  maximum = BACKUP_V2_LIMITS.controlResponseBytes,
+): Promise<Uint8Array> {
   const before = await Deno.lstat(path);
-  if (!before.isFile || before.isSymlink || before.uid !== 0 || before.nlink !== 1 || before.mode === null || (before.mode & 0o777) !== 0o600 || before.size > maximum) fail();
+  if (
+    !before.isFile || before.isSymlink || before.uid !== 0 ||
+    before.nlink !== 1 || before.mode === null ||
+    (before.mode & 0o777) !== 0o600 || before.size > maximum
+  ) fail();
   const bytes = await Deno.readFile(path), after = await Deno.lstat(path);
-  if (bytes.length !== before.size || after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || bytes.length > maximum) fail();
+  if (
+    bytes.length !== before.size || after.dev !== before.dev ||
+    after.ino !== before.ino || after.size !== before.size ||
+    bytes.length > maximum
+  ) fail();
   return bytes;
 }
 async function rootDirectory(path: string): Promise<void> {
-  try { await Deno.mkdir(path, { mode: 0o700 }); } catch (error) { if (!(error instanceof Deno.errors.AlreadyExists)) throw error; }
+  try {
+    await Deno.mkdir(path, { mode: 0o700 });
+  } catch (error) {
+    if (!(error instanceof Deno.errors.AlreadyExists)) throw error;
+  }
   await assertBackupV2Directory(path);
 }
-async function atomicArtifact(directory: string, name: string, value: unknown, immutable = false): Promise<string> {
+async function atomicArtifact(
+  directory: string,
+  name: string,
+  value: unknown,
+  immutable = false,
+): Promise<string> {
   if (!/^[a-z0-9-]+\.json$/.test(name)) fail();
   await assertBackupV2Directory(directory);
   const bytes = backupV2ArtifactBytes(value), path = `${directory}/${name}`;
-  if (bytes.length > (name === BACKUP_V2_CHECKPOINT_FILE ? 16 * 1024 * 1024 : BACKUP_V2_LIMITS.controlResponseBytes)) fail();
+  if (
+    bytes.length >
+      (name === BACKUP_V2_CHECKPOINT_FILE
+        ? 16 * 1024 * 1024
+        : BACKUP_V2_LIMITS.controlResponseBytes)
+  ) fail();
   if (immutable) {
-    try { const old = await rootRead(path, bytes.length); if (backupV2ArtifactSha256(old) !== backupV2ArtifactSha256(bytes)) fail(); return backupV2ArtifactSha256(old); }
-    catch (error) { if (!(error instanceof Deno.errors.NotFound)) throw error; }
+    try {
+      const old = await rootRead(path, bytes.length);
+      if (backupV2ArtifactSha256(old) !== backupV2ArtifactSha256(bytes)) fail();
+      return backupV2ArtifactSha256(old);
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    }
   }
   const temporary = `${path}.${crypto.randomUUID()}.tmp`;
-  const file = await Deno.open(temporary, { createNew: true, write: true, mode: 0o600 });
-  try { let at = 0; while (at < bytes.length) { const count = await file.write(bytes.subarray(at)); if (count <= 0 || count > bytes.length - at) fail(); at += count; } await file.sync(); }
-  finally { file.close(); }
+  const file = await Deno.open(temporary, {
+    createNew: true,
+    write: true,
+    mode: 0o600,
+  });
+  try {
+    let at = 0;
+    while (at < bytes.length) {
+      const count = await file.write(bytes.subarray(at));
+      if (count <= 0 || count > bytes.length - at) fail();
+      at += count;
+    }
+    await file.sync();
+  } finally {
+    file.close();
+  }
   await Deno.rename(temporary, path);
-  using parent = await Deno.open(directory, { read: true }); await parent.sync();
+  using parent = await Deno.open(directory, { read: true });
+  await parent.sync();
   return backupV2ArtifactSha256(bytes);
 }
 async function ownExecution(gate: BackupV2Gate): Promise<BackupV2Gate> {
-  const boot = (await Deno.readTextFile("/proc/sys/kernel/random/boot_id")).trim();
-  const cgroup = (await Deno.readTextFile("/proc/self/cgroup")).trim().split("\n").find((line) => line.startsWith("0::"))?.slice(3);
-  const process = await Deno.readTextFile("/proc/self/stat"), mainStartTicks = process.slice(process.lastIndexOf(")") + 2).split(" ")[19];
+  const boot = (await Deno.readTextFile("/proc/sys/kernel/random/boot_id"))
+    .trim();
+  const cgroup = (await Deno.readTextFile("/proc/self/cgroup")).trim().split(
+    "\n",
+  ).find((line) => line.startsWith("0::"))?.slice(3);
+  const process = await Deno.readTextFile("/proc/self/stat"),
+    mainStartTicks = process.slice(process.lastIndexOf(")") + 2).split(" ")[19];
   const invocationId = Deno.env.get("INVOCATION_ID");
-  if (boot !== gate.sourceBootId || cgroup !== `${GATE_BACKUP_CGROUP_ROOT}/${gate.unitName}`) fail();
-  return validateBackupV2Gate({ ...gate, state: "ACTIVE", custody: { unitName: gate.unitName, invocationId, mainPid: Deno.pid, mainStartTicks, cgroup }, updatedAtUtc: new Date().toISOString() });
+  if (
+    boot !== gate.sourceBootId ||
+    cgroup !== `${GATE_BACKUP_CGROUP_ROOT}/${gate.unitName}`
+  ) fail();
+  return validateBackupV2Gate({
+    ...gate,
+    state: "ACTIVE",
+    custody: {
+      unitName: gate.unitName,
+      invocationId,
+      mainPid: Deno.pid,
+      mainStartTicks,
+      cgroup,
+    },
+    updatedAtUtc: new Date().toISOString(),
+  });
+}
+
+/** An explicit controller resume launches a fresh invocation. Reuse only sealed
+ * immutable roles from the same original request; an unfinished GPG stream is
+ * never concatenated or resumed. M05 revalidates boot/package compatibility. */
+async function previousSealedRoles(
+  settings: BackupV2WorkerSettings,
+  gate: BackupV2Gate,
+  directory: string,
+): Promise<BackupV2SealedRoleCheckpoint[]> {
+  const parent = directory.slice(0, directory.lastIndexOf("/")),
+    selected = new Map<string, BackupV2SealedRoleCheckpoint>();
+  let count = 0;
+  for await (const entry of Deno.readDir(parent)) {
+    if (++count > 64) fail();
+    if (entry.name === gate.custody!.invocationId) continue;
+    if (!entry.isDirectory || !/^[a-f0-9]{32}$/.test(entry.name)) fail();
+    const previous = `${parent}/${entry.name}`;
+    await assertBackupV2Directory(previous);
+    let bytes: Uint8Array;
+    try {
+      bytes = await rootRead(
+        `${previous}/${BACKUP_V2_CHECKPOINT_FILE}`,
+        16 * 1024 * 1024,
+      );
+    } catch (e) {
+      if (e instanceof Deno.errors.NotFound) continue;
+      throw e;
+    }
+    const value = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    );
+    if (
+      !value || Object.keys(value).length !== 5 ||
+      !Array.isArray(value.roles) || value.roles.length > BACKUP_V2_ROLES.length
+    ) fail();
+    const old = validateBackupV2Gate({
+      ...settings.workerGate,
+      state: "ACTIVE",
+      custody: value.custody,
+      updatedAtUtc: new Date().toISOString(),
+    });
+    same(value.envelope, settings.envelope);
+    same(value.gateId, gate.gateId);
+    same(value.sourceBootId, gate.sourceBootId);
+    if (old.custody!.invocationId !== entry.name) fail();
+    // A crash preserves its actual last nonterminal status. The explicit Pi
+    // resume and current gate ack carry the independently proved settlement;
+    // never rewrite that old status to fabricate a terminal timestamp.
+    validateBackupV2Status(
+      JSON.parse(
+        new TextDecoder().decode(
+          await rootRead(`${previous}/${BACKUP_V2_STATUS_FILE}`),
+        ),
+      ),
+      old,
+    );
+    for (const checkpoint of value.roles as BackupV2SealedRoleCheckpoint[]) {
+      const role = validateBackupV2RoleManifest(checkpoint.manifest).role,
+        prior = selected.get(role);
+      if (prior) same(prior, checkpoint);
+      else selected.set(role, checkpoint);
+    }
+  }
+  return BACKUP_V2_ROLES.flatMap((role) =>
+    selected.has(role) ? [selected.get(role)!] : []
+  );
 }
 
 /** Actual workspace and deleted-handle accounting, scoped to this unit only.
  * Numeric margins are initial implementation bounds; live capacity acceptance
  * must validate them under the preserved current host/ancestor resource caps. */
-async function capacity(directory: string, cgroup: string): Promise<BackupV2CapacityObservation> {
-  let allocated = 0, entries = 0, workspaceHeldDeletedBytes = 0, sourceHeldDeletedBytes = 0;
+async function capacity(
+  directory: string,
+  cgroup: string,
+): Promise<BackupV2CapacityObservation> {
+  let allocated = 0,
+    entries = 0,
+    workspaceHeldDeletedBytes = 0,
+    sourceHeldDeletedBytes = 0;
   const walk = async (path: string, depth: number): Promise<void> => {
     if (++entries > 10_000 || depth > 32) fail();
-    const info = await lstat(path, { bigint: true }); allocated += Number(info.blocks * 512n);
+    const info = await lstat(path, { bigint: true });
+    allocated += Number(info.blocks * 512n);
     if (info.isSymbolicLink()) fail();
-    if (info.isDirectory()) for await (const child of Deno.readDir(path)) await walk(`${path}/${child.name}`, depth + 1);
+    if (info.isDirectory()) {
+      for await (const child of Deno.readDir(path)) {
+        await walk(`${path}/${child.name}`, depth + 1);
+      }
+    }
   };
   await walk(directory, 0);
   const held = new Set<string>();
-  const pids = (await Deno.readTextFile(`/sys/fs/cgroup${cgroup}/cgroup.procs`)).trim().split("\n").filter(Boolean);
+  const pids = (await Deno.readTextFile(`/sys/fs/cgroup${cgroup}/cgroup.procs`))
+    .trim().split("\n").filter(Boolean);
   if (pids.length > 4096) fail();
   for (const pid of pids) {
     if (!/^[1-9][0-9]*$/.test(pid)) fail();
     try {
-      if (!(await Deno.readTextFile(`/proc/${pid}/cgroup`)).split("\n").some((line) => line === `0::${cgroup}`)) fail();
+      if (
+        !(await Deno.readTextFile(`/proc/${pid}/cgroup`)).split("\n").some((
+          line,
+        ) => line === `0::${cgroup}`)
+      ) fail();
       let fds = 0;
       for await (const fd of Deno.readDir(`/proc/${pid}/fd`)) {
         if (++fds > 4096) fail();
         try {
-          const path = `/proc/${pid}/fd/${fd.name}`, info = await stat(path, { bigint: true });
+          const path = `/proc/${pid}/fd/${fd.name}`,
+            info = await stat(path, { bigint: true });
           if (info.nlink !== 0n || !info.isFile()) continue;
-          const key = `${info.dev}/${info.ino}`; if (held.has(key)) continue; held.add(key);
-          const bytes = Number(info.blocks * 512n), target = await Deno.readLink(path);
-          if (target.startsWith(directory + "/")) workspaceHeldDeletedBytes += bytes; else sourceHeldDeletedBytes += bytes;
-        } catch (error) { if (!(error instanceof Deno.errors.NotFound) && !(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error; }
+          const key = `${info.dev}/${info.ino}`;
+          if (held.has(key)) continue;
+          held.add(key);
+          const bytes = Number(info.blocks * 512n),
+            target = await Deno.readLink(path);
+          if (target.startsWith(directory + "/")) {
+            workspaceHeldDeletedBytes += bytes;
+          } else sourceHeldDeletedBytes += bytes;
+        } catch (error) {
+          if (
+            !(error instanceof Deno.errors.NotFound) &&
+            !(error instanceof Error && "code" in error &&
+              error.code === "ENOENT")
+          ) throw error;
+        }
       }
-    } catch (error) { if (!(error instanceof Deno.errors.NotFound)) throw error; }
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    }
   }
   const fs = await statfs(directory, { bigint: true });
-  return { observedMonotonicMs: performance.now(), availableBytes: Number(fs.bavail * fs.bsize), freeInodes: Number(fs.ffree), allocatedWorkspaceBytes: allocated + workspaceHeldDeletedBytes, workspaceHeldDeletedBytes, sourceHeldDeletedBytes };
+  return {
+    observedMonotonicMs: performance.now(),
+    availableBytes: Number(fs.bavail * fs.bsize),
+    freeInodes: Number(fs.ffree),
+    allocatedWorkspaceBytes: allocated + workspaceHeldDeletedBytes,
+    workspaceHeldDeletedBytes,
+    sourceHeldDeletedBytes,
+  };
 }
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
-    const abort = () => { clearTimeout(timer); reject(new Error("Source operation cancelled")); };
-    const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, ms);
-    signal?.addEventListener("abort", abort, { once: true }); if (signal?.aborted) abort();
+    const abort = () => {
+      clearTimeout(timer);
+      reject(new Error("Source operation cancelled"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
   });
 }
 
 /** Real source entrypoint used by the version-specific generated wrappers.
  * Heavy children are always inside the caller's proved finite managed unit. */
-export async function runBackupV2RemoteWorker(jobId: string, kind: "worker" | "verify"): Promise<BackupV2Status> {
+export async function runBackupV2RemoteWorker(
+  jobId: string,
+  kind: "worker" | "verify",
+): Promise<BackupV2Status> {
   if (!/^job-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(jobId)) fail();
   const runtime = `${JOBS_RUNTIME_ROOT}/${jobId}`;
   if (await Deno.realPath(Deno.cwd()) !== runtime) fail();
-  const settings = validateBackupV2WorkerSettings(JSON.parse(new TextDecoder().decode(await rootRead(`${runtime}/settings.json`))));
+  const settings = validateBackupV2WorkerSettings(
+    JSON.parse(
+      new TextDecoder().decode(await rootRead(`${runtime}/settings.json`)),
+    ),
+  );
   if (settings.envelope.request.jobId !== jobId) fail();
-  const request = settings.envelope.request, release = `${RELEASES_ROOT}/${request.sourceRevision}`;
-  if (new URL(import.meta.url).pathname !== `${release}/scripts/backup-v2-worker.ts`) fail();
-  const manifest = validateReleaseManifest(JSON.parse(new TextDecoder().decode(await rootRead(`${release}/release.json`))), request.sourceRevision);
-  for (const entry of manifest.files) if (backupV2ArtifactSha256(await rootRead(`${release}/${entry.path}`)) !== entry.sha256) fail();
-  const gate = await ownExecution(kind === "worker" ? settings.workerGate : settings.verifierGate), directory = backupV2GateDirectory(gate);
-  await rootDirectory(BACKUP_BASE); await rootDirectory(`${BACKUP_BASE}/${request.captureId}`); await rootDirectory(`${BACKUP_BASE}/${request.captureId}/v2-${gate.gateId}`); await rootDirectory(directory);
+  const request = settings.envelope.request,
+    release = `${RELEASES_ROOT}/${request.sourceRevision}`;
+  if (
+    new URL(import.meta.url).pathname !==
+      `${release}/scripts/backup-v2-worker.ts`
+  ) fail();
+  const manifest = validateReleaseManifest(
+    JSON.parse(
+      new TextDecoder().decode(await rootRead(`${release}/release.json`)),
+    ),
+    request.sourceRevision,
+  );
+  for (const entry of manifest.files) {
+    if (
+      backupV2ArtifactSha256(await rootRead(`${release}/${entry.path}`)) !==
+        entry.sha256
+    ) fail();
+  }
+  const gate = await ownExecution(
+      kind === "worker" ? settings.workerGate : settings.verifierGate,
+    ),
+    directory = backupV2GateDirectory(gate);
+  await rootDirectory(BACKUP_BASE);
+  await rootDirectory(`${BACKUP_BASE}/${request.captureId}`);
+  await rootDirectory(`${BACKUP_BASE}/${request.captureId}/v2-${gate.gateId}`);
+  await rootDirectory(directory);
   for await (const _entry of Deno.readDir(directory)) fail();
+  await atomicArtifact(directory, BACKUP_V2_GATE_FILE, gate, true);
   return await withBackupLock(GATE_SOURCE_LOCK_PATH, async () => {
-    const stage = `${directory}/stage`, spoolDirectory = `${directory}/spool`, journalDirectory = `${directory}/journal`;
-    for (const path of [stage, spoolDirectory, journalDirectory]) await rootDirectory(path);
-    const spool = new BackupV2Spool(await createBackupV2FileSpoolStorage(spoolDirectory)), journal = await openBackupV2UploadJournal(journalDirectory, request.captureId);
-    const store = new BackupV2Store(settings.B2Settings), pace = createBackupV2UploadPacer(), work = new BackupV2WorkerProgress(), notifier = createBackupV2Notifier();
+    const stage = `${directory}/stage`,
+      spoolDirectory = `${directory}/spool`,
+      journalDirectory = `${directory}/journal`;
+    for (const path of [stage, spoolDirectory, journalDirectory]) {
+      await rootDirectory(path);
+    }
+    const spool = new BackupV2Spool(
+        await createBackupV2FileSpoolStorage(spoolDirectory),
+      ),
+      journal = await openBackupV2UploadJournal(
+        journalDirectory,
+        request.captureId,
+      );
+    const store = new BackupV2Store(settings.B2Settings),
+      pace = createBackupV2UploadPacer(),
+      work = new BackupV2WorkerProgress(),
+      notifier = createBackupV2Notifier();
     const startedAtUtc = new Date().toISOString();
-    let last: BackupV2Status | null = null, terminal = false, stopping: Promise<never> | null = null;
+    let last: BackupV2Status | null = null,
+      terminal = false,
+      stopping: Promise<never> | null = null;
     let statusWrites: Promise<unknown> = Promise.resolve();
-    let supervisor!: BackupV2Supervisor;
-    const writeStatus = (finishedAtUtc: string | null = null, resultSha256: string | null = null): Promise<BackupV2Status> => {
+    const writeStatus = (
+      finishedAtUtc: string | null = null,
+      resultSha256: string | null = null,
+    ): Promise<BackupV2Status> => {
       const written = statusWrites.then(async () => {
-      const now = performance.now(), lease = { ...supervisor.window(), observedMonotonicMs: now };
-      const status = validateBackupV2Status({ schemaVersion: 2, format: "backup-v2", envelope: settings.envelope, ...execution(gate), kind, phase: work.phase, activeRoleAttempt: work.activeRoleAttempt, startedAtUtc, updatedAtUtc: new Date().toISOString(), finishedAtUtc, progress: work.snapshot(now), lease, resultSha256 }, gate);
-      if (last) assertBackupV2StatusTransition(last, status);
-      await atomicArtifact(directory, BACKUP_V2_STATUS_FILE, status); last = status; return status;
+        const now = performance.now(),
+          lease = { ...supervisor.window(), observedMonotonicMs: now };
+        const status = validateBackupV2Status({
+          schemaVersion: 2,
+          format: "backup-v2",
+          envelope: settings.envelope,
+          ...execution(gate),
+          kind,
+          phase: work.phase,
+          activeRoleAttempt: work.activeRoleAttempt,
+          startedAtUtc,
+          updatedAtUtc: new Date().toISOString(),
+          finishedAtUtc,
+          progress: work.snapshot(now),
+          lease,
+          resultSha256,
+        }, gate);
+        if (last) assertBackupV2StatusTransition(last, status);
+        await atomicArtifact(directory, BACKUP_V2_STATUS_FILE, status);
+        last = status;
+        return status;
       });
-      statusWrites = written.catch(() => {}); return written;
+      statusWrites = written.catch(() => {});
+      return written;
     };
     const cancel = (reason: unknown): Promise<never> => {
-      if (!stopping) stopping = (async () => {
-        supervisor.cancel(); work.phase = "CANCELLATION_BLOCKED";
-        // Retain the MainPID so RemainAfterExit cannot disable the finite
-        // runtime timer while a child/namespace is unproved. Never renew here.
-        setInterval(() => {}, 1000);
-        await writeStatus().catch(() => {});
-        void reason;
-        return await new Promise<never>(() => {});
-      })();
+      if (!stopping) {
+        stopping = (async () => {
+          supervisor.cancel();
+          work.phase = "CANCELLATION_BLOCKED";
+          // Retain the MainPID so RemainAfterExit cannot disable the finite
+          // runtime timer while a child/namespace is unproved. Never renew here.
+          setInterval(() => {}, 1000);
+          await writeStatus().catch(() => {});
+          void reason;
+          return await new Promise<never>(() => {});
+        })();
+      }
       return stopping;
     };
-    supervisor = new BackupV2Supervisor(gate.custody!, { progressGraceMs: 120_000, notificationGraceMs: 60_000, observationTimeoutMs: 5000, maximumObservationAgeMs: 5000, productionWriterMarginBytes: 512 * 1024 * 1024, minimumFreeInodes: 256, maximumSourceHeldDeletedBytes: BACKUP_V2_LIMITS.workspaceBytes }, {
-      now: () => performance.now(), notifier,
-      async observe() { const sample = await capacity(directory, gate.custody!.cgroup); return { identity: gate.custody!, progress: work.snapshot(sample.observedMonotonicMs), capacity: sample }; },
+    const supervisor = new BackupV2Supervisor(gate.custody!, {
+      startupGraceMs: 300_000,
+      progressGraceMs: 300_000,
+      notificationGraceMs: 30_000,
+      observationTimeoutMs: 5000,
+      maximumObservationAgeMs: 5000,
+      productionWriterMarginBytes: 512 * 1024 * 1024,
+      minimumFreeInodes: 256,
+      maximumSourceHeldDeletedBytes: BACKUP_V2_LIMITS.workspaceBytes,
+    }, {
+      now: () => performance.now(),
+      notifier,
+      async observe() {
+        const sample = await capacity(directory, gate.custody!.cgroup);
+        return {
+          identity: gate.custody!,
+          progress: work.snapshot(sample.observedMonotonicMs),
+          capacity: sample,
+        };
+      },
     });
-    const native = { async assertManaged() { const actual = await ownExecution(gate); same(actual.custody, gate.custody); }, cancel };
+    const native = {
+      async assertManaged() {
+        const actual = await ownExecution(gate);
+        same(actual.custody, gate.custody);
+      },
+      cancel,
+    };
     let serial = Promise.resolve();
-    const supervise = () => {
-      const next = serial.then(async () => { const decision = await supervisor.poll(); if (decision.action !== "renew") await cancel(decision.reason); await writeStatus(); });
-      serial = next.catch(() => {}); return next;
+    const supervise = (change?: () => void) => {
+      const next = serial.then(async () => {
+        const decision = await supervisor.poll();
+        if (decision.action !== "renew") await cancel(decision.reason);
+        change?.();
+        await writeStatus();
+      });
+      serial = next.catch(() => {});
+      return next;
     };
-    const documents: import("./backup-v2-index.ts").BackupV2DocumentBinding[] = [];
+    const onRetryEpisode = (episode: BackupV2UploadRetryEpisode) =>
+      supervise(() => {
+        supervisor.beginRetryEpisode({ ...episode, retryableTransport: true });
+      });
+    const onTransferEpisode = (episode: BackupV2TransferEpisode) =>
+      supervise(() => {
+        supervisor.beginTransferEpisode(episode);
+      });
+    const onTransferComplete = (operationId: string) =>
+      supervise(() => {
+        supervisor.completeTransferEpisode(operationId);
+      });
+    const documents: import("./backup-v2-index.ts").BackupV2DocumentBinding[] =
+      [];
     const encrypt = async (plaintext: Uint8Array, signal: AbortSignal) => {
-      const child = new Deno.Command("gpg", { ...backupChildProcessOptions(), args: gpgArgs(`${stage}/gpg-public-home`, settings.captureSettings.recipientFile, "-", "-"), stdin: "piped", stdout: "piped", stderr: "piped", signal }).spawn();
-      const input = (async () => { const writer = child.stdin.getWriter(); try { await writer.write(plaintext); await writer.close(); } finally { writer.releaseLock(); } })();
-      const stderr = (async () => { let bytes = 0; for await (const part of child.stderr) { bytes += part.length; if (bytes > 64 * 1024) throw new Error("Document diagnostics exceeded bound"); } })();
-      return { ciphertext: child.stdout, completed: Promise.all([input, stderr, child.status]).then(([, , status]) => { if (!status.success) throw new Error("Document encryption failed"); }) };
+      await native.assertManaged();
+      const child = new Deno.Command("gpg", {
+        ...backupChildProcessOptions(),
+        args: gpgArgs(
+          `${stage}/gpg-public-home`,
+          settings.captureSettings.recipientFile,
+          "-",
+          "-",
+        ),
+        stdin: "piped",
+        stdout: "piped",
+        stderr: "piped",
+        signal,
+      }).spawn();
+      const input = (async () => {
+        const writer = child.stdin.getWriter();
+        try {
+          await writer.write(plaintext);
+          await writer.close();
+        } finally {
+          writer.releaseLock();
+        }
+      })();
+      const stderr = (async () => {
+        let bytes = 0;
+        for await (const part of child.stderr) {
+          bytes += part.length;
+          if (bytes > 64 * 1024) {
+            throw new Error("Document diagnostics exceeded bound");
+          }
+        }
+      })();
+      return {
+        ciphertext: child.stdout,
+        completed: Promise.all([input, stderr, child.status]).then(
+          ([, , status]) => {
+            if (!status.success) throw new Error("Document encryption failed");
+          },
+        ),
+      };
     };
-    const publisher = (identity: BackupV2UploadIdentity) => new BackupV2DocumentPublisher({ upload: { identity, store, spool, journal, pace, signal: supervisor.signal, classifyFailure: (error) => ({ retryable: error instanceof BackupV2TransportError && error.retryable, mayHaveCommitted: error instanceof BackupV2TransportError && error.putMayHaveCommitted }), onVerified: () => work.verifiedObject() }, encrypt, bindings: documents, async persistBinding(binding) {
-      documents.push(binding);
-      const bytes = backupV2ArtifactBytes(binding), path = `${journalDirectory}/document-bindings.ndjson`;
-      using file = await Deno.open(path, { create: true, append: true, write: true, mode: 0o600 });
-      let at = 0; while (at < bytes.length) { const count = await file.write(bytes.subarray(at)); if (count <= 0 || count > bytes.length - at) fail(); at += count; } await file.sync();
-    } });
+    const publisher = (identity: BackupV2UploadIdentity) => {
+      if (kind === "worker") {
+        work.phase = "CAPTURING_AND_UPLOADING";
+        work.activeRoleAttempt = {
+          role: identity.role,
+          attemptId: identity.attemptId,
+        };
+      }
+      return new BackupV2DocumentPublisher({
+        upload: {
+          identity,
+          store,
+          spool,
+          journal,
+          pace,
+          signal: supervisor.signal,
+          classifyFailure: (error) => ({
+            retryable: error instanceof BackupV2TransportError &&
+              error.retryable,
+            mayHaveCommitted: error instanceof BackupV2TransportError &&
+              error.putMayHaveCommitted,
+          }),
+          onVerified: () => work.verifiedObject(),
+          onRetryEpisode,
+          onTransferEpisode,
+          onTransferComplete,
+        },
+        encrypt,
+        bindings: documents,
+        async persistBinding(binding) {
+          documents.push(binding);
+          const bytes = backupV2ArtifactBytes(binding),
+            path = `${journalDirectory}/document-bindings.ndjson`;
+          using file = await Deno.open(path, {
+            create: true,
+            append: true,
+            write: true,
+            mode: 0o600,
+          });
+          let at = 0;
+          while (at < bytes.length) {
+            const count = await file.write(bytes.subarray(at));
+            if (count <= 0 || count > bytes.length - at) fail();
+            at += count;
+          }
+          await file.sync();
+        },
+      });
+    };
     const loopAbort = new AbortController();
     try {
       await supervise();
-      const monitor = (async () => { while (!terminal) { await delay(1000, loopAbort.signal); if (!terminal) await supervise(); } })().catch(async (error) => { if (!terminal) await cancel(error); });
-      let verifyInput: { workerGate: BackupV2Gate; workerResult: BackupV2Result; workerResultBytes: number[] } | null = null;
+      const monitor = (async () => {
+        while (!terminal) {
+          await delay(1000, loopAbort.signal);
+          if (!terminal) await supervise();
+        }
+      })().catch(async (error) => {
+        if (!terminal) await cancel(error);
+      });
+      let verifyInput: {
+        workerGate: BackupV2Gate;
+        workerResult: BackupV2Result;
+        workerResultBytes: number[];
+      } | null = null;
       if (kind === "verify") {
-        verifyInput = JSON.parse(new TextDecoder().decode(await rootRead(`${runtime}/verifier-request.json`)));
+        verifyInput = JSON.parse(
+          new TextDecoder().decode(
+            await rootRead(`${runtime}/verifier-request.json`),
+          ),
+        );
         if (!verifyInput) fail();
         verifyInput.workerGate = validateBackupV2Gate(verifyInput.workerGate);
-        verifyInput.workerResult = validateBackupV2Result(verifyInput.workerResult, verifyInput.workerGate);
-        if (verifyInput.workerGate.gateId !== settings.workerGate.gateId) fail();
+        verifyInput.workerResult = validateBackupV2Result(
+          verifyInput.workerResult,
+          verifyInput.workerGate,
+        );
+        if (verifyInput.workerGate.gateId !== settings.workerGate.gateId) {
+          fail();
+        }
         same(verifyInput.workerResult.envelope, settings.envelope);
-        same(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(verifyInput.workerResultBytes))), verifyInput.workerResult);
+        same(
+          JSON.parse(
+            new TextDecoder("utf-8", { fatal: true }).decode(
+              new Uint8Array(verifyInput.workerResultBytes),
+            ),
+          ),
+          verifyInput.workerResult,
+        );
       }
       // This fixed acknowledgement binds Pi custody before any producer starts.
       // No heartbeat can extend the startup grace while a controller is absent.
       while (true) {
-        try { same(JSON.parse(new TextDecoder().decode(await rootRead(`${directory}/gate-bound.json`))), { gateId: gate.gateId, requestSha256: settings.envelope.requestSha256, sourceBootId: gate.sourceBootId, custody: gate.custody }); break; }
-        catch (error) { if (!(error instanceof Deno.errors.NotFound)) throw error; await delay(250, supervisor.signal); }
+        try {
+          same(
+            JSON.parse(
+              new TextDecoder().decode(
+                await rootRead(`${directory}/gate-bound.json`),
+              ),
+            ),
+            {
+              gateId: gate.gateId,
+              requestSha256: settings.envelope.requestSha256,
+              sourceBootId: gate.sourceBootId,
+              custody: gate.custody,
+            },
+          );
+          break;
+        } catch (error) {
+          if (!(error instanceof Deno.errors.NotFound)) throw error;
+          await delay(250, supervisor.signal);
+        }
       }
       const run = createBackupV2MetadataRunner(stage, native);
       await prepareRecipient(settings.captureSettings, stage, run);
       let result: BackupV2Result | BackupV2VerifiedResult;
       if (kind === "worker") {
-        const checkpoints: BackupV2SealedRoleCheckpoint[] = [];
+        const checkpoints = await previousSealedRoles(
+          settings,
+          gate,
+          directory,
+        );
+        if (checkpoints.length) {
+          await atomicArtifact(directory, BACKUP_V2_CHECKPOINT_FILE, {
+            envelope: settings.envelope,
+            ...execution(gate),
+            roles: checkpoints,
+          });
+        }
         result = await captureBackupV2Worker(settings, gate, {
-          context: { stage, sourceConfigSha256: request.sourceConfigSha256, native, spool, journal, store, pace, signal: supervisor.signal, classifyFailure: (error) => ({ retryable: error instanceof BackupV2TransportError && error.retryable, mayHaveCommitted: error instanceof BackupV2TransportError && error.putMayHaveCommitted }), admit: () => supervise() }, publisher,
-          checkpoint: async (value) => { checkpoints.push(value); await atomicArtifact(directory, BACKUP_V2_CHECKPOINT_FILE, { envelope: settings.envelope, ...execution(gate), roles: checkpoints }); },
-          progress: (value, active) => work.capture(value, active), now: () => new Date(),
+          context: {
+            stage,
+            sourceConfigSha256: request.sourceConfigSha256,
+            native,
+            spool,
+            journal,
+            store,
+            pace,
+            signal: supervisor.signal,
+            classifyFailure: (error) => ({
+              retryable: error instanceof BackupV2TransportError &&
+                error.retryable,
+              mayHaveCommitted: error instanceof BackupV2TransportError &&
+                error.putMayHaveCommitted,
+            }),
+            admit: () => supervise(),
+            onRetryEpisode,
+            onTransferEpisode,
+            onTransferComplete,
+          },
+          publisher,
+          reused: checkpoints,
+          checkpoint: async (value) => {
+            checkpoints.push(value);
+            await atomicArtifact(directory, BACKUP_V2_CHECKPOINT_FILE, {
+              envelope: settings.envelope,
+              ...execution(gate),
+              roles: checkpoints,
+            });
+          },
+          progress: (value, active) => work.capture(value, active),
+          now: () => new Date(),
         });
       } else {
         if (!verifyInput) fail();
         const publicHome = `${PUBLIC_HOME_BASE}/${request.captureId}`;
-        await ensurePublicHome(publicHome); await importRecipient(publicHome, await rootRead(settings.captureSettings.recipientFile, 64 * 1024));
+        await ensurePublicHome(publicHome);
+        await importRecipient(
+          publicHome,
+          await rootRead(settings.captureSettings.recipientFile, 64 * 1024),
+        );
         work.phase = "VERIFYING";
-        const seen = new Set<string>(), readerStore = { async getExactToFile(...args: Parameters<BackupV2Store["getExactToFile"]>) { await pace(args[0].contentLength); const slot = await store.getExactToFile(...args); if (!seen.has(args[0].fileId)) { seen.add(args[0].fileId); work.verifiedObject(); } return slot; } };
-        const readDirectory = `${directory}/read-slots`; await rootDirectory(readDirectory);
+        let readSerial = 0;
+        const readerStore = {
+          async getExactToFile(
+            ...args: Parameters<BackupV2Store["getExactToFile"]>
+          ) {
+            const [object] = args,
+              operationId = `read-${++readSerial}-${object.fileId}`,
+              startedAtMs = performance.now();
+            const episode: BackupV2TransferEpisode = {
+              kind: "SEALED_TRANSFER",
+              operationId,
+              phase: "READBACK",
+              sealedObjectIdentity: object.fileName,
+              retainedBytes: object.contentLength,
+              startedAtMs,
+              expiresAtMs: startedAtMs + backupV2TransferWindowMs("READBACK"),
+            };
+            const path = `${journalDirectory}/read-intents.ndjson`,
+              bytes = backupV2ArtifactBytes({
+                episode,
+                reference: object,
+                target: args[1],
+                startedAtUtc: new Date().toISOString(),
+              });
+            using file = await Deno.open(path, {
+              create: true,
+              append: true,
+              write: true,
+              mode: 0o600,
+            });
+            let at = 0;
+            while (at < bytes.length) {
+              const count = await file.write(bytes.subarray(at));
+              if (count <= 0) fail();
+              at += count;
+            }
+            await file.sync();
+            if ((await file.stat()).size > BACKUP_V2_LIMITS.journalBytes) {
+              fail();
+            }
+            await onTransferEpisode(episode);
+            await pace(object.contentLength);
+            const slot = await store.getExactToFile(...args);
+            work.verifiedObject();
+            await onTransferComplete(operationId);
+            return slot;
+          },
+        };
+        const readDirectory = `${directory}/read-slots`;
+        await rootDirectory(readDirectory);
         const tools = await recordToolVersions(stage, run);
-        result = await verifyBackupV2Worker(settings, gate, verifyInput.workerResult, verifyInput.workerGate, { reader: { objects: await createBackupV2FileObjectReader(readDirectory, readerStore), decryptDocument: makeStreamDecryptArchive(publicHome), signal: supervisor.signal }, verification: { decrypt: makeStreamDecryptArchive(publicHome), native: { temporaryDirectory: stage, progress: (value) => { work.verification(value); return Promise.resolve(); } }, configurationSha256: request.sourceConfigSha256, verifierRevision: request.sourceRevision, tools: { tar: tools.tar.split("\n")[0], zstd: tools.zstd.split("\n")[0], gpg: tools.gpg.split("\n")[0] }, now: () => new Date() }, publisher: publisher({ captureId: request.captureId, attemptId: settings.publicationAttemptId, role: "recovery", kind: "receipt" }), workerResultBytes: new Uint8Array(verifyInput.workerResultBytes) });
+        result = await verifyBackupV2Worker(
+          settings,
+          gate,
+          verifyInput.workerResult,
+          verifyInput.workerGate,
+          {
+            reader: {
+              objects: await createBackupV2FileObjectReader(
+                readDirectory,
+                readerStore,
+              ),
+              decryptDocument: makeStreamDecryptArchive(publicHome),
+              signal: supervisor.signal,
+            },
+            verification: {
+              decrypt: makeStreamDecryptArchive(publicHome),
+              native: {
+                temporaryDirectory: stage,
+                progress: (value) => {
+                  work.verification(value);
+                  return Promise.resolve();
+                },
+              },
+              configurationSha256: request.sourceConfigSha256,
+              verifierRevision: request.sourceRevision,
+              tools: {
+                tar: tools.tar.split("\n")[0],
+                zstd: tools.zstd.split("\n")[0],
+                gpg: tools.gpg.split("\n")[0],
+              },
+              now: () => new Date(),
+            },
+            publisher: publisher({
+              captureId: request.captureId,
+              attemptId: settings.publicationAttemptId,
+              role: "recovery",
+              kind: "receipt",
+            }),
+            workerResultBytes: new Uint8Array(verifyInput.workerResultBytes),
+          },
+        );
       }
-      terminal = true; loopAbort.abort(); await monitor;
-      const resultSha256 = await atomicArtifact(directory, BACKUP_V2_RESULT_FILE, result, true);
+      terminal = true;
+      loopAbort.abort();
+      await monitor;
+      const resultSha256 = await atomicArtifact(
+        directory,
+        BACKUP_V2_RESULT_FILE,
+        result,
+        true,
+      );
       work.phase = kind === "worker" ? "CLOUD_COMPLETE" : "ACCEPTED";
       const status = await writeStatus(new Date().toISOString(), resultSha256);
-      journal.close(); notifier.close(); // No STOPPING: retain active/exited custody.
+      journal.close();
+      notifier.close(); // No STOPPING: retain active/exited custody.
       return status;
-    } catch (error) { return await cancel(error); }
+    } catch (error) {
+      return await cancel(error);
+    }
   });
 }
