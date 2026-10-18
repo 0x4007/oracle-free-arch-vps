@@ -9,6 +9,13 @@ import type { BackupV2SupervisorIdentity } from "./backup-v2-supervisor.ts";
 import { GATE_BACKUP_CGROUP_ROOT } from "./backblaze-controller-contract.ts";
 import { backupV2ChildEnvironment } from "./backup-v2-supervisor.ts";
 import { shellQuote } from "./backup-guest.ts";
+import {
+  BACKUP_V2_NATIVE_CUSTODY_FILE,
+  type BackupV2NativeCustody,
+  parseBackupV2NativeCustody,
+  validateBackupV2NativeCustodyRecord,
+} from "./backup-v2-native-custody.ts";
+import { BACKUP_V2_LIMITS } from "./backup-v2-profile.ts";
 
 const ROOT = "/sys/fs/cgroup";
 const GROUP = ROOT + GATE_BACKUP_CGROUP_ROOT;
@@ -17,6 +24,36 @@ const UNIT = new RegExp(
   `^arch-vps-b2-v2-(worker|verify|prune)-(${UUID})-(${UUID})\\.service$`,
 );
 const MAX_BYTES = 2 * 1024 * 1024;
+const JOURNAL_PATH = new RegExp(
+  `^/var/tmp/arch-vps-file-backup/generation-${UUID}/v2-${UUID}/[a-f0-9]{32}/${
+    BACKUP_V2_NATIVE_CUSTODY_FILE.replaceAll(".", "\\.")
+  }$`,
+);
+export interface BackupV2KernelObservation
+  extends Omit<BackupV2ControllerObservation, "status" | "resultBytes"> {
+  nativeCustodySha256: string | null;
+  managerNamespaceReferences: number | null;
+}
+export interface BackupV2KernelRetainedTerminalProof {
+  gate: BackupV2Gate;
+  observation: BackupV2KernelObservation;
+  resultSha256: string | null;
+  exactStop: {
+    unitName: string;
+    invocationId: string;
+    sourceBootId: string;
+    completed: true;
+  };
+}
+export interface BackupV2KernelObservationOptions {
+  expectedCustodySha256?: string;
+  retainedTerminalProof?: BackupV2KernelRetainedTerminalProof;
+}
+function outputLimit(command: string, args: string[]): number {
+  return command === "/usr/bin/cat" && JOURNAL_PATH.test(args.at(-1) ?? "")
+    ? BACKUP_V2_LIMITS.journalBytes
+    : MAX_BYTES;
+}
 const MAX_PIDS = 4096, MAX_FDS = 4096, MAX_GROUPS = 128;
 const COUNTERS = new Set([
   "cgroup.procs",
@@ -113,7 +150,7 @@ export const realBackupV2KernelCommand: BackupV2KernelCommand = async (
     if (commandsInFlight === 0) unsettledFailure = false;
   });
   const operation = Promise.all([
-    collect(output, MAX_BYTES),
+    collect(output, outputLimit(command, args)),
     collect(errors, 8192),
     terminal,
   ]);
@@ -138,30 +175,41 @@ export const realBackupV2KernelCommand: BackupV2KernelCommand = async (
     clearTimeout(timer);
   }
 };
-function bounded(run: BackupV2KernelCommand): BackupV2KernelCommand {
+function bounded(
+  run: BackupV2KernelCommand,
+  duration = 4000,
+  calls = 256,
+  maximum = 8 * MAX_BYTES,
+): BackupV2KernelCommand {
   const start = performance.now();
   let count = 0, total = 0;
   return async (command, args) => {
-    if (++count > 256 || performance.now() - start > 4000) fail("BOUNDED");
+    if (++count > calls || performance.now() - start > duration) {
+      fail("BOUNDED");
+    }
     const result = await run(command, args);
     if (
-      new TextEncoder().encode(result.stdout).length > MAX_BYTES ||
+      new TextEncoder().encode(result.stdout).length >
+        outputLimit(command, args) ||
       new TextEncoder().encode(result.stderr).length > 8192
     ) fail("BOUNDED");
     total += new TextEncoder().encode(result.stdout).length +
       new TextEncoder().encode(result.stderr).length;
-    if (total > 8 * MAX_BYTES || performance.now() - start > 4000) {
+    if (total > maximum || performance.now() - start > duration) {
       fail("BOUNDED");
     }
     return result;
   };
 }
-function result(value: BackupV2KernelCommandResult): string {
+function result(
+  value: BackupV2KernelCommandResult,
+  maximum = MAX_BYTES,
+): string {
   if (value.code !== 0) {
     if (value.stderr.includes("No such file or directory")) fail("ABSENT");
     fail("UNREADABLE");
   }
-  if (new TextEncoder().encode(value.stdout).length > MAX_BYTES) {
+  if (new TextEncoder().encode(value.stdout).length > maximum) {
     fail("BOUNDED");
   }
   return value.stdout;
@@ -418,13 +466,383 @@ async function lockFree(
     return null;
   }
 }
+const digest = async (text: string) =>
+  Array.from(
+    new Uint8Array(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)),
+    ),
+    (b) => b.toString(16).padStart(2, "0"),
+  ).join("");
+async function privateArtifact(
+  path: string,
+  run: BackupV2KernelCommand,
+  maximum: number,
+  contents = false,
+): Promise<{ sha256: string; text: string }> {
+  const parent = path.slice(0, path.lastIndexOf("/"));
+  if (
+    result(await run("/usr/bin/readlink", ["-e", "--", parent])).trim() !==
+      parent ||
+    result(await run("/usr/bin/stat", ["--printf=%u:%a:%F", "--", parent])) !==
+      "0:700:directory"
+  ) fail("CUSTODY");
+  const args = ["--printf=%d:%i:%u:%a:%h:%s:%F", "--", path];
+  const before = result(await run("/usr/bin/stat", args)),
+    fields = before.split(":");
+  if (
+    fields.length !== 7 || fields[2] !== "0" || fields[3] !== "600" ||
+    fields[4] !== "1" || !/^[0-9]+$/.test(fields[5]) || Number(fields[5]) < 1 ||
+    Number(fields[5]) > maximum || fields[6] !== "regular file"
+  ) fail("CUSTODY");
+  const text = contents
+    ? result(await run("/usr/bin/cat", ["--", path]), maximum)
+    : "";
+  const hash = result(await run("/usr/bin/sha256sum", ["--", path]));
+  if (
+    !/^[a-f0-9]{64} {2}/.test(hash) || hash.slice(66).trim() !== path ||
+    before !== result(await run("/usr/bin/stat", args))
+  ) fail("CUSTODY");
+  const sha256 = hash.slice(0, 64);
+  if (
+    contents &&
+    (new TextEncoder().encode(text).length !== Number(fields[5]) ||
+      await digest(text) !== sha256)
+  ) fail("CUSTODY");
+  return { sha256, text };
+}
+function sameIdentity(
+  a: BackupV2SupervisorIdentity,
+  b: BackupV2SupervisorIdentity,
+): boolean {
+  return ([
+    "unitName",
+    "invocationId",
+    "mainPid",
+    "mainStartTicks",
+    "cgroup",
+  ] as const).every((key) => a[key] === b[key]);
+}
+function retained(
+  gate: BackupV2Gate,
+  options: BackupV2KernelObservationOptions,
+): BackupV2KernelRetainedTerminalProof | null {
+  const proof = options.retainedTerminalProof;
+  if (!proof || !gate.custody) return null;
+  validateBackupV2NativeCustodyRecord({
+    type: "BOUND",
+    schemaVersion: 1,
+    gate: proof.gate,
+  }, gate);
+  const before = proof.observation, tree = before.tree, stop = proof.exactStop;
+  if (
+    before.sourceBootId !== gate.sourceBootId ||
+    !["EXITED", "FAILED"].includes(before.unit) || !before.identity ||
+    !sameIdentity(before.identity, gate.custody) || !tree ||
+    !sameIdentity(tree.identity, gate.custody) || tree.mainPid !== 0 ||
+    tree.controlPid !== 0 || tree.descendants !== 0 ||
+    tree.cgroupPopulated !== false || tree.escapedProcesses !== 0 ||
+    tree.openPipelineHandles !== 0 || tree.pendingOperations !== 0 ||
+    tree.sourceLockFree !== true ||
+    !Number.isSafeInteger(tree.namespaceReferences) ||
+    tree.namespaceReferences! < 0 ||
+    before.managerNamespaceReferences !== tree.namespaceReferences ||
+    !/^[a-f0-9]{64}$/.test(before.nativeCustodySha256 ?? "") ||
+    options.expectedCustodySha256 !== undefined &&
+      options.expectedCustodySha256 !== before.nativeCustodySha256 ||
+    proof.resultSha256 !== null && !/^[a-f0-9]{64}$/.test(proof.resultSha256) ||
+    before.unit === "EXITED" && proof.resultSha256 === null ||
+    stop.completed !== true || stop.unitName !== gate.unitName ||
+    stop.invocationId !== gate.custody.invocationId ||
+    stop.sourceBootId !== gate.sourceBootId
+  ) fail("CUSTODY");
+  return proof;
+}
+function numbers(text: string, descriptors = false): number[] {
+  const values = text.split("\0");
+  if (values.pop() !== "" || values.length > MAX_PIDS) fail("BOUNDED");
+  return [
+    ...new Set(
+      values.map((value) => descriptors && value === "0" ? 0 : pid(value)),
+    ),
+  ];
+}
+async function namespaceId(
+  path: string,
+  run: BackupV2KernelCommand,
+): Promise<string> {
+  const value = result(
+    await run("/usr/bin/stat", ["-L", "--printf=%d:%i", "--", path]),
+  );
+  if (!/^[0-9]{1,20}:[1-9][0-9]{0,19}$/.test(value)) fail("MALFORMED");
+  return value;
+}
+async function namespaceCensus(
+  privateIds: Set<string>,
+  allPids: number[],
+  run: BackupV2KernelCommand,
+): Promise<{ references: number; manager: number }> {
+  let references = 0, manager = 0;
+  for (const current of allPids) {
+    try {
+      if (privateIds.has(await namespaceId(`/proc/${current}/ns/mnt`, run))) {
+        references++;
+      }
+      const found = result(
+        await run("/usr/bin/find", [
+          `/proc/${current}/fd`,
+          "-mindepth",
+          "1",
+          "-maxdepth",
+          "1",
+          "-type",
+          "l",
+          "-lname",
+          "mnt:[[]*[]]",
+          "-printf",
+          "%f\\0",
+        ]),
+      );
+      const fds = numbers(found, true);
+      if (fds.length > MAX_FDS) fail("BOUNDED");
+      for (const fd of fds) {
+        if (
+          privateIds.has(await namespaceId(`/proc/${current}/fd/${fd}`, run))
+        ) {
+          references++;
+          if (current === 1) manager++;
+        }
+      }
+    } catch (error) {
+      if (!absent(error)) throw error;
+    }
+  }
+  return { references, manager };
+}
+interface CustodyFacts {
+  hash: string | null;
+  escaped: number | null;
+  namespaces: number | null;
+  manager: number | null;
+  handles: number | null;
+  pending: number | null;
+  mainGone: boolean;
+}
+async function custodyFacts(
+  gate: BackupV2Gate,
+  identity: BackupV2SupervisorIdentity,
+  descendants: number | null,
+  command: BackupV2KernelCommand,
+  options: BackupV2KernelObservationOptions,
+  proof: BackupV2KernelRetainedTerminalProof | null,
+): Promise<CustodyFacts> {
+  const facts: CustodyFacts = {
+    hash: null,
+    escaped: null,
+    namespaces: null,
+    manager: null,
+    handles: null,
+    pending: null,
+    mainGone: false,
+  };
+  if (!gate.custody || !sameIdentity(gate.custody, identity)) return facts;
+  try {
+    const directory = (await import("./backup-v2-worker.ts"))
+        .backupV2GateDirectory(gate),
+      path = `${directory}/${BACKUP_V2_NATIVE_CUSTODY_FILE}`;
+    const artifact = await privateArtifact(
+        path,
+        command,
+        BACKUP_V2_LIMITS.journalBytes,
+        true,
+      ),
+      expected = options.expectedCustodySha256 ??
+        proof?.observation.nativeCustodySha256;
+    if (
+      expected !== undefined &&
+      (!/^[a-f0-9]{64}$/.test(expected ?? "") || expected !== artifact.sha256)
+    ) fail("CUSTODY");
+    const journal: BackupV2NativeCustody = parseBackupV2NativeCustody(
+      new TextEncoder().encode(artifact.text),
+      gate,
+    );
+    facts.hash = artifact.sha256;
+    if (
+      proof?.resultSha256 !== null && proof?.resultSha256 !== undefined &&
+      (await privateArtifact(`${directory}/result.json`, command, MAX_BYTES))
+          .sha256 !== proof.resultSha256
+    ) fail("CUSTODY");
+    const enumerated = await command("/usr/bin/find", [
+      "/proc",
+      "-mindepth",
+      "1",
+      "-maxdepth",
+      "1",
+      "-type",
+      "d",
+      "-regex",
+      "/proc/[1-9][0-9]*",
+      "-printf",
+      "%f\\0",
+    ]);
+    const allPids = numbers(result(enumerated)).filter((current) =>
+        current !== enumerated.observerPid
+      ),
+      present = new Set(allPids);
+    const known = [{
+      identity: { pid: identity.mainPid, startTicks: identity.mainStartTicks },
+      exit: null,
+    }, ...journal.children];
+    const live = new Set<number>();
+    let escaped = 0, handles = 0, complete = true;
+    for (let at = 0; at < known.length; at++) {
+      const entry = known[at];
+      let exists = false;
+      if (present.has(entry.identity.pid)) {
+        try {
+          exists = fields(
+            result(
+              await command("/usr/bin/cat", [
+                "--",
+                `/proc/${entry.identity.pid}/stat`,
+              ]),
+            ),
+            entry.identity.pid,
+          ).start === entry.identity.startTicks;
+        } catch (error) {
+          if (!absent(error)) throw error;
+        }
+      }
+      if (at === 0) facts.mainGone = !exists;
+      if (!exists) {
+        if (at !== 0 && !entry.exit) complete = false;
+        continue;
+      }
+      if (entry.exit) complete = false;
+      live.add(entry.identity.pid);
+      const member = result(
+        await command("/usr/bin/cat", [
+          "--",
+          `/proc/${entry.identity.pid}/cgroup`,
+        ]),
+      ).trim();
+      if (
+        member !== `0::${identity.cgroup}` &&
+        !member.startsWith(`0::${identity.cgroup}/`)
+      ) escaped++;
+      const fds = result(
+        await command("/usr/bin/find", [
+          `/proc/${entry.identity.pid}/fd`,
+          "-mindepth",
+          "1",
+          "-maxdepth",
+          "1",
+          "-type",
+          "l",
+          "(",
+          "-lname",
+          "pipe:[[]*[]]",
+          "-o",
+          "-lname",
+          "socket:[[]*[]]",
+          "-o",
+          "-lname",
+          `${directory}/*`,
+          ")",
+          "-printf",
+          "%f\\0",
+        ]),
+      );
+      handles += numbers(fds, true).length;
+      if (
+        fields(
+          result(
+            await command("/usr/bin/cat", [
+              "--",
+              `/proc/${entry.identity.pid}/stat`,
+            ]),
+          ),
+          entry.identity.pid,
+        ).start !== entry.identity.startTicks
+      ) fail("CUSTODY");
+    }
+    let groupMembers: number[] = [];
+    try {
+      groupMembers = await pids(identity.cgroup, command);
+    } catch (error) {
+      if (!(absent(error) && descendants === 0)) throw error;
+    }
+    if (groupMembers.some((current) => !live.has(current))) complete = false;
+    if (
+      !complete || !journal.mounts.some((mount) => mount.scope === "UNIT") ||
+      journal.unresolvedNamespaceLeaders.length
+    ) return facts;
+    facts.escaped = escaped;
+    facts.handles = handles;
+    if (
+      facts.mainGone && live.size === 0 && descendants === 0 &&
+      journal.children.every((child) => child.exit !== null)
+    ) facts.pending = 0;
+    const host = await namespaceId("/proc/1/ns/mnt", command);
+    if (
+      journal.mounts.some((mount) =>
+        `${mount.hostDevice}:${mount.hostInode}` !== host
+      )
+    ) return facts;
+    const privateIds = new Set(
+      journal.mounts.filter((mount) =>
+        `${mount.device}:${mount.inode}` !== host
+      ).map((mount) => `${mount.device}:${mount.inode}`),
+    );
+    for (const mount of journal.mounts) {
+      if (
+        live.has(mount.leader.pid) &&
+        await namespaceId(`/proc/${mount.leader.pid}/ns/mnt`, command) !==
+          `${mount.device}:${mount.inode}`
+      ) return { ...facts, namespaces: null, manager: null };
+    }
+    if (privateIds.size === 0) {
+      if (journal.noPrivateMountProved) {
+        facts.namespaces = 0;
+        facts.manager = 0;
+      }
+    } else {
+      const census = await namespaceCensus(privateIds, allPids, command);
+      facts.namespaces = census.references;
+      facts.manager = census.manager;
+    }
+    // Recheck the same root-owned bytes after the census; a live append can
+    // never turn a partial snapshot into a complete terminal proof.
+    if (
+      (await privateArtifact(path, command, BACKUP_V2_LIMITS.journalBytes))
+        .sha256 !== artifact.sha256
+    ) fail("CUSTODY");
+    return facts;
+  } catch {
+    return {
+      ...facts,
+      escaped: null,
+      namespaces: null,
+      manager: null,
+      handles: null,
+      pending: null,
+    };
+  }
+}
 /** Tree facts that need complete child/namespace custody stay null until the
  * producer publishes that exact gate-bound record. No host-wide argv scan. */
 export async function observeBackupV2Kernel(
   gateInput: BackupV2Gate,
   command: BackupV2KernelCommand = realBackupV2KernelCommand,
-): Promise<Omit<BackupV2ControllerObservation, "status" | "resultBytes">> {
-  const gate = validateBackupV2Gate(gateInput), run = bounded(command);
+  options: BackupV2KernelObservationOptions = {},
+): Promise<BackupV2KernelObservation> {
+  const gate = validateBackupV2Gate(gateInput),
+    run = bounded(
+      command,
+      20_000,
+      16_384,
+      2 * BACKUP_V2_LIMITS.journalBytes + 8 * MAX_BYTES,
+    ),
+    proof = retained(gate, options);
   const sourceBootId = result(
     await run("/usr/bin/cat", ["--", "/proc/sys/kernel/random/boot_id"]),
   ).trim();
@@ -448,8 +866,17 @@ export async function observeBackupV2Kernel(
     : props.ActiveState === "active"
     ? "RUNNING"
     : "STARTING";
-  const unknown = { sourceBootId, unit, identity: null, tree: null } as const;
-  if (sourceBootId !== gate.sourceBootId || unit === "ABSENT") return unknown;
+  const unknown = {
+    sourceBootId,
+    unit,
+    identity: null,
+    tree: null,
+    nativeCustodySha256: null,
+    managerNamespaceReferences: null,
+  } as const;
+  if (sourceBootId !== gate.sourceBootId || unit === "ABSENT" && !proof) {
+    return unknown;
+  }
   if (!/^[0-9]+$/.test(props.MainPID) || !/^[0-9]+$/.test(props.ControlPID)) {
     fail("MALFORMED");
   }
@@ -483,6 +910,7 @@ export async function observeBackupV2Kernel(
     props.InvocationID === gate.custody.invocationId &&
     ["EXITED", "FAILED"].includes(unit)
   ) identity = gate.custody;
+  else if (unit === "ABSENT" && proof) identity = gate.custody;
   if (!identity) return unknown;
   let descendants: number | null = null, cgroupPopulated: boolean | null = null;
   try {
@@ -498,8 +926,11 @@ export async function observeBackupV2Kernel(
     // Only exact retained successful terminal custody permits original group
     // absence to prove an empty tree; missing/unreadable alone stays unknown.
     if (
-      absent(error) && unit === "EXITED" && props.Result === "success" &&
-      props.InvocationID === identity.invocationId && mainPid === 0 &&
+      absent(error) &&
+      (unit === "EXITED" && props.Result === "success" &&
+          props.InvocationID === identity.invocationId ||
+        unit === "ABSENT" && proof !== null) &&
+      mainPid === 0 &&
       controlPid === 0
     ) {
       try {
@@ -514,10 +945,24 @@ export async function observeBackupV2Kernel(
       }
     }
   }
+  const facts = await custodyFacts(
+    gate,
+    identity,
+    descendants,
+    run,
+    options,
+    proof,
+  );
+  if (
+    unit === "ABSENT" &&
+    (!facts.mainGone || facts.hash !== proof!.observation.nativeCustodySha256)
+  ) return unknown;
   return {
     sourceBootId,
     unit,
     identity,
+    nativeCustodySha256: facts.hash,
+    managerNamespaceReferences: facts.manager,
     tree: {
       identity,
       observedMonotonicMs: performance.now(),
@@ -525,10 +970,10 @@ export async function observeBackupV2Kernel(
       controlPid,
       cgroupPopulated,
       descendants,
-      escapedProcesses: null,
-      namespaceReferences: null,
-      openPipelineHandles: null,
-      pendingOperations: null,
+      escapedProcesses: facts.escaped,
+      namespaceReferences: facts.namespaces,
+      openPipelineHandles: facts.handles,
+      pendingOperations: facts.pending,
       sourceLockFree: await lockFree(gate, run),
     },
   };
