@@ -2616,6 +2616,25 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
   const payload = JSON.parse(new TextDecoder().decode(installCall.input));
   assert(payload.jobId === fixture.jobId);
   assert(installCall.args.join(" ").includes("deno eval"));
+  assert(installCall.args.includes(`/usr/bin/env`));
+  assert(
+    installCall.args.includes(
+      `DENO_DIR=${JOBS_RUNTIME_ROOT}/control-cache-${fixture.jobId}`,
+    ),
+  );
+  assert(
+    !installCall.args.includes(
+      `DENO_DIR=${JOBS_RUNTIME_ROOT}/${fixture.jobId}/control-cache`,
+    ),
+  );
+  const previousCalls = calls.length;
+  let rejected = false;
+  try {
+    await seam.installer({ jobId: "../foreign", files: [] });
+  } catch {
+    rejected = true;
+  }
+  assert(rejected && calls.length === previousCalls);
 });
 
 Deno.test("wiring: installer source is quoted so the real ssh command survives remote-shell parsing", async () => {
@@ -2669,17 +2688,22 @@ Deno.test("wiring: installer source is quoted so the real ssh command survives r
       .split("\0");
     const argv = parts.at(-1) === "" ? parts.slice(0, -1) : parts;
     assert(
-      argv.length === 4,
+      argv.length === 6,
       `the remote shell must produce the sudo argv, got ${
         JSON.stringify(argv)
       }`,
     );
     assert(argv[0] === "-n");
-    assert(argv[1] === "/usr/local/bin/deno");
-    assert(argv[2] === "eval");
+    assert(argv[1] === "/usr/bin/env");
     assert(
-      argv[3].startsWith("const payload") && argv[3].includes("\n") &&
-        argv[3].includes("installed: true") && argv[3].endsWith("}));"),
+      argv[2] ===
+        `DENO_DIR=${JOBS_RUNTIME_ROOT}/control-cache-${fixture.jobId}`,
+    );
+    assert(argv[3] === "/usr/local/bin/deno");
+    assert(argv[4] === "eval");
+    assert(
+      argv[5].startsWith("const payload") && argv[5].includes("\n") &&
+        argv[5].includes("installed: true") && argv[5].endsWith("}));"),
       "the installer source must survive as one exact eval argument",
     );
   } finally {

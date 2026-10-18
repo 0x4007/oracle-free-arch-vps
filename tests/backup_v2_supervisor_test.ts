@@ -1,11 +1,14 @@
 import {
   backupV2ChildEnvironment,
+  backupV2FailureEvidence,
   type BackupV2Notifier,
   BackupV2Supervisor,
+  type BackupV2SupervisorFailure,
   type BackupV2SupervisorIdentity,
   type BackupV2SupervisorObservation,
   backupV2SupervisorUnitProperties,
   type BackupV2TreeObservation,
+  classifyBackupV2Failure,
   createBackupV2Notifier,
   encodeBackupV2Notification,
   evaluateBackupV2Lease,
@@ -20,6 +23,7 @@ import {
   type BackupV2TransferEpisode,
   backupV2TransferWindowMs,
 } from "../scripts/backup-v2-contract.ts";
+import { BackupV2KernelEvidenceError } from "../scripts/backup-v2-kernel.ts";
 
 function assert(value: unknown): asserts value {
   if (!value) throw new Error("Assertion failed");
@@ -106,6 +110,119 @@ function fixture() {
     supervisor: new BackupV2Supervisor(identity, options, capabilities),
   };
 }
+
+Deno.test("supervisor preserves sanitized capacity guard causes without changing cancellation decisions", async () => {
+  for (
+    const guard of [
+      "WORKSPACE_LIMIT",
+      "FREE_SPACE",
+      "FREE_INODES",
+      "WORKSPACE_DELETED_ACCOUNTING",
+      "SOURCE_DELETED_LIMIT",
+    ]
+  ) {
+    const f = fixture(), failures: BackupV2SupervisorFailure[] = [];
+    const capacity = f.state.sample.capacity;
+    if (guard === "WORKSPACE_LIMIT") {
+      capacity.allocatedWorkspaceBytes = BACKUP_V2_LIMITS.workspaceBytes + 1;
+    }
+    if (guard === "FREE_SPACE") capacity.availableBytes = 0;
+    if (guard === "FREE_INODES") capacity.freeInodes = 0;
+    if (guard === "WORKSPACE_DELETED_ACCOUNTING") {
+      capacity.workspaceHeldDeletedBytes = 1;
+    }
+    if (guard === "SOURCE_DELETED_LIMIT") {
+      capacity.sourceHeldDeletedBytes = 1025;
+    }
+    const supervisor = new BackupV2Supervisor(identity, f.options, {
+      ...f.capabilities,
+      onFailure: (failure) => failures.push(failure),
+    });
+    equal(await supervisor.poll(), {
+      action: "cancel",
+      reason: "OBSERVATION_OR_NOTIFICATION_UNPROVED",
+    });
+    equal(failures, [{
+      stage: "capacity",
+      errorClass: "BackupV2CapacityGuardError",
+      kind: guard,
+    }]);
+    equal(f.state.messages, []);
+  }
+});
+
+Deno.test("supervisor observer diagnostics retain only whitelisted kernel kind and ignore diagnostic callback failures", async () => {
+  const f = fixture(), failures: BackupV2SupervisorFailure[] = [];
+  const supervisor = new BackupV2Supervisor(identity, f.options, {
+    ...f.capabilities,
+    observe: () =>
+      Promise.reject(new BackupV2KernelEvidenceError("UNREADABLE")),
+    onFailure: (failure) => {
+      failures.push(failure);
+      throw Error("private callback token");
+    },
+  });
+  equal(await supervisor.poll(), {
+    action: "cancel",
+    reason: "OBSERVATION_OR_NOTIFICATION_UNPROVED",
+  });
+  equal(failures, [{
+    stage: "observation",
+    errorClass: "BackupV2KernelEvidenceError",
+    kind: "UNREADABLE",
+  }]);
+});
+
+Deno.test("failure evidence drops exception text, private fields and unclassified reasons while preserving last observed counters", () => {
+  const secret = "https://private.example/token?secret=PRIVATE_VALUE";
+  const sample = observation(0);
+  sample.progress.sourceBytes = 123;
+  Object.assign(sample.capacity, { headers: secret });
+  const error = Object.assign(new Error(secret), {
+    stack: secret,
+    headers: secret,
+    kind: secret,
+  });
+  const evidence = backupV2FailureEvidence({
+    identity: Object.assign({ ...identity }, { token: secret }),
+    reason: error,
+    supervisorFailure: null,
+    observation: sample,
+    observedAtUtc: "2026-10-18T22:10:00.000Z",
+    observedMonotonicMs: 10,
+  });
+  assert(!JSON.stringify(evidence).includes(secret));
+  equal(evidence.identity, identity);
+  equal(evidence.reason, "UNCLASSIFIED_FAILURE");
+  equal(evidence.errorClass, "Error");
+  equal(evidence.kind, null);
+  equal(evidence.capacityAgeMs, 10);
+  equal(evidence.progressAgeMs, 10);
+  equal(evidence.observation?.progress.sourceBytes, 123);
+  equal(
+    evidence.observation?.capacity.availableBytes,
+    sample.capacity.availableBytes,
+  );
+  assert(new TextEncoder().encode(JSON.stringify(evidence)).length < 8192);
+  equal(
+    backupV2FailureEvidence({
+      identity,
+      reason: secret,
+      supervisorFailure: null,
+      observation: null,
+      observedAtUtc: evidence.observedAtUtc,
+      observedMonotonicMs: 10,
+    }).observation,
+    null,
+  );
+  class PrivateProviderError extends Error {
+    kind = secret;
+  }
+  equal(classifyBackupV2Failure(new PrivateProviderError(secret)), {
+    errorClass: "UNKNOWN",
+    kind: null,
+  });
+});
 
 Deno.test("supervisor fixed initialization window is independent of short notification renewals", async () => {
   const f = fixture();

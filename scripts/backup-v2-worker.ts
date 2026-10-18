@@ -78,7 +78,10 @@ import {
 import { createBackupV2FileObjectReader } from "./backup-v2-recovery.ts";
 import {
   type BackupV2CapacityObservation,
+  backupV2FailureEvidence,
   BackupV2Supervisor,
+  type BackupV2SupervisorFailure,
+  type BackupV2SupervisorObservation,
   createBackupV2Notifier,
 } from "./backup-v2-supervisor.ts";
 import {
@@ -118,6 +121,7 @@ import {
 } from "./backup-v2-protection.ts";
 import {
   BACKUP_BASE,
+  backupV2ControlCacheDirectory,
   ensurePublicHome,
   JOBS_RUNTIME_ROOT,
   makeStreamDecryptArchive,
@@ -136,6 +140,7 @@ export const BACKUP_V2_STATUS_FILE = "status.json";
 export const BACKUP_V2_RESULT_FILE = "result.json";
 export const BACKUP_V2_CHECKPOINT_FILE = "sealed-roles.json";
 export const BACKUP_V2_GATE_FILE = "gate.json";
+export { backupV2ControlCacheDirectory };
 const encoder = new TextEncoder();
 export const backupV2ArtifactBytes = (value: unknown) =>
   encoder.encode(JSON.stringify(value) + "\n");
@@ -725,7 +730,7 @@ async function rootRead(
   return bytes;
 }
 /** Only ephemeral decoder/producer scratch is removed. Native/upload journals,
- * source results, checkpoints and protected graph copies are retained. */
+ * source results, failure evidence, checkpoints and protected graphs stay. */
 export interface BackupV2ScratchCleanupReceipt {
   schemaVersion: 2;
   format: "backup-v2-scratch-cleanup";
@@ -1079,6 +1084,7 @@ async function previousSealedRoles(
 }
 
 export interface BackupV2CapacityIO {
+  now?(): number;
   lstat(path: string): Promise<{
     blocks: bigint;
     dev: bigint;
@@ -1125,48 +1131,91 @@ export async function observeBackupV2Capacity(
   additionalRoots: readonly string[] = [],
   io: BackupV2CapacityIO = capacityIO,
 ): Promise<BackupV2CapacityObservation> {
+  const clock = io.now ?? (() => performance.now()), deadline = clock() + 5000;
+  const budget = () => {
+    const now = clock();
+    if (!Number.isFinite(now) || now < 0 || now >= deadline) fail();
+  };
+  const absent = (error: unknown) =>
+    error instanceof Deno.errors.NotFound ||
+    error instanceof Error && "code" in error && error.code === "ENOENT";
   let allocated = 0, entries = 0;
   const seen = new Set<string>();
+  budget();
   const primary = await io.lstat(directory);
   if (!primary.isDirectory() || primary.isSymbolicLink()) fail();
-  const walk = async (path: string, depth: number): Promise<void> => {
-    if (++entries > 10_000 || depth > 32) fail();
-    const info = await io.lstat(path);
-    if (info.isSymbolicLink() || info.dev !== primary.dev || info.blocks < 0n) {
-      fail();
-    }
-    const key = `${info.dev}:${info.ino}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    allocated += Number(info.blocks * 512n);
-    if (!Number.isSafeInteger(allocated)) fail();
-    if (info.isDirectory()) {
-      for await (const child of io.entries(path)) {
-        if (!child || child.includes("/") || child === "." || child === "..") {
-          fail();
-        }
-        await walk(`${path}/${child}`, depth + 1);
-      }
-    }
+  const assertPrimary = async () => {
+    budget();
+    const current = await io.lstat(directory);
+    if (
+      !current.isDirectory() || current.isSymbolicLink() ||
+      current.dev !== primary.dev || current.ino !== primary.ino
+    ) fail();
+    budget();
   };
-  for (const root of backupV2CapacityRoots(directory, additionalRoots)) {
+  const vanished = new Set<unknown>();
+  const walk = async (path: string, depth: number): Promise<void> => {
+    budget();
+    if (++entries > 10_000 || depth > 32) fail();
     try {
-      // A registered future root may not exist yet; disappearing descendants
-      // or any other failed observation remain unknown and fail closed.
-      await io.lstat(root);
-    } catch (error) {
+      const info = await io.lstat(path);
+      budget();
       if (
-        root !== directory && (error instanceof Deno.errors.NotFound ||
-          error instanceof Error && "code" in error && error.code === "ENOENT")
-      ) continue;
+        info.isSymbolicLink() || info.dev !== primary.dev || info.blocks < 0n
+      ) fail();
+      const key = `${info.dev}:${info.ino}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      allocated += Number(info.blocks * 512n);
+      if (!Number.isSafeInteger(allocated)) fail();
+      if (info.isDirectory()) {
+        for await (const child of io.entries(path)) {
+          if (
+            !child || child.includes("/") || child === "." || child === ".."
+          ) fail();
+          await walk(`${path}/${child}`, depth + 1);
+        }
+      }
+    } catch (error) {
+      if (depth > 0 && absent(error)) vanished.add(error);
       throw error;
     }
-    await walk(root, 0);
+  };
+  const roots = backupV2CapacityRoots(directory, additionalRoots),
+    present = new Set([directory]);
+  for (let attempt = 0;; attempt++) {
+    allocated = 0;
+    seen.clear();
+    vanished.clear();
+    try {
+      for (const root of roots) {
+        budget();
+        try {
+          await io.lstat(root);
+        } catch (error) {
+          // A registered future root may not yet exist. An observed root
+          // disappearing is never treated as an empty directory.
+          if (!present.has(root) && absent(error)) continue;
+          throw error;
+        }
+        present.add(root);
+        await walk(root, 0);
+      }
+      await assertPrimary();
+      break;
+    } catch (error) {
+      // WAL/shm removal restarts the entire walk with fresh inode accounting,
+      // sharing one time/entry budget; no partial count is accepted.
+      if (!vanished.has(error) || attempt >= 2) throw error;
+      await assertPrimary();
+    }
   }
+  budget();
   const {
     workspaceHeldDeletedBytes: workspaceDeleted,
     sourceHeldDeletedBytes: sourceDeleted,
   } = await io.deleted(directory, cgroup);
+  budget();
   if (
     ![workspaceDeleted, sourceDeleted].every((value) =>
       Number.isSafeInteger(value) && value >= 0
@@ -1174,6 +1223,7 @@ export async function observeBackupV2Capacity(
   ) fail();
   const workspaceHeldDeletedBytes = workspaceDeleted + sourceDeleted;
   const fs = await io.statfs(directory);
+  budget();
   const availableBytes = Number(fs.bavail * fs.bsize),
     freeInodes = Number(fs.ffree);
   if (
@@ -1306,7 +1356,10 @@ export async function runBackupV2RemoteWorker(
       work = new BackupV2WorkerProgress(),
       notifier = createBackupV2Notifier();
     const startedAtUtc = new Date().toISOString();
-    const activeRoots = new Set<string>([`${runtime}/deno-cache`]);
+    const activeRoots = new Set<string>([
+      `${runtime}/deno-cache`,
+      backupV2ControlCacheDirectory(jobId),
+    ]);
     if (pruneInput) {
       activeRoots.add(
         `${BACKUP_V2_PRUNE_TRANSACTIONS}/${pruneInput.transactionId}`,
@@ -1315,6 +1368,8 @@ export async function runBackupV2RemoteWorker(
     let last: BackupV2Status | null = null,
       terminal = false,
       stopping: Promise<never> | null = null;
+    let lastObservation: BackupV2SupervisorObservation | null = null,
+      supervisorFailure: BackupV2SupervisorFailure | null = null;
     let statusWrites: Promise<unknown> = Promise.resolve();
     const writeStatus = (
       finishedAtUtc: string | null = null,
@@ -1354,8 +1409,26 @@ export async function runBackupV2RemoteWorker(
           // Retain the MainPID so RemainAfterExit cannot disable the finite
           // runtime timer while a child/namespace is unproved. Never renew here.
           setInterval(() => {}, 1000);
+          try {
+            await atomicArtifact(
+              directory,
+              "failure.json",
+              backupV2FailureEvidence({
+                identity: gate.custody!,
+                reason,
+                supervisorFailure,
+                observation: lastObservation,
+                observedAtUtc: new Date().toISOString(),
+                observedMonotonicMs: performance.now(),
+              }),
+              true,
+            );
+          } catch {
+            console.error(
+              "Backup v2 sanitized failure evidence persistence unproved",
+            );
+          }
           await writeStatus().catch(() => {});
-          void reason;
           return await new Promise<never>(() => {});
         })();
       }
@@ -1373,17 +1446,21 @@ export async function runBackupV2RemoteWorker(
     }, {
       now: () => performance.now(),
       notifier,
+      onFailure: (failure) => {
+        supervisorFailure ??= failure;
+      },
       async observe() {
         const sample = await observeBackupV2Capacity(
           directory,
           gate.custody!.cgroup,
           [...activeRoots],
         );
-        return {
+        lastObservation = {
           identity: gate.custody!,
           progress: work.snapshot(sample.observedMonotonicMs),
           capacity: sample,
         };
+        return lastObservation;
       },
     });
     const processes = createBackupV2NativeProcessStarter({

@@ -53,6 +53,7 @@ import {
 import {
   backupV2ArtifactBytes,
   backupV2ArtifactSha256,
+  backupV2ControlCacheDirectory,
   backupV2GateDirectory,
   type BackupV2PruneWorkerResult,
   type BackupV2VerifiedResult,
@@ -1064,10 +1065,10 @@ export function backupV2LaunchArguments(
 }
 
 /** Root-only bounded control read; payload and private keys never cross this seam. */
-function remoteProgram(program: string): string {
-  return `printf '%s' ${
-    shellQuote(program)
-  } | /usr/local/bin/deno run --no-prompt --no-config --no-lock --cached-only --allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${BACKUP_V2_PROTECTION_SOURCE_BASE} --allow-run=/bin/sh,/usr/bin/systemctl,/usr/bin/flock,/usr/bin/cat,/usr/bin/find,/usr/bin/stat,/usr/bin/readlink,/usr/bin/sha256sum -`;
+export function backupV2RemoteProgram(jobId: string, program: string): string {
+  return `printf '%s' ${shellQuote(program)} | DENO_DIR=${
+    shellQuote(backupV2ControlCacheDirectory(jobId))
+  } /usr/local/bin/deno run --no-prompt --no-config --no-lock --no-code-cache --cached-only --allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${BACKUP_V2_PROTECTION_SOURCE_BASE} --allow-run=/bin/sh,/usr/bin/systemctl,/usr/bin/flock,/usr/bin/cat,/usr/bin/find,/usr/bin/stat,/usr/bin/readlink,/usr/bin/sha256sum -`;
 }
 export function backupV2ObservationProgram(
   gateInput: BackupV2Gate,
@@ -1098,7 +1099,10 @@ export async function observeBackupV2Source(
   options: BackupV2KernelObservationOptions = {},
 ): Promise<BackupV2ControllerObservation> {
   const result = await remote.root(
-    remoteProgram(backupV2ObservationProgram(gate, options)),
+    backupV2RemoteProgram(
+      gate.envelope.request.jobId,
+      backupV2ObservationProgram(gate, options),
+    ),
   );
   if (
     result.code !== 0 ||
@@ -1117,6 +1121,7 @@ export async function observeBackupV2Source(
 /** Persist one exact generated artifact without replacing an old job's bytes. */
 async function installBackupV2Artifact(
   deps: PiDeps,
+  jobId: string,
   path: string,
   value: unknown,
 ): Promise<void> {
@@ -1128,9 +1133,9 @@ async function installBackupV2Artifact(
   const program = `const path=${JSON.stringify(path)},bytes=new Uint8Array(${
     JSON.stringify(bytes)
   });const before=await Deno.lstat(path.slice(0,path.lastIndexOf("/")));if(!before.isDirectory||before.isSymlink||before.uid!==0||(before.mode&511)!==448||await Deno.realPath(path.slice(0,path.lastIndexOf("/")))!==path.slice(0,path.lastIndexOf("/")))throw Error("Unsafe parent");try{const info=await Deno.lstat(path);if(!info.isFile||info.isSymlink||info.uid!==0||info.nlink!==1||(info.mode&511)!==384||info.size!==bytes.length)throw Error("Unsafe existing artifact");const prior=await Deno.readFile(path);if(prior.some((b,i)=>b!==bytes[i]))throw Error("Artifact conflict");}catch(e){if(!(e instanceof Deno.errors.NotFound))throw e;using file=await Deno.open(path,{createNew:true,write:true,mode:384});let at=0;while(at<bytes.length){const count=await file.write(bytes.subarray(at));if(count<=0)throw Error("Short write");at+=count;}await file.sync();}using parent=await Deno.open(path.slice(0,path.lastIndexOf("/")),{read:true});await parent.sync();`;
-  const script = `printf '%s' ${
-    shellQuote(program)
-  } | /usr/local/bin/deno run --no-prompt --no-config --no-lock --allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT} --allow-write=${BACKUP_BASE},${JOBS_RUNTIME_ROOT} -`;
+  const script = `printf '%s' ${shellQuote(program)} | DENO_DIR=${
+    shellQuote(backupV2ControlCacheDirectory(jobId))
+  } /usr/local/bin/deno run --no-prompt --no-config --no-lock --no-code-cache --allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT} --allow-write=${BACKUP_BASE},${JOBS_RUNTIME_ROOT} -`;
   if ((await deps.remote.root(script)).code !== 0) {
     throw new Error("Backup v2 immutable artifact installation failed");
   }
@@ -1393,6 +1398,7 @@ export function realBackupV2ControllerCapabilities(
     acknowledge: (gate) =>
       installBackupV2Artifact(
         deps,
+        gate.envelope.request.jobId,
         `${backupV2GateDirectory(gate)}/gate-bound.json`,
         {
           gateId: gate.gateId,
@@ -1404,6 +1410,7 @@ export function realBackupV2ControllerCapabilities(
     verifierInput: (job) =>
       installBackupV2Artifact(
         deps,
+        job.settings.envelope.request.jobId,
         `${JOBS_RUNTIME_ROOT}/${job.settings.envelope.request.jobId}/verifier-request.json`,
         {
           workerGate: job.workerGate,
@@ -1442,7 +1449,9 @@ export function realBackupV2ControllerCapabilities(
           const program = `const path=${
             JSON.stringify(path)
           },parent=path.slice(0,path.lastIndexOf("/")),dir=await Deno.lstat(parent);if(!dir.isDirectory||dir.isSymlink||dir.uid!==0||(dir.mode&511)!==448||await Deno.realPath(parent)!==parent)throw Error("Unsafe graph parent");const before=await Deno.lstat(path);if(!before.isFile||before.isSymlink||before.uid!==0||before.nlink!==1||(before.mode&511)!==384||before.size>${BACKUP_V2_LIMITS.controlResponseBytes})throw Error("Unsafe graph");const bytes=await Deno.readFile(path),after=await Deno.lstat(path);if(bytes.length!==before.size||before.dev!==after.dev||before.ino!==after.ino||before.size!==after.size)throw Error("Changed graph");let at=0;while(at<bytes.length){const count=await Deno.stdout.write(bytes.subarray(at));if(count<=0)throw Error("Short graph read");at+=count;}`;
-          const result = await deps.remote.root(remoteProgram(program));
+          const result = await deps.remote.root(
+            backupV2RemoteProgram(verified.envelope.request.jobId, program),
+          );
           const bytes = new TextEncoder().encode(result.stdout);
           if (
             result.code !== 0 ||
@@ -1626,6 +1635,7 @@ export async function prepareAcceptedBackupV2ScratchCleanup(
   }
   await installBackupV2Artifact(
     deps,
+    job.settings.envelope.request.jobId,
     `${JOBS_RUNTIME_ROOT}/${job.settings.envelope.request.jobId}/prune-cleanup-proofs.json`,
     proofs,
   );
@@ -1753,7 +1763,8 @@ export async function runBackupV2RetentionCycle(
     if (await caps.gate.read() !== null) fail();
     await caps.admit(state.legacy);
     const result = await deps.remote.root(
-      remoteProgram(
+      backupV2RemoteProgram(
+        settings.envelope.request.jobId,
         `const {discoverBackupV2UnresolvedPuts}=await import(${
           JSON.stringify(
             `${RELEASES_ROOT}/${settings.envelope.request.sourceRevision}/scripts/backup-v2-worker.ts`,
@@ -1867,6 +1878,7 @@ export async function runBackupV2RetentionCycle(
     ) fail();
     await installBackupV2Artifact(
       deps,
+      settings.envelope.request.jobId,
       `${JOBS_RUNTIME_ROOT}/${settings.envelope.request.jobId}/prune-${
         control.input.stage === "PLAN" ? "plan" : "execute"
       }-request.json`,

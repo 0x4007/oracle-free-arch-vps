@@ -142,3 +142,68 @@ Deno.test("capacity never turns unreadable roots, vanished descendants or unknow
     );
   }
 });
+
+Deno.test("capacity restarts every active root after transient descendant removal without reusing earlier counts", async () => {
+  const f = fixture(),
+    lstat = f.io.lstat,
+    disappearing = f.graph + "/removed-wal";
+  f.nodes.set(disappearing, { ino: 12n, blocks: 32n, dir: false });
+  let removed = false;
+  f.io.lstat = (path) => {
+    if (path === disappearing && !removed) {
+      removed = true;
+      f.nodes.delete(disappearing);
+      f.nodes.set(f.gate + "/slot", { ino: 2n, blocks: 256n, dir: false });
+      throw new Deno.errors.NotFound();
+    }
+    return lstat(path);
+  };
+  const sample = await observeBackupV2Capacity(
+    f.gate,
+    "cgroup",
+    [f.graph],
+    f.io,
+  );
+  equal(sample.allocatedWorkspaceBytes, 288 * 512 + 4096 + 8192);
+  equal(f.reads.filter((path) => path === f.gate + "/slot").length, 2);
+});
+
+Deno.test("capacity bounds persistent descendant churn by three walks and one shared five-second budget", async () => {
+  for (const timed of [false, true]) {
+    const f = fixture(), lstat = f.io.lstat;
+    let removals = 0, now = 0;
+    f.io.now = () => now;
+    f.io.lstat = (path) => {
+      if (path === f.gate + "/slot") {
+        removals++;
+        if (timed) now += 2501;
+        throw new Deno.errors.NotFound();
+      }
+      return lstat(path);
+    };
+    await rejects(() => observeBackupV2Capacity(f.gate, "cgroup", [], f.io));
+    equal(removals, timed ? 2 : 3);
+  }
+});
+
+Deno.test("capacity never retries a missing or denied primary root, or continues after primary replacement", async () => {
+  for (const fault of ["missing", "denied", "replaced"] as const) {
+    const f = fixture(), lstat = f.io.lstat;
+    let primaryReads = 0, removed = false;
+    f.io.lstat = (path) => {
+      if (path === f.gate) {
+        primaryReads++;
+        if (fault === "missing") throw new Deno.errors.NotFound();
+        if (fault === "denied") throw new Deno.errors.PermissionDenied();
+      }
+      if (path === f.gate + "/slot") {
+        removed = true;
+        f.nodes.set(f.gate, { ino: 99n, blocks: 8n, dir: true });
+        throw new Deno.errors.NotFound();
+      }
+      return lstat(path);
+    };
+    await rejects(() => observeBackupV2Capacity(f.gate, "cgroup", [], f.io));
+    equal(fault === "replaced" ? removed : primaryReads === 1, true);
+  }
+});
