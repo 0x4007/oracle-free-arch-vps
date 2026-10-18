@@ -146,7 +146,9 @@ export function createTarInventory(
   let linkBytes = 0;
   return {
     add(member: NativeTarMember) {
-      summary.add({ path: member.path, metadata: member.metadata });
+      // Inventory binds the raw path stream. Native display metadata differs
+      // between create -vv and list -v; archive hashes bind actual pax metadata.
+      summary.add({ path: member.path });
       const key = tarPathKey(member.path);
       if (selectedKeys.has(key)) {
         observed.set(key, {
