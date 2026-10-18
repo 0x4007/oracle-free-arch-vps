@@ -23,9 +23,12 @@ import {
 import {
   backupV2BootSamples,
   backupV2CompatibilitySha256,
+  type BackupV2ReusedRole,
   backupV2SourceConfigSha256,
   createBackupV2MetadataRunner,
   encodeBackupV2RecoveryMetadata,
+  restoreBackupV2RecoveryMetadata,
+  validateBackupV2ReusedRoles,
 } from "../scripts/backup-v2-metadata.ts";
 import {
   BackupV2Spool,
@@ -451,6 +454,228 @@ for (const fault of ["readback", "native"] as const) {
     equals(f.state().cancelled, 1);
   });
 }
+
+async function reuseFixture() {
+  const f = uploadFixture();
+  const capture = await uploadBackupV2RoleProducer({
+    ...params,
+    producer: f.producer,
+  }, f.context);
+  const before = {
+    layout: settings.sources.map((source, index) => ({
+      path: `/dev/fixture${index}`,
+      type: "part",
+      size: source.size,
+      fstype: source.filesystem,
+      uuid: source.uuid,
+      mountpoints: source.livePath ? [source.livePath] : [null],
+    })),
+    pacman: "kernel 1\n",
+    bootHashes: `${"1".repeat(64)}  /boot/Image\n${
+      "2".repeat(64)
+    }  /boot/initramfs-linux.img\n`,
+  };
+  capture.compatibilitySha256 = backupV2CompatibilitySha256(settings, before);
+  const recovery = {
+    role: "root" as const,
+    initial: before,
+    tools: {},
+    bootBytes: [10, 20],
+  };
+  const entry: BackupV2ReusedRole = { capture, recovery };
+  const validate = (entries: BackupV2ReusedRole[]) =>
+    validateBackupV2ReusedRoles(
+      entries,
+      settings,
+      before,
+      {},
+      [10, 20],
+      "2026-10-18T00:01:00.000Z",
+    );
+  return { entry, before, validate };
+}
+
+Deno.test("v2 reuse preserves original intervals and attempts and detaches checkpoint aliases", async () => {
+  const f = await reuseFixture();
+  const old = JSON.stringify(f.entry.capture),
+    reused = f.validate([f.entry]).get("root")!;
+  equals(JSON.stringify(reused.capture), old);
+  f.entry.capture.attemptId = "00000000-0000-4000-8000-000000000099";
+  equals(reused.capture.attemptId, ATTEMPT);
+  assert(
+    reused.capture.captureFinishedAtUtc !== reused.capture.uploadFinishedAtUtc,
+  );
+});
+
+Deno.test("v2 reuse rejects missing snapshots, changed identities, boot metadata, future intervals and duplicates", async () => {
+  const f = await reuseFixture();
+  for (
+    const change of [
+      (entry: BackupV2ReusedRole) => {
+        entry.capture.compatibilitySha256 = "c".repeat(64);
+      },
+      (entry: BackupV2ReusedRole) => {
+        entry.capture.recipientSha256 = "c".repeat(64);
+      },
+      (entry: BackupV2ReusedRole) => {
+        entry.capture.sourceConfigSha256 = "c".repeat(64);
+      },
+      (entry: BackupV2ReusedRole) => {
+        entry.capture.captureId =
+          "generation-00000000-0000-4000-8000-000000000099";
+      },
+      (entry: BackupV2ReusedRole) => {
+        entry.capture.uploadFinishedAtUtc = "2027-01-01T00:00:00.000Z";
+      },
+      (entry: BackupV2ReusedRole) => {
+        if (entry.recovery.role === "root") entry.recovery.bootBytes[0]++;
+      },
+      (entry: BackupV2ReusedRole) => {
+        if (entry.recovery.role === "root") {
+          entry.recovery.initial.bootHashes = "changed";
+        }
+      },
+    ]
+  ) {
+    const changed = structuredClone(f.entry);
+    change(changed);
+    throws(() => f.validate([changed]));
+  }
+  throws(() => f.validate([f.entry, f.entry]));
+  throws(() =>
+    f.validate([{ capture: f.entry.capture } as BackupV2ReusedRole])
+  );
+});
+
+Deno.test("v2 reuse keeps cold-role original boot and swap metadata and rejects partial recovery reuse", async () => {
+  const f = await reuseFixture();
+  const staging: BackupV2ReusedRole = {
+    capture: { ...f.entry.capture, role: "staging-boot" },
+    recovery: {
+      role: "staging-boot",
+      beforeHashes: `${"1".repeat(64)}  ./arch-vmlinuz\n${
+        "2".repeat(64)
+      }  ./arch-initrd.img\n`,
+      afterHashes: `${"1".repeat(64)}  ./arch-vmlinuz\n${
+        "2".repeat(64)
+      }  ./arch-initrd.img\n`,
+      beforeBytes: "10\n20\n",
+      afterBytes: "10\n20\n",
+    },
+  };
+  assert(f.validate([staging]).has("staging-boot"));
+  const changed = structuredClone(staging);
+  if (changed.recovery.role === "staging-boot") {
+    changed.recovery.afterBytes = "10\n21\n";
+  }
+  throws(() => f.validate([changed]));
+  const oracle: BackupV2ReusedRole = {
+    capture: { ...f.entry.capture, role: "oracle-root" },
+    recovery: { role: "oracle-root", swapfileStat: "present 4096 600 0 0\n" },
+  };
+  equals(f.validate([oracle]).get("oracle-root")!.recovery, oracle.recovery);
+  const original = {
+    role: "recovery" as const,
+    text: "{}",
+    sha256: hash("{}"),
+  };
+  throws(() =>
+    f.validate([{
+      capture: {
+        ...f.entry.capture,
+        role: "recovery",
+        format: "json.zst.gpg",
+        inventory: null,
+      },
+      recovery: original,
+    }])
+  );
+});
+
+Deno.test("v2 complete recovery reuse preserves exact plaintext and rejects regenerated or incomplete metadata", async () => {
+  const f = await reuseFixture(),
+    boot = backupV2BootSamples(
+      f.before.bootHashes,
+      `${"1".repeat(64)}  ./arch-vmlinuz\n${
+        "2".repeat(64)
+      }  ./arch-initrd.img\n`,
+      [10, 20],
+      [10, 20],
+    );
+  const body = {
+    schemaVersion: 2,
+    format: "backup-v2-recovery",
+    generation: CAPTURE,
+    sourceConfigSha256: backupV2SourceConfigSha256(settings),
+    compatibilitySha256: backupV2CompatibilitySha256(settings, f.before),
+    recipient: {
+      fingerprint: settings.recipientFingerprint,
+      publicSha256: settings.recipientSha256,
+    },
+    startedAtUtc: params.captureStartedAtUtc,
+    finishedAtUtc: f.entry.capture.uploadFinishedAtUtc,
+    consistency: "live-file-copy",
+    sourceShutdown: false,
+    machineBootRestoreProved: false,
+    captureMethod: "live-file-copy",
+    sources: settings.sources,
+    blockLayouts: { initial: f.before.layout, final: f.before.layout },
+    mountMetadata: [],
+    findmnt: {},
+    partitionTables: [],
+    lvm: {},
+    packages: f.before.pacman,
+    bootHashes: { root: f.before.bootHashes },
+    finalChecks: {},
+    exclusions: {},
+    swapRecreation: {},
+    procCmdline: "original",
+    fstab: "original",
+    tools: {},
+    archiveOptions: {},
+    efivars: {},
+    archives: [f.entry.capture],
+    bootSamples: boot.map((sample) => ({
+      ...sample,
+      member: new TextDecoder().decode(sample.member),
+    })),
+  };
+  const original = {
+    role: "recovery" as const,
+    text: JSON.stringify(body),
+    sha256: hash(JSON.stringify(body)),
+  };
+  const restored = restoreBackupV2RecoveryMetadata(
+    original,
+    settings,
+    f.before,
+    [f.entry.capture],
+    boot,
+  );
+  equals(new TextDecoder().decode(restored.bytes), original.text);
+  equals(restored.sha256, original.sha256);
+  throws(() =>
+    restoreBackupV2RecoveryMetadata(
+      { ...original, text: original.text + " " },
+      settings,
+      f.before,
+      [f.entry.capture],
+      boot,
+    )
+  );
+  throws(() =>
+    restoreBackupV2RecoveryMetadata(original, settings, f.before, [], boot)
+  );
+  throws(() =>
+    restoreBackupV2RecoveryMetadata(
+      { role: "recovery", text: "{}", sha256: hash("{}") },
+      settings,
+      f.before,
+      [f.entry.capture],
+      boot,
+    )
+  );
+});
 
 // The sole operator supplies this public, task-local custody record. No keys
 // are generated here; decryption uses the existing off-host agent adapter.

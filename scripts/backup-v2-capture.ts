@@ -30,9 +30,17 @@ import { type BackupV2InventorySummary } from "./backup-v2-inventory.ts";
 import {
   backupV2BootSamples,
   backupV2CompatibilitySha256,
+  type BackupV2ReusedRole,
+  type BackupV2RoleRecoveryMetadata,
   backupV2SourceConfigSha256,
   collectBackupV2RecoveryMetadata,
   createBackupV2MetadataRunner,
+  restoreBackupV2RecoveryMetadata,
+  validateBackupV2ReusedRoles,
+} from "./backup-v2-metadata.ts";
+export type {
+  BackupV2ReusedRole,
+  BackupV2RoleRecoveryMetadata,
 } from "./backup-v2-metadata.ts";
 import { assertBackupV2Budget } from "./backup-v2-profile.ts";
 import { assertBackupV2Directory } from "./backup-v2-spool.ts";
@@ -622,7 +630,11 @@ export interface BackupV2CaptureContext
   createProducer?: (
     params: BackupV2RoleProducerParams,
   ) => Promise<BackupV2RoleProducer>;
-  onRole?: (value: BackupV2CapturedRole) => void | Promise<void>;
+  reusedRoles?: readonly BackupV2ReusedRole[];
+  onRole?: (
+    value: BackupV2CapturedRole,
+    recovery: BackupV2RoleRecoveryMetadata,
+  ) => void | Promise<void>;
 }
 
 /** Bind real producer and upload intervals, and settle both branches on error. */
@@ -740,7 +752,7 @@ export async function captureBackupV2Generation(
     fail("source configuration hash");
   }
   const now = context.now ?? (() => new Date());
-  const startedAtUtc = now().toISOString();
+  let startedAtUtc = now().toISOString();
   await context.native.assertManaged();
   await assertBackupV2Directory(context.stage);
   await context.admit("root");
@@ -755,14 +767,77 @@ export async function captureBackupV2Generation(
     "/boot/initramfs-linux.img",
   ]);
   if (rootSizes.code !== 0) fail("root boot sizes");
+  const rootBytes = rootSizes.stdout.trim().split("\n").map(Number);
+  const reused = validateBackupV2ReusedRoles(
+    context.reusedRoles ?? [],
+    settings,
+    before,
+    tools,
+    rootBytes,
+    now().toISOString(),
+  );
+  startedAtUtc = [
+    startedAtUtc,
+    ...[...reused.values()].map((entry) => entry.capture.captureStartedAtUtc),
+  ].sort()[0];
+  const rootMetadata = reused.get("root")?.recovery;
+  const metadataBefore = rootMetadata?.role === "root"
+    ? rootMetadata.initial
+    : before;
+  const metadataTools = rootMetadata?.role === "root"
+    ? rootMetadata.tools
+    : tools;
   const compatibilitySha256 = backupV2CompatibilitySha256(settings, before);
   const roles: BackupV2CapturedRole[] = [];
+  const roleMetadata: BackupV2ReusedRole[] = [];
+  const attempts = new Set(
+    [...reused.values()].map((entry) => entry.capture.attemptId),
+  );
   const capture = async (role: BackupV2Role, recovery?: Uint8Array) => {
     await context.admit(role);
     context.signal?.throwIfAborted();
     await assertRecipientPinned(settings, context.stage);
+    const previous = reused.get(role);
+    if (previous) {
+      const metadata = previous.recovery;
+      const files = metadata.role === "staging-boot"
+        ? {
+          "staging-boot.sha.before": metadata.beforeHashes,
+          "staging-boot.sha.after": metadata.afterHashes,
+          "staging-boot.bytes.before": metadata.beforeBytes,
+          "staging-boot.bytes.after": metadata.afterBytes,
+        }
+        : metadata.role === "oracle-root"
+        ? { "oracle-root.swapfile.stat": metadata.swapfileStat }
+        : {};
+      for (const [name, text] of Object.entries(files)) {
+        const file = await Deno.open(`${context.stage}/${name}`, {
+          createNew: true,
+          write: true,
+          mode: 0o600,
+        });
+        try {
+          const writer = file.writable.getWriter();
+          await writer.write(encoder.encode(text));
+          await writer.close();
+        } finally {
+          try {
+            file.close();
+          } catch { /* writable owns closure. */ }
+        }
+      }
+      await assertMountGuards(settings, context.stage, `guard:v2:${role}`, run);
+      if (role === "staging-boot") {
+        await assertStagingBootParity(context.stage, before);
+      }
+      roles.push(previous.capture);
+      roleMetadata.push(previous);
+      return;
+    }
     const captureStartedAtUtc = now().toISOString();
     const attemptId = (context.newAttemptId ?? (() => crypto.randomUUID()))();
+    if (attempts.has(attemptId)) fail("producer attempt was reused");
+    attempts.add(attemptId);
     const producer =
       await (context.createProducer ?? createBackupV2RoleProducer)({
         settings,
@@ -787,8 +862,50 @@ export async function captureBackupV2Generation(
     if (role === "staging-boot") {
       await assertStagingBootParity(context.stage, before);
     }
+    const metadata: BackupV2RoleRecoveryMetadata = role === "root"
+      ? {
+        role,
+        initial: structuredClone(before),
+        tools: structuredClone(tools),
+        bootBytes: [...rootBytes],
+      }
+      : role === "staging-boot"
+      ? {
+        role,
+        beforeHashes: await readSmall(
+          `${context.stage}/staging-boot.sha.before`,
+        ),
+        afterHashes: await readSmall(`${context.stage}/staging-boot.sha.after`),
+        beforeBytes: await readSmall(
+          `${context.stage}/staging-boot.bytes.before`,
+        ),
+        afterBytes: await readSmall(
+          `${context.stage}/staging-boot.bytes.after`,
+        ),
+      }
+      : role === "oracle-root"
+      ? {
+        role,
+        swapfileStat: await readSmall(
+          `${context.stage}/oracle-root.swapfile.stat`,
+        ),
+      }
+      : role === "recovery"
+      ? {
+        role,
+        text: new TextDecoder("utf-8", { fatal: true }).decode(recovery!),
+        sha256: createHash("sha256").update(recovery!).digest("hex"),
+      }
+      : { role };
+    if (metadata.role !== "recovery") {
+      assertBackupV2Budget(
+        "metadataRecordBytes",
+        encoder.encode(JSON.stringify(metadata)).length,
+      );
+    }
     roles.push(result);
-    await context.onRole?.(result);
+    roleMetadata.push({ capture: result, recovery: metadata });
+    await context.onRole?.(result, metadata);
   };
   for (const role of ROLE_ORDER) await capture(role);
   await assertStagingBootParity(context.stage, before);
@@ -821,20 +938,29 @@ export async function captureBackupV2Generation(
       "\n",
     ).map(Number),
   );
-  const recovery = await collectBackupV2RecoveryMetadata({
-    settings,
-    stage: context.stage,
-    before,
-    layoutFinal,
-    tools,
-    archives: roles,
-    swapRecreation: swapfileRecreation(
-      await readSmall(`${context.stage}/oracle-root.swapfile.stat`),
-    ),
-    startedAtUtc,
-    finishedAtUtc: now().toISOString(),
-    run,
-  }, samples);
+  const oldRecovery = reused.get("recovery")?.recovery;
+  const recovery = oldRecovery?.role === "recovery"
+    ? restoreBackupV2RecoveryMetadata(
+      oldRecovery,
+      settings,
+      metadataBefore,
+      roles,
+      samples,
+    )
+    : await collectBackupV2RecoveryMetadata({
+      settings,
+      stage: context.stage,
+      before: metadataBefore,
+      layoutFinal,
+      tools: metadataTools,
+      archives: roles,
+      swapRecreation: swapfileRecreation(
+        await readSmall(`${context.stage}/oracle-root.swapfile.stat`),
+      ),
+      startedAtUtc,
+      finishedAtUtc: now().toISOString(),
+      run,
+    }, samples);
   await capture("recovery", recovery.bytes);
   // Catch a boot/package/source change during metadata encryption, too.
   const lastLayout = await finalInspection(
@@ -851,6 +977,7 @@ export async function captureBackupV2Generation(
     generation: settings.generation,
     roles,
     recovery,
+    roleMetadata,
     startedAtUtc,
     finishedAtUtc: now().toISOString(),
     consistency: "live-file-copy" as const,
