@@ -257,6 +257,67 @@ export interface BackupV2LeaseWindow {
   usefulProgressAtMs: number;
   usefulProgressExpiresAtMs: number;
   retryEpisode: { startedAtMs: number; expiresAtMs: number } | null;
+  transferEpisode?: BackupV2TransferEpisode | null;
+}
+export const BACKUP_V2_CONTROL_REQUEST_MS = 120_000;
+export const BACKUP_V2_TRANSFER_SETTLEMENT_MS = 30_000;
+export type BackupV2TransferPhase = "PUT" | "READBACK";
+export interface BackupV2TransferEpisode {
+  kind: "SEALED_TRANSFER";
+  operationId: string;
+  phase: BackupV2TransferPhase;
+  sealedObjectIdentity: string;
+  retainedBytes: number;
+  startedAtMs: number;
+  expiresAtMs: number;
+}
+/** Upper wait bound from actual M02 calls: authorization/upload-target/PUT,
+ * or authorization/exact GET, then bounded native request settlement. */
+export function backupV2TransferWindowMs(phase: BackupV2TransferPhase): number {
+  if (phase !== "PUT" && phase !== "READBACK") fail();
+  return (phase === "PUT" ? 2 : 1) * BACKUP_V2_CONTROL_REQUEST_MS +
+    BACKUP_V2_LIMITS.blockedTransportMs + BACKUP_V2_TRANSFER_SETTLEMENT_MS;
+}
+export function validateBackupV2TransferEpisode(
+  value: unknown,
+  observedMonotonicMs: number,
+): BackupV2TransferEpisode {
+  const r = object(value, [
+    "kind",
+    "operationId",
+    "phase",
+    "sealedObjectIdentity",
+    "retainedBytes",
+    "startedAtMs",
+    "expiresAtMs",
+  ]);
+  if (
+    r.kind !== "SEALED_TRANSFER" ||
+    (r.phase !== "PUT" && r.phase !== "READBACK")
+  ) fail();
+  const phase = r.phase,
+    operationId = text(r.operationId, 1024),
+    sealedObjectIdentity = text(r.sealedObjectIdentity, 1024);
+  const retainedBytes = assertBackupV2Budget(
+      "slotBytes",
+      r.retainedBytes as number,
+    ),
+    startedAtMs = monotonic(r.startedAtMs),
+    expiresAtMs = monotonic(r.expiresAtMs);
+  if (
+    retainedBytes < 1 || startedAtMs > monotonic(observedMonotonicMs) ||
+    expiresAtMs < startedAtMs ||
+    expiresAtMs - startedAtMs > backupV2TransferWindowMs(phase)
+  ) fail();
+  return {
+    kind: "SEALED_TRANSFER",
+    operationId,
+    phase,
+    sealedObjectIdentity,
+    retainedBytes,
+    startedAtMs,
+    expiresAtMs,
+  };
 }
 export interface BackupV2ReachabilityReader {
   references(root: BackupV2ManifestRef): Promise<readonly BackupV2ObjectRef[]>;
@@ -959,6 +1020,10 @@ export function validateBackupV2LeaseWindow(
     "usefulProgressAtMs",
     "usefulProgressExpiresAtMs",
     "retryEpisode",
+    ...(value && typeof value === "object" &&
+        Object.hasOwn(value, "transferEpisode")
+      ? ["transferEpisode"]
+      : []),
   ]);
   const observedMonotonicMs = monotonic(r.observedMonotonicMs),
     usefulProgressAtMs = monotonic(r.usefulProgressAtMs),
@@ -983,5 +1048,15 @@ export function validateBackupV2LeaseWindow(
     usefulProgressAtMs,
     usefulProgressExpiresAtMs,
     retryEpisode,
+    ...(Object.hasOwn(r, "transferEpisode")
+      ? {
+        transferEpisode: r.transferEpisode === null
+          ? null
+          : validateBackupV2TransferEpisode(
+            r.transferEpisode,
+            observedMonotonicMs,
+          ),
+      }
+      : {}),
   };
 }

@@ -3,6 +3,7 @@ import {
   BACKUP_V2_ROLES,
   type BackupV2ObjectKind,
   backupV2ObjectName,
+  backupV2TransferWindowMs,
   parseBackupV2ObjectName,
   validateBackupV2ArchiveProof,
   validateBackupV2ChunkPage,
@@ -466,6 +467,41 @@ Deno.test("v2 progress excludes heartbeat-only fields and leases retain original
       },
     })
   );
+});
+Deno.test("v2 sealed-transfer lease is distinct, bound to retained bytes and actual transport limits", () => {
+  equal(backupV2TransferWindowMs("PUT"), 21_870_000);
+  equal(backupV2TransferWindowMs("READBACK"), 21_750_000);
+  const lease = {
+    observedMonotonicMs: 100,
+    usefulProgressAtMs: 0,
+    usefulProgressExpiresAtMs: 0,
+    retryEpisode: null,
+    transferEpisode: {
+      kind: "SEALED_TRANSFER",
+      operationId: "object/PUT",
+      phase: "PUT",
+      sealedObjectIdentity: "object",
+      retainedBytes: 64,
+      startedAtMs: 10,
+      expiresAtMs: 10 + backupV2TransferWindowMs("PUT"),
+    },
+  };
+  equal(validateBackupV2LeaseWindow(lease), lease);
+  for (
+    const changed of [
+      { ...lease.transferEpisode, retainedBytes: 0 },
+      {
+        ...lease.transferEpisode,
+        expiresAtMs: lease.transferEpisode.expiresAtMs + 1,
+      },
+      { ...lease.transferEpisode, kind: "RETRY" },
+      { ...lease.transferEpisode, heartbeat: true },
+    ]
+  ) {
+    throws(() =>
+      validateBackupV2LeaseWindow({ ...lease, transferEpisode: changed })
+    );
+  }
 });
 Deno.test("v2 inventory framing is unambiguous for newlines and preserves non-UTF8 bytes", async () => {
   const encoder = new TextEncoder();

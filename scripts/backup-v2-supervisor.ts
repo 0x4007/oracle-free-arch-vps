@@ -1,8 +1,10 @@
 import {
   type BackupV2LeaseWindow,
   type BackupV2Progress,
+  type BackupV2TransferEpisode,
   validateBackupV2LeaseWindow,
   validateBackupV2Progress,
+  validateBackupV2TransferEpisode,
 } from "./backup-v2-contract.ts";
 import {
   BACKUP_V2_LIMITS,
@@ -138,7 +140,7 @@ export function evaluateBackupV2Lease(
   if (checked.observedMonotonicMs > nowMs) {
     throw new Error("Future lease observation");
   }
-  const absoluteDeadlineMs = Math.max(
+  const absoluteDeadlineMs = checked.transferEpisode?.expiresAtMs ?? Math.max(
     startupDeadlineMs,
     checked.usefulProgressExpiresAtMs,
     checked.retryEpisode?.expiresAtMs ?? 0,
@@ -291,6 +293,7 @@ export class BackupV2Supervisor {
   #serial = 0;
   #episodeSerial = -1;
   #reason: string | null = null;
+  readonly #transfers = new Map<string, BackupV2TransferEpisode>();
 
   constructor(
     identity: BackupV2SupervisorIdentity,
@@ -332,6 +335,50 @@ export class BackupV2Supervisor {
 
   window(): BackupV2LeaseWindow {
     return structuredClone(this.#window);
+  }
+  /** Pending sealed I/O is an explicitly bounded wait, never a work counter.
+   * The uploader supplies it only after its operation intent is fsynced. */
+  beginTransferEpisode(value: BackupV2TransferEpisode): BackupV2LeaseWindow {
+    if (this.#reason || this.#busy || !this.#previous) {
+      throw new Error("Transfer episode is not eligible");
+    }
+    const now = this.#now(),
+      episode = validateBackupV2TransferEpisode(value, now);
+    if (
+      episode.expiresAtMs <= now ||
+      evaluateBackupV2Lease(
+          this.#window,
+          now,
+          this.#options.notificationGraceMs,
+          this.#startupDeadline,
+        ).action !== "renew"
+    ) throw new Error("Transfer cannot revive expired custody");
+    const old = this.#transfers.get(episode.operationId),
+      active = this.#window.transferEpisode;
+    if (old && JSON.stringify(old) !== JSON.stringify(episode)) {
+      throw new Error("Transfer window changed");
+    }
+    if (
+      active && active.operationId !== episode.operationId &&
+      !(active.sealedObjectIdentity === episode.sealedObjectIdentity &&
+        active.phase === "PUT" && episode.phase === "READBACK")
+    ) throw new Error("Overlapping sealed transfers");
+    if (!old && this.#transfers.size >= BACKUP_V2_LIMITS.logicalObjects * 4) {
+      throw new Error("Transfer episode budget exhausted");
+    }
+    this.#transfers.set(episode.operationId, structuredClone(episode));
+    this.#window.transferEpisode = structuredClone(episode);
+    this.#window.observedMonotonicMs = now;
+    return this.window();
+  }
+  completeTransferEpisode(operationId: string): BackupV2LeaseWindow {
+    if (
+      !this.#transfers.has(operationId) ||
+      this.#window.transferEpisode?.operationId !== operationId
+    ) throw new Error("Transfer completion identity changed");
+    this.#window.transferEpisode = null;
+    this.#window.observedMonotonicMs = this.#now();
+    return this.window();
   }
 
   cancel(reason = "CANCELLED"): BackupV2LeaseDecision {
