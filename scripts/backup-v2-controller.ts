@@ -515,7 +515,7 @@ export async function stepBackupV2Controller(
         workerResult: null,
         workerResultBytes: null,
         verified: null,
-        updatedAtUtc: now.toISOString(),
+        updatedAtUtc: deps.now().toISOString(),
       },
     };
     return await save();

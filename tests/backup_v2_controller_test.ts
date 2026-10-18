@@ -87,7 +87,7 @@ const uuid = (n: number) =>
 const START = "2026-10-18T10:00:00.000Z",
   END = "2026-10-18T10:01:00.000Z",
   SHA = "a".repeat(64);
-function settings(): BackupV2WorkerSettings {
+function settings(requestedAtUtc = START): BackupV2WorkerSettings {
   const captureSettings: CaptureSettings = {
     generation: `generation-${uuid(1)}`,
     recipientFile: "/fixture/recipient.asc",
@@ -117,7 +117,7 @@ function settings(): BackupV2WorkerSettings {
     jobId: `job-${uuid(1)}`,
     captureId: captureSettings.generation,
     periodKey: "2026-10-18",
-    requestedAtUtc: START,
+    requestedAtUtc,
     sourceRevision: "a".repeat(40),
     sourceConfigSha256: backupV2SourceConfigSha256(captureSettings),
     recipientSha256: SHA,
@@ -137,8 +137,8 @@ function settings(): BackupV2WorkerSettings {
     state: "PENDING",
     remoteHost: GATE_REMOTE_HOST,
     sourceLockPath: GATE_SOURCE_LOCK_PATH,
-    createdAtUtc: START,
-    updatedAtUtc: START,
+    createdAtUtc: requestedAtUtc,
+    updatedAtUtc: requestedAtUtc,
   });
   return validateBackupV2WorkerSettings({
     schemaVersion: 2,
@@ -1140,4 +1140,20 @@ Deno.test("verification work bounds cover replay without enlarging source admiss
   equal(value.decodedBytes, 1200 * gib);
   equal(value.decryptedBytes, 400 * gib);
   equal(value.compressionInputBytes, 0);
+});
+
+Deno.test("initial persistence samples time after asynchronous request creation", async () => {
+  const f = fixture();
+  let clock = Date.parse(END);
+  f.deps.now = () => new Date(clock);
+  f.deps.create = async () => {
+    clock += 1000;
+    return settings(new Date(clock).toISOString());
+  };
+  const state = await stepBackupV2Controller(legacy(), f.deps);
+  equal(state.job!.updatedAtUtc, new Date(clock).toISOString());
+  equal(
+    state.job!.settings.envelope.request.requestedAtUtc,
+    state.job!.updatedAtUtc,
+  );
 });
