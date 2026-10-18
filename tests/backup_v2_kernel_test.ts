@@ -332,7 +332,8 @@ Deno.test("kernel deleted handles count physical blocks once and preserve newlin
   });
   assert(
     f.calls.some(([command, args]) =>
-      command === "/usr/bin/readlink" && args[0] === "-z"
+      command === "/usr/bin/readlink" &&
+      JSON.stringify(args.slice(0, 3)) === JSON.stringify(["-z", "-v", "--"])
     ),
   );
   assert(
@@ -442,6 +443,85 @@ Deno.test("kernel deleted accounting retries a changed final PID list but bounds
       equal(completed, 2);
     }
   }
+});
+
+Deno.test("kernel deleted accounting retries a closed descriptor within the same live PID using fresh complete facts", async () => {
+  const f = fixture();
+  let readlinks = 0, samples = 0, metadata = 0;
+  const closing: BackupV2KernelCommand = (command, args) => {
+    if (command === "/usr/bin/cat" && args.at(-1)!.endsWith("/cgroup.procs")) {
+      samples++;
+    }
+    if (command === "/usr/bin/cat" && args.at(-1) === "/proc/123/stat") {
+      metadata++;
+    }
+    if (command === "/usr/bin/readlink" && ++readlinks === 1) {
+      return Promise.resolve({
+        code: 1,
+        stdout: `${directory}/spool/partial (deleted)\0`,
+        stderr: args.includes("-v")
+          ? "readlink: /proc/123/fd/5: No such file or directory\n"
+          : "",
+      });
+    }
+    return f.run(command, args);
+  };
+  equal(await backupV2DeletedHandleBytes(directory, cgroup, closing), {
+    workspaceHeldDeletedBytes: 1024,
+    sourceHeldDeletedBytes: 4096,
+  });
+  equal(readlinks, 2);
+  equal(samples, 3);
+  equal(metadata, 3);
+});
+
+Deno.test("kernel deleted accounting exhausts three whole censuses for persistent same-PID descriptor closure", async () => {
+  const f = fixture();
+  let readlinks = 0, samples = 0;
+  const closing: BackupV2KernelCommand = (command, args) => {
+    if (command === "/usr/bin/cat" && args.at(-1)!.endsWith("/cgroup.procs")) {
+      samples++;
+    }
+    if (command === "/usr/bin/readlink") {
+      readlinks++;
+      return Promise.resolve({
+        code: 1,
+        stdout: "",
+        stderr: args.includes("-v")
+          ? "readlink: /proc/123/fd/5: No such file or directory\n"
+          : "",
+      });
+    }
+    return f.run(command, args);
+  };
+  await rejects(
+    () => backupV2DeletedHandleBytes(directory, cgroup, closing),
+    "ABSENT",
+  );
+  equal(readlinks, 3);
+  equal(samples, 3);
+});
+
+Deno.test("kernel verbose readlink permission failure in a stable live PID remains unreadable", async () => {
+  const f = fixture();
+  let readlinks = 0;
+  const denied: BackupV2KernelCommand = (command, args) => {
+    if (command === "/usr/bin/readlink") {
+      readlinks++;
+      assert(args.includes("-v"));
+      return Promise.resolve({
+        code: 1,
+        stdout: "",
+        stderr: "readlink: /proc/123/fd/5: Permission denied\n",
+      });
+    }
+    return f.run(command, args);
+  };
+  await rejects(
+    () => backupV2DeletedHandleBytes(directory, cgroup, denied),
+    "UNREADABLE",
+  );
+  equal(readlinks, 1);
 });
 
 Deno.test("kernel deleted accounting never retries permission failure as a topology race", async () => {
