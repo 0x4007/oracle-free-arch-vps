@@ -101,6 +101,7 @@ export class BackupV2KernelEvidenceError extends Error {
       | "BOUNDED"
       | "MALFORMED"
       | "CUSTODY",
+    readonly silent = false,
   ) {
     super(`Backup kernel evidence ${kind.toLowerCase()}`);
   }
@@ -191,13 +192,24 @@ function bounded(
   duration = 4000,
   calls = 256,
   maximum = 8 * MAX_BYTES,
-): BackupV2KernelCommand {
-  const start = performance.now();
-  let count = 0, total = 0;
-  return async (command, args) => {
-    if (++count > calls || performance.now() - start > duration) {
+  now = () => performance.now(),
+): BackupV2KernelCommand & { check(): void } {
+  const start = now();
+  let count = 0, total = 0, latest = start;
+  const check = () => {
+    const observed = now();
+    if (
+      !Number.isFinite(start) || !Number.isFinite(observed) ||
+      observed < latest ||
+      count > calls || total > maximum || observed - start > duration
+    ) {
       fail("BOUNDED");
     }
+    latest = observed;
+  };
+  const execute: BackupV2KernelCommand = async (command, args) => {
+    count++;
+    check();
     const result = await run(command, args);
     if (
       new TextEncoder().encode(result.stdout).length >
@@ -206,11 +218,10 @@ function bounded(
     ) fail("BOUNDED");
     total += new TextEncoder().encode(result.stdout).length +
       new TextEncoder().encode(result.stderr).length;
-    if (total > maximum || performance.now() - start > duration) {
-      fail("BOUNDED");
-    }
+    check();
     return result;
   };
+  return Object.assign(execute, { check });
 }
 function result(
   value: BackupV2KernelCommandResult,
@@ -218,7 +229,7 @@ function result(
 ): string {
   if (value.code !== 0) {
     if (value.stderr.includes("No such file or directory")) fail("ABSENT");
-    fail("UNREADABLE");
+    throw new BackupV2KernelEvidenceError("UNREADABLE", value.stderr === "");
   }
   if (new TextEncoder().encode(value.stdout).length > maximum) {
     fail("BOUNDED");
@@ -344,10 +355,19 @@ function stats(
 }
 /** File contents are never read. stat -L observes only blocks/inodes and
  * readlink emits NUL-separated FD targets, preserving arbitrary filenames. */
+export interface BackupV2KernelRetryClock {
+  now(): number;
+  sleep(ms: number): Promise<void>;
+}
+const retryClock: BackupV2KernelRetryClock = {
+  now: () => performance.now(),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
 export async function backupV2DeletedHandleBytes(
   directory: string,
   cgroup: string,
   command: BackupV2KernelCommand = realBackupV2KernelCommand,
+  clock: BackupV2KernelRetryClock = retryClock,
 ): Promise<
   { workspaceHeldDeletedBytes: number; sourceHeldDeletedBytes: number }
 > {
@@ -366,8 +386,9 @@ export async function backupV2DeletedHandleBytes(
   // Child exit and our bounded metadata readers can change a live census.
   // Start over with fresh facts, sharing one original time/call/byte budget;
   // exhausted or unreadable observations never become an accounting zero.
-  const run = bounded(command),
+  const run = bounded(command, 4000, 256, 8 * MAX_BYTES, () => clock.now()),
     changed = new BackupV2KernelEvidenceError("CUSTODY");
+  const delays = [25, 50, 100, 200, 400, 500, 500];
   for (let attempt = 0;; attempt++) {
     let processes: number[] | undefined;
     try {
@@ -462,17 +483,20 @@ export async function backupV2DeletedHandleBytes(
       ) fail("BOUNDED");
       return { workspaceHeldDeletedBytes, sourceHeldDeletedBytes };
     } catch (error) {
-      if (attempt >= 2) throw error;
+      if (attempt >= delays.length) throw error;
       if (error !== changed && !absent(error)) {
         // readlink may report only exit 1 when its process vanishes. A fresh
         // changed PID list proves that race; ordinary permission failures stay
         // unknown rather than being ignored or repeatedly sampled as zero.
         if (
           !processes || !(error instanceof BackupV2KernelEvidenceError) ||
-          error.kind !== "UNREADABLE" ||
+          error.kind !== "UNREADABLE" || !error.silent ||
           JSON.stringify(await pids(cgroup, run)) === JSON.stringify(processes)
         ) throw error;
       }
+      run.check();
+      await clock.sleep(delays[attempt]);
+      run.check();
     }
   }
 }

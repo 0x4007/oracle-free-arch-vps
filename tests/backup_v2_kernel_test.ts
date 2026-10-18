@@ -432,8 +432,8 @@ Deno.test("kernel deleted accounting retries a changed final PID list but bounds
         () => backupV2DeletedHandleBytes(directory, cgroup, churn),
         "CUSTODY",
       );
-      equal(samples, 6);
-      equal(completed, 3);
+      equal(samples, 16);
+      equal(completed, 8);
     } else {
       equal(await backupV2DeletedHandleBytes(directory, cgroup, churn), {
         workspaceHeldDeletedBytes: 1024,
@@ -475,7 +475,7 @@ Deno.test("kernel deleted accounting retries a closed descriptor within the same
   equal(metadata, 3);
 });
 
-Deno.test("kernel deleted accounting exhausts three whole censuses for persistent same-PID descriptor closure", async () => {
+Deno.test("kernel deleted accounting exhausts eight whole censuses for persistent same-PID descriptor closure", async () => {
   const f = fixture();
   let readlinks = 0, samples = 0;
   const closing: BackupV2KernelCommand = (command, args) => {
@@ -498,8 +498,63 @@ Deno.test("kernel deleted accounting exhausts three whole censuses for persisten
     () => backupV2DeletedHandleBytes(directory, cgroup, closing),
     "ABSENT",
   );
-  equal(readlinks, 3);
-  equal(samples, 3);
+  equal(readlinks, 8);
+  equal(samples, 8);
+});
+
+Deno.test("kernel census backoff survives three initial transient absences without resetting its original budget", async () => {
+  const f = fixture(), delays: number[] = [];
+  let now = 0, failed = 0;
+  const transient: BackupV2KernelCommand = (command, args) => {
+    if (
+      command === "/usr/bin/cat" && args.at(-1) === "/proc/123/stat" &&
+      failed++ < 3
+    ) {
+      return Promise.resolve(missing());
+    }
+    return f.run(command, args);
+  };
+  equal(
+    await backupV2DeletedHandleBytes(directory, cgroup, transient, {
+      now: () => now,
+      sleep: (ms) => {
+        delays.push(ms);
+        now += ms;
+        return Promise.resolve();
+      },
+    }),
+    { workspaceHeldDeletedBytes: 1024, sourceHeldDeletedBytes: 4096 },
+  );
+  equal(delays, [25, 50, 100]);
+  equal(now, 175);
+});
+
+Deno.test("kernel census persistent absence is bounded by both eight attempts and the original four-second clock", async () => {
+  for (const overrun of [false, true]) {
+    const f = fixture(), delays: number[] = [];
+    let now = 0, attempts = 0;
+    const missingPid: BackupV2KernelCommand = (command, args) => {
+      if (command === "/usr/bin/cat" && args.at(-1) === "/proc/123/stat") {
+        attempts++;
+        return Promise.resolve(missing());
+      }
+      return f.run(command, args);
+    };
+    await rejects(
+      () =>
+        backupV2DeletedHandleBytes(directory, cgroup, missingPid, {
+          now: () => now,
+          sleep: (ms) => {
+            delays.push(ms);
+            now += overrun ? 4001 : ms;
+            return Promise.resolve();
+          },
+        }),
+      overrun ? "BOUNDED" : "ABSENT",
+    );
+    equal(attempts, overrun ? 1 : 8);
+    equal(delays, overrun ? [25] : [25, 50, 100, 200, 400, 500, 500]);
+  }
 });
 
 Deno.test("kernel verbose readlink permission failure in a stable live PID remains unreadable", async () => {
@@ -522,6 +577,34 @@ Deno.test("kernel verbose readlink permission failure in a stable live PID remai
     "UNREADABLE",
   );
   equal(readlinks, 1);
+});
+
+Deno.test("kernel permission failure never enters backoff even when another PID changed", async () => {
+  const f = fixture();
+  let samples = 0, sleeps = 0;
+  const denied: BackupV2KernelCommand = (command, args) => {
+    if (command === "/usr/bin/cat" && args.at(-1)!.endsWith("/cgroup.procs")) {
+      return Promise.resolve(ok(++samples === 1 ? "123\n" : "123\n124\n"));
+    }
+    if (command === "/usr/bin/cat" && args.at(-1) === "/proc/123/stat") {
+      return Promise.resolve({
+        code: 1,
+        stdout: "",
+        stderr: "Permission denied",
+      });
+    }
+    return f.run(command, args);
+  };
+  await rejects(() =>
+    backupV2DeletedHandleBytes(directory, cgroup, denied, {
+      now: () => 0,
+      sleep: () => {
+        sleeps++;
+        return Promise.resolve();
+      },
+    }), "UNREADABLE");
+  equal(samples, 1);
+  equal(sleeps, 0);
 });
 
 Deno.test("kernel deleted accounting never retries permission failure as a topology race", async () => {
