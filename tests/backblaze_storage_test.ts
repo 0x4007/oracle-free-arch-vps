@@ -1,3 +1,4 @@
+import { BACKUP_V2_NAMESPACE } from "../scripts/backup-v2-profile.ts";
 /** Mocked-transport tests for the dedicated-bucket B2 storage client.
  *
  * All responses are synthetic; nothing here reaches the network, and no
@@ -1307,4 +1308,29 @@ Deno.test("provider and network errors only report operation plus status", async
   );
   assert(authError.message === "b2_authorize_account failed (HTTP 401)");
   assert(!authError.message.includes(SECRET_ACCESS_KEY));
+});
+
+Deno.test("versions exact v2 inventory keeps default v1 and refuses ancestor or cross-namespace cursors", async () => {
+  const v2 = BACKUP_V2_NAMESPACE;
+  for (const prefix of [undefined,v2]) {
+    const expected = prefix ?? DIRECT_PREFIX;
+    const {fetch,calls} = fakeFetch((call) => call.url === AUTH_URL ? jsonResponse(authBody()) : jsonResponse({files:[uploadItem(`${expected}object`,"selected-id")],nextFileName:null,nextFileId:null}));
+    const store = new B2Store(settings(),fetch);
+    const objects = await store.versions(prefix);
+    assert(objects.length === 1 && objects[0].fileName === `${expected}object`);
+    assert(bodyOf(calls[1]).prefix === expected);
+    if (prefix === v2) {
+      const before = calls.length;
+      await rejectWith(store.remove(objects[0]));
+      assert(calls.length === before,"readonly v2 inventory cannot widen legacy deletion");
+    }
+  }
+  for (const prefix of ["restic/","","restic/direct-v2/sub/","restic/foreign/"]) {
+    const {fetch,calls} = fakeFetch(() => {throw Error("No network expected");});
+    await rejectWith(new B2Store(settings(),fetch).versions(prefix));assert(calls.length === 0);
+  }
+  for (const drift of ["item","cursor"]) {
+    const {fetch} = fakeFetch((call) => call.url === AUTH_URL ? jsonResponse(authBody()) : jsonResponse({files:drift === "item" ? [uploadItem(`${DIRECT_PREFIX}foreign`,"bad-id")] : [],nextFileName:drift === "cursor" ? `${DIRECT_PREFIX}foreign` : null,nextFileId:drift === "cursor" ? "bad-id" : null}));
+    await rejectWith(new B2Store(settings(),fetch).versions(v2));
+  }
 });
