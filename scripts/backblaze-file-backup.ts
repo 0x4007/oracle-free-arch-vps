@@ -233,6 +233,11 @@ export function validateJobId(jobId: unknown): string {
   return jobId;
 }
 
+/** Sibling cache avoids creating a new job directory before installer checks. */
+export function backupV2ControlCacheDirectory(jobId: unknown): string {
+  return `${JOBS_RUNTIME_ROOT}/control-cache-${validateJobId(jobId)}`;
+}
+
 export function validateGeneration(generation: unknown): string {
   if (
     typeof generation !== "string" || !GENERATION_PATTERN.test(generation) ||
@@ -1361,11 +1366,16 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
       );
     },
     async installer(payload: unknown) {
+      const cache = backupV2ControlCacheDirectory(
+        (payload as { jobId?: unknown } | null)?.jobId,
+      );
       return await runner(
         "ssh",
         ssh([
           "sudo",
           "-n",
+          "/usr/bin/env",
+          `DENO_DIR=${cache}`,
           "/usr/local/bin/deno",
           "eval",
           shellQuote(REMOTE_INSTALLER),

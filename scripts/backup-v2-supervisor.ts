@@ -191,6 +191,146 @@ export interface BackupV2SupervisorCapabilities {
   /** Bounded collector: independently check work, cgroup and filesystem/FD
    * accounting; counters are cumulative within the exact invocation. */
   observe(signal: AbortSignal): Promise<BackupV2SupervisorObservation>;
+  /** Diagnostic only: failures here cannot alter the cancellation decision. */
+  onFailure?(failure: BackupV2SupervisorFailure): void;
+}
+
+const failureStages = [
+  "observation",
+  "validation",
+  "capacity",
+  "notification",
+  "worker",
+] as const;
+const failureClasses = [
+  "Error",
+  "TypeError",
+  "RangeError",
+  "DOMException",
+  "BackupV2KernelEvidenceError",
+  "BackupV2TransportError",
+  "BackupV2CapacityGuardError",
+];
+const failureKinds = [
+  "ABSENT",
+  "UNREADABLE",
+  "BOUNDED",
+  "MALFORMED",
+  "CUSTODY",
+  "network",
+  "http",
+  "integrity",
+  "protocol",
+  "cancelled",
+  "limit",
+  "WORKSPACE_LIMIT",
+  "FREE_SPACE",
+  "FREE_INODES",
+  "WORKSPACE_DELETED_ACCOUNTING",
+  "SOURCE_DELETED_LIMIT",
+];
+const failureReasons = [
+  "CANCELLED",
+  "LEASE_EXPIRED",
+  "OVERLAPPING_OBSERVATION",
+  "IDENTITY_CHANGED",
+  "NON_WORKING_PHASE",
+  "PROGRESS_REGRESSED",
+  "PROGRESS_WRONG_PHASE",
+  "PROGRESS_TIMESTAMP_REUSED",
+  "OBSERVATION_OR_NOTIFICATION_UNPROVED",
+];
+export interface BackupV2SupervisorFailure {
+  stage: typeof failureStages[number];
+  errorClass: string;
+  kind: string | null;
+}
+class BackupV2CapacityGuardError extends Error {
+  constructor(readonly kind: string) {
+    super("Backup capacity guard rejected");
+  }
+}
+/** Never retain message, stack, URLs, headers or arbitrary exception fields. */
+export function classifyBackupV2Failure(error: unknown) {
+  let errorClass = "UNKNOWN", kind: string | null = null;
+  try {
+    if (error instanceof Error) {
+      const name = error.constructor.name;
+      if (failureClasses.includes(name)) errorClass = name;
+      const fields = error as Error & { kind?: unknown; category?: unknown };
+      const value = errorClass === "BackupV2TransportError"
+        ? fields.category
+        : fields.kind;
+      if (
+        errorClass !== "UNKNOWN" && typeof value === "string" &&
+        failureKinds.includes(value)
+      ) kind = value;
+    }
+  } catch {
+    return { errorClass: "UNKNOWN", kind: null };
+  }
+  return { errorClass, kind };
+}
+export function backupV2FailureEvidence(input: {
+  identity: BackupV2SupervisorIdentity;
+  reason: unknown;
+  supervisorFailure: BackupV2SupervisorFailure | null;
+  observation: BackupV2SupervisorObservation | null;
+  observedAtUtc: string;
+}) {
+  const identity = validIdentity({
+    unitName: input.identity.unitName,
+    invocationId: input.identity.invocationId,
+    mainPid: input.identity.mainPid,
+    mainStartTicks: input.identity.mainStartTicks,
+    cgroup: input.identity.cgroup,
+  });
+  if (new Date(input.observedAtUtc).toISOString() !== input.observedAtUtc) {
+    throw new Error("Invalid failure timestamp");
+  }
+  let observation: {
+    progress: BackupV2Progress;
+    capacity: BackupV2CapacityObservation;
+  } | null = null;
+  if (input.observation) {
+    try {
+      const source = input.observation.capacity;
+      const capacity = {
+        observedMonotonicMs: finite(source.observedMonotonicMs),
+        availableBytes: count(source.availableBytes),
+        freeInodes: count(source.freeInodes),
+        allocatedWorkspaceBytes: count(source.allocatedWorkspaceBytes),
+        workspaceHeldDeletedBytes: count(source.workspaceHeldDeletedBytes),
+        sourceHeldDeletedBytes: count(source.sourceHeldDeletedBytes),
+      };
+      observation = {
+        progress: validateBackupV2Progress(input.observation.progress),
+        capacity,
+      };
+    } catch { /* Unknown facts remain absent, never invented as zero. */ }
+  }
+  const detail = input.supervisorFailure;
+  const classified = detail ?? classifyBackupV2Failure(input.reason);
+  return {
+    schemaVersion: 1,
+    format: "backup-v2-failure",
+    observedAtUtc: input.observedAtUtc,
+    identity,
+    reason:
+      typeof input.reason === "string" && failureReasons.includes(input.reason)
+        ? input.reason
+        : "UNCLASSIFIED_FAILURE",
+    stage: detail && failureStages.includes(detail.stage)
+      ? detail.stage
+      : "worker",
+    errorClass: failureClasses.includes(classified.errorClass)
+      ? classified.errorClass
+      : "UNKNOWN",
+    kind: classified.kind !== null && failureKinds.includes(classified.kind)
+      ? classified.kind
+      : null,
+    observation,
+  };
 }
 
 function validIdentity(
@@ -467,6 +607,7 @@ export class BackupV2Supervisor {
     if (this.#reason) return this.cancel();
     if (this.#busy) return this.cancel("OVERLAPPING_OBSERVATION");
     this.#busy = true;
+    let stage: BackupV2SupervisorFailure["stage"] = "observation";
     try {
       const sample = await bounded(
         (signal) => this.#caps.observe(signal),
@@ -474,6 +615,7 @@ export class BackupV2Supervisor {
         this.signal,
       );
       if (this.#reason) return this.cancel();
+      stage = "validation";
       const now = this.#now();
       const prior = evaluateBackupV2Lease(
         this.#window,
@@ -487,7 +629,9 @@ export class BackupV2Supervisor {
       }
       const progress = validateBackupV2Progress(sample.progress);
       this.#fresh(progress.observedMonotonicMs, now);
+      stage = "capacity";
       this.#capacity(sample.capacity, now);
+      stage = "validation";
       const fields = useful[progress.phase];
       if (!fields) return this.cancel("NON_WORKING_PHASE");
       if (this.#previous) {
@@ -530,13 +674,17 @@ export class BackupV2Supervisor {
         this.#startupDeadline,
       );
       if (decision.action === "cancel") return this.cancel(decision.reason);
+      stage = "notification";
       if (!this.#ready) {
         this.#caps.notifier.ready();
         this.#ready = true;
       }
       this.#caps.notifier.extend(decision.extendUsec);
       return decision;
-    } catch {
+    } catch (error) {
+      try {
+        this.#caps.onFailure?.({ stage, ...classifyBackupV2Failure(error) });
+      } catch { /* Diagnostic failure never changes the original decision. */ }
       return this.cancel("OBSERVATION_OR_NOTIFICATION_UNPROVED");
     } finally {
       this.#busy = false;
@@ -567,17 +715,26 @@ export class BackupV2Supervisor {
         "sourceHeldDeletedBytes",
       ] as const
     ) count(capacity[field]);
+    if (capacity.allocatedWorkspaceBytes > BACKUP_V2_LIMITS.workspaceBytes) {
+      throw new BackupV2CapacityGuardError("WORKSPACE_LIMIT");
+    }
     const required = backupV2RequiredFreeBytes(
       capacity.allocatedWorkspaceBytes,
       this.#options.productionWriterMarginBytes,
     );
+    if (capacity.availableBytes < required) {
+      throw new BackupV2CapacityGuardError("FREE_SPACE");
+    }
+    if (capacity.freeInodes < this.#options.minimumFreeInodes) {
+      throw new BackupV2CapacityGuardError("FREE_INODES");
+    }
+    if (capacity.workspaceHeldDeletedBytes > capacity.allocatedWorkspaceBytes) {
+      throw new BackupV2CapacityGuardError("WORKSPACE_DELETED_ACCOUNTING");
+    }
     if (
-      capacity.availableBytes < required ||
-      capacity.freeInodes < this.#options.minimumFreeInodes ||
-      capacity.workspaceHeldDeletedBytes > capacity.allocatedWorkspaceBytes ||
       capacity.sourceHeldDeletedBytes >
         this.#options.maximumSourceHeldDeletedBytes
-    ) throw new Error("Capacity is not safe");
+    ) throw new BackupV2CapacityGuardError("SOURCE_DELETED_LIMIT");
   }
 }
 

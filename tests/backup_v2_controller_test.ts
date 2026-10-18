@@ -37,6 +37,7 @@ import {
 import {
   backupV2ArtifactBytes,
   backupV2ArtifactSha256,
+  backupV2ControlCacheDirectory,
   backupV2GateDirectory,
   type BackupV2VerifiedResult,
   BackupV2WorkerProgress,
@@ -52,6 +53,7 @@ import {
   backupV2ObservationProgram,
   backupV2PeriodSatisfied,
   backupV2PiReleaseRoot,
+  backupV2RemoteProgram,
   type BackupV2RetentionControl,
   collectBackupV2Release,
   copyBackupV2Protection,
@@ -670,6 +672,39 @@ Deno.test("actual generated source launch is finite notify custody with pinned s
   assert(
     !argv.find((arg) => arg.startsWith("--allow-read="))!.includes("/proc"),
   );
+});
+Deno.test("root control helpers use each exact job cache with unchanged read-only script grants", async () => {
+  const s = settings(), jobId = s.envelope.request.jobId;
+  const cache = backupV2ControlCacheDirectory(jobId);
+  const program = backupV2RemoteProgram(jobId, "console.log('control')");
+  assert(program.includes(`DENO_DIR='${cache}' /usr/local/bin/deno run`));
+  assert(
+    program.includes("--no-code-cache") && program.includes("--cached-only"),
+  );
+  assert(
+    !program.includes("--allow-write") && !program.includes("/root") &&
+      !program.includes("HOME="),
+  );
+  assert(
+    backupV2RemoteProgram(jobId.replace(/.$/, "9"), "").includes(
+      "/control-cache-" + jobId.replace(/.$/, "9"),
+    ),
+  );
+  await rejects(() => backupV2RemoteProgram("../another-job", ""));
+  const scripts: string[] = [];
+  const deps = {
+    remote: {
+      root: async (script: string) => {
+        scripts.push(script);
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    },
+  } as unknown as PiDeps;
+  await realBackupV2ControllerCapabilities(deps, fixture().deps.bridge)
+    .acknowledge(bound(s.workerGate));
+  equal(scripts.length, 1);
+  assert(scripts[0].includes(`DENO_DIR='${cache}' /usr/local/bin/deno run`));
+  assert(scripts[0].includes("--no-code-cache"));
 });
 Deno.test("worker progress rejects reused counters and invocation paths retain old attempts", async () => {
   const p = new BackupV2WorkerProgress(),
