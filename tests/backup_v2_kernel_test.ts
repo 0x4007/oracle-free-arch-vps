@@ -3,9 +3,15 @@ import {
   type BackupV2KernelCommand,
   type BackupV2KernelCommandResult,
   BackupV2KernelEvidenceError,
+  type BackupV2KernelRetainedTerminalProof,
   observeBackupV2Kernel,
   readBackupV2KernelText,
 } from "../scripts/backup-v2-kernel.ts";
+import {
+  BACKUP_V2_NATIVE_CUSTODY_FILE,
+  type BackupV2NativeCustodyRecord,
+  backupV2NativeMain,
+} from "../scripts/backup-v2-native-custody.ts";
 import {
   type BackupV2Gate,
   type BackupV2Request,
@@ -409,4 +415,287 @@ Deno.test("kernel deleted accounting accepts growing unlinked blocks without inv
     workspaceHeldDeletedBytes: 2048,
     sourceHeldDeletedBytes: 0,
   });
+});
+
+async function nativeFixture(
+  options: {
+    privateMount?: boolean;
+    liveChild?: boolean;
+    escaped?: boolean;
+    missingExit?: boolean;
+    unresolved?: boolean;
+    reused?: boolean;
+  } = {},
+) {
+  const base = fixture();
+  base.state.main = options.liveChild ? 123 : 0;
+  base.state.sub = options.liveChild ? "running" : "exited";
+  base.state.absent = !options.liveChild;
+  const state = {
+    managerPin: options.privateMount === true,
+    wrongOwner: false,
+    changedHash: false,
+  };
+  const child = {
+    pid: 124,
+    startTicks: "789",
+    bootId: ID,
+    cgroup,
+    kind: options.unresolved ? "unshare" as const : "gpg" as const,
+  };
+  const records: BackupV2NativeCustodyRecord[] = [
+    { type: "BOUND", schemaVersion: 1, gate },
+    {
+      type: "MOUNT",
+      namespace: {
+        scope: "UNIT",
+        leader: backupV2NativeMain(gate),
+        device: "4",
+        inode: options.privateMount ? "5000" : "1000",
+        hostDevice: "4",
+        hostInode: "1000",
+      },
+    },
+    { type: "CHILD", identity: child },
+  ];
+  if (!options.liveChild && !options.missingExit) {
+    records.push({ type: "EXIT", identity: child, code: 0, signal: null });
+  }
+  if (!options.privateMount && !options.unresolved) {
+    records.push({ type: "NO_PRIVATE_MOUNT" });
+  }
+  const body = records.map((record) => JSON.stringify(record)).join("\n") +
+      "\n",
+    journal = `${directory}/${BACKUP_V2_NATIVE_CUSTODY_FILE}`;
+  const sha = async (text: string) =>
+    Array.from(
+      new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)),
+      ),
+      (b) => b.toString(16).padStart(2, "0"),
+    ).join("");
+  const digest = await sha(body), resultDigest = await sha("{}\n");
+  const calls: [string, string[]][] = [];
+  const run: BackupV2KernelCommand = (command, args) => {
+    calls.push([command, args]);
+    const path = args.at(-1)!;
+    if (command === "/usr/bin/readlink" && args[0] === "-e") {
+      return Promise.resolve(ok(directory + "\n"));
+    }
+    if (command === "/usr/bin/stat" && args[0] === "--printf=%u:%a:%F") {
+      return Promise.resolve(ok("0:700:directory"));
+    }
+    if (
+      command === "/usr/bin/stat" && args[0] === "--printf=%d:%i:%u:%a:%h:%s:%F"
+    ) {
+      return Promise.resolve(
+        ok(
+          `1:99:${state.wrongOwner ? 1 : 0}:600:1:${
+            path === journal ? new TextEncoder().encode(body).length : 3
+          }:regular file`,
+        ),
+      );
+    }
+    if (command === "/usr/bin/sha256sum") {
+      return Promise.resolve(
+        ok(
+          `${
+            path === journal
+              ? (state.changedHash ? "f".repeat(64) : digest)
+              : resultDigest
+          }  ${path}\n`,
+        ),
+      );
+    }
+    if (command === "/usr/bin/cat" && path === journal) {
+      return Promise.resolve(ok(body));
+    }
+    if (command === "/usr/bin/find" && args[0] === "/proc") {
+      return Promise.resolve(
+        ok(
+          "1\0" + (base.state.main ? "123\0" : "") +
+            (options.liveChild || options.reused ? "124\0" : ""),
+        ),
+      );
+    }
+    if (command === "/usr/bin/cat" && path === "/proc/124/stat") {
+      return Promise.resolve(ok(stat(124, options.reused ? "999" : "789")));
+    }
+    if (command === "/usr/bin/cat" && path === "/proc/124/cgroup") {
+      return Promise.resolve(
+        ok(`0::${options.escaped ? "/user.slice/session-99.scope" : cgroup}\n`),
+      );
+    }
+    if (command === "/usr/bin/find" && /^\/proc\/[0-9]+\/fd$/.test(args[0])) {
+      if (args.includes("mnt:[[]*[]]")) {
+        return Promise.resolve(
+          ok(args[0] === "/proc/1/fd" && state.managerPin ? "7\0" : ""),
+        );
+      }
+      return Promise.resolve(ok("0\0" + "1\0"));
+    }
+    if (
+      command === "/usr/bin/stat" && args[0] === "-L" &&
+      args[1] === "--printf=%d:%i"
+    ) {
+      return Promise.resolve(
+        ok(
+          path === "/proc/1/fd/7" ||
+            options.privateMount && path !== "/proc/1/ns/mnt" && !options.reused
+            ? "4:5000"
+            : "4:1000",
+        ),
+      );
+    }
+    if (
+      command === "/usr/bin/cat" && path.endsWith("/cgroup.procs") &&
+      !base.state.absent
+    ) {
+      return Promise.resolve(
+        ok("123\n" + (options.liveChild && !options.escaped ? "124\n" : "")),
+      );
+    }
+    return base.run(command, args);
+  };
+  return { base, state, run, calls, digest, resultDigest, journal };
+}
+
+Deno.test("kernel verified complete journal turns absent physical actors and explicit shared namespace into zeros", async () => {
+  const f = await nativeFixture();
+  const observed = await observeBackupV2Kernel(gate, f.run, {
+    expectedCustodySha256: f.digest,
+  });
+  equal(observed.nativeCustodySha256, f.digest);
+  equal([
+    observed.tree?.escapedProcesses,
+    observed.tree?.namespaceReferences,
+    observed.tree?.openPipelineHandles,
+    observed.tree?.pendingOperations,
+  ], [0, 0, 0, 0]);
+  equal(observed.managerNamespaceReferences, 0);
+});
+
+Deno.test("kernel journal owner, content hash and unresolved exit/namespace evidence fail closed", async () => {
+  const owner = await nativeFixture();
+  owner.state.wrongOwner = true;
+  equal(
+    (await observeBackupV2Kernel(gate, owner.run)).tree?.escapedProcesses,
+    null,
+  );
+  const changed = await nativeFixture();
+  changed.state.changedHash = true;
+  equal(
+    (await observeBackupV2Kernel(gate, changed.run)).nativeCustodySha256,
+    null,
+  );
+  const incomplete = await nativeFixture({ missingExit: true });
+  equal(
+    (await observeBackupV2Kernel(gate, incomplete.run)).tree?.pendingOperations,
+    null,
+  );
+  const namespace = await nativeFixture({ unresolved: true });
+  equal(
+    (await observeBackupV2Kernel(gate, namespace.run)).tree
+      ?.namespaceReferences,
+    null,
+  );
+  const mismatch = await nativeFixture();
+  equal(
+    (await observeBackupV2Kernel(gate, mismatch.run, {
+      expectedCustodySha256: "e".repeat(64),
+    })).tree?.escapedProcesses,
+    null,
+  );
+});
+
+Deno.test("kernel current child placement and actual pipe/socket FD metadata report an escape", async () => {
+  const f = await nativeFixture({ liveChild: true, escaped: true });
+  const observed = await observeBackupV2Kernel(gate, f.run);
+  equal(observed.tree?.escapedProcesses, 1);
+  equal(observed.tree?.openPipelineHandles, 4);
+  equal(observed.tree?.pendingOperations, null);
+  assert(
+    !f.calls.some(([, args]) =>
+      args.some((arg) => arg.includes("cmdline") || arg.includes("environ"))
+    ),
+  );
+});
+
+Deno.test("kernel PID reuse never reads foreign payload FD targets or retains old liveness", async () => {
+  const f = await nativeFixture({ reused: true });
+  const observed = await observeBackupV2Kernel(gate, f.run);
+  equal(observed.tree?.escapedProcesses, 0);
+  assert(
+    !f.calls.some(([command, args]) =>
+      command === "/usr/bin/cat" && args.at(-1) === "/proc/124/cgroup"
+    ),
+  );
+  assert(
+    !f.calls.some(([command, args]) =>
+      command === "/usr/bin/find" && args[0] === "/proc/124/fd" &&
+      !args.includes("mnt:[[]*[]]")
+    ),
+  );
+});
+
+Deno.test("kernel exact manager namespace FD is counted then fresh post-stop proof establishes zero", async () => {
+  const f = await nativeFixture({ privateMount: true });
+  const before = await observeBackupV2Kernel(gate, f.run, {
+    expectedCustodySha256: f.digest,
+  });
+  equal(before.tree?.namespaceReferences, 1);
+  equal(before.managerNamespaceReferences, 1);
+  equal(before.tree?.pendingOperations, 0);
+  const proof: BackupV2KernelRetainedTerminalProof = {
+    gate,
+    observation: before,
+    resultSha256: f.resultDigest,
+    exactStop: {
+      unitName: gate.unitName,
+      invocationId: gate.custody!.invocationId,
+      sourceBootId: gate.sourceBootId,
+      completed: true,
+    },
+  };
+  f.base.state.load = "not-found";
+  f.base.state.invocation = "";
+  f.state.managerPin = false;
+  equal((await observeBackupV2Kernel(gate, f.run)).identity, null);
+  const after = await observeBackupV2Kernel(gate, f.run, {
+    expectedCustodySha256: f.digest,
+    retainedTerminalProof: proof,
+  });
+  equal(after.unit, "ABSENT");
+  equal(after.identity, gate.custody);
+  equal([
+    after.tree?.cgroupPopulated,
+    after.tree?.descendants,
+    after.tree?.escapedProcesses,
+    after.tree?.namespaceReferences,
+    after.tree?.openPipelineHandles,
+    after.tree?.pendingOperations,
+    after.tree?.sourceLockFree,
+  ], [false, 0, 0, 0, 0, 0, true]);
+});
+
+Deno.test("kernel malformed exact-stop proof and another invocation cannot authorize absent-unit reconciliation", async () => {
+  const f = await nativeFixture();
+  const before = await observeBackupV2Kernel(gate, f.run);
+  const proof: BackupV2KernelRetainedTerminalProof = {
+    gate,
+    observation: before,
+    resultSha256: f.resultDigest,
+    exactStop: {
+      unitName: gate.unitName,
+      invocationId: "f".repeat(32),
+      sourceBootId: gate.sourceBootId,
+      completed: true,
+    },
+  };
+  f.base.state.load = "not-found";
+  f.base.state.invocation = "";
+  await rejects(
+    () => observeBackupV2Kernel(gate, f.run, { retainedTerminalProof: proof }),
+    "CUSTODY",
+  );
 });
