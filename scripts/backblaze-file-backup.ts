@@ -5969,7 +5969,24 @@ async function piMain(): Promise<void> {
   }
   const deps = realPiDeps();
   await deps.lock(CONTROLLER_LOCK_PATH, async () => {
-    const reportValue = await runBackblazeCycle(deps);
+    const saved = await deps.private.read<
+      ControllerState | { schemaVersion: 2 }
+    >(CONTROLLER_STATE_PATH);
+    const legacyActive = saved?.schemaVersion === 1 &&
+      saved.job !== undefined &&
+      !["COMPLETE", "FAILED"].includes(saved.job.phase);
+    let reportValue: BackblazeRunReport;
+    if (legacyActive) reportValue = await runBackblazeCycle(deps);
+    else {
+      const runtime = await import("./backup-v2-controller.ts"),
+        bridge = await import("./backup-v2-bridge-runtime.ts");
+      const deployment = await loadDeployment(deps);
+      await runtime.installBackupV2PiRelease(deps, deployment.sourceRevision);
+      reportValue = await runtime.runBackupV2ControllerCycle(
+        deps,
+        bridge.realBackupV2BridgeRuntime(deps),
+      );
+    }
     console.log(JSON.stringify(reportValue));
     if (!reportValue.healthy) Deno.exitCode = 1;
   });
