@@ -127,6 +127,7 @@ export async function fanoutBackupStream(
   destinations: readonly WritableStream<Uint8Array>[],
   inspect: (bytes: Uint8Array) => void | Promise<void>,
   terminated: () => boolean,
+  report: (stage: string, error: unknown) => void = () => {},
 ): Promise<boolean> {
   const writers = destinations.map((stream) => stream.getWriter());
   const closed = writers.map(() => false);
@@ -135,8 +136,9 @@ export async function fanoutBackupStream(
     for await (const bytes of source) {
       try {
         await inspect(bytes);
-      } catch {
+      } catch (error) {
         good = false;
+        report("decoded-inspection", error);
       }
       for (let index = 0; index < writers.length; index++) {
         if (closed[index]) continue;
@@ -146,6 +148,7 @@ export async function fanoutBackupStream(
           closed[index] = true;
           if (!terminated() || !(error instanceof Deno.errors.BrokenPipe)) {
             good = false;
+            report(`consumer-write-${index}`, error);
           }
         }
       }
@@ -158,6 +161,7 @@ export async function fanoutBackupStream(
         } catch (error) {
           if (!terminated() || !(error instanceof Deno.errors.BrokenPipe)) {
             good = false;
+            report(`consumer-close-${index}`, error);
           }
         }
       }
@@ -185,8 +189,64 @@ async function consumeHash(
 
 async function boundedDiagnostics(stream: ReadableStream<Uint8Array>) {
   let bytes = 0;
-  for await (const chunk of stream) bytes += chunk.length;
-  if (bytes > 256 * 1024) fail("native diagnostics budget");
+  const hash = createHash("sha256");
+  const retained: Uint8Array[] = [];
+  for await (const chunk of stream) {
+    hash.update(chunk);
+    if (bytes < 256 * 1024) retained.push(chunk.slice(0, 256 * 1024 - bytes));
+    bytes += chunk.length;
+  }
+  const data = new Uint8Array(Math.min(bytes, 256 * 1024));
+  let offset = 0;
+  for (const chunk of retained) {
+    data.set(chunk, offset);
+    offset += chunk.length;
+  }
+  const text = new TextDecoder().decode(data);
+  const categories = [
+    ["permission", /Permission denied|Read-only file system/i],
+    [
+      "unsupported-option",
+      /unrecognized option|unknown option|invalid option/i,
+    ],
+    ["decoder-memory", /too much memory|window.*larger|memory.*limit/i],
+    ["corrupt-or-truncated", /corrupt|checksum|unexpected end|premature end/i],
+    ["missing-selection", /Not found in archive/i],
+  ] as const;
+  return {
+    bytes,
+    sha256: hash.digest("hex"),
+    overflow: bytes > 256 * 1024,
+    categories: categories.filter(([, pattern]) => pattern.test(text)).map((
+      [name],
+    ) => name),
+  };
+}
+
+function safeStageFailure(stage: string, error: unknown) {
+  const names = new Set([
+    "Error",
+    "TypeError",
+    "RangeError",
+    "BadResource",
+    "BrokenPipe",
+    "PermissionDenied",
+    "NotFound",
+    "InvalidData",
+    "Interrupted",
+  ]);
+  const name = error instanceof Error && names.has(error.name)
+    ? error.name
+    : "UnknownError";
+  const message = error instanceof Error ? error.message : "";
+  // Only our own fixed parser labels are exposed, never provider/filename diagnostics.
+  const detail =
+    /^(Stream tar rejected|Stream verification failed): [a-z /:-]+$/.test(
+        message,
+      )
+      ? message.slice(0, 160)
+      : null;
+  return { stage, name, detail };
 }
 
 function countedCiphertext(
@@ -256,10 +316,21 @@ async function runPass(
   const spawn = deps.spawn ?? nativeSpawn;
   const selections: BackupStreamSelection[] = [];
   const children: BackupStreamProcess[] = [];
+  const childStages: string[] = [];
   const tasks: Promise<unknown>[] = [];
-  const failures: unknown[] = [];
+  const failures: ReturnType<typeof safeStageFailure>[] = [];
+  const report = (stage: string, error: unknown) => {
+    if (failures.length < 32) failures.push(safeStageFailure(stage, error));
+  };
   const start = (command: "tar" | "zstd", args: string[]) => {
     const child = spawn(command, args);
+    childStages.push(
+      command === "zstd"
+        ? "zstd"
+        : args.includes("--list")
+        ? "tar-listing"
+        : `tar-sample-${children.length - 2}`,
+    );
     children.push(child);
     return child;
   };
@@ -301,17 +372,26 @@ async function runPass(
     const guard = createTarTerminationGuard();
     let decodedBytes = 0;
     const metadata: Uint8Array[] = [];
-    const observe = <T>(promise: Promise<T>): Promise<T | undefined> =>
+    const observe = <T>(
+      promise: Promise<T>,
+      stage = "pipeline",
+    ): Promise<T | undefined> =>
       promise.catch((error) => {
-        failures.push(error);
+        report(stage, error);
         return undefined;
       });
     const listingTask = listing
-      ? observe(consumeNativeTarListing(listing.stdout, inventory.add))
+      ? observe(
+        consumeNativeTarListing(listing.stdout, inventory.add),
+        "native-listing",
+      )
       : Promise.resolve();
     tasks.push(listingTask);
     const sampleTasks = samples.map((child) =>
-      observe(consumeHash(child.stdout))
+      observe(
+        consumeHash(child.stdout),
+        `sample-output-${samples.indexOf(child)}`,
+      )
     );
     tasks.push(...sampleTasks);
     const fanout = observe(
@@ -341,13 +421,22 @@ async function runPass(
           });
         },
         () => isTar && guard.terminated(),
+        report,
       ),
     );
     tasks.push(fanout);
-    const statuses = children.map((child) => observe(child.status));
+    const statuses = children.map((child, index) =>
+      observe(child.status, `${childStages[index]}-status`)
+    );
+    const diagnostics = children.map((child, index) =>
+      observe(
+        boundedDiagnostics(child.stderr),
+        `${childStages[index]}-diagnostics`,
+      )
+    );
     tasks.push(
       ...statuses,
-      ...children.map((child) => observe(boundedDiagnostics(child.stderr))),
+      ...diagnostics,
     );
     const input = countedCiphertext(
       descriptor,
@@ -356,59 +445,76 @@ async function runPass(
     const writer = zstd.stdin.getWriter();
     const hash = createHash("sha256");
     let compressedBytes = 0, pipeFailed = false;
-    const decryption = observe((async () => {
-      try {
-        const integrity = await deps.decrypt(input.stream, {
-          async write(bytes) {
-            compressedBytes = assertBackupV2Budget(
-              "ciphertextBytes",
-              compressedBytes + bytes.length,
-            );
-            if (!isTar && compressedBytes > 8 * 1024 * 1024) {
-              fail("compressed metadata bound");
-            }
-            hash.update(bytes);
-            if (!pipeFailed) {
-              try {
-                await writer.write(bytes);
-              } catch (error) {
-                pipeFailed = true;
-                failures.push(error);
+    const decryption = observe(
+      (async () => {
+        try {
+          const integrity = await deps.decrypt(input.stream, {
+            async write(bytes) {
+              compressedBytes = assertBackupV2Budget(
+                "ciphertextBytes",
+                compressedBytes + bytes.length,
+              );
+              if (!isTar && compressedBytes > 8 * 1024 * 1024) {
+                fail("compressed metadata bound");
               }
-            }
-            await deps.progress?.({
-              role: descriptor.role,
-              pass,
-              kind: "compressedPlaintext",
-              bytes: compressedBytes,
-            });
-            return bytes.length;
-          },
-        });
-        if (integrity?.integrityChecked !== true) {
-          fail("decryption integrity result");
+              hash.update(bytes);
+              if (!pipeFailed) {
+                try {
+                  await writer.write(bytes);
+                } catch (error) {
+                  pipeFailed = true;
+                  report("zstd-input", error);
+                }
+              }
+              await deps.progress?.({
+                role: descriptor.role,
+                pass,
+                kind: "compressedPlaintext",
+                bytes: compressedBytes,
+              });
+              return bytes.length;
+            },
+          });
+          if (integrity?.integrityChecked !== true) {
+            fail("decryption integrity result");
+          }
+          input.finish();
+          await writer.close();
+        } catch (error) {
+          try {
+            await input.stream.cancel(error);
+          } catch { /* Backend may still own its lock. */ }
+          try {
+            await writer.abort(error);
+          } catch { /* Preserve primary failure. */ }
+          throw error;
+        } finally {
+          writer.releaseLock();
         }
-        input.finish();
-        await writer.close();
-      } catch (error) {
-        try {
-          await input.stream.cancel(error);
-        } catch { /* Backend may still own its lock. */ }
-        try {
-          await writer.abort(error);
-        } catch { /* Preserve primary failure. */ }
-        throw error;
-      } finally {
-        writer.releaseLock();
-      }
-    })());
+      })(),
+      "decryption",
+    );
     tasks.push(decryption);
     await Promise.all(tasks);
     const nativeStatuses = await Promise.all(statuses);
+    const nativeDiagnostics = await Promise.all(diagnostics);
     if (
       failures.length || await fanout !== true ||
-      nativeStatuses.some((status) => !status?.success || status.code !== 0)
-    ) fail("pipeline did not completely succeed");
+      nativeStatuses.some((status) => !status?.success || status.code !== 0) ||
+      nativeDiagnostics.some((item) => item?.overflow !== false)
+    ) {
+      fail(`pipeline ${
+        JSON.stringify({
+          failures,
+          fanout: await fanout,
+          children: childStages.map((stage, index) => ({
+            stage,
+            code: nativeStatuses[index]?.code ?? null,
+            diagnostics: nativeDiagnostics[index] ?? null,
+          })),
+        })
+      }`);
+    }
     const compressedSha256 = hash.digest("hex");
     if (
       !compressedBytes || (descriptor.compressedPlaintext &&

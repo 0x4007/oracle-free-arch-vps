@@ -148,6 +148,38 @@ Deno.test("stream verifier rejects a decrypt capability returning before input E
   );
 });
 
+Deno.test("stream pipeline failures identify stages without exposing raw diagnostics", async () => {
+  const sentinel = "private-filename-or-provider-body";
+  const native = tools({ nativeCode: 2 });
+  await assertRejects(() =>
+    verifyBackupStreamArchive(descriptor, {
+      ciphertext: () => stream(payload),
+      decrypt,
+      spawn(command) {
+        const child = native(command);
+        if (command === "tar") {
+          child.stderr = stream(text.encode(`Permission denied: ${sentinel}`));
+        }
+        return child;
+      },
+    }), (error: unknown) => {
+    assert(error instanceof Error);
+    assert(!error.message.includes(sentinel));
+    const detail = JSON.parse(error.message.slice(error.message.indexOf("{")));
+    const listing = detail.children.find((item: { stage: string }) =>
+      item.stage === "tar-listing"
+    );
+    assertEquals(listing.code, 2);
+    assertEquals(listing.diagnostics.categories, ["permission"]);
+    assertEquals(
+      listing.diagnostics.bytes,
+      text.encode(`Permission denied: ${sentinel}`).length,
+    );
+    assertEquals(listing.diagnostics.sha256.length, 64);
+    return true;
+  });
+});
+
 Deno.test("fanout applies slow-consumer backpressure and drains after failure", async () => {
   let release!: () => void, pulled = 0, consumed = 0;
   const blocked = new Promise<void>((resolve) => {
