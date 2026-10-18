@@ -73,6 +73,7 @@ import {
   validateGate,
 } from "./backblaze-controller-contract.ts";
 import { shellQuote } from "./backup-guest.ts";
+import type { BackupV2KernelObservationOptions, BackupV2KernelObservation } from "./backup-v2-kernel.ts";
 
 export type BackupV2ControllerPhase =
   | "REQUESTED"
@@ -117,6 +118,7 @@ export interface BackupV2ControllerObservation {
   status: unknown | null;
   resultBytes: Uint8Array | null;
   nativeCustodySha256?: string | null;
+  managerNamespaceReferences?: number | null;
   /** Independent collector, never inferred from a source status or missing unit. */
   tree: BackupV2TreeObservation | null;
 }
@@ -407,7 +409,7 @@ export function backupV2ProcessesSettled(
     tree.cgroupPopulated === false && tree.descendants === 0 &&
     tree.escapedProcesses === 0 && tree.namespaceReferences !== null && Number.isSafeInteger(tree.namespaceReferences) && tree.namespaceReferences >= 0 &&
     tree.openPipelineHandles === 0 && tree.pendingOperations === 0 &&
-    tree.sourceLockFree === true;
+    tree.sourceLockFree === true && tree.namespaceReferences === (observation.managerNamespaceReferences ?? null);
 }
 
 /** Exactly one bounded reconciliation; no polling loop and no whole-job timer. */
@@ -945,62 +947,40 @@ export function backupV2LaunchArguments(
     "--no-config",
     "--no-lock",
     "--cached-only",
-    `--allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${publicHome},/proc,/sys/fs/cgroup`,
+    `--allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${publicHome}`,
     `--allow-write=${BACKUP_BASE},${PUBLIC_HOME_BASE}`,
     "--allow-env=INVOCATION_ID,NOTIFY_SOCKET",
     "--allow-ffi=/usr/lib/libsystemd.so.0",
-    "--allow-run=/usr/bin/bash,/usr/bin/unshare,/usr/bin/gpg,/usr/bin/zstd,/usr/bin/tar,/usr/bin/mkfifo,/usr/bin/curl,/usr/bin/sudo,/usr/bin/cat,/usr/bin/chown",
+    "--allow-run=/usr/bin/bash,/usr/bin/unshare,/usr/bin/gpg,/usr/bin/zstd,/usr/bin/tar,/usr/bin/mkfifo,/usr/bin/curl,/usr/bin/sudo,/usr/bin/cat,/usr/bin/chown,/usr/bin/find,/usr/bin/stat,/usr/bin/readlink",
     `${runtime}/entry-${kind}.ts`,
   ];
 }
 
 /** Root-only bounded control read; payload and private keys never cross this seam. */
 function remoteProgram(program: string): string {
-  return `printf '%s' ${
-    shellQuote(program)
-  } | /usr/local/bin/deno run --no-prompt --no-config --no-lock --allow-read=/proc,/sys/fs/cgroup,${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT} --allow-run=/usr/bin/systemctl,/usr/bin/flock -`;
+  return `printf '%s' ${shellQuote(program)} | /usr/local/bin/deno run --no-prompt --no-config --no-lock --cached-only --allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT} --allow-run=/usr/bin/systemctl,/usr/bin/flock,/usr/bin/cat,/usr/bin/find,/usr/bin/stat,/usr/bin/readlink,/usr/bin/sha256sum -`;
 }
-export function backupV2ObservationProgram(gateInput: BackupV2Gate): string {
+export function backupV2ObservationProgram(gateInput: BackupV2Gate, options: BackupV2KernelObservationOptions = {}): string {
   const gate = validateBackupV2Gate(gateInput);
   return `
-const gate=${JSON.stringify(gate)};
-const opts={clearEnv:true,env:{PATH:"/usr/bin:/bin",LC_ALL:"C"},stdout:"piped",stderr:"piped"};
-const run=async(command,args)=>await new Deno.Command(command,{...opts,args}).output();
-const out=await run("/usr/bin/systemctl",["show",gate.unitName,"--no-pager","--property=LoadState,ActiveState,SubState,Result,MainPID,ControlPID,ControlGroup,InvocationID"]);
-const props=Object.fromEntries(new TextDecoder().decode(out.stdout).trim().split("\\n").map(x=>{const p=x.indexOf("=");return[x.slice(0,p),x.slice(p+1)]}));
-if(!out.success&&props.LoadState!=="not-found")throw Error("Unit observation unavailable");
-const boot=(await Deno.readTextFile("/proc/sys/kernel/random/boot_id")).trim();
-const group=${JSON.stringify(GATE_BACKUP_CGROUP_ROOT)}+"/"+gate.unitName;
-let unit=props.LoadState==="not-found"?"ABSENT":props.ActiveState==="failed"?"FAILED":props.ActiveState==="active"&&props.SubState==="exited"?"EXITED":props.ActiveState==="active"?"RUNNING":"STARTING";
-const pid=Number(props.MainPID||0),controlPid=Number(props.ControlPID||0);
-let identity=null;
-if(pid>0){const text=await Deno.readTextFile("/proc/"+pid+"/stat");const start=text.slice(text.lastIndexOf(")")+2).split(" ")[19];const cg=(await Deno.readTextFile("/proc/"+pid+"/cgroup")).trim();if(cg!=="0::"+group||props.ControlGroup!==group||! /^[0-9a-f]{32}$/.test(props.InvocationID))throw Error("Unit identity mismatch");identity={unitName:gate.unitName,invocationId:props.InvocationID,mainPid:pid,mainStartTicks:start,cgroup:group};}
-else if(gate.custody&&props.InvocationID===gate.custody.invocationId&&props.LoadState==="loaded"){identity=gate.custody;}
-else if(gate.custody&&unit==="ABSENT"){let gone=false;try{const s=await Deno.readTextFile("/proc/"+gate.custody.mainPid+"/stat");gone=s.slice(s.lastIndexOf(")")+2).split(" ")[19]!==gate.custody.mainStartTicks;}catch(e){if(!(e instanceof Deno.errors.NotFound))throw e;gone=true;}if(!gone)throw Error("Original process still exists");identity=gate.custody;}
-const read=async(path,limit)=>{try{const info=await Deno.lstat(path);if(!info.isFile||info.isSymlink||info.uid!==0||info.nlink!==1||(info.mode&511)!==384||info.size>limit)throw Error("Unsafe artifact");const bytes=await Deno.readFile(path);if(bytes.length!==info.size)throw Error("Changed artifact");return bytes;}catch(e){if(e instanceof Deno.errors.NotFound)return null;throw e;}};
-const directory=identity?${
-    JSON.stringify(BACKUP_BASE)
-  }+"/"+gate.envelope.request.captureId+"/v2-"+gate.gateId+"/"+identity.invocationId:null;
+const {observeBackupV2Kernel}=await import(${JSON.stringify(`${RELEASES_ROOT}/${gate.envelope.request.sourceRevision}/scripts/backup-v2-kernel.ts`)});
+const gate=${JSON.stringify(gate)},options=${JSON.stringify(options)};
+const observed=await observeBackupV2Kernel(gate,undefined,options);
+const read=async(path,limit)=>{try{const info=await Deno.lstat(path);if(!info.isFile||info.isSymlink||info.uid!==0||info.nlink!==1||(info.mode&511)!==384||info.size>limit)throw Error("Unsafe artifact");const bytes=await Deno.readFile(path),after=await Deno.lstat(path);if(bytes.length!==info.size||info.dev!==after.dev||info.ino!==after.ino||info.size!==after.size)throw Error("Changed artifact");return bytes;}catch(e){if(e instanceof Deno.errors.NotFound)return null;throw e;}};
+const directory=observed.identity?${JSON.stringify(BACKUP_BASE)}+"/"+gate.envelope.request.captureId+"/v2-"+gate.gateId+"/"+observed.identity.invocationId:null;
 const statusBytes=directory?await read(directory+"/status.json",${BACKUP_V2_LIMITS.controlResponseBytes}):null;
 const resultBytes=directory?await read(directory+"/result.json",${BACKUP_V2_LIMITS.controlResponseBytes}):null;
-let descendants=0,populated=false;
-const walk=async(path,depth=0)=>{if(depth>32)throw Error("Cgroup depth bound");try{const procs=(await Deno.readTextFile(path+"/cgroup.procs")).trim().split("\\n").filter(Boolean);descendants+=procs.length;if(descendants>4096)throw Error("Process count bound");for await(const child of Deno.readDir(path))if(child.isDirectory)await walk(path+"/"+child.name,depth+1);}catch(e){if(!(e instanceof Deno.errors.NotFound))throw e;}};
-await walk("/sys/fs/cgroup"+group);populated=descendants>0;
-const ancestors=new Set();let ancestor=Deno.pid;while(ancestor>0&&!ancestors.has(ancestor)){ancestors.add(ancestor);try{const s=await Deno.readTextFile("/proc/"+ancestor+"/stat");ancestor=Number(s.slice(s.lastIndexOf(")")+2).split(" ")[1]);}catch{break;}}
-let escaped=0,references=0,handles=0,count=0;
-for await(const entry of Deno.readDir("/proc")){if(!/^[1-9][0-9]*$/.test(entry.name))continue;if(++count>4096)throw Error("Host process bound");const n=Number(entry.name);if(ancestors.has(n))continue;const base="/proc/"+entry.name;try{const command=new TextDecoder().decode(await Deno.readFile(base+"/cmdline"));let matches=command.includes(gate.envelope.request.captureId)||command.includes(gate.envelope.request.jobId);let fds=0;for await(const fd of Deno.readDir(base+"/fd")){if(++fds>4096)throw Error("Handle bound");try{const target=await Deno.readLink(base+"/fd/"+fd.name);if(target.includes(gate.envelope.request.captureId)||target.includes(gate.envelope.request.jobId)){handles++;matches=true;}}catch(e){if(!(e instanceof Deno.errors.NotFound))throw e;}}const mounts=await Deno.readTextFile(base+"/mountinfo");if(mounts.length>2097152)throw Error("Namespace metadata bound");if(mounts.includes(gate.envelope.request.captureId)){references++;matches=true;}if(matches&&!(await Deno.readTextFile(base+"/cgroup")).split("\\n").includes("0::"+group))escaped++;}catch(e){if(!(e instanceof Deno.errors.NotFound))throw e;}}
-const lock=await run("/usr/bin/flock",["-n",gate.sourceLockPath,"/usr/bin/true"]);
-const tree=identity?{identity,observedMonotonicMs:0,mainPid:pid,controlPid,cgroupPopulated:populated,descendants,escapedProcesses:escaped,namespaceReferences:references,openPipelineHandles:handles,pendingOperations:descendants===0&&escaped===0&&handles===0?0:null,sourceLockFree:lock.code===0}:null;
-console.log(JSON.stringify({sourceBootId:boot,unit,identity,status:statusBytes?JSON.parse(new TextDecoder().decode(statusBytes)):null,resultBytes:resultBytes?[...resultBytes]:null,tree}));
+console.log(JSON.stringify({...observed,status:statusBytes?JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(statusBytes)):null,resultBytes:resultBytes?[...resultBytes]:null}));
 `;
 }
 
 export async function observeBackupV2Source(
   gate: BackupV2Gate,
   remote: Pick<RemoteSeam, "root"> = realRemoteSeam(realRemoteRunner),
+  options: BackupV2KernelObservationOptions = {},
 ): Promise<BackupV2ControllerObservation> {
   const result = await remote.root(
-    remoteProgram(backupV2ObservationProgram(gate)),
+    remoteProgram(backupV2ObservationProgram(gate, options)),
   );
   if (
     result.code !== 0 ||
@@ -1045,13 +1025,41 @@ export function realBackupV2ControllerCapabilities(
 ): BackupV2ControllerCapabilities {
   const pathForClear = (gate: BackupV2Gate) =>
     `${PIP_JOB_EVIDENCE_PATH}/${gate.envelope.request.jobId}/v2-${gate.gateId}-${gate.custody?.invocationId}-cleared.json`;
-  const observe = (gate: BackupV2Gate) =>
-    observeBackupV2Source(gate, deps.remote);
+  type StopProof = {
+    gate: BackupV2Gate;
+    proof: BackupV2ControllerObservation;
+    cancellation?: boolean;
+    artifacts?: { resultSha256: string; nativeCustodySha256: string };
+    exactStop?: {unitName: string; invocationId: string; sourceBootId: string; completed: true; code: 0};
+  };
+  const observe = async (gate: BackupV2Gate) => {
+    const saved = await deps.private.read<StopProof>(pathForClear(gate));
+    let options: BackupV2KernelObservationOptions = {};
+    if (saved?.exactStop) {
+      same(saved.gate, gate);
+      if (saved.cancellation) {
+        options = {cancellationStopProof: {
+          gate, observation: saved.proof as BackupV2KernelObservation, exactStop: saved.exactStop,
+        }} as BackupV2KernelObservationOptions;
+      } else {
+      if (!backupV2ProcessesSettled(gate, saved.proof)) fail();
+      options = {
+        expectedCustodySha256: saved.artifacts?.nativeCustodySha256,
+        retainedTerminalProof: {
+          gate, observation: saved.proof as BackupV2KernelObservation,
+          resultSha256: saved.artifacts?.resultSha256 ?? null,
+          exactStop: saved.exactStop,
+        },
+      };
+      }
+    }
+    return await observeBackupV2Source(gate, deps.remote, options);
+  };
   const retainedProof = async (gate: BackupV2Gate): Promise<boolean> => {
     const saved = await deps.private.read<
-      { gate: unknown; proof: BackupV2ControllerObservation; cancellation?:boolean; artifacts?:{resultSha256:string;nativeCustodySha256:string} }
+      StopProof
     >(pathForClear(gate));
-    if (!saved) return false;
+    if (!saved?.exactStop) return false;
     same(saved.gate, gate);
     if(saved.cancellation){if(saved.proof.sourceBootId!==gate.sourceBootId)fail();same(saved.proof.identity,gate.custody);}
     else if (!backupV2ProcessesSettled(gate, saved.proof, false)) fail();
@@ -1263,10 +1271,13 @@ export function realBackupV2ControllerCapabilities(
       }
       if (!backupV2ProcessesSettled(gate, actual)) fail();
       if(expected&&(!actual.resultBytes||backupV2ArtifactSha256(actual.resultBytes)!==expected.resultSha256||actual.nativeCustodySha256!==expected.nativeCustodySha256))fail();
+      const artifacts = expected ?? (actual.resultBytes && actual.nativeCustodySha256
+        ? {resultSha256: backupV2ArtifactSha256(actual.resultBytes), nativeCustodySha256: actual.nativeCustodySha256}
+        : undefined);
       if(!await deps.private.read(pathForClear(gate)))await deps.private.write(pathForClear(gate), {
         gate,
         proof: {...actual,resultBytes:null},
-        ...(expected?{artifacts:expected}:{}),
+        ...(artifacts?{artifacts}:{}),
         recordedAtUtc: deps.now().toISOString(),
       });
       const script = `test "$(cat /proc/sys/kernel/random/boot_id)" = ${
@@ -1279,6 +1290,13 @@ export function realBackupV2ControllerCapabilities(
       if ((await deps.remote.root(script)).code !== 0) {
         throw new Error("Exact source unit stop failed");
       }
+      const saved = await deps.private.read<StopProof>(pathForClear(gate));
+      if (!saved) fail();
+      same(saved.gate, gate);
+      await deps.private.write(pathForClear(gate), {...saved, exactStop: {
+        unitName: gate.unitName, invocationId: gate.custody!.invocationId,
+        sourceBootId: gate.sourceBootId, completed: true, code: 0,
+      }});
     },
     async cancel(gate) {
       if (!gate.custody) return "CANCELLATION_BLOCKED";
@@ -1296,13 +1314,21 @@ export function realBackupV2ControllerCapabilities(
           if(!await deps.private.read(pathForClear(gate)))await deps.private.write(pathForClear(gate),{gate,proof:{...before,resultBytes:null},cancellation:true,recordedAtUtc:deps.now().toISOString()});
           if (
             (await deps.remote.root(
-              `test "$(systemctl show --value --property=InvocationID ${
+              `test "$(cat /proc/sys/kernel/random/boot_id)" = ${shellQuote(gate.sourceBootId)}
+test "$(systemctl show --value --property=InvocationID ${
                 shellQuote(gate.unitName)
               })" = ${shellQuote(gate.custody!.invocationId)}\nsystemctl stop ${
                 shellQuote(gate.unitName)
               }`,
             )).code !== 0
           ) fail();
+          const saved = await deps.private.read<StopProof>(pathForClear(gate));
+          if (!saved) fail();
+          same(saved.gate, gate);
+          await deps.private.write(pathForClear(gate), {...saved, exactStop: {
+            unitName: gate.unitName, invocationId: gate.custody!.invocationId,
+            sourceBootId: gate.sourceBootId, completed: true, code: 0,
+          }});
         },
       });
       if (settled.state === "SETTLED") {

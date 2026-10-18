@@ -3162,14 +3162,27 @@ export function makeDecryptArchive(publicHome: string): DecryptArchive {
 /** Stream ciphertext on the remote target using the existing Pi agent tunnel.
  * Only bounded GPG protocol traffic reaches the Pi, never archive contents.
  */
-export function makeStreamDecryptArchive(publicHome: string) {
+export interface StreamDecryptProcesses {
+  command(args: string[]): Promise<{ success: boolean; stdout: Uint8Array }>;
+  spawn(args: string[]): Promise<{
+    stdin: WritableStream<Uint8Array>;
+    stdout: ReadableStream<Uint8Array>;
+    stderr: ReadableStream<Uint8Array>;
+    status: Promise<Deno.CommandStatus>;
+  }>;
+}
+export function makeStreamDecryptArchive(publicHome: string, processes?: StreamDecryptProcesses) {
   return async (
     ciphertext: ReadableStream<Uint8Array>,
     destination: Pick<Deno.FsFile, "write">,
   ): Promise<{ integrityChecked: true }> => {
-    const socketResult = await new Deno.Command("sudo", {
+    const command = processes?.command ?? ((args: string[]) => new Deno.Command("sudo", {
       ...backupChildProcessOptions(),
-      args: [
+      args,
+      stdout: "piped",
+      stderr: "piped",
+    }).output());
+    const socketResult = await command([
         "-n",
         "-u",
         "codex",
@@ -3178,21 +3191,13 @@ export function makeStreamDecryptArchive(publicHome: string) {
         publicHome,
         "--list-dirs",
         "agent-socket",
-      ],
-      stdout: "piped",
-      stderr: "piped",
-    }).output();
+      ]);
     if (!socketResult.success) {
       throw new Error("Custom agent socket resolution failed");
     }
     const agentSocket = new TextDecoder().decode(socketResult.stdout).trim()
       .split("\n").at(-1) ?? "";
-    const defaultResult = await new Deno.Command("sudo", {
-      ...backupChildProcessOptions(),
-      args: ["-n", "-u", "codex", "gpgconf", "--list-dirs", "agent-socket"],
-      stdout: "piped",
-      stderr: "piped",
-    }).output();
+    const defaultResult = await command(["-n", "-u", "codex", "gpgconf", "--list-dirs", "agent-socket"]);
     if (!defaultResult.success) {
       throw new Error("Default agent socket resolution failed");
     }
@@ -3213,13 +3218,7 @@ export function makeStreamDecryptArchive(publicHome: string) {
     } catch (error) {
       if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
-    const child = new Deno.Command("sudo", {
-      ...backupChildProcessOptions(),
-      args: [
-        "-n",
-        "-u",
-        "codex",
-        "gpg",
+    const decryptArgs = [
         "--no-options",
         "--no-autostart",
         "--batch",
@@ -3228,7 +3227,10 @@ export function makeStreamDecryptArchive(publicHome: string) {
         publicHome,
         "--status-fd=2",
         "--decrypt",
-      ],
+      ];
+    const child = processes ? await processes.spawn(decryptArgs) : new Deno.Command("sudo", {
+      ...backupChildProcessOptions(),
+      args: ["-n", "-u", "codex", "gpg", ...decryptArgs],
       stdin: "piped",
       stdout: "piped",
       stderr: "piped",
@@ -3312,7 +3314,7 @@ export async function importRecipient(
   if (!output.success) throw new Error("Public recipient import failed");
 }
 
-export async function ensurePublicHome(publicHome: string): Promise<void> {
+export async function ensurePublicHome(publicHome: string, command?: (name: string, args: string[]) => Promise<{ code: number }>): Promise<void> {
   try {
     const info = await Deno.lstat(publicHome);
     if (info.isSymlink || !info.isDirectory) {
@@ -3325,11 +3327,11 @@ export async function ensurePublicHome(publicHome: string): Promise<void> {
     if (!(error instanceof Deno.errors.NotFound)) throw error;
     await Deno.mkdir(publicHome, { mode: 0o700, recursive: true });
     const parent = publicHome.slice(0, publicHome.lastIndexOf("/"));
-    const chown = await new Deno.Command("chown", {
+    const chown = command ? await command("chown", ["codex:codex", publicHome]) : await new Deno.Command("chown", {
       ...backupChildProcessOptions(),
       args: ["codex:codex", publicHome],
     }).output();
-    void chown;
+    if (chown.code !== 0) throw new Error("Source public key home ownership failed");
     const real = await Deno.realPath(parent);
     void real;
     await Deno.chmod(publicHome, 0o700);

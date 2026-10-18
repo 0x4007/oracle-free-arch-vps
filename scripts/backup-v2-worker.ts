@@ -2,7 +2,7 @@
  * entry; the independent controller owns acceptance and terminal custody. */
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { lstat, stat, statfs } from "node:fs/promises";
+import { lstat, statfs } from "node:fs/promises";
 import {
   type CaptureSettings,
   gpgArgs,
@@ -63,7 +63,7 @@ import {
   createBackupV2FileSpoolStorage,
 } from "./backup-v2-spool.ts";
 import { BACKUP_V2_LIMITS } from "./backup-v2-profile.ts";
-import { BackupV2Store, BackupV2TransportError } from "./backup-v2-store.ts";
+import { BackupV2Store, BackupV2TransportError, createCurlBackupV2Wire } from "./backup-v2-store.ts";
 import { createBackupV2FileObjectReader } from "./backup-v2-recovery.ts";
 import {
   type BackupV2CapacityObservation,
@@ -87,11 +87,15 @@ import {
   validateBackupV2NativeCustodyRecord,
 } from "./backup-v2-native-custody.ts";
 import { createBackupV2MetadataRunner } from "./backup-v2-metadata.ts";
+import { createBackupV2NativeProcessStarter } from "./backup-v2-native-process.ts";
+import { spawnBackupV2GpgDecrypt } from "./backup-v2-decrypt.ts";
+import {
+  backupV2DeletedHandleBytes,
+  readBackupV2KernelText,
+} from "./backup-v2-kernel.ts";
 import {
   BACKUP_BASE,
-  backupChildProcessOptions,
   ensurePublicHome,
-  importRecipient,
   JOBS_RUNTIME_ROOT,
   makeStreamDecryptArchive,
   PUBLIC_HOME_BASE,
@@ -709,12 +713,12 @@ async function atomicArtifact(
   return backupV2ArtifactSha256(bytes);
 }
 async function ownExecution(gate: BackupV2Gate): Promise<BackupV2Gate> {
-  const boot = (await Deno.readTextFile("/proc/sys/kernel/random/boot_id"))
+  const boot = (await readBackupV2KernelText("/proc/sys/kernel/random/boot_id"))
     .trim();
-  const cgroup = (await Deno.readTextFile("/proc/self/cgroup")).trim().split(
+  const cgroup = (await readBackupV2KernelText(`/proc/${Deno.pid}/cgroup`)).trim().split(
     "\n",
   ).find((line) => line.startsWith("0::"))?.slice(3);
-  const process = await Deno.readTextFile("/proc/self/stat"),
+  const process = await readBackupV2KernelText(`/proc/${Deno.pid}/stat`),
     mainStartTicks = process.slice(process.lastIndexOf(")") + 2).split(" ")[19];
   const invocationId = Deno.env.get("INVOCATION_ID");
   if (
@@ -825,45 +829,10 @@ async function capacity(
     }
   };
   await walk(directory, 0);
-  const held = new Set<string>();
-  const pids = (await Deno.readTextFile(`/sys/fs/cgroup${cgroup}/cgroup.procs`))
-    .trim().split("\n").filter(Boolean);
-  if (pids.length > 4096) fail();
-  for (const pid of pids) {
-    if (!/^[1-9][0-9]*$/.test(pid)) fail();
-    try {
-      if (
-        !(await Deno.readTextFile(`/proc/${pid}/cgroup`)).split("\n").some((
-          line,
-        ) => line === `0::${cgroup}`)
-      ) fail();
-      let fds = 0;
-      for await (const fd of Deno.readDir(`/proc/${pid}/fd`)) {
-        if (++fds > 4096) fail();
-        try {
-          const path = `/proc/${pid}/fd/${fd.name}`,
-            info = await stat(path, { bigint: true });
-          if (info.nlink !== 0n || !info.isFile()) continue;
-          const key = `${info.dev}/${info.ino}`;
-          if (held.has(key)) continue;
-          held.add(key);
-          const bytes = Number(info.blocks * 512n),
-            target = await Deno.readLink(path);
-          if (target.startsWith(directory + "/")) {
-            workspaceHeldDeletedBytes += bytes;
-          } else sourceHeldDeletedBytes += bytes;
-        } catch (error) {
-          if (
-            !(error instanceof Deno.errors.NotFound) &&
-            !(error instanceof Error && "code" in error &&
-              error.code === "ENOENT")
-          ) throw error;
-        }
-      }
-    } catch (error) {
-      if (!(error instanceof Deno.errors.NotFound)) throw error;
-    }
-  }
+  const { workspaceHeldDeletedBytes: workspaceDeleted, sourceHeldDeletedBytes: sourceDeleted } =
+    await backupV2DeletedHandleBytes(directory, cgroup);
+  workspaceHeldDeletedBytes = workspaceDeleted;
+  sourceHeldDeletedBytes = sourceDeleted;
   const fs = await statfs(directory, { bigint: true });
   return {
     observedMonotonicMs: performance.now(),
@@ -873,6 +842,13 @@ async function capacity(
     workspaceHeldDeletedBytes,
     sourceHeldDeletedBytes,
   };
+}
+async function drainDiagnostics(stream: ReadableStream<Uint8Array>): Promise<void> {
+  let bytes = 0;
+  for await (const part of stream) {
+    bytes += part.length;
+    if (bytes > 64 * 1024) throw new Error("Document diagnostics exceeded bound");
+  }
 }
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -947,8 +923,7 @@ export async function runBackupV2RemoteWorker(
         journalDirectory,
         request.captureId,
       );
-    const store = new BackupV2Store(settings.B2Settings),
-      pace = createBackupV2UploadPacer(),
+    const pace = createBackupV2UploadPacer(),
       work = new BackupV2WorkerProgress(),
       notifier = createBackupV2Notifier();
     const startedAtUtc = new Date().toISOString();
@@ -1022,12 +997,21 @@ export async function runBackupV2RemoteWorker(
         };
       },
     });
+    const processes = createBackupV2NativeProcessStarter({ gate, append: nativeCustody.append, cancel });
+    const store = new BackupV2Store(settings.B2Settings, createCurlBackupV2Wire(undefined, processes.spawn));
     const native = {
       async assertManaged() {
         const actual = await ownExecution(gate);
         same(actual.custody, gate.custody);
       },
       cancel,
+      spawn: (command: string, args: string[]) => {
+        const kind = command === "unshare" || command === "gpg" || command === "zstd" || command === "tar"
+          ? command : "metadata";
+        return processes.spawn(kind, command, args, { signal: supervisor.signal, env: { TZ: "UTC", TMPDIR: stage } });
+      },
+      registerNamespace: processes.registerNamespace,
+      registerChild: processes.registerChild,
     };
     let serial = Promise.resolve();
     const supervise = (change?: () => void) => {
@@ -1056,19 +1040,9 @@ export async function runBackupV2RemoteWorker(
       [];
     const encrypt = async (plaintext: Uint8Array, signal: AbortSignal) => {
       await native.assertManaged();
-      const child = new Deno.Command("gpg", {
-        ...backupChildProcessOptions(),
-        args: gpgArgs(
-          `${stage}/gpg-public-home`,
-          settings.captureSettings.recipientFile,
-          "-",
-          "-",
-        ),
-        stdin: "piped",
-        stdout: "piped",
-        stderr: "piped",
-        signal,
-      }).spawn();
+      const child = await processes.spawn("gpg", "gpg", gpgArgs(
+        `${stage}/gpg-public-home`, settings.captureSettings.recipientFile, "-", "-",
+      ), { signal });
       const input = (async () => {
         const writer = child.stdin.getWriter();
         try {
@@ -1147,6 +1121,7 @@ export async function runBackupV2RemoteWorker(
     };
     const loopAbort = new AbortController();
     try {
+      const unitNamespace = await processes.registerUnitNamespace();
       await supervise();
       const monitor = (async () => {
         while (!terminal) {
@@ -1262,11 +1237,20 @@ export async function runBackupV2RemoteWorker(
       } else {
         if (!verifyInput) fail();
         const publicHome = `${PUBLIC_HOME_BASE}/${request.captureId}`;
-        await ensurePublicHome(publicHome);
-        await importRecipient(
-          publicHome,
-          await rootRead(settings.captureSettings.recipientFile, 64 * 1024),
-        );
+        await ensurePublicHome(publicHome, run);
+        const importChild = await spawnBackupV2GpgDecrypt(processes, [
+          "--no-options", "--no-autostart", "--batch", "--no-tty", "--homedir", publicHome, "--import",
+        ], supervisor.signal);
+        const publicBytes = await rootRead(settings.captureSettings.recipientFile, 64 * 1024);
+        const imported = await Promise.all([
+          new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(publicBytes); controller.close(); } }).pipeTo(importChild.stdin),
+          drainDiagnostics(importChild.stdout), drainDiagnostics(importChild.stderr), importChild.status,
+        ]);
+        if (!imported[3].success) fail();
+        const decrypt = makeStreamDecryptArchive(publicHome, {
+          async command(args) { const result = await run("sudo", args); return {success: result.code === 0, stdout: encoder.encode(result.stdout)}; },
+          spawn: (args) => spawnBackupV2GpgDecrypt(processes, args, supervisor.signal),
+        });
         work.phase = "VERIFYING";
         let readSerial = 0;
         const readerStore = {
@@ -1330,12 +1314,13 @@ export async function runBackupV2RemoteWorker(
                 readDirectory,
                 readerStore,
               ),
-              decryptDocument: makeStreamDecryptArchive(publicHome),
+              decryptDocument: decrypt,
               signal: supervisor.signal,
             },
             verification: {
-              decrypt: makeStreamDecryptArchive(publicHome),
+              decrypt,
               native: {
+                spawn: (command, args) => processes.spawn(command, `/usr/bin/${command}`, args, {signal: supervisor.signal}),
                 temporaryDirectory: stage,
                 progress: (value) => {
                   work.verification(value);
@@ -1364,7 +1349,11 @@ export async function runBackupV2RemoteWorker(
       terminal = true;
       loopAbort.abort();
       await monitor;
-      const nativeFacts = await nativeCustody.flush();
+      let nativeFacts = await nativeCustody.flush();
+      if (!unitNamespace.privateMount && !nativeFacts.mounts.some((mount) => mount.scope === "PRODUCER")) {
+        await processes.recordNoPrivateMount();
+        nativeFacts = await nativeCustody.flush();
+      }
       if (nativeFacts.children.some(child => child.exit === null) || nativeFacts.unresolvedNamespaceLeaders.length) fail();
       result={...result,nativeCustodySha256:nativeFacts.sha256};
       const resultSha256 = await atomicArtifact(
