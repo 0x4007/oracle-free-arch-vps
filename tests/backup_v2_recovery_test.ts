@@ -327,7 +327,7 @@ Deno.test("v2 independent receipt assembly binds measured role outputs metadata 
  * Caller supplies one fresh managed root-owned0700 directory. */
 export async function runBackupV2ReadSlotProof(directory: string) {
   const bytes = encoder.encode("bounded-native-slot");
-  const ref: BackupV2ObjectRef = {
+  const ref: BackupV2ObjectRef = validateBackupV2ObjectRef({
     fileId: "native-slot",
     fileName: backupV2ObjectName(C, uuid(2), "data", 0, uuid(3)),
     contentLength: bytes.length,
@@ -335,7 +335,7 @@ export async function runBackupV2ReadSlotProof(directory: string) {
     sha256: hash(bytes),
     action: "upload",
     uploadTimestamp: 1,
-  };
+  });
   const files = await createBackupV2FileObjectReader(directory, {
     async getExactToFile(object, target) {
       equal(object, ref);
