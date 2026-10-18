@@ -90,6 +90,33 @@ Deno.test("tar links resolve bytes and reject cycles and escapes", () => {
   assertThrows(() => resolveTarSample(text.encode("a"), cycle.finish().links));
 });
 
+Deno.test("inventory summaries bind paths independently of native display metadata", () => {
+  const original = parseNativeTarLine(line('"./same\\377"'));
+  const display = parseNativeTarLine(
+    line('"./same\\377"').replace("-rw-r--r--", "-rw-r--r--*").replace(
+      "0/0",
+      "1002/1002",
+    ),
+  );
+  const first = createTarInventory([original.path]);
+  const second = createTarInventory([display.path]);
+  first.add(original);
+  second.add(display);
+  const left = first.finish(), right = second.finish();
+  assertEquals(left.inventory, right.inventory);
+  assertEquals(
+    left.observed.get(tarPathKey(original.path))?.member.metadata,
+    original.metadata,
+  );
+  assertEquals(
+    right.observed.get(tarPathKey(display.path))?.member.metadata,
+    display.metadata,
+  );
+  assert(
+    original.metadata.some((byte, index) => byte !== display.metadata[index]),
+  );
+});
+
 Deno.test("tar framing requires two terminators and rejects hidden second archive", () => {
   const valid = joinBytes(
     tarHeader(3),
