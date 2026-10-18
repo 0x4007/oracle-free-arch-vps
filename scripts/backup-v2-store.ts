@@ -435,7 +435,7 @@ async function jsonBody(
   exactNotPresent = false,
 ): Promise<Record<string, unknown> | null> {
   try {
-    const rejected = response.status < 200 || response.status >= 300;
+    const rejected = response.status !== 200;
     if (rejected && !(exactNotPresent && response.status === 404)) {
       throw new BackupV2TransportError(
         "http",

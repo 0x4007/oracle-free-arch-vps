@@ -399,6 +399,7 @@ Deno.test("v2 exact absence requires the documented get-info status and code", a
       [403, { status: 403, code: "not_found" }, false],
       [500, { status: 500, code: "not_found" }, false],
       [200, { status: 404, code: "not_found" }, false],
+      [202, listed(), false],
     ] as const
   ) {
     const calls: BackupV2WireRequest[] = [];
@@ -482,6 +483,7 @@ Deno.test("v2 exact deletion response loss conflicts and errors never replay del
       "name",
       "http",
       "absent",
+      "accepted",
     ]
   ) {
     let deletes = 0, cancelled = 0;
@@ -498,6 +500,8 @@ Deno.test("v2 exact deletion response loss conflicts and errors never replay del
         ? response({ status: 503, code: "service_unavailable" }, 503)
         : fault === "absent"
         ? response({ status: 400, code: "file_not_present" }, 400)
+        : fault === "accepted"
+        ? response({ fileId: ref().fileId, fileName: name }, 202)
         : response({
           fileId: fault === "id" ? "other" : ref().fileId,
           fileName: fault === "name" ? "other" : name,
