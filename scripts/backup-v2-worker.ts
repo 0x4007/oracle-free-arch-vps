@@ -1,6 +1,7 @@
 /** V2 source adapters. These never rewrite a v1 envelope or accept a catalog
  * entry; the independent controller owns acceptance and terminal custody. */
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { lstat, stat, statfs } from "node:fs/promises";
 import { type CaptureSettings, gpgArgs, prepareRecipient, recordToolVersions, validateCaptureSettings } from "./backblaze-capture.ts";
 import { type B2Settings, validateB2Settings } from "./backblaze-storage.ts";
@@ -45,7 +46,7 @@ const encoder = new TextEncoder();
 export const backupV2ArtifactBytes = (value: unknown) => encoder.encode(JSON.stringify(value) + "\n");
 export const backupV2ArtifactSha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 function fail(): never { throw new Error("Backup v2 worker input or custody invalid"); }
-function same(a: unknown, b: unknown): void { if (JSON.stringify(a) !== JSON.stringify(b)) fail(); }
+function same(a: unknown, b: unknown): void { if (!isDeepStrictEqual(a,b)) fail(); }
 
 export interface BackupV2WorkerSettings {
   schemaVersion: 2;
@@ -371,6 +372,16 @@ export async function runBackupV2RemoteWorker(jobId: string, kind: "worker" | "v
     try {
       await supervise();
       const monitor = (async () => { while (!terminal) { await delay(1000, loopAbort.signal); if (!terminal) await supervise(); } })().catch(async (error) => { if (!terminal) await cancel(error); });
+      let verifyInput: { workerGate: BackupV2Gate; workerResult: BackupV2Result; workerResultBytes: number[] } | null = null;
+      if (kind === "verify") {
+        verifyInput = JSON.parse(new TextDecoder().decode(await rootRead(`${runtime}/verifier-request.json`)));
+        if (!verifyInput) fail();
+        verifyInput.workerGate = validateBackupV2Gate(verifyInput.workerGate);
+        verifyInput.workerResult = validateBackupV2Result(verifyInput.workerResult, verifyInput.workerGate);
+        if (verifyInput.workerGate.gateId !== settings.workerGate.gateId) fail();
+        same(verifyInput.workerResult.envelope, settings.envelope);
+        same(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(verifyInput.workerResultBytes))), verifyInput.workerResult);
+      }
       // This fixed acknowledgement binds Pi custody before any producer starts.
       // No heartbeat can extend the startup grace while a controller is absent.
       while (true) {
@@ -388,7 +399,7 @@ export async function runBackupV2RemoteWorker(jobId: string, kind: "worker" | "v
           progress: (value, active) => work.capture(value, active), now: () => new Date(),
         });
       } else {
-        const verifyInput = JSON.parse(new TextDecoder().decode(await rootRead(`${runtime}/verifier-request.json`))) as { workerGate: BackupV2Gate; workerResult: BackupV2Result; workerResultBytes: number[] };
+        if (!verifyInput) fail();
         const publicHome = `${PUBLIC_HOME_BASE}/${request.captureId}`;
         await ensurePublicHome(publicHome); await importRecipient(publicHome, await rootRead(settings.captureSettings.recipientFile, 64 * 1024));
         work.phase = "VERIFYING";

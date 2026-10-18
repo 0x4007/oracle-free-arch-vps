@@ -3802,7 +3802,7 @@ export interface PiSourceConfig {
   exclusionsText: string;
 }
 
-async function loadDeployment(deps: PiDeps): Promise<PiDeployment> {
+export async function loadDeployment(deps: PiDeps): Promise<PiDeployment> {
   const value = await deps.private.read<unknown>(DEPLOYMENT_PATH);
   if (!isRecord(value) || Object.keys(value).length !== 3) {
     throw new Error("Backblaze deployment identity is missing");
@@ -3826,7 +3826,7 @@ async function loadDeployment(deps: PiDeps): Promise<PiDeployment> {
   };
 }
 
-async function loadSourceConfig(deps: PiDeps): Promise<PiSourceConfig> {
+export async function loadSourceConfig(deps: PiDeps): Promise<PiSourceConfig> {
   const config = await deps.private.read<Record<string, unknown>>(
     B2_CONFIG_PATH,
   );
