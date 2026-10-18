@@ -31,7 +31,10 @@ export interface BackupStreamSelection {
 export interface BackupStreamVerifierDependencies {
   ciphertext: BackupV2CiphertextFactory;
   decrypt: BackupV2DecryptStream;
-  spawn?: (command: "tar" | "zstd", args: string[]) => BackupStreamProcess;
+  spawn?: (
+    command: "tar" | "zstd",
+    args: string[],
+  ) => BackupStreamProcess | Promise<BackupStreamProcess>;
   selection?: (member: Uint8Array) => Promise<BackupStreamSelection>;
   temporaryDirectory?: string;
   progress?: (
@@ -322,8 +325,8 @@ async function runPass(
   const report = (stage: string, error: unknown) => {
     if (failures.length < 32) failures.push(safeStageFailure(stage, error));
   };
-  const start = (command: "tar" | "zstd", args: string[]) => {
-    const child = spawn(command, args);
+  const start = async (command: "tar" | "zstd", args: string[]) => {
+    const child = await spawn(command, args);
     childStages.push(
       command === "zstd"
         ? "zstd"
@@ -338,7 +341,7 @@ async function runPass(
     ((name) => nativeSelection(deps.temporaryDirectory, name));
   try {
     for (const target of targets) selections.push(await selectionsFor(target));
-    const zstd = start("zstd", [
+    const zstd = await start("zstd", [
       "-d",
       "-c",
       "--memory=128MiB",
@@ -346,7 +349,7 @@ async function runPass(
     ]);
     const isTar = descriptor.format === "tar.zst.gpg";
     const listing = isTar
-      ? start("tar", [
+      ? await start("tar", [
         "--list",
         "--verbose",
         "--numeric-owner",
@@ -356,20 +359,23 @@ async function runPass(
         "--file=-",
       ])
       : null;
-    const samples = selections.map((selection) =>
-      start("tar", [
-        "--extract",
-        "--to-stdout",
-        "--file=-",
-        "--no-wildcards",
-        "--anchored",
-        "--no-recursion",
-        "--null",
-        "--verbatim-files-from",
-        "--no-unquote",
-        `--files-from=${selection.path}`,
-      ])
-    );
+    const samples: BackupStreamProcess[] = [];
+    for (const selection of selections) {
+      samples.push(
+        await start("tar", [
+          "--extract",
+          "--to-stdout",
+          "--file=-",
+          "--no-wildcards",
+          "--anchored",
+          "--no-recursion",
+          "--null",
+          "--verbatim-files-from",
+          "--no-unquote",
+          `--files-from=${selection.path}`,
+        ]),
+      );
+    }
     const inventory = createTarInventory(
       selected,
       pass === 1 && targets.length > 0,

@@ -98,7 +98,7 @@ Deno.test("stream verifier fully binds ciphertext, compressed bytes and native i
           `--memory=${BACKUP_V2_LIMITS.decoderMemoryBytes / (1024 * 1024)}MiB`,
         );
       }
-      return native(command);
+      return Promise.resolve(native(command));
     },
     progress(event) {
       events.push(event.bytes);

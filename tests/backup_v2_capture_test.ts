@@ -18,6 +18,7 @@ import {
   classifyBackupV2TarDiagnostics,
   createBackupV2RoleProducer,
   pumpBackupV2Capture,
+  trackBackupV2CaptureNamespace,
   uploadBackupV2RoleProducer,
 } from "../scripts/backup-v2-capture.ts";
 import {
@@ -67,6 +68,146 @@ async function rejects(fn: () => Promise<unknown>) {
 }
 const hash = (bytes: Uint8Array | string) =>
   createHash("sha256").update(bytes).digest("hex");
+const nativeIdentity = {
+  pid: 222,
+  startTicks: "123",
+  bootId: "00000000-0000-4000-8000-000000000001",
+  cgroup: "/fixture",
+  kind: "tar" as const,
+};
+Deno.test("v2 namespace records actual readiness and tar birth before controls and retains diagnostics", async () => {
+  const events: string[] = [];
+  const bytes = new TextEncoder().encode(
+    "BACKUP_V2_NAMESPACE_READY\nBACKUP_V2_TAR_CHILD 222\nBACKUP_V2_TAR_ACK\ntar: diagnostic\nBACKUP_V2_TAR_EXIT 222 0\n",
+  );
+  const child = {
+    pid: 111,
+    stdin: new WritableStream<Uint8Array>({
+      write(bytes) {
+        events.push(new TextDecoder().decode(bytes).trim());
+      },
+    }),
+    stdout: new ReadableStream<Uint8Array>({
+      start(c) {
+        c.close();
+      },
+    }),
+    stderr: new ReadableStream<Uint8Array>({
+      start(c) {
+        for (const byte of bytes) c.enqueue(Uint8Array.of(byte));
+        c.close();
+      },
+    }),
+    status: Promise.resolve({ code: 0 }),
+  };
+  const tracked = trackBackupV2CaptureNamespace(child, {
+    assertManaged: async () => {},
+    cancel: async () => {},
+    async registerNamespace(actual) {
+      assert(actual === child);
+      events.push("MOUNT_SYNC");
+    },
+    async registerChild(pid) {
+      equals(pid, 222);
+      events.push("CHILD_SYNC");
+      return {
+        identity: nativeIdentity,
+        async exit(status) {
+          equals(status.code, 0);
+          events.push("EXIT_SYNC");
+        },
+      };
+    },
+  });
+  const text = new Response(tracked.stderr).text();
+  await tracked.ready;
+  equals(await text, "tar: diagnostic\n");
+  equals(events, [
+    "MOUNT_SYNC",
+    "CAPTURE",
+    "CHILD_SYNC",
+    "TAR_START",
+    "EXIT_SYNC",
+  ]);
+});
+Deno.test("v2 namespace refuses failed registration wrong tar identity and incomplete control", async () => {
+  for (const fault of ["mount", "birth", "identity", "eof"]) {
+    const input = fault === "eof"
+      ? "BACKUP_V2_NAMESPACE_READY\n"
+      : "BACKUP_V2_NAMESPACE_READY\nBACKUP_V2_TAR_CHILD 222\nBACKUP_V2_TAR_ACK\nBACKUP_V2_TAR_EXIT 223 0\n";
+    const tracked = trackBackupV2CaptureNamespace({
+      pid: 111,
+      stdin: new WritableStream({ write() {} }),
+      stdout: new ReadableStream({
+        start(c) {
+          c.close();
+        },
+      }),
+      stderr: new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode(input));
+          c.close();
+        },
+      }),
+      status: Promise.resolve({ code: 0 }),
+    }, {
+      assertManaged: async () => {},
+      cancel: async () => {},
+      async registerNamespace() {
+        if (fault === "mount") throw Error("fsync");
+      },
+      async registerChild() {
+        if (fault === "birth") throw Error("fsync");
+        return {
+          identity: nativeIdentity,
+          async exit() {
+            throw Error("wrong exit must not be recorded");
+          },
+        };
+      },
+    });
+    const text = new Response(tracked.stderr).text();
+    text.catch(() => {});
+    if (fault !== "identity") await rejects(() => tracked.ready);
+    else await tracked.ready;
+    await rejects(() => text);
+  }
+});
+Deno.test("v2 metadata awaits optional tracked spawn and closes stdin after ACK", async () => {
+  const events: string[] = [];
+  const run = createBackupV2MetadataRunner("/fixture", {
+    async assertManaged() {
+      events.push("MANAGED");
+    },
+    async cancel() {},
+    async spawn(command, args) {
+      equals(command, "bash");
+      assert(args.includes('ulimit -f 2048 || exit 80; exec "$@"'));
+      events.push("REGISTERED_ACK");
+      return {
+        stdin: new WritableStream({
+          close() {
+            events.push("EOF");
+          },
+        }),
+        stdout: new ReadableStream({
+          start(c) {
+            c.enqueue(new TextEncoder().encode("metadata"));
+            c.close();
+          },
+        }),
+        stderr: new ReadableStream({
+          start(c) {
+            c.close();
+          },
+        }),
+        status: Promise.resolve({ code: 0 }),
+      };
+    },
+  });
+  equals((await run("id", [])).stdout, "metadata");
+  equals(events, ["MANAGED", "REGISTERED_ACK", "EOF"]);
+});
 const CAPTURE = "generation-00000000-0000-4000-8000-000000000001";
 const ATTEMPT = "00000000-0000-4000-8000-000000000002";
 const settings: CaptureSettings = {

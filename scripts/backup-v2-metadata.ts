@@ -21,7 +21,10 @@ import {
   BACKUP_V2_PROFILE_ID,
 } from "./backup-v2-profile.ts";
 import { validateBackupV2InventorySummary } from "./backup-v2-inventory.ts";
-import type { BackupV2CapturedRole } from "./backup-v2-capture.ts";
+import type {
+  BackupV2CaptureChild,
+  BackupV2CapturedRole,
+} from "./backup-v2-capture.ts";
 
 const encoder = new TextEncoder();
 export const BACKUP_V2_RECOVERY_BYTES = 8 * 1024 * 1024;
@@ -34,24 +37,39 @@ export function createBackupV2MetadataRunner(
   custody: {
     assertManaged(): Promise<void>;
     cancel(reason: unknown): Promise<void>;
+    spawn?: (
+      command: string,
+      args: string[],
+    ) => BackupV2CaptureChild | Promise<BackupV2CaptureChild>;
   },
 ): CaptureCommandRunner {
   return async (command, args, stderrLog) => {
     await custody.assertManaged();
-    const child = new Deno.Command("bash", {
-      args: [
-        "-c",
-        'ulimit -f 2048 || exit 80; exec "$@"',
-        "m05-metadata",
-        command,
-        ...args,
-      ],
-      stdin: "null",
-      stdout: "piped",
-      stderr: "piped",
-      clearEnv: true,
-      env: { PATH: "/usr/bin:/bin", LC_ALL: "C", TZ: "UTC", TMPDIR: stage },
-    }).spawn();
+    const childArgs = [
+      "-c",
+      'ulimit -f 2048 || exit 80; exec "$@"',
+      "m05-metadata",
+      command,
+      ...args,
+    ];
+    const child = custody.spawn
+      ? await custody.spawn("bash", childArgs)
+      : new Deno.Command("bash", {
+        args: childArgs,
+        stdin: "null",
+        stdout: "piped",
+        stderr: "piped",
+        clearEnv: true,
+        env: { PATH: "/usr/bin:/bin", LC_ALL: "C", TZ: "UTC", TMPDIR: stage },
+      }).spawn();
+    if (custody.spawn) {
+      const writer = child.stdin.getWriter();
+      try {
+        await writer.close();
+      } finally {
+        writer.releaseLock();
+      }
+    }
     const collect = async (
       stream: ReadableStream<Uint8Array>,
       limit: number,

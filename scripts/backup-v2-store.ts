@@ -29,6 +29,7 @@ import {
   BACKUP_V2_LIMITS as LIMIT,
   BACKUP_V2_NAMESPACE,
 } from "./backup-v2-profile.ts";
+import type { BackupV2NativeSpawn } from "./backup-v2-native-process.ts";
 
 const AUTH = "https://api.backblazeb2.com/b2api/v4/b2_authorize_account";
 const API = "/b2api/v3/";
@@ -143,6 +144,7 @@ function quote(value: string): string {
  * the B2 store still independently rejects non-provider API/upload endpoints. */
 export function createCurlBackupV2Wire(
   fixture?: { loopback: true; connectSeconds: number; lowSpeedSeconds: number },
+  spawn?: BackupV2NativeSpawn,
 ): BackupV2Wire {
   if (fixture) {
     require(
@@ -231,15 +233,18 @@ export function createCurlBackupV2Wire(
     const abort = new AbortController();
     const relay = () => abort.abort();
     request.signal?.addEventListener("abort", relay, { once: true });
-    const child = new Deno.Command("/usr/bin/curl", {
-      args: ["--disable", "--config", "-"],
+    const args = ["--disable", "--config", "-"];
+    const childOptions: Deno.CommandOptions = {
       clearEnv: true,
       env: { LC_ALL: "C" },
       stdin: "piped",
       stdout: "piped",
       stderr: "piped",
       signal: abort.signal,
-    }).spawn();
+    };
+    const child = spawn
+      ? await spawn("curl", "/usr/bin/curl", args, childOptions)
+      : new Deno.Command("/usr/bin/curl", { ...childOptions, args }).spawn();
     let exited = false;
     const status = child.status.finally(() => {
       exited = true;
