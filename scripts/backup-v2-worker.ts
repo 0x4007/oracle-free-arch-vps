@@ -730,7 +730,7 @@ async function rootRead(
   return bytes;
 }
 /** Only ephemeral decoder/producer scratch is removed. Native/upload journals,
- * source results, checkpoints and protected graph copies are retained. */
+ * source results, failure evidence, checkpoints and protected graphs stay. */
 export interface BackupV2ScratchCleanupReceipt {
   schemaVersion: 2;
   format: "backup-v2-scratch-cleanup";
@@ -1419,6 +1419,7 @@ export async function runBackupV2RemoteWorker(
                 supervisorFailure,
                 observation: lastObservation,
                 observedAtUtc: new Date().toISOString(),
+                observedMonotonicMs: performance.now(),
               }),
               true,
             );

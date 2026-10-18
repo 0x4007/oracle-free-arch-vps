@@ -277,7 +277,11 @@ export function backupV2FailureEvidence(input: {
   supervisorFailure: BackupV2SupervisorFailure | null;
   observation: BackupV2SupervisorObservation | null;
   observedAtUtc: string;
+  observedMonotonicMs: number;
 }) {
+  const observedMonotonicMs = finite(input.observedMonotonicMs);
+  const age = (sample: number) =>
+    sample <= observedMonotonicMs ? observedMonotonicMs - sample : null;
   const identity = validIdentity({
     unitName: input.identity.unitName,
     invocationId: input.identity.invocationId,
@@ -315,6 +319,13 @@ export function backupV2FailureEvidence(input: {
     schemaVersion: 1,
     format: "backup-v2-failure",
     observedAtUtc: input.observedAtUtc,
+    observedMonotonicMs,
+    capacityAgeMs: observation
+      ? age(observation.capacity.observedMonotonicMs)
+      : null,
+    progressAgeMs: observation
+      ? age(observation.progress.observedMonotonicMs)
+      : null,
     identity,
     reason:
       typeof input.reason === "string" && failureReasons.includes(input.reason)

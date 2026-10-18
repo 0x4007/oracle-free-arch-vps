@@ -189,12 +189,15 @@ Deno.test("failure evidence drops exception text, private fields and unclassifie
     supervisorFailure: null,
     observation: sample,
     observedAtUtc: "2026-10-18T22:10:00.000Z",
+    observedMonotonicMs: 10,
   });
   assert(!JSON.stringify(evidence).includes(secret));
   equal(evidence.identity, identity);
   equal(evidence.reason, "UNCLASSIFIED_FAILURE");
   equal(evidence.errorClass, "Error");
   equal(evidence.kind, null);
+  equal(evidence.capacityAgeMs, 10);
+  equal(evidence.progressAgeMs, 10);
   equal(evidence.observation?.progress.sourceBytes, 123);
   equal(
     evidence.observation?.capacity.availableBytes,
@@ -208,6 +211,7 @@ Deno.test("failure evidence drops exception text, private fields and unclassifie
       supervisorFailure: null,
       observation: null,
       observedAtUtc: evidence.observedAtUtc,
+      observedMonotonicMs: 10,
     }).observation,
     null,
   );
