@@ -91,6 +91,13 @@ export interface BackupV2ObjectStore {
     intent: BackupV2PutIntent,
     signal?: AbortSignal,
   ): Promise<BackupV2ObjectRef>;
+  /** Stream and discard the complete exact-ID readback; verify name, length,
+   * SHA1 and SHA256 before resolving. Allocate no payload file or slot and
+   * never overwrite sealed upload bytes while both ciphertext slots are busy. */
+  verifyExactReadback(
+    object: BackupV2ObjectRef,
+    signal?: AbortSignal,
+  ): Promise<void>;
   getExactToFile(
     object: BackupV2ObjectRef,
     target: BackupV2SlotTarget,
