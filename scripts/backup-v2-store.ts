@@ -34,6 +34,29 @@ const AUTH = "https://api.backblazeb2.com/b2api/v4/b2_authorize_account";
 const API = "/b2api/v3/";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
+const CONTROL_MS = 120_000;
+const SETTLEMENT_MS = 30_000;
+/** Worst-case uncached chains, not expected rates or whole-job deadlines. */
+export const BACKUP_V2_TRANSPORT_BOUNDS = Object.freeze({
+  connectMs: 30_000,
+  lowSpeedMs: 120_000,
+  controlMs: CONTROL_MS,
+  payloadMs: LIMIT.blockedTransportMs,
+  settlementMs: SETTLEMENT_MS,
+  putControlRequests: 2,
+  readbackControlRequests: 1,
+  putEpisodeMs: 2 * CONTROL_MS + LIMIT.blockedTransportMs + SETTLEMENT_MS,
+  readbackEpisodeMs: CONTROL_MS + LIMIT.blockedTransportMs + SETTLEMENT_MS,
+});
+export type BackupV2ExactObjectState = "PRESENT" | "ABSENT";
+export interface BackupV2ExactObjectStore extends BackupV2ObjectStore {
+  reconcileExact(
+    object: BackupV2ObjectRef,
+    signal?: AbortSignal,
+  ): Promise<BackupV2ExactObjectState>;
+  /** Caller owns durable deletion intent and reconciliation after any failure. */
+  removeExact(object: BackupV2ObjectRef, signal?: AbortSignal): Promise<void>;
+}
 export type BackupV2TransportCategory =
   | "network"
   | "http"
@@ -81,6 +104,8 @@ export interface BackupV2WireRequest {
   json?: string;
   uploadPath?: string;
   maximumBodyBytes: number;
+  /** Includes connection, headers and complete response body. */
+  maximumTimeMs?: number;
   signal?: AbortSignal;
 }
 export interface BackupV2WireResponse {
@@ -156,6 +181,12 @@ export function createCurlBackupV2Wire(
       !(request.uploadPath && request.json !== undefined),
       "multiple wire bodies",
     );
+    const maximumTimeMs = request.maximumTimeMs ?? LIMIT.blockedTransportMs;
+    require(
+      Number.isSafeInteger(maximumTimeMs) && maximumTimeMs > 0 &&
+        maximumTimeMs <= LIMIT.blockedTransportMs,
+      "invalid request time bound",
+    );
     const config = [
       "silent",
       "show-error",
@@ -167,10 +198,14 @@ export function createCurlBackupV2Wire(
       "max-redirs = 0",
       `proto = "=${fixture ? url.protocol.slice(0, -1) : "https"}"`,
       'noproxy = "*"',
-      `connect-timeout = ${fixture?.connectSeconds ?? 30}`,
-      `speed-time = ${fixture?.lowSpeedSeconds ?? 120}`,
+      `connect-timeout = ${
+        fixture?.connectSeconds ?? BACKUP_V2_TRANSPORT_BOUNDS.connectMs / 1000
+      }`,
+      `speed-time = ${
+        fixture?.lowSpeedSeconds ?? BACKUP_V2_TRANSPORT_BOUNDS.lowSpeedMs / 1000
+      }`,
       "speed-limit = 1",
-      `max-time = ${LIMIT.blockedTransportMs / 1000}`,
+      `max-time = ${maximumTimeMs / 1000}`,
       `max-filesize = ${Math.max(1, request.maximumBodyBytes)}`,
       `url = ${quote(request.url)}`,
       `request = ${quote(request.method)}`,
@@ -223,7 +258,7 @@ export function createCurlBackupV2Wire(
                 } catch { /* already exited */ }
               }
               done();
-            }, 30_000);
+            }, SETTLEMENT_MS);
           }),
         ]);
         await status;
@@ -389,9 +424,19 @@ function text(value: unknown): string {
 }
 async function jsonBody(
   response: BackupV2WireResponse,
-): Promise<Record<string, unknown>> {
+  exactNotPresent?: false,
+): Promise<Record<string, unknown>>;
+async function jsonBody(
+  response: BackupV2WireResponse,
+  exactNotPresent: true,
+): Promise<Record<string, unknown> | null>;
+async function jsonBody(
+  response: BackupV2WireResponse,
+  exactNotPresent = false,
+): Promise<Record<string, unknown> | null> {
   try {
-    if (response.status < 200 || response.status >= 300) {
+    const rejected = response.status < 200 || response.status >= 300;
+    if (rejected && !(exactNotPresent && response.status === 404)) {
       throw new BackupV2TransportError(
         "http",
         "HTTP rejected",
@@ -406,7 +451,17 @@ async function jsonBody(
       parts.push(bytes);
     }
     await response.finished;
-    return record(JSON.parse(decoder.decode(join(parts, total))));
+    const body = record(JSON.parse(decoder.decode(join(parts, total))));
+    if (rejected) {
+      // https://www.backblaze.com/apidocs/b2-get-file-info (11 Sep 2026).
+      if (body.status === 404 && body.code === "not_found") return null;
+      throw new BackupV2TransportError(
+        "http",
+        "HTTP rejected",
+        response.status,
+      );
+    }
+    return body;
   } catch (error) {
     await response.cancel();
     throw safeFailure(error);
@@ -481,7 +536,7 @@ async function verifySlot(slot: BackupV2SealedSlot): Promise<void> {
   );
 }
 
-export class BackupV2Store implements BackupV2ObjectStore {
+export class BackupV2Store implements BackupV2ExactObjectStore {
   readonly #settings: B2Settings;
   readonly #wire: BackupV2Wire;
   readonly #usedPuts = new Set<string>();
@@ -506,18 +561,39 @@ export class BackupV2Store implements BackupV2ObjectStore {
     token: string,
     payload?: unknown,
     signal?: AbortSignal,
-  ) {
+    exactNotPresent?: false,
+  ): Promise<Record<string, unknown>>;
+  async #request(
+    url: string,
+    token: string,
+    payload: unknown,
+    signal: AbortSignal | undefined,
+    exactNotPresent: true,
+  ): Promise<Record<string, unknown> | null>;
+  async #request(
+    url: string,
+    token: string,
+    payload?: unknown,
+    signal?: AbortSignal,
+    exactNotPresent = false,
+  ): Promise<Record<string, unknown> | null> {
     if (signal?.aborted) fail("cancelled before request", "cancelled");
-    return await jsonBody(
-      await this.#wire({
+    try {
+      const response = await this.#wire({
         url,
         method: payload === undefined ? "GET" : "POST",
         headers: { authorization: token, "content-type": "application/json" },
         json: payload === undefined ? undefined : JSON.stringify(payload),
         maximumBodyBytes: LIMIT.controlResponseBytes,
+        maximumTimeMs: CONTROL_MS,
         signal,
-      }),
-    );
+      });
+      return exactNotPresent
+        ? await jsonBody(response, true)
+        : await jsonBody(response);
+    } catch (error) {
+      throw safeFailure(error, "network");
+    }
   }
   #authorized(signal?: AbortSignal) {
     if (signal?.aborted) fail("cancelled before request", "cancelled");
@@ -584,6 +660,7 @@ export class BackupV2Store implements BackupV2ObjectStore {
           "x-bz-content-sha1": intent.slot.sha1,
         },
         maximumBodyBytes: LIMIT.controlResponseBytes,
+        maximumTimeMs: LIMIT.blockedTransportMs,
         signal,
       });
       const body = await jsonBody(response);
@@ -635,6 +712,7 @@ export class BackupV2Store implements BackupV2ObjectStore {
       method: "GET",
       headers: { authorization: scope.token, "accept-encoding": "identity" },
       maximumBodyBytes: object.contentLength,
+      maximumTimeMs: LIMIT.blockedTransportMs,
       signal,
     });
     try {
@@ -802,5 +880,48 @@ export class BackupV2Store implements BackupV2ObjectStore {
       "nonadvancing list cursor",
     );
     return page;
+  }
+  /** Metadata reconciliation is not complete hash readback proof. */
+  async reconcileExact(
+    value: BackupV2ObjectRef,
+    signal?: AbortSignal,
+  ): Promise<BackupV2ExactObjectState> {
+    const object = validateBackupV2ObjectRef(value);
+    const scope = await this.#authorized(signal);
+    const body = await this.#request(
+      `${scope.api}${API}b2_get_file_info`,
+      scope.token,
+      { fileId: object.fileId },
+      signal,
+      true,
+    );
+    if (body === null) return "ABSENT";
+    require(
+      body.bucketId === this.#settings.bucketId &&
+        body.fileId === object.fileId && body.fileName === object.fileName &&
+        body.action === object.action &&
+        body.contentLength === object.contentLength &&
+        body.contentSha1 === object.contentSha1 &&
+        body.uploadTimestamp === object.uploadTimestamp,
+      "exact object metadata mismatch",
+    );
+    return "PRESENT";
+  }
+  async removeExact(
+    value: BackupV2ObjectRef,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const object = validateBackupV2ObjectRef(value);
+    const scope = await this.#authorized(signal);
+    const body = await this.#request(
+      `${scope.api}${API}b2_delete_file_version`,
+      scope.token,
+      { fileName: object.fileName, fileId: object.fileId },
+      signal,
+    );
+    require(
+      body.fileId === object.fileId && body.fileName === object.fileName,
+      "DELETE response binding mismatch",
+    );
   }
 }

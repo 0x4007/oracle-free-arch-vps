@@ -2,6 +2,7 @@
  * fixtures ONLY when the sole live operator runs them inside a bounded unit. */
 import { createHash } from "node:crypto";
 import {
+  BACKUP_V2_TRANSPORT_BOUNDS,
   BackupV2Store,
   BackupV2TransportError,
   type BackupV2Wire,
@@ -150,7 +151,8 @@ Deno.test("v2 one bounded page preserves markers and exact continuation", async 
   assert(calls.length === 2 && JSON.parse(calls[1].json!).maxFileCount === 100);
   assert(
     calls.every((call) =>
-      call.maximumBodyBytes === BACKUP_V2_LIMITS.controlResponseBytes
+      call.maximumBodyBytes === BACKUP_V2_LIMITS.controlResponseBytes &&
+      call.maximumTimeMs === 120_000
     ),
   );
 });
@@ -305,6 +307,224 @@ Deno.test("v2 GET HTTP failure classification preserves retry policy", async () 
   }
 });
 
+Deno.test("v2 control and payload chains expose separate finite wait bounds", async () => {
+  const bounds = BACKUP_V2_TRANSPORT_BOUNDS;
+  assert(bounds.connectMs === 30_000 && bounds.lowSpeedMs === 120_000);
+  assert(bounds.controlMs === 120_000 && bounds.payloadMs === 21_600_000);
+  assert(bounds.settlementMs === 30_000);
+  assert(
+    bounds.putControlRequests === 2 && bounds.readbackControlRequests === 1,
+  );
+  assert(bounds.putEpisodeMs === 21_870_000);
+  assert(bounds.readbackEpisodeMs === 21_750_000);
+  const calls: BackupV2WireRequest[] = [];
+  const store = new BackupV2Store(settings, (request) => {
+    calls.push(request);
+    if (request.url.endsWith("b2_authorize_account")) {
+      return Promise.resolve(response(auth()));
+    }
+    const result = response("not payload", 503);
+    return Promise.resolve(result);
+  });
+  await rejects(store.verifyExactReadback(ref()));
+  assert(calls.length === 2);
+  assert(calls[0].maximumTimeMs === bounds.controlMs);
+  assert(calls[1].maximumTimeMs === bounds.payloadMs);
+});
+
+Deno.test("v2 exact reconciliation and deletion reject invalid refs before wire", async () => {
+  const calls: BackupV2WireRequest[] = [];
+  const store = new BackupV2Store(settings, fakeWire({}, calls));
+  for (
+    const invalid of [
+      ref({ fileName: "restic/direct-v1/x" }),
+      ref({ fileId: "" }),
+      ref({ contentLength: 0 }),
+      ref({ contentSha1: "none" }),
+      ref({ uploadTimestamp: -1 }),
+      ref({ sha256: "bad" }),
+      { ...ref(), action: "hide" },
+      { ...ref(), unknown: true },
+    ]
+  ) {
+    await rejects(store.reconcileExact(invalid as BackupV2ObjectRef));
+    await rejects(store.removeExact(invalid as BackupV2ObjectRef));
+  }
+  await rejects(store.reconcileExact(ref(), AbortSignal.abort()));
+  await rejects(store.removeExact(ref(), AbortSignal.abort()));
+  assert(calls.length === 0);
+});
+
+Deno.test("v2 exact reconciliation binds provider identity and immutable metadata", async () => {
+  const calls: BackupV2WireRequest[] = [];
+  const store = new BackupV2Store(settings, fakeWire(listed(), calls));
+  assert(await store.reconcileExact(ref()) === "PRESENT");
+  assert(calls.length === 2);
+  assert(calls[1].url.endsWith("/b2api/v3/b2_get_file_info"));
+  assert(
+    JSON.stringify(JSON.parse(calls[1].json!)) === JSON.stringify({
+      fileId: ref().fileId,
+    }),
+  );
+  assert(calls.every((call) => call.maximumTimeMs === 120_000));
+  for (
+    const change of [
+      { bucketId: "other" },
+      { fileId: "other" },
+      { fileName: "restic/direct-v1/x" },
+      { action: "hide" },
+      { contentLength: data.length + 1 },
+      { contentSha1: "a".repeat(40) },
+      { uploadTimestamp: 2 },
+    ]
+  ) {
+    const conflicting = new BackupV2Store(
+      settings,
+      fakeWire({ ...listed(), ...change }),
+    );
+    await rejects(conflicting.reconcileExact(ref()), /metadata mismatch/);
+  }
+});
+
+Deno.test("v2 exact absence requires the documented get-info status and code", async () => {
+  for (
+    const [status, body, absent] of [
+      [404, { status: 404, code: "not_found" }, true],
+      [404, { status: 400, code: "not_found" }, false],
+      [404, { status: 404, code: "unknown" }, false],
+      [404, { code: "not_found" }, false],
+      [404, "not JSON", false],
+      [400, { status: 400, code: "file_not_present" }, false],
+      [401, { status: 401, code: "not_found" }, false],
+      [403, { status: 403, code: "not_found" }, false],
+      [500, { status: 500, code: "not_found" }, false],
+      [200, { status: 404, code: "not_found" }, false],
+    ] as const
+  ) {
+    const calls: BackupV2WireRequest[] = [];
+    const store = new BackupV2Store(settings, (request) => {
+      calls.push(request);
+      return Promise.resolve(
+        request.url.endsWith("b2_authorize_account")
+          ? response(auth())
+          : response(body, status),
+      );
+    });
+    if (absent) assert(await store.reconcileExact(ref()) === "ABSENT");
+    else await rejects(store.reconcileExact(ref()));
+    assert(calls.length === 2, "reconciliation silently retried");
+  }
+});
+
+Deno.test("v2 exact reconciliation never treats auth network or lost body as absence", async () => {
+  for (const fault of ["auth", "network", "body", "finished"]) {
+    let calls = 0;
+    const store = new BackupV2Store(settings, (request) => {
+      calls++;
+      if (request.url.endsWith("b2_authorize_account")) {
+        return Promise.resolve(
+          fault === "auth"
+            ? response({ status: 401, code: "bad_auth_token" }, 401)
+            : response(auth()),
+        );
+      }
+      if (fault === "network") {
+        return Promise.reject(new Error("SENSITIVE_NETWORK_DETAIL"));
+      }
+      const result = response({ status: 404, code: "not_found" }, 404);
+      if (fault === "body") {
+        result.body = new ReadableStream({
+          start(controller) {
+            controller.error(new Error("SENSITIVE_BODY_DETAIL"));
+          },
+        });
+      } else {
+        result.finished = Promise.reject(new Error("SENSITIVE_FINISH_DETAIL"));
+        result.finished.catch(() => {});
+      }
+      return Promise.resolve(result);
+    });
+    const error = await rejects(store.reconcileExact(ref()));
+    assert(!error.message.includes("SENSITIVE"));
+    assert(calls === (fault === "auth" ? 1 : 2));
+  }
+});
+
+Deno.test("v2 exact deletion sends one version and validates its echoed identity", async () => {
+  const calls: BackupV2WireRequest[] = [];
+  const object = ref();
+  const store = new BackupV2Store(
+    settings,
+    fakeWire({
+      fileId: object.fileId,
+      fileName: object.fileName,
+    }, calls),
+  );
+  await store.removeExact(object);
+  assert(calls.length === 2);
+  assert(calls[1].url.endsWith("/b2api/v3/b2_delete_file_version"));
+  assert(calls[1].method === "POST" && calls[1].maximumTimeMs === 120_000);
+  assert(
+    calls[1].json === JSON.stringify({
+      fileName: object.fileName,
+      fileId: object.fileId,
+    }),
+  );
+});
+
+Deno.test("v2 exact deletion response loss conflicts and errors never replay deletion", async () => {
+  for (
+    const fault of [
+      "network",
+      "body",
+      "finished",
+      "id",
+      "name",
+      "http",
+      "absent",
+    ]
+  ) {
+    let deletes = 0, cancelled = 0;
+    const store = new BackupV2Store(settings, (request) => {
+      if (request.url.endsWith("b2_authorize_account")) {
+        return Promise.resolve(response(auth()));
+      }
+      assert(request.url.endsWith("b2_delete_file_version"));
+      deletes++;
+      if (fault === "network") {
+        return Promise.reject(new Error("SENSITIVE_DELETE_DETAIL"));
+      }
+      const result = fault === "http"
+        ? response({ status: 503, code: "service_unavailable" }, 503)
+        : fault === "absent"
+        ? response({ status: 400, code: "file_not_present" }, 400)
+        : response({
+          fileId: fault === "id" ? "other" : ref().fileId,
+          fileName: fault === "name" ? "other" : name,
+        });
+      result.cancel = () => {
+        cancelled++;
+        return Promise.resolve();
+      };
+      if (fault === "body") {
+        result.body = new ReadableStream({
+          start(controller) {
+            controller.error(new Error("SENSITIVE_DELETE_BODY"));
+          },
+        });
+      }
+      if (fault === "finished") {
+        result.finished = Promise.reject(new Error("SENSITIVE_DELETE_FINISH"));
+        result.finished.catch(() => {});
+      }
+      return Promise.resolve(result);
+    });
+    const error = await rejects(store.removeExact(ref()));
+    assert(deletes === 1 && !error.message.includes("SENSITIVE"));
+    assert(cancelled === (["network", "id", "name"].includes(fault) ? 0 : 1));
+  }
+});
+
 async function consume(
   result: BackupV2WireResponse,
 ): Promise<Uint8Array<ArrayBuffer>> {
@@ -348,6 +568,57 @@ function curl() {
     lowSpeedSeconds: 1,
   });
 }
+
+Deno.test({
+  name:
+    "native: curl total request bound covers delayed headers and active body",
+  ignore: !native,
+  async fn() {
+    for (const phase of ["headers", "body"]) {
+      let timer: ReturnType<typeof setInterval> | undefined;
+      let finishTimer: ReturnType<typeof setTimeout> | undefined;
+      const server = await loopback(async () => {
+        if (phase === "headers") {
+          await new Promise((done) => setTimeout(done, 600));
+          return new Response("finished");
+        }
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoder.encode("a"));
+              timer = setInterval(
+                () => controller.enqueue(encoder.encode("a")),
+                50,
+              );
+              finishTimer = setTimeout(() => {
+                clearInterval(timer);
+                controller.close();
+              }, 600);
+            },
+            cancel() {
+              clearInterval(timer);
+              clearTimeout(finishTimer);
+            },
+          }),
+        );
+      });
+      try {
+        const started = performance.now();
+        await rejects(
+          curl()(raw(server.url, { maximumTimeMs: 250 })).then(consume),
+        );
+        assert(
+          performance.now() - started < 1000,
+          "total request bound did not apply",
+        );
+      } finally {
+        clearInterval(timer);
+        clearTimeout(finishTimer);
+        await server.close();
+      }
+    }
+  },
+});
 
 Deno.test({
   name:
