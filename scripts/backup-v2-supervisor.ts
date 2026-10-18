@@ -1,0 +1,582 @@
+import {
+  type BackupV2LeaseWindow,
+  type BackupV2Progress,
+  validateBackupV2LeaseWindow,
+  validateBackupV2Progress,
+} from "./backup-v2-contract.ts";
+import {
+  BACKUP_V2_LIMITS,
+  backupV2RequiredFreeBytes,
+} from "./backup-v2-profile.ts";
+
+/** Internal service plumbing only; m08 must grant this exact FFI path, never -A. */
+export const BACKUP_V2_NOTIFY_LIBRARY = "/usr/lib/libsystemd.so.0";
+export const BACKUP_V2_MAX_NOTIFICATION_MS = 60_000;
+export type BackupV2Notification =
+  | { kind: "ready" }
+  | { kind: "stopping" }
+  | { kind: "extend"; usec: number };
+export interface BackupV2Notifier {
+  ready(): void;
+  extend(usec: number): void;
+  stopping(): void;
+  close(): void;
+}
+
+function finite(
+  value: number,
+  minimum = 0,
+  maximum = Number.MAX_SAFE_INTEGER,
+): number {
+  if (!Number.isFinite(value) || value < minimum || value > maximum) {
+    throw new Error("Invalid supervisor number");
+  }
+  return value;
+}
+function count(value: number): number {
+  if (!Number.isSafeInteger(value)) {
+    throw new Error("Invalid supervisor counter");
+  }
+  return finite(value);
+}
+
+export function encodeBackupV2Notification(
+  message: BackupV2Notification,
+): Uint8Array {
+  let text: string;
+  if (message.kind === "extend") {
+    count(message.usec);
+    finite(message.usec, 1, BACKUP_V2_MAX_NOTIFICATION_MS * 1000);
+    text = `EXTEND_TIMEOUT_USEC=${message.usec}`;
+  } else if (message.kind === "ready") text = "READY=1";
+  else if (message.kind === "stopping") text = "STOPPING=1";
+  else throw new Error("Invalid supervisor notification");
+  if (text.length > 128 || !/^[\x20-\x7e]+$/.test(text)) {
+    throw new Error("Invalid supervisor notification");
+  }
+  return new TextEncoder().encode(text + "\0");
+}
+
+/** Runs in the stable MainPID with NotifyAccess=main. This is not isolation
+ * against a malicious root child able to forge process credentials. */
+export function createBackupV2Notifier(): BackupV2Notifier {
+  const socket = Deno.env.get("NOTIFY_SOCKET");
+  if (!socket || !/^(\/|@)[^\0\r\n]{1,2047}$/.test(socket)) {
+    throw new Error("Systemd notification socket unavailable");
+  }
+  const library = Deno.dlopen(BACKUP_V2_NOTIFY_LIBRARY, {
+    sd_notify: { parameters: ["i32", "buffer"], result: "i32" },
+  });
+  let closed = false;
+  const send = (message: BackupV2Notification) => {
+    if (closed) throw new Error("Supervisor notifier is closed");
+    if (
+      library.symbols.sd_notify(0, encodeBackupV2Notification(message)) <= 0
+    ) {
+      throw new Error("Supervisor notification was not enqueued");
+    }
+  };
+  return {
+    ready: () => send({ kind: "ready" }),
+    extend: (usec) => send({ kind: "extend", usec }),
+    stopping: () => send({ kind: "stopping" }),
+    close: () => {
+      if (!closed) {
+        closed = true;
+        library.close();
+      }
+    },
+  };
+}
+
+/** Supply this result with clearEnv:true at every child spawn. The supervisor
+ * retains its own NOTIFY_SOCKET because libsystemd reads it on every call. */
+export function backupV2ChildEnvironment(
+  approved: Record<string, string>,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(approved).filter(([name]) =>
+      !/^(NOTIFY_SOCKET|WATCHDOG_PID|WATCHDOG_USEC|LISTEN_PID|LISTEN_FDS|LISTEN_FDNAMES)$/
+        .test(name)
+    ),
+  );
+}
+
+export function backupV2SupervisorUnitProperties(
+  notificationGraceMs: number,
+): Record<string, string> {
+  finite(notificationGraceMs, 1, BACKUP_V2_MAX_NOTIFICATION_MS);
+  return {
+    Type: "notify",
+    NotifyAccess: "main",
+    RuntimeMaxSec: `${notificationGraceMs}ms`,
+    TimeoutStartSec: `${notificationGraceMs}ms`,
+    TimeoutStopSec: "30s",
+    KillMode: "control-group",
+    SendSIGKILL: "yes",
+    RemainAfterExit: "no",
+    Restart: "no",
+  };
+}
+
+export type BackupV2LeaseDecision =
+  | { action: "renew"; absoluteDeadlineMs: number; extendUsec: number }
+  | { action: "cancel"; reason: string };
+
+/** Absolute timestamps belong to one supervisor invocation's monotonic domain.
+ * Repeating the same window cannot turn its deadline into now + full grace. */
+export function evaluateBackupV2Lease(
+  window: BackupV2LeaseWindow,
+  nowMs: number,
+  notificationGraceMs: number,
+  startupDeadlineMs = 0,
+): BackupV2LeaseDecision {
+  const checked = validateBackupV2LeaseWindow(window);
+  finite(nowMs);
+  finite(notificationGraceMs, 1, BACKUP_V2_MAX_NOTIFICATION_MS);
+  finite(startupDeadlineMs);
+  if (checked.observedMonotonicMs > nowMs) {
+    throw new Error("Future lease observation");
+  }
+  const absoluteDeadlineMs = Math.max(
+    startupDeadlineMs,
+    checked.usefulProgressExpiresAtMs,
+    checked.retryEpisode?.expiresAtMs ?? 0,
+  );
+  const extendUsec = Math.floor(
+    Math.min(notificationGraceMs, absoluteDeadlineMs - nowMs) * 1000,
+  );
+  return extendUsec > 0
+    ? { action: "renew", absoluteDeadlineMs, extendUsec }
+    : { action: "cancel", reason: "LEASE_EXPIRED" };
+}
+
+export interface BackupV2SupervisorIdentity {
+  unitName: string;
+  invocationId: string;
+  mainPid: number;
+  mainStartTicks: string;
+  cgroup: string;
+}
+export interface BackupV2CapacityObservation {
+  observedMonotonicMs: number;
+  availableBytes: number;
+  freeInodes: number;
+  /** Includes allocated blocks still held through deleted workspace handles. */
+  allocatedWorkspaceBytes: number;
+  workspaceHeldDeletedBytes: number;
+  sourceHeldDeletedBytes: number;
+}
+export interface BackupV2SupervisorObservation {
+  identity: BackupV2SupervisorIdentity;
+  progress: BackupV2Progress;
+  capacity: BackupV2CapacityObservation;
+}
+export interface BackupV2SupervisorOptions {
+  progressGraceMs: number;
+  notificationGraceMs: number;
+  observationTimeoutMs: number;
+  maximumObservationAgeMs: number;
+  productionWriterMarginBytes: number;
+  minimumFreeInodes: number;
+  maximumSourceHeldDeletedBytes: number;
+}
+export interface BackupV2SupervisorCapabilities {
+  now(): number;
+  notifier: BackupV2Notifier;
+  /** Bounded collector: independently check work, cgroup and filesystem/FD
+   * accounting; counters are cumulative within the exact invocation. */
+  observe(signal: AbortSignal): Promise<BackupV2SupervisorObservation>;
+}
+
+function validIdentity(
+  identity: BackupV2SupervisorIdentity,
+): BackupV2SupervisorIdentity {
+  if (
+    !/^[a-zA-Z0-9_.:@-]{1,247}\.service$/.test(identity.unitName) ||
+    !/^[a-f0-9]{32}$/.test(identity.invocationId) ||
+    !/^[1-9][0-9]{0,19}$/.test(identity.mainStartTicks) ||
+    !identity.cgroup.startsWith("/") ||
+    !identity.cgroup.endsWith("/" + identity.unitName) ||
+    identity.cgroup.length > 2048 ||
+    identity.cgroup.split("/").some((part) =>
+      part === ".." || /[\0\r\n]/.test(part)
+    )
+  ) {
+    throw new Error("Invalid supervisor identity");
+  }
+  count(identity.mainPid);
+  finite(identity.mainPid, 1);
+  return Object.freeze({ ...identity });
+}
+function sameIdentity(
+  expected: BackupV2SupervisorIdentity,
+  actual: BackupV2SupervisorIdentity,
+): boolean {
+  const checked = validIdentity(actual);
+  return (Object.keys(expected) as (keyof BackupV2SupervisorIdentity)[]).every((
+    key,
+  ) => checked[key] === expected[key]);
+}
+
+async function bounded<T>(
+  run: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  outer?: AbortSignal,
+): Promise<T> {
+  finite(timeoutMs, 1, BACKUP_V2_LIMITS.blockedTransportMs);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  outer?.addEventListener("abort", abort, { once: true });
+  if (outer?.aborted) abort();
+  const timer = setTimeout(abort, timeoutMs);
+  let rejectAbort: () => void = () => {};
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => {
+        controller.signal.throwIfAborted();
+        return run(controller.signal);
+      }),
+      new Promise<never>((_, reject) => {
+        rejectAbort = () =>
+          reject(new Error("Supervisor operation did not settle in time"));
+        controller.signal.addEventListener("abort", rejectAbort, {
+          once: true,
+        });
+        if (controller.signal.aborted) rejectAbort();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    outer?.removeEventListener("abort", abort);
+    controller.signal.removeEventListener("abort", rejectAbort);
+  }
+}
+
+const counters = [
+  "sourceBytes",
+  "compressionInputBytes",
+  "verifiedChunks",
+  "decryptedBytes",
+  "inventoryMembers",
+] as const;
+const useful: Partial<
+  Record<BackupV2Progress["phase"], readonly typeof counters[number][]>
+> = {
+  PREFLIGHT: ["sourceBytes", "inventoryMembers"],
+  CAPTURING_AND_UPLOADING: [
+    "sourceBytes",
+    "compressionInputBytes",
+    "verifiedChunks",
+    "inventoryMembers",
+  ],
+  VERIFYING: ["verifiedChunks", "decryptedBytes", "inventoryMembers"],
+  PRUNING: ["inventoryMembers"],
+};
+
+export class BackupV2Supervisor {
+  readonly identity: BackupV2SupervisorIdentity;
+  readonly signal: AbortSignal;
+  readonly #abort = new AbortController();
+  readonly #options: BackupV2SupervisorOptions;
+  readonly #caps: BackupV2SupervisorCapabilities;
+  readonly #startupDeadline: number;
+  #window: BackupV2LeaseWindow;
+  #previous: BackupV2Progress | null = null;
+  #lastNow: number;
+  #busy = false;
+  #ready = false;
+  #serial = 0;
+  #episodeSerial = -1;
+  #reason: string | null = null;
+
+  constructor(
+    identity: BackupV2SupervisorIdentity,
+    options: BackupV2SupervisorOptions,
+    capabilities: BackupV2SupervisorCapabilities,
+  ) {
+    this.identity = validIdentity(identity);
+    for (const value of Object.values(options)) finite(value);
+    finite(options.notificationGraceMs, 1, BACKUP_V2_MAX_NOTIFICATION_MS);
+    finite(
+      options.progressGraceMs,
+      options.notificationGraceMs,
+      BACKUP_V2_LIMITS.blockedTransportMs,
+    );
+    finite(options.observationTimeoutMs, 1, options.notificationGraceMs);
+    finite(options.maximumObservationAgeMs, 0, options.progressGraceMs);
+    count(options.minimumFreeInodes);
+    count(options.productionWriterMarginBytes);
+    count(options.maximumSourceHeldDeletedBytes);
+    this.#options = Object.freeze({ ...options });
+    this.#caps = capabilities;
+    this.#lastNow = finite(capabilities.now());
+    this.#startupDeadline = this.#lastNow + options.notificationGraceMs;
+    this.#window = {
+      observedMonotonicMs: this.#lastNow,
+      usefulProgressAtMs: 0,
+      usefulProgressExpiresAtMs: 0,
+      retryEpisode: null,
+    };
+    this.signal = this.#abort.signal;
+  }
+
+  window(): BackupV2LeaseWindow {
+    return structuredClone(this.#window);
+  }
+
+  cancel(reason = "CANCELLED"): BackupV2LeaseDecision {
+    this.#reason ??= reason;
+    this.#abort.abort();
+    return { action: "cancel", reason: this.#reason };
+  }
+
+  /** m04/m08 may call only for a classified retryable blockage with durable
+   * sealed bytes/intent retained. Repeated attempts cannot reset this episode. */
+  beginRetryEpisode(
+    evidence: {
+      sealedObjectIdentity: string;
+      retainedBytes: number;
+      retryableTransport: true;
+    },
+  ): BackupV2LeaseWindow {
+    if (
+      this.#reason || this.#busy || !this.#previous ||
+      evidence.retryableTransport !== true ||
+      typeof evidence.sealedObjectIdentity !== "string" ||
+      evidence.sealedObjectIdentity.length < 1 ||
+      evidence.sealedObjectIdentity.length > 1024
+    ) {
+      throw new Error("Retry episode is not eligible");
+    }
+    count(evidence.retainedBytes);
+    finite(evidence.retainedBytes, 1, BACKUP_V2_LIMITS.slotBytes);
+    const now = this.#now();
+    if (
+      evaluateBackupV2Lease(
+        this.#window,
+        now,
+        this.#options.notificationGraceMs,
+        this.#startupDeadline,
+      ).action === "cancel"
+    ) {
+      this.cancel("LEASE_EXPIRED");
+      throw new Error("Retry cannot revive an expired lease");
+    }
+    this.#fresh(this.#previous.observedMonotonicMs, now);
+    if (!this.#window.retryEpisode) {
+      if (this.#serial <= this.#episodeSerial) {
+        throw new Error("Retry episode needs new useful work");
+      }
+      this.#episodeSerial = this.#serial;
+      this.#window.retryEpisode = {
+        startedAtMs: now,
+        expiresAtMs: now + BACKUP_V2_LIMITS.blockedTransportMs,
+      };
+    }
+    this.#window.observedMonotonicMs = now;
+    return this.window();
+  }
+
+  async poll(): Promise<BackupV2LeaseDecision> {
+    if (this.#reason) return this.cancel();
+    if (this.#busy) return this.cancel("OVERLAPPING_OBSERVATION");
+    this.#busy = true;
+    try {
+      const sample = await bounded(
+        (signal) => this.#caps.observe(signal),
+        this.#options.observationTimeoutMs,
+        this.signal,
+      );
+      if (this.#reason) return this.cancel();
+      const now = this.#now();
+      const prior = evaluateBackupV2Lease(
+        this.#window,
+        now,
+        this.#options.notificationGraceMs,
+        this.#startupDeadline,
+      );
+      if (prior.action === "cancel") return this.cancel(prior.reason);
+      if (!sameIdentity(this.identity, sample.identity)) {
+        return this.cancel("IDENTITY_CHANGED");
+      }
+      const progress = validateBackupV2Progress(sample.progress);
+      this.#fresh(progress.observedMonotonicMs, now);
+      this.#capacity(sample.capacity, now);
+      const fields = useful[progress.phase];
+      if (!fields) return this.cancel("NON_WORKING_PHASE");
+      if (this.#previous) {
+        if (
+          progress.observedMonotonicMs < this.#previous.observedMonotonicMs ||
+          counters.some((field) => progress[field] < this.#previous![field])
+        ) {
+          return this.cancel("PROGRESS_REGRESSED");
+        }
+        const changed = counters.filter((field) =>
+          progress[field] > this.#previous![field]
+        );
+        if (changed.some((field) => !fields.includes(field))) {
+          return this.cancel("PROGRESS_WRONG_PHASE");
+        }
+        if (changed.length) {
+          if (
+            progress.observedMonotonicMs <= this.#previous.observedMonotonicMs
+          ) return this.cancel("PROGRESS_TIMESTAMP_REUSED");
+          this.#serial++;
+          this.#window.usefulProgressAtMs = progress.observedMonotonicMs;
+          this.#window.usefulProgressExpiresAtMs =
+            progress.observedMonotonicMs + this.#options.progressGraceMs;
+          if (
+            !this.#window.retryEpisode ||
+            progress.observedMonotonicMs > this.#window.retryEpisode.startedAtMs
+          ) {
+            this.#window.retryEpisode = null;
+          }
+        }
+      }
+      this.#previous = progress;
+      this.#window.observedMonotonicMs = now;
+      const decision = evaluateBackupV2Lease(
+        this.#window,
+        now,
+        this.#options.notificationGraceMs,
+        this.#startupDeadline,
+      );
+      if (decision.action === "cancel") return this.cancel(decision.reason);
+      if (!this.#ready) {
+        this.#caps.notifier.ready();
+        this.#ready = true;
+      }
+      this.#caps.notifier.extend(decision.extendUsec);
+      return decision;
+    } catch {
+      return this.cancel("OBSERVATION_OR_NOTIFICATION_UNPROVED");
+    } finally {
+      this.#busy = false;
+    }
+  }
+
+  #now(): number {
+    const now = finite(this.#caps.now(), this.#lastNow);
+    this.#lastNow = now;
+    return now;
+  }
+  #fresh(observed: number, now: number): void {
+    finite(
+      observed,
+      Math.max(0, now - this.#options.maximumObservationAgeMs),
+      now,
+    );
+  }
+  #capacity(capacity: BackupV2CapacityObservation, now: number): void {
+    this.#fresh(capacity.observedMonotonicMs, now);
+    for (const value of Object.values(capacity)) finite(value);
+    for (
+      const field of [
+        "availableBytes",
+        "freeInodes",
+        "allocatedWorkspaceBytes",
+        "workspaceHeldDeletedBytes",
+        "sourceHeldDeletedBytes",
+      ] as const
+    ) count(capacity[field]);
+    const required = backupV2RequiredFreeBytes(
+      capacity.allocatedWorkspaceBytes,
+      this.#options.productionWriterMarginBytes,
+    );
+    if (
+      capacity.availableBytes < required ||
+      capacity.freeInodes < this.#options.minimumFreeInodes ||
+      capacity.workspaceHeldDeletedBytes > capacity.allocatedWorkspaceBytes ||
+      capacity.sourceHeldDeletedBytes >
+        this.#options.maximumSourceHeldDeletedBytes
+    ) throw new Error("Capacity is not safe");
+  }
+}
+
+export interface BackupV2TreeObservation {
+  identity: BackupV2SupervisorIdentity;
+  observedMonotonicMs: number;
+  mainPid: number;
+  controlPid: number;
+  cgroupPopulated: boolean | null;
+  descendants: number | null;
+  escapedProcesses: number | null;
+  namespaceReferences: number | null;
+  openPipelineHandles: number | null;
+  pendingOperations: number | null;
+  sourceLockFree: boolean | null;
+}
+export interface BackupV2CancellationCapabilities {
+  now(): number;
+  observe(signal: AbortSignal): Promise<BackupV2TreeObservation>;
+  /** Reconcile the exact invocation again immediately before mutation; never
+   * stop a replacement invocation sharing the unit name. */
+  stop(
+    identity: BackupV2SupervisorIdentity,
+    signal: AbortSignal,
+  ): Promise<void>;
+}
+export type BackupV2CancellationResult = {
+  state: "SETTLED" | "CANCELLATION_BLOCKED";
+  identity: BackupV2SupervisorIdentity;
+};
+
+/** External controller only: the MainPID cannot stop itself and subsequently
+ * prove its own death. No gate/lock/scratch/namespace is released here. */
+export async function settleBackupV2Cancellation(
+  identity: BackupV2SupervisorIdentity,
+  capabilities: BackupV2CancellationCapabilities,
+  timeoutMs = 30_000,
+): Promise<BackupV2CancellationResult> {
+  const expected = validIdentity(identity);
+  finite(timeoutMs, 1, 30_000);
+  const started = finite(capabilities.now()), deadline = started + timeoutMs;
+  let observed = started;
+  const remaining = () => {
+    observed = finite(capabilities.now(), observed, deadline);
+    return deadline - observed;
+  };
+  const read = async () => {
+    const proof = await bounded(
+      (signal) => capabilities.observe(signal),
+      remaining(),
+    );
+    if (!sameIdentity(expected, proof.identity)) {
+      throw new Error("Cancellation identity changed");
+    }
+    finite(
+      proof.observedMonotonicMs,
+      observed,
+      finite(capabilities.now(), observed, deadline),
+    );
+    count(proof.mainPid);
+    count(proof.controlPid);
+    if (proof.mainPid !== 0 && proof.mainPid !== expected.mainPid) {
+      throw new Error("Cancellation MainPID changed");
+    }
+    return proof;
+  };
+  const settled = (proof: BackupV2TreeObservation) =>
+    proof.mainPid === 0 && proof.controlPid === 0 &&
+    proof.cgroupPopulated === false &&
+    proof.descendants === 0 && proof.escapedProcesses === 0 &&
+    proof.namespaceReferences === 0 &&
+    proof.openPipelineHandles === 0 && proof.pendingOperations === 0 &&
+    proof.sourceLockFree === true;
+  try {
+    const before = await read();
+    if (!settled(before)) {
+      await bounded(
+        (signal) => capabilities.stop(expected, signal),
+        remaining(),
+      );
+      if (!settled(await read())) {
+        throw new Error("Cancellation tree is not settled");
+      }
+    }
+    return { state: "SETTLED", identity: expected };
+  } catch {
+    return { state: "CANCELLATION_BLOCKED", identity: expected };
+  }
+}
