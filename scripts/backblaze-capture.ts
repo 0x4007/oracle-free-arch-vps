@@ -142,6 +142,9 @@ const MIB = 1024 ** 2;
 const SPACE_RESERVE = 5 * GIB;
 const SPACE_MARGIN = 512 * MIB;
 const SPACE_MIN_FREE = SPACE_RESERVE + SPACE_MARGIN;
+// More than thirteen times the measured 4.9 MB root encryption expansion.
+// This admission allowance is not a safety bound: ciphertext is capped too.
+const ENCRYPTION_OVERHEAD = 64 * MIB;
 const RECIPIENT_MAX_BYTES = 64 * 1024;
 const MAX_SFDUMP_BYTES = 1024 * 1024;
 const MAX_VG_BYTES = 1024 * 1024;
@@ -810,6 +813,7 @@ const INVENTORY_PRODUCERS: PipelineProducer[] = [
 export function pipelineStatusLines(
   pipeline: string,
   producers: PipelineProducer[],
+  snapshotChecks: readonly string[] = [],
 ): string[] {
   for (const producer of producers) {
     if (
@@ -822,6 +826,7 @@ export function pipelineStatusLines(
   const lines = [
     pipeline,
     `ps=("\${PIPESTATUS[@]}")`,
+    ...snapshotChecks,
   ];
   producers.forEach((producer, index) => {
     lines.push(`${producer.variable}=\${ps[${index}]}`);
@@ -849,6 +854,57 @@ export function pipelineStatusLines(
     lines.push("esac");
   }
   return lines;
+}
+
+/** Fresh per-role staging budget, rounded down to filesystem blocks. The
+ * extra byte admits overflow detection without crossing the write budget.
+ * Free space is a snapshot; unrelated writers are not reserved or stopped. */
+export function stagingLimitLines(
+  stage: string,
+  copies: 1 | 2,
+  plaintextBytes = 0,
+): string[] {
+  if (
+    (copies !== 1 && copies !== 2) ||
+    !Number.isSafeInteger(plaintextBytes) || plaintextBytes < 0
+  ) fail("script:generate");
+  return [
+    `avail=$(df -B1 --output=avail ${
+      shellQuote(stage)
+    } | tail -n 1) || exit 65`,
+    `block=$(stat -f -c %S ${shellQuote(stage)}) || exit 65`,
+    `[[ "$avail" =~ ^[1-9][0-9]{0,14}$ && "$block" =~ ^[1-9][0-9]{0,6}$ ]] || { echo 'staging space measurement invalid' >&2; exit 65; }`,
+    ...(copies === 1
+      ? [
+        `test $((avail - ${plaintextBytes} - ${ENCRYPTION_OVERHEAD})) -ge ${SPACE_MIN_FREE} || { echo 'staging encryption space insufficient' >&2; exit 65; }`,
+      ]
+      : []),
+    `archive_limit=$(( ((avail - ${SPACE_MIN_FREE} - ${
+      copies === 2 ? ENCRYPTION_OVERHEAD : 0
+    }) / ${copies} / block) * block - 1 ))`,
+    `test "$archive_limit" -gt 0 || { echo 'staging space insufficient' >&2; exit 65; }`,
+  ];
+}
+
+/** Bound both compressed and encrypted writes. Inspect overflow before
+ * producer statuses because a full limiter normally SIGPIPEs its producers.
+ * All foreground pipeline children have settled before any check runs. */
+export function boundedPipelineLines(
+  pipeline: string,
+  producers: PipelineProducer[],
+  output: string,
+): string[] {
+  return [
+    ...pipelineStatusLines(
+      `${pipeline} | head -c "$((archive_limit + 1))" > ${shellQuote(output)}`,
+      [...producers, { label: "limiter", variable: "ls", exitCode: 65 }],
+      [
+        `written=$(stat -c %s ${shellQuote(output)}) || exit 65`,
+        `test "$written" -le "$archive_limit" || { printf 'staging output limit exceeded limit=%s bytes=%s\\n' "$archive_limit" "$written" >&2; exit 65; }`,
+      ],
+    ),
+    `test "$written" -gt 0 || { echo 'staging output empty' >&2; exit 65; }`,
+  ];
 }
 
 /** Generated bash lines that record the excluded oracle-root fallback
@@ -932,10 +988,7 @@ function captureScript(params: {
   lines.push(
     `test -n "$sel" || { echo 'du produced no measurement' >&2; exit 64; }`,
   );
-  lines.push(`avail=$(df -B1 --output=avail ${shellQuote(stage)} | tail -n 1)`);
-  lines.push(
-    `test $((avail - 2 * sel)) -ge ${SPACE_MIN_FREE} || { printf 'staging space insufficient selected=%s avail=%s\\n' "$sel" "$avail" >&2; exit 65; }`,
-  );
+  lines.push(...stagingLimitLines(stage, 2));
   if (role === "staging-boot") {
     lines.push(
       `sha256sum ./arch-vmlinuz ./arch-initrd.img > ${
@@ -951,9 +1004,10 @@ function captureScript(params: {
   ];
   lines.push(`args=(${tarArgs.map(shellQuote).join(" ")})`);
   lines.push(
-    ...pipelineStatusLines(
-      `tar "\${args[@]}" | zstd -3 -T1 --check -c > ${shellQuote(partial)}`,
+    ...boundedPipelineLines(
+      `tar "\${args[@]}" | zstd -3 -T1 --check -c`,
       TAR_ZSTD_PRODUCERS,
+      partial,
     ),
   );
   lines.push(
@@ -1052,17 +1106,31 @@ async function captureRole(
   await commitFile(partial, plaintext);
   const size = (await Deno.stat(plaintext)).size;
   const avail = await stagingAvail(stage, `space:${role}`);
-  if (avail - size < SPACE_MIN_FREE) fail(`space:${role}`);
+  if (avail - size - ENCRYPTION_OVERHEAD < SPACE_MIN_FREE) {
+    fail(`space:${role}`);
+  }
   await assertRecipientPinned(settings, stage);
   const cipherPartial = `${stage}/${role}.tar.zst.gpg.partial`;
-  const encrypt = await runCommand(
-    "gpg",
-    gpgArgs(
-      `${stage}/gpg-public-home`,
-      `${stage}/recipient.asc`,
-      cipherPartial,
-      plaintext,
-    ),
+  const encrypt = await runBash(
+    [
+      "umask 077",
+      "set -u",
+      "set -o pipefail",
+      ...stagingLimitLines(stage, 1, size),
+      ...boundedPipelineLines(
+        [
+          "gpg",
+          ...gpgArgs(
+            `${stage}/gpg-public-home`,
+            `${stage}/recipient.asc`,
+            "-",
+            plaintext,
+          ),
+        ].map(shellQuote).join(" "),
+        [{ label: "gpg", variable: "gs", exitCode: 66 }],
+        cipherPartial,
+      ),
+    ].join("\n"),
     logPath(stage, `encrypt-${role}`),
   );
   requireOk(encrypt, `encrypt:${role}`);

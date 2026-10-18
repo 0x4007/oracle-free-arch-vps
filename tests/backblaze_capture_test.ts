@@ -1,5 +1,6 @@
 import {
   assertLiveMountTargets,
+  boundedPipelineLines,
   type CaptureSettings,
   exclusionPaths,
   type FileSource,
@@ -10,6 +11,7 @@ import {
   type LsblkNode,
   pipelineStatusLines,
   sha256File,
+  stagingLimitLines,
   swapfileRecreation,
   swapfileStatLines,
   validateCaptureSettings,
@@ -17,6 +19,7 @@ import {
   validateSources,
   validateSourceShapes,
 } from "../scripts/backblaze-capture.ts";
+import { shellQuote } from "../scripts/backup-guest.ts";
 
 function assert(value: unknown, message?: string): asserts value {
   if (!value) throw new Error(message ?? "Assertion failed");
@@ -746,6 +749,234 @@ const INVENTORY_PRODUCERS = [
   { label: "tar", variable: "s1", exitCode: 63 },
   { label: "awk", variable: "s2", exitCode: 63 },
 ];
+
+const STAGING_RESERVE = 5.5 * 1024 ** 3;
+const STAGING_ENCRYPTION_ALLOWANCE = 64 * 1024 ** 2;
+const STAGING_FIXTURE_AVAILABLE = STAGING_RESERVE +
+  STAGING_ENCRYPTION_ALLOWANCE + 128 * 1024;
+const BOUNDED_TAR_PRODUCERS = [
+  { label: "tar", variable: "ts", exitCode: 60, benignExitCodes: [1] },
+  { label: "zstd", variable: "zs", exitCode: 61 },
+];
+
+runtimeTest(
+  "bounded staging admits compressible data rejected by the old raw-size guard",
+  async () => {
+    const dir = await Deno.makeTempDir({ prefix: "capture-bounded-" });
+    try {
+      const source = `${dir}/source`;
+      const partial = `${dir}/root.tar.zst.partial`;
+      await Deno.mkdir(source);
+      const result = await runBash([
+        "set -u",
+        "set -o pipefail",
+        `head -c 67108864 /dev/zero > ${shellQuote(`${source}/payload`)}`,
+        `selected=$(du -sx -B1 ${shellQuote(source)} | cut -f1)`,
+        `test $(( ${STAGING_FIXTURE_AVAILABLE} - 2 * selected )) -lt ${STAGING_RESERVE} || exit 90`,
+        `df() { printf 'Avail\\n${STAGING_FIXTURE_AVAILABLE}\\n'; }`,
+        ...stagingLimitLines(dir, 2),
+        ...boundedPipelineLines(
+          `tar -C ${shellQuote(source)} -cf - . | zstd -3 -T1 --check -c`,
+          BOUNDED_TAR_PRODUCERS,
+          partial,
+        ),
+        `zstd -t ${shellQuote(partial)} || exit 91`,
+        ...pipelineStatusLines(
+          inventoryPipeline(partial, ["./payload"]),
+          INVENTORY_PRODUCERS,
+        ),
+        `printf 'bounded=%s\\n' "$archive_limit"`,
+      ].join("\n"));
+      assert(result.code === 0, result.stderr);
+      assert(result.stdout.includes("entries=2"), result.stdout);
+      const limit = Number(result.stdout.match(/bounded=(\d+)/)?.[1]);
+      assert(limit > 0 && limit < 64 * 1024);
+      assert((await Deno.stat(partial)).size <= limit);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+);
+
+runtimeTest(
+  "bounded staging rejects incompressible overflow before producer SIGPIPE errors",
+  async () => {
+    const dir = await Deno.makeTempDir({ prefix: "capture-overflow-" });
+    try {
+      const input = new Uint8Array(256 * 1024);
+      let seed = 0x12345678;
+      for (let index = 0; index < input.length; index++) {
+        seed ^= seed << 13;
+        seed ^= seed >>> 17;
+        seed ^= seed << 5;
+        input[index] = seed & 255;
+      }
+      await Deno.writeFile(`${dir}/payload`, input);
+      const partial = `${dir}/root.tar.zst.partial`;
+      const result = await runBash([
+        "set -u",
+        "set -o pipefail",
+        `df() { printf 'Avail\\n${STAGING_FIXTURE_AVAILABLE}\\n'; }`,
+        ...stagingLimitLines(dir, 2),
+        `printf 'bounded=%s\\n' "$archive_limit"`,
+        ...boundedPipelineLines(
+          `tar -C ${shellQuote(dir)} -cf - payload | zstd -3 -T1 --check -c`,
+          BOUNDED_TAR_PRODUCERS,
+          partial,
+        ),
+        `mv ${shellQuote(partial)} ${shellQuote(`${dir}/root.tar.zst`)}`,
+      ].join("\n"));
+      assert(result.code === 65, result.stderr);
+      assert(
+        result.stderr.includes("staging output limit exceeded"),
+        result.stderr,
+      );
+      assert(!result.stderr.includes("producer exit"), result.stderr);
+      const limit = Number(result.stdout.match(/bounded=(\d+)/)?.[1]);
+      assert(limit > 0);
+      assert((await Deno.stat(partial)).size === limit + 1);
+      await assertThrowsAsync(() => Deno.stat(`${dir}/root.tar.zst`));
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+);
+
+runtimeTest(
+  "bounded staging retains tar, compressor and limiter failures and tar status one",
+  async () => {
+    const dir = await Deno.makeTempDir({ prefix: "capture-producers-" });
+    try {
+      for (const fault of ["tar", "zstd", "head", "benign"] as const) {
+        const partial = `${dir}/${fault}.partial`;
+        const result = await runBash([
+          "set -u",
+          "set -o pipefail",
+          "archive_limit=4095",
+          `tar() { printf payload; return ${
+            fault === "tar" ? 2 : fault === "benign" ? 1 : 0
+          }; }`,
+          `zstd() { cat; return ${fault === "zstd" ? 1 : 0}; }`,
+          ...(fault === "head" ? ["head() { cat; return 1; }"] : []),
+          ...boundedPipelineLines("tar | zstd", BOUNDED_TAR_PRODUCERS, partial),
+          `mv ${shellQuote(partial)} ${shellQuote(`${dir}/${fault}.final`)}`,
+        ].join("\n"));
+        const code = fault === "tar"
+          ? 60
+          : fault === "zstd"
+          ? 61
+          : fault === "head"
+          ? 65
+          : 0;
+        assert(result.code === code, `${fault}: ${result.stderr}`);
+        if (fault === "benign") {
+          assert(
+            result.stderr.includes("tar producer exit 1 tolerated"),
+            result.stderr,
+          );
+          assert((await Deno.stat(`${dir}/${fault}.final`)).size === 7);
+        } else {
+          assert(
+            result.stderr.includes(
+              `${fault === "head" ? "limiter" : fault} producer exit`,
+            ),
+            result.stderr,
+          );
+          await assertThrowsAsync(() => Deno.stat(`${dir}/${fault}.final`));
+        }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+);
+
+runtimeTest(
+  "bounded ciphertext rejects expansion, failed encryption and empty output",
+  async () => {
+    const dir = await Deno.makeTempDir({ prefix: "capture-cipher-" });
+    try {
+      for (const fault of ["overflow", "gpg", "empty"] as const) {
+        const partial = `${dir}/${fault}.gpg.partial`;
+        const encrypt = fault === "overflow"
+          ? "gpg() { command head -c 8192 /dev/zero; }"
+          : fault === "gpg"
+          ? "gpg() { printf ciphertext; return 1; }"
+          : "gpg() { return 0; }";
+        const result = await runBash([
+          "set -u",
+          "set -o pipefail",
+          "archive_limit=4095",
+          encrypt,
+          ...boundedPipelineLines("gpg", [{
+            label: "gpg",
+            variable: "gs",
+            exitCode: 66,
+          }], partial),
+          `mv ${shellQuote(partial)} ${shellQuote(`${dir}/${fault}.gpg`)}`,
+        ].join("\n"));
+        assert(result.code === (fault === "gpg" ? 66 : 65), result.stderr);
+        assert((await Deno.stat(partial)).size <= 4096);
+        if (fault === "overflow") {
+          assert(result.stderr.includes("staging output limit exceeded"));
+        }
+        if (fault === "gpg") {
+          assert(result.stderr.includes("gpg producer exit 1"));
+        }
+        if (fault === "empty") {
+          assert(result.stderr.includes("staging output empty"));
+        }
+        await assertThrowsAsync(() => Deno.stat(`${dir}/${fault}.gpg`));
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+);
+
+runtimeTest(
+  "fresh encryption capacity rejects lost headroom and invalid measurements before encryption",
+  async () => {
+    const dir = await Deno.makeTempDir({ prefix: "capture-fresh-space-" });
+    try {
+      const plaintext = 1024;
+      for (
+        const available of [
+          STAGING_RESERVE + STAGING_ENCRYPTION_ALLOWANCE + plaintext - 1,
+          0,
+          "invalid",
+          "9999999999999999999",
+        ]
+      ) {
+        const result = await runBash([
+          "set -u",
+          "set -o pipefail",
+          `df() { printf 'Avail\\n${available}\\n'; }`,
+          ...stagingLimitLines(dir, 1, plaintext),
+          `printf invoked > ${shellQuote(`${dir}/encrypted`)}`,
+        ].join("\n"));
+        assert(result.code === 65, result.stderr);
+        await assertThrowsAsync(() => Deno.stat(`${dir}/encrypted`));
+      }
+      const boundary = await runBash([
+        "set -u",
+        "set -o pipefail",
+        `df() { printf 'Avail\\n${
+          STAGING_RESERVE + STAGING_ENCRYPTION_ALLOWANCE + plaintext
+        }\\n'; }`,
+        ...stagingLimitLines(dir, 1, plaintext),
+        `printf '%s\\n' "$archive_limit"`,
+      ].join("\n"));
+      assert(boundary.code === 0, boundary.stderr);
+      const limit = Number(boundary.stdout.trim());
+      assert(limit > plaintext);
+      // The sentinel write and its allocation stay inside the snapshot budget.
+      assert(limit + 1 <= STAGING_ENCRYPTION_ALLOWANCE + plaintext);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+);
 
 async function inventoryFixture(
   dir: string,
