@@ -12,7 +12,7 @@ WorkingDirectory=/home/pi/ops/weekly-backup-controller
 # unrestricted in the sandbox because Backblaze returns dynamic pod-*
 # subdomains; every URL is still host-validated inside B2Store against the
 # exact backblazeb2.com/backblaze.com namespace.
-ExecStart=/usr/local/bin/safepi deno run --allow-read=.,.private --allow-write=.private --allow-run --allow-net scripts/backblaze-file-backup.ts
+ExecStart=/usr/local/bin/safepi deno run --allow-read=.,.private --allow-write=.private --allow-run --allow-sys=uid --allow-net scripts/backblaze-file-backup.ts
 UMask=0077
 # Legacy v1 polling remains bounded by its original 12 h request. V2 runs
 # bounded reconciliation attempts and exits after establishing custody; its
