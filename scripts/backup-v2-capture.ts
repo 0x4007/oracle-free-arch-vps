@@ -44,6 +44,7 @@ export type {
 } from "./backup-v2-metadata.ts";
 import { assertBackupV2Budget } from "./backup-v2-profile.ts";
 import { assertBackupV2Directory } from "./backup-v2-spool.ts";
+import type { BackupV2RegisteredChild } from "./backup-v2-native-process.ts";
 import {
   type BackupV2UploadContext,
   uploadBackupV2Stream,
@@ -70,6 +71,7 @@ export interface BackupV2CaptureProgress {
   members: number;
 }
 export interface BackupV2CaptureChild {
+  pid?: number;
   stdin: WritableStream<Uint8Array>;
   stdout: ReadableStream<Uint8Array>;
   stderr: ReadableStream<Uint8Array>;
@@ -79,7 +81,15 @@ export interface BackupV2CaptureChild {
 export interface BackupV2CaptureNative {
   assertManaged(): Promise<void>;
   cancel(reason: unknown): Promise<void>;
-  spawn?: (command: string, args: string[]) => BackupV2CaptureChild;
+  spawn?: (
+    command: string,
+    args: string[],
+  ) => BackupV2CaptureChild | Promise<BackupV2CaptureChild>;
+  registerNamespace?: (child: BackupV2CaptureChild) => Promise<void>;
+  registerChild?: (
+    pid: number,
+    kind: "tar",
+  ) => Promise<BackupV2RegisteredChild>;
 }
 export interface BackupV2RoleProducerParams {
   settings: CaptureSettings;
@@ -153,6 +163,7 @@ export function backupV2NamespaceScript(params: {
   index: string;
   status: string;
   exclusions: string[];
+  tracked?: boolean;
 }): string {
   const { source, role, stage, index, status, exclusions } = params;
   const quote = shellQuote;
@@ -205,13 +216,24 @@ export function backupV2NamespaceScript(params: {
       } || exit 76`,
     );
   }
-  lines.push(
-    `tar ${
-      backupV2TarArguments(exclusions, "/proc/self/fd/3").map(quote).join(" ")
-    }`,
-    "ts=$?",
-    "exec 3>&-",
-  );
+  const tar = `tar ${
+    backupV2TarArguments(exclusions, "/proc/self/fd/3").map(quote).join(" ")
+  }`;
+  if (params.tracked) {
+    lines.push(
+      'printf "BACKUP_V2_NAMESPACE_READY\\n" >&2',
+      'IFS= read -r run && test "$run" = CAPTURE || exit 78',
+      "exec 4<&0",
+      `( IFS= read -r run <&4 && test "$run" = TAR_START || exit 78; printf "BACKUP_V2_TAR_ACK\\n" >&2; exec 4<&-; exec ${tar} ) <&4 &`,
+      "tar_pid=$!",
+      'printf "BACKUP_V2_TAR_CHILD %s\\n" "$tar_pid" >&2',
+      'wait "$tar_pid"',
+      "ts=$?",
+      'printf "BACKUP_V2_TAR_EXIT %s %s\\n" "$tar_pid" "$ts" >&2',
+      "exec 4<&-",
+    );
+  } else lines.push(tar, "ts=$?");
+  lines.push("exec 3>&-");
   if (role === "staging-boot") {
     lines.push(
       `sha256sum ./arch-vmlinuz ./arch-initrd.img > ${
@@ -232,6 +254,115 @@ export function backupV2NamespaceScript(params: {
     'IFS= read -r release && test "$release" = RELEASE || exit 78',
   );
   return lines.join("\n");
+}
+
+/** Only these ordered script-owned records are removed from diagnostics. */
+export function trackBackupV2CaptureNamespace(
+  child: BackupV2CaptureChild,
+  native: BackupV2CaptureNative,
+) {
+  let resolveReady!: () => void, rejectReady!: (reason: unknown) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  ready.catch(() => {});
+  let state = 0, tar: BackupV2RegisteredChild | undefined;
+  const send = async (record: string) => {
+    const writer = child.stdin.getWriter();
+    try {
+      await writer.write(encoder.encode(record + "\n"));
+    } finally {
+      writer.releaseLock();
+    }
+  };
+  const control = async (bytes: Uint8Array) => {
+    const line = new TextDecoder().decode(bytes);
+    if (line === "BACKUP_V2_NAMESPACE_READY\n") {
+      if (state !== 0 || !native.registerNamespace || !native.registerChild) {
+        fail("namespace control order");
+      }
+      await native.registerNamespace(child);
+      await send("CAPTURE");
+      state = 1;
+      return true;
+    }
+    const birth = /^BACKUP_V2_TAR_CHILD ([1-9][0-9]{0,9})\n$/.exec(line);
+    if (birth) {
+      if (state !== 1 || !native.registerChild) fail("tar control order");
+      tar = await native.registerChild(Number(birth[1]), "tar");
+      await send("TAR_START");
+      state = 2;
+      return true;
+    }
+    if (line === "BACKUP_V2_TAR_ACK\n") {
+      if (state !== 2) fail("tar control order");
+      state = 3;
+      resolveReady();
+      return true;
+    }
+    const exit = /^BACKUP_V2_TAR_EXIT ([1-9][0-9]{0,9}) ([0-9]{1,3})\n$/.exec(
+      line,
+    );
+    if (exit) {
+      if (
+        state !== 3 || !tar || tar.identity.pid !== Number(exit[1]) ||
+        Number(exit[2]) > 255
+      ) fail("tar exit identity");
+      await tar.exit({ code: Number(exit[2]), signal: null });
+      state = 4;
+      return true;
+    }
+    return false;
+  };
+  const reader = child.stderr.getReader();
+  let pending = new Uint8Array(0), eof = false;
+  const stderr = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        while (true) {
+          const end = pending.indexOf(10);
+          if (end >= 0) {
+            const line = pending.slice(0, end + 1);
+            pending = pending.slice(end + 1);
+            if (await control(line)) continue;
+            controller.enqueue(line);
+            return;
+          }
+          if (eof) {
+            if (state !== 4) fail("incomplete namespace control");
+            reader.releaseLock();
+            if (pending.length) controller.enqueue(pending);
+            controller.close();
+            return;
+          }
+          const next = await reader.read();
+          if (next.done) {
+            eof = true;
+            continue;
+          }
+          if (pending.length + next.value.length > DIAGNOSTIC_BYTES) {
+            fail("native diagnostic bound");
+          }
+          const joined = new Uint8Array(pending.length + next.value.length);
+          joined.set(pending);
+          joined.set(next.value, pending.length);
+          pending = joined;
+        }
+      } catch (error) {
+        rejectReady(error);
+        await reader.cancel().catch(() => {});
+        reader.releaseLock();
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      rejectReady(reason);
+      await reader.cancel(reason);
+      reader.releaseLock();
+    },
+  }, { highWaterMark: 0 });
+  return { stderr, ready };
 }
 
 /** Every write is awaited, including short native writes; no tee or payload queue. */
@@ -374,8 +505,8 @@ export async function createBackupV2RoleProducer(
     void cancel(params.signal?.reason).catch(() => {});
   };
   params.signal?.addEventListener("abort", aborted, { once: true });
-  const start = (command: string, args: string[]) => {
-    const child = spawn(command, args);
+  const start = async (command: string, args: string[]) => {
+    const child = await spawn(command, args);
     children.push(child);
     observe(child.status.then((status) => {
       if (status.code !== 0) fail(`${command} status`);
@@ -398,8 +529,8 @@ export async function createBackupV2RoleProducer(
   };
   const statusPath = `${stage}/producer-${role}-${attemptId}.status`;
   try {
-    const zstd = start("zstd", ["-3", "-T1", "--check", "-c"]);
-    const gpg = start(
+    const zstd = await start("zstd", ["-3", "-T1", "--check", "-c"]);
+    const gpg = await start(
       "gpg",
       gpgArgs(`${stage}/gpg-public-home`, `${stage}/recipient.asc`, "-", "-"),
     );
@@ -464,7 +595,11 @@ export async function createBackupV2RoleProducer(
       const source = params.settings.sources.find((item) =>
         item.name === role
       )!;
-      namespace = spawn("unshare", [
+      const tracked = Boolean(native.registerNamespace || native.registerChild);
+      if (tracked && (!native.registerNamespace || !native.registerChild)) {
+        fail("incomplete native namespace hooks");
+      }
+      namespace = await spawn("unshare", [
         "--mount",
         "bash",
         "-c",
@@ -477,6 +612,7 @@ export async function createBackupV2RoleProducer(
           exclusions: fsRelativeExclusions(
             exclusionPaths(params.settings.exclusionsText),
           ),
+          tracked,
         }),
       ]);
       children.push(namespace);
@@ -484,13 +620,17 @@ export async function createBackupV2RoleProducer(
         await releaseIndexOpen();
         if (status.code !== 0) fail("namespace status");
       }));
+      const control = tracked
+        ? trackBackupV2CaptureNamespace(namespace, native)
+        : undefined;
       tarError = observe(
         boundedText(
-          namespace.stderr,
+          control?.stderr ?? namespace.stderr,
           DIAGNOSTIC_BYTES,
           `${stage}/producer-${role}-${attemptId}.tar.log`,
         ),
       );
+      await control?.ready;
       input = namespace.stdout;
     }
     const inputTask = observe(

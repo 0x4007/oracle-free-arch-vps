@@ -1,6 +1,7 @@
 /** Pure policy tests by default. --native enables owned loopback/curl/file
  * fixtures ONLY when the sole live operator runs them inside a bounded unit. */
 import { createHash } from "node:crypto";
+import type { BackupV2TrackedProcess } from "../scripts/backup-v2-native-process.ts";
 import {
   BACKUP_V2_TRANSPORT_BOUNDS,
   BackupV2Store,
@@ -111,6 +112,66 @@ function fakeWire(
     );
   };
 }
+
+Deno.test("v2 curl awaits tracked START ACK before writing config and keeps one wire request", async () => {
+  let ready!: (child: BackupV2TrackedProcess) => void;
+  const registered = new Promise<BackupV2TrackedProcess>((resolve) => {
+    ready = resolve;
+  });
+  const writes: Uint8Array[] = [];
+  let calls = 0;
+  const wire = createCurlBackupV2Wire({
+    loopback: true,
+    connectSeconds: 1,
+    lowSpeedSeconds: 1,
+  }, (kind, command, args, options) => {
+    calls++;
+    assert(kind === "curl" && command === "/usr/bin/curl");
+    assert(args.join(" ") === "--disable --config -" && options?.clearEnv);
+    return registered;
+  });
+  const pending = wire({
+    url: "http://127.0.0.1:1/",
+    method: "GET",
+    headers: {},
+    maximumBodyBytes: 3,
+  });
+  await Promise.resolve();
+  assert(writes.length === 0);
+  ready({
+    pid: 123,
+    identity: {
+      pid: 123,
+      startTicks: "1",
+      bootId: "00000000-0000-4000-8000-000000000001",
+      cgroup: "/fixture",
+      kind: "curl",
+    },
+    stdin: new WritableStream({
+      write(bytes) {
+        writes.push(bytes.slice());
+      },
+    }),
+    stdout: new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc"),
+        );
+        controller.close();
+      },
+    }),
+    stderr: new ReadableStream({
+      start(controller) {
+        controller.close();
+      },
+    }),
+    status: Promise.resolve({ code: 0, success: true, signal: null }),
+    kill() {},
+  });
+  assert(new TextDecoder().decode(await consume(await pending)) === "abc");
+  assert(calls === 1 && Number(writes.length) === 1);
+  assert(new TextDecoder().decode(writes[0]).startsWith("silent\n"));
+});
 
 Deno.test("v2 namespace and cursor rejection occur before any wire request", async () => {
   const calls: BackupV2WireRequest[] = [];
