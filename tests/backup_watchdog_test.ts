@@ -1,5 +1,6 @@
 import {
   acceptedBackupRuntimeCapture,
+  assessBackupV2Retention,
   assessBackupV2Watchdog,
   assessHourlyProgress,
   assessOracleBootDrillEvidence,
@@ -629,4 +630,108 @@ Deno.test("v2 due-period proof uses capture interval, not new acceptance or veri
   if (assessBackupV2Watchdog(state, v2Fixture().workerGate, V2_NOW).healthy) {
     throw Error("Held source gate was ignored");
   }
+});
+
+Deno.test("accepted backup retains prune stage reporting until controller cleanup completes", () => {
+  const f = v2Fixture(),
+    unitName = f.workerGate.unitName.replace("worker", "prune");
+  const gate = validateBackupV2Gate({
+    ...f.workerGate,
+    kind: "prune",
+    unitName,
+    custody: {
+      ...f.workerGate.custody!,
+      unitName,
+      cgroup: `/weekly.slice/weekly-backup.slice/${unitName}`,
+    },
+  });
+  const status = validateBackupV2Status({
+    ...f.source.status as object,
+    kind: "prune",
+    phase: "PRUNING",
+    activeRoleAttempt: null,
+    custody: gate.custody,
+    progress: { ...f.progress.sample.v2Status.progress, phase: "PRUNING" },
+  }, gate);
+  const source = { ...f.source, identity: gate.custody, status };
+  const control = {
+    schemaVersion: 2,
+    format: "backup-v2-retention-controller",
+    input: {
+      schemaVersion: 2,
+      format: "backup-v2-prune",
+      gate,
+      transactionId: V2_GATE,
+      stage: "PLAN",
+    },
+    gate,
+    phase: "RUNNING",
+    result: null,
+  };
+  const running = assessBackupV2Retention(
+    f.envelope,
+    gate,
+    V2_NOW,
+    control,
+    source,
+  );
+  if (running.status !== "B2_RETENTION_PLAN_RUNNING" || !running.healthy) {
+    throw Error("Prune work was hidden behind final backup status");
+  }
+  for (
+    const phase of [
+      "REQUESTED",
+      "SETTLED",
+      "PARTIAL",
+      "CANCELLATION_BLOCKED",
+    ] as const
+  ) {
+    const report = assessBackupV2Retention(f.envelope, null, V2_NOW, {
+      ...control,
+      phase,
+    });
+    if (report.status !== `B2_RETENTION_PLAN_${phase}` || report.healthy) {
+      throw Error("Incomplete retention became healthy");
+    }
+  }
+  const blocked = assessBackupV2Retention(
+    f.envelope,
+    { ...gate, state: "CANCELLATION_BLOCKED" },
+    V2_NOW,
+    control,
+    source,
+  );
+  if (
+    blocked.status !== "B2_RETENTION_PLAN_CANCELLATION_BLOCKED" ||
+    blocked.healthy
+  ) throw Error("Blocked prune became healthy");
+  const complete = {
+    ...control,
+    input: { ...control.input, stage: "EXECUTE" },
+    phase: "COMPLETE",
+    result: {
+      schemaVersion: 2,
+      format: "backup-v2-prune-result",
+      stage: "EXECUTE",
+      state: "COMPLETE",
+      gate,
+      transactionId: V2_GATE,
+      nativeCustodySha256: V2_HASH,
+    },
+  };
+  if (
+    !assessBackupV2Retention(f.envelope, null, V2_NOW, complete).healthy ||
+    assessBackupV2Retention(f.envelope, gate, V2_NOW, complete).healthy ||
+    assessBackupV2Retention(f.envelope, null, V2_NOW, {
+      ...complete,
+      result: null,
+    }).healthy
+  ) throw Error("Cleanup completion or held-gate distinction was lost");
+  if (
+    assessBackupV2Retention(f.envelope, gate, V2_NOW, undefined).healthy ||
+    assessBackupV2Retention(f.envelope, gate, V2_NOW, {
+        ...control,
+        gate: { ...gate, gateId: V2_VERIFY },
+      }).status !== "B2_RETENTION_UNKNOWN"
+  ) throw Error("Unknown or mismatched retention was accepted");
 });
