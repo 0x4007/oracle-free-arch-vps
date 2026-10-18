@@ -274,7 +274,12 @@ const useful: Partial<
     "verifiedChunks",
     "inventoryMembers",
   ],
-  VERIFYING: ["verifiedChunks", "decryptedBytes", "inventoryMembers"],
+  VERIFYING: [
+    "verifiedChunks",
+    "decryptedBytes",
+    "compressionInputBytes",
+    "inventoryMembers",
+  ],
   PRUNING: ["inventoryMembers"],
 };
 

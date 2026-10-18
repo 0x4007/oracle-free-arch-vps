@@ -5,6 +5,7 @@ import {
   backupV2BridgeRuntimePaths,
   backupV2BridgeSourceProgram,
   backupV2BridgeUserRunner,
+  createBackupV2BridgeWaitProjection,
   decodeBackupV2BridgeSource,
   realBackupV2BridgeRuntime,
 } from "../scripts/backup-v2-bridge-runtime.ts";
@@ -98,6 +99,26 @@ const input: BackupV2BridgeRuntimeInput = {
   defaultSocketIdentity: "ABSENT",
 };
 const now = new Date("2026-10-18T15:01:00.000Z");
+Deno.test("source transfer projection preserves expiry across heartbeats and rejects rebinding", () => {
+  const project = createBackupV2BridgeWaitProjection(), value = status();
+  value.lease.transferEpisode = {
+    kind: "SEALED_TRANSFER",
+    operationId: "read/one",
+    phase: "READBACK",
+    sealedObjectIdentity: "sealed-one",
+    retainedBytes: 64,
+    startedAtMs: 900,
+    expiresAtMs: 200000,
+  };
+  const first = project(value, now, 100);
+  assert(first.transferEpisode !== null);
+  value.lease.observedMonotonicMs += 10000;
+  value.updatedAtUtc = new Date(now.getTime() + 10000).toISOString();
+  const later = project(value, new Date(now.getTime() + 10000), 10100);
+  equal(later.transferEpisode!.expiresAtMs, first.transferEpisode!.expiresAtMs);
+  value.lease.transferEpisode.expiresAtMs++;
+  throws(() => project(value, new Date(now.getTime() + 10000), 10100));
+});
 function status(terminal = false): BackupV2Status {
   return {
     schemaVersion: 2,

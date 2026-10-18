@@ -2,6 +2,7 @@ import type { TunnelSeam } from "./backblaze-file-backup.ts";
 import {
   type BackupV2LeaseWindow,
   type BackupV2Progress,
+  validateBackupV2LeaseWindow,
   validateBackupV2Progress,
 } from "./backup-v2-contract.ts";
 import { BACKUP_V2_LIMITS } from "./backup-v2-profile.ts";
@@ -32,6 +33,8 @@ export interface BackupV2BridgeObservation {
   gate: "OWNED" | "CANCELLED" | "TERMINAL";
   /** Independently checked cumulative work within this source invocation. */
   progress: Omit<BackupV2Progress, "observedMonotonicMs">;
+  /** Source-bound waits projected once into this keeper's monotonic clock. */
+  sourceWait?: Pick<BackupV2LeaseWindow, "retryEpisode" | "transferEpisode">;
 }
 export interface BackupV2BridgeClosure {
   keeper: BackupV2SupervisorIdentity;
@@ -208,7 +211,12 @@ const useful: Partial<Record<BackupV2Progress["phase"], readonly string[]>> = {
     "inventoryMembers",
   ],
   CLOUD_COMPLETE: [],
-  VERIFYING: ["verifiedChunks", "decryptedBytes", "inventoryMembers"],
+  VERIFYING: [
+    "verifiedChunks",
+    "decryptedBytes",
+    "compressionInputBytes",
+    "inventoryMembers",
+  ],
 };
 
 /** One managed helper owns this object and SSH stdin for the exact gate. The
@@ -450,6 +458,13 @@ export class BackupV2BridgeKeeper {
     }
     this.#previous = progress;
     this.#window.observedMonotonicMs = now;
+    if (sample.sourceWait) {
+      this.#window = validateBackupV2LeaseWindow({
+        ...this.#window,
+        retryEpisode: sample.sourceWait.retryEpisode,
+        transferEpisode: sample.sourceWait.transferEpisode ?? null,
+      });
+    }
   }
 
   async #bounded<T>(

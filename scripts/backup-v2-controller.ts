@@ -5,6 +5,7 @@ import {
   B2_REPORT_PATH,
   type BackblazeRunReport,
   BACKUP_BASE,
+  BACKUP_RUNTIME_BASE,
   CONTROLLER_STATE_PATH,
   type ControllerState,
   GATE_PATH,
@@ -1048,11 +1049,11 @@ export function backupV2LaunchArguments(
     "--no-config",
     "--no-lock",
     "--cached-only",
-    `--allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${publicHome},${BACKUP_V2_PROTECTION_SOURCE_BASE}`,
+    `--allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${publicHome},${BACKUP_RUNTIME_BASE}`,
     `--allow-write=${BACKUP_BASE},${PUBLIC_HOME_BASE},${BACKUP_V2_PROTECTION_SOURCE_BASE}`,
     "--allow-env=INVOCATION_ID,NOTIFY_SOCKET",
     "--allow-ffi=/usr/lib/libsystemd.so.0",
-    "--allow-run=/usr/bin/bash,/usr/bin/unshare,/usr/bin/gpg,/usr/bin/zstd,/usr/bin/tar,/usr/bin/mkfifo,/usr/bin/curl,/usr/bin/sudo,/usr/bin/cat,/usr/bin/chown,/usr/bin/find,/usr/bin/stat,/usr/bin/readlink",
+    "--allow-run=/bin/sh,/usr/bin/systemctl,/usr/bin/sha256sum,/usr/bin/flock,/usr/bin/bash,/usr/bin/unshare,/usr/bin/gpg,/usr/bin/zstd,/usr/bin/tar,/usr/bin/mkfifo,/usr/bin/curl,/usr/bin/sudo,/usr/bin/cat,/usr/bin/chown,/usr/bin/find,/usr/bin/stat,/usr/bin/readlink",
     kind === "prune"
       ? `${RELEASES_ROOT}/${request.sourceRevision}/scripts/backup-v2-worker.ts`
       : `${runtime}/entry-${kind}.ts`,
@@ -1063,7 +1064,7 @@ export function backupV2LaunchArguments(
 function remoteProgram(program: string): string {
   return `printf '%s' ${
     shellQuote(program)
-  } | /usr/local/bin/deno run --no-prompt --no-config --no-lock --cached-only --allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${BACKUP_V2_PROTECTION_SOURCE_BASE} --allow-run=/usr/bin/systemctl,/usr/bin/flock,/usr/bin/cat,/usr/bin/find,/usr/bin/stat,/usr/bin/readlink,/usr/bin/sha256sum -`;
+  } | /usr/local/bin/deno run --no-prompt --no-config --no-lock --cached-only --allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${BACKUP_V2_PROTECTION_SOURCE_BASE} --allow-run=/bin/sh,/usr/bin/systemctl,/usr/bin/flock,/usr/bin/cat,/usr/bin/find,/usr/bin/stat,/usr/bin/readlink,/usr/bin/sha256sum -`;
 }
 export function backupV2ObservationProgram(
   gateInput: BackupV2Gate,

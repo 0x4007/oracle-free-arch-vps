@@ -27,6 +27,12 @@ import {
 } from "./backup-v2-supervisor.ts";
 import { shellQuote } from "./backup-guest.ts";
 import { DEFAULT_GATE_PATH } from "./backblaze-controller-gate.ts";
+import { createHash } from "node:crypto";
+import {
+  type BackupV2LeaseWindow,
+  validateBackupV2LeaseWindow,
+} from "./backup-v2-contract.ts";
+import { BACKUP_V2_LIMITS } from "./backup-v2-profile.ts";
 
 const MAX = 64 * 1024;
 const LIBRARY = "/lib/aarch64-linux-gnu/libsystemd.so.0";
@@ -40,6 +46,73 @@ const environment = () => ({
   }),
 });
 const bytes = (value: unknown) => encoder.encode(JSON.stringify(value) + "\n");
+
+/** The first observation fixes each source episode's local expiry. Later
+ * heartbeats, network delays or wall-clock corrections cannot extend it. */
+export function createBackupV2BridgeWaitProjection() {
+  const seen = new Map<
+    string,
+    { signature: string; startedAtMs: number; expiresAtMs: number }
+  >();
+  const hash = (value: unknown) =>
+    createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  return (
+    status: BackupV2Status,
+    wallNow: Date,
+    localNow: number,
+  ): Pick<BackupV2LeaseWindow, "retryEpisode" | "transferEpisode"> => {
+    const lease = validateBackupV2LeaseWindow(status.lease);
+    const age = wallNow.getTime() - Date.parse(status.updatedAtUtc);
+    if (
+      !Number.isFinite(age) || age < -5000 || age > 90_000 ||
+      !Number.isFinite(localNow) || localNow < 0
+    ) fail();
+    const project = (
+      key: string,
+      value: { startedAtMs: number; expiresAtMs: number },
+    ) => {
+      const signature = hash(value), id = hash(key), previous = seen.get(id);
+      if (previous && previous.signature !== signature) fail();
+      // Deduct status age and the permitted clock skew rather than crediting it.
+      const elapsed = lease.observedMonotonicMs - value.startedAtMs +
+        Math.max(0, age) + 5000;
+      const remaining = value.expiresAtMs - lease.observedMonotonicMs -
+        Math.max(0, age) - 5000;
+      const expiresAtMs = Math.max(0, localNow + remaining);
+      if (!previous && seen.size >= BACKUP_V2_LIMITS.physicalPuts * 3) fail();
+      const result = previous
+        ? {
+          ...previous,
+          expiresAtMs: Math.min(previous.expiresAtMs, expiresAtMs),
+        }
+        : {
+          signature,
+          startedAtMs: Math.max(0, localNow - elapsed),
+          expiresAtMs,
+        };
+      result.startedAtMs = Math.min(result.startedAtMs, result.expiresAtMs);
+      seen.set(id, result);
+      return {
+        startedAtMs: result.startedAtMs,
+        expiresAtMs: result.expiresAtMs,
+      };
+    };
+    return {
+      retryEpisode: lease.retryEpisode
+        ? project(`retry/${lease.retryEpisode.startedAtMs}`, lease.retryEpisode)
+        : null,
+      transferEpisode: lease.transferEpisode
+        ? {
+          ...lease.transferEpisode,
+          ...project(
+            `transfer/${lease.transferEpisode.operationId}`,
+            lease.transferEpisode,
+          ),
+        }
+        : null,
+    };
+  };
+}
 function fail(): never {
   throw new Error("Bridge runtime custody or transport is unproved");
 }
@@ -742,6 +815,7 @@ export async function runBackupV2BridgeRuntime(
     ) fail();
     return current.identity;
   };
+  const projectWait = createBackupV2BridgeWaitProjection();
   const bridge = new BackupV2BridgeKeeper(keeper, input.binding, {
     notificationGraceMs: 60_000,
     progressGraceMs: 120_000,
@@ -793,6 +867,7 @@ export async function runBackupV2BridgeRuntime(
           ? "CANCELLED"
           : "OWNED",
         progress,
+        sourceWait: projectWait(remote.status, new Date(), performance.now()),
       };
     },
     observeClosure: async () => {

@@ -624,6 +624,20 @@ Deno.test("actual generated source launch is finite notify custody with pinned s
       "--allow-ffi=/usr/lib/libsystemd.so.0",
     ]
   ) assert(argv.includes(part));
+  const runGrant = argv.find((arg) => arg.startsWith("--allow-run="))!;
+  for (
+    const tool of [
+      "/bin/sh",
+      "/usr/bin/flock",
+      "/usr/bin/systemctl",
+      "/usr/bin/sha256sum",
+    ]
+  ) assert(runGrant.split(/[=,]/).includes(tool));
+  assert(
+    argv.find((arg) => arg.startsWith("--allow-read="))!.split(/[=,]/).includes(
+      "/var/tmp/arch-vps-file-backup-runtime",
+    ),
+  );
   assert(
     !argv.includes("-A") && !argv.includes("--allow-env") &&
       !argv.includes("--allow-ffi"),
@@ -659,6 +673,32 @@ Deno.test("worker progress rejects reused counters and invocation paths retain o
   const a = bound(settings().workerGate),
     b = { ...a, custody: { ...a.custody!, invocationId: "3".repeat(32) } };
   assert(backupV2GateDirectory(a) !== backupV2GateDirectory(b));
+});
+
+Deno.test("verification exports decompression work after compressed input ends", () => {
+  const progress = new BackupV2WorkerProgress();
+  progress.verification({
+    role: "root",
+    pass: 1,
+    kind: "compressedPlaintext",
+    bytes: 50,
+  });
+  progress.verification({
+    role: "root",
+    pass: 1,
+    kind: "decoded",
+    bytes: 100000,
+  });
+  const before = progress.snapshot(1);
+  progress.verification({
+    role: "root",
+    pass: 1,
+    kind: "decoded",
+    bytes: 200000,
+  });
+  const after = progress.snapshot(2);
+  equal(after.decryptedBytes, before.decryptedBytes);
+  equal(after.compressionInputBytes - before.compressionInputBytes, 100000);
 });
 
 Deno.test("immutable release closure includes dynamic/type-only imports and refuses unpinned modules", async () => {

@@ -580,6 +580,9 @@ export class BackupV2WorkerProgress {
     if (value.kind === "compressedPlaintext") {
       this.#values.decryptedBytes += delta;
     }
+    if (value.kind === "decoded") {
+      this.#values.compressionInputBytes += delta;
+    }
   }
   verifiedObject(): void {
     this.#values.verifiedChunks++;
@@ -1521,7 +1524,7 @@ export async function runBackupV2RemoteWorker(
         }
       }
       const run = createBackupV2MetadataRunner(stage, native);
-      if (kind !== "prune") {
+      if (kind === "verify") {
         await prepareRecipient(settings.captureSettings, stage, run);
       }
       let result:
