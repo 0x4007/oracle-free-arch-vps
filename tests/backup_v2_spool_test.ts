@@ -148,8 +148,10 @@ Deno.test("producer errors retain occupied bytes and abort wakes a blocked slot 
   assert(memory.files.size === 2);
 });
 const native =
-  (await Deno.permissions.query({ name: "read" })).state === "granted" &&
-  (await Deno.permissions.query({ name: "write" })).state === "granted";
+  (await Deno.permissions.query({ name: "read", path: "/var/tmp" })).state ===
+    "granted" &&
+  (await Deno.permissions.query({ name: "write", path: "/var/tmp" })).state ===
+    "granted";
 Deno.test({
   name:
     "native: guarded files seal/hash and reclaim without an extra payload copy",

@@ -285,8 +285,10 @@ Deno.test("journal replay retains old unresolved intents and blocks producer-att
   await rejects(() => replay.append({ type: "begin", identity }));
 });
 const native =
-  (await Deno.permissions.query({ name: "read" })).state === "granted" &&
-  (await Deno.permissions.query({ name: "write" })).state === "granted";
+  (await Deno.permissions.query({ name: "read", path: "/var/tmp" })).state ===
+    "granted" &&
+  (await Deno.permissions.query({ name: "write", path: "/var/tmp" })).state ===
+    "granted";
 Deno.test({
   name: "native: upload journal fsync/replay and actual slot reclaim",
   ignore: !native,
