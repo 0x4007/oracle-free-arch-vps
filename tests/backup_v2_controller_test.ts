@@ -629,6 +629,8 @@ Deno.test("actual generated source launch is finite notify custody with pinned s
       "--property=RemainAfterExit=yes",
       "--property=RuntimeMaxSec=30000ms",
       "--property=LimitCORE=0",
+      `--property=Environment=DENO_DIR=/var/tmp/arch-vps-file-backup-runtime/jobs/${s.envelope.request.jobId}/deno-cache`,
+      "--no-code-cache",
       "--allow-ffi=/usr/lib/libsystemd.so.0",
     ]
   ) assert(argv.includes(part));

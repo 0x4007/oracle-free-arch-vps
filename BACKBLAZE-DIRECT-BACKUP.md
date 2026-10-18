@@ -26,17 +26,17 @@ Independent verification starts from trusted cloud references and an off-VPS acc
 
 The declared profile in [backup-v2-profile.ts](scripts/backup-v2-profile.ts) is a finite admission envelope, not a measured capacity guarantee:
 
-| Dimension | Declared bound |
-| --- | --- |
-| Ciphertext payload slots | Two × 64 MiB, 128 MiB total |
-| Aggregate workspace, including metadata, temporary/cache files and overhead | 2 GiB |
-| Protected free-space reserve | 5.5 GiB plus unallocated workspace and production-writer margin |
-| Journal / individual manifest | 64 MiB / 1 MiB |
-| Logical source / capture ciphertext / physical PUT bytes | 1 TiB / 256 GiB / 512 GiB |
-| Logical objects / physical PUT attempts / attempts per object | 5,000 / 16,384 / 16 |
-| Members / aggregate path bytes / inventory stream | 2,000,000 / 128 MiB / 512 MiB |
+| Dimension                                                                       | Declared bound                                                                |
+| ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Ciphertext payload slots                                                        | Two × 64 MiB, 128 MiB total                                                   |
+| Active engine workspace, including metadata, temporary/cache files and overhead | 768 MiB                                                                       |
+| Additional ordinary-user free space                                             | Remaining engine workspace plus one 512 MiB writer margin; 1.25 GiB initially |
+| Journal / individual manifest                                                   | 64 MiB / 1 MiB                                                                |
+| Logical source / capture ciphertext / physical PUT bytes                        | 1 TiB / 256 GiB / 512 GiB                                                     |
+| Logical objects / physical PUT attempts / attempts per object                   | 5,000 / 16,384 / 16                                                           |
+| Members / aggregate path bytes / inventory stream                               | 2,000,000 / 128 MiB / 512 MiB                                                 |
 
-Admission counts already allocated workspace once and observes free blocks, inodes and held-deleted files. The source currently adds a 512 MiB production-writer margin. The full profile also bounds hardlinks, directory listings, sparse extents, extended metadata, decoder memory and pruning candidates. Exceeding a bound fails closed without dropping source data. Fixed payload slots do not imply constant metadata, GNU tar RAM, runtime or cumulative disk I/O. This remains a weekly full-capture design, without incremental transfer or cross-generation deduplication; complete source reading, compression/encryption, upload/readback and independent cloud verification still consume work proportional to the selected data and metadata.
+Admission counts already allocated active workspace once and observes ordinary-user available blocks (`statfs.bavail`), inodes and held-deleted files. Filesystem reserved blocks remain protected without adding the inherited 5.5 GiB floor again. Code-derived phase maxima are about 381 MiB during capture and 499 MiB during sealing; the 768 MiB ceiling includes further native temporary and filesystem allowance. The single 512 MiB writer margin provides more than fourteen seconds at the preserved backup write ceiling, covering monitor/observation/stop reaction rather than promising to bound unrelated writers. Exact active roots include the gate, job-local Deno cache, verifier public-key home, prune transaction and new protection graph; unrelated retained graphs are excluded. Deno uses the accounted job cache with V8 code caching disabled. Unknown capacity fails closed. These bounds need live bounded acceptance and a real complete cycle. The full profile also bounds hardlinks, directory listings, sparse extents, extended metadata, decoder memory and pruning candidates. Exceeding a bound fails closed without dropping source data. Fixed payload slots do not imply constant metadata, GNU tar RAM, runtime or cumulative disk I/O. This remains a weekly full-capture design, without incremental transfer or cross-generation deduplication; complete source reading, compression/encryption, upload/readback and independent cloud verification still consume work proportional to the selected data and metadata.
 
 V2 requests have no inherited twelve-hour whole-job deadline. Source and bridge lifetime instead require finite managed leases bound to the exact gate, boot, invocation, PID/start and cgroup. Source code currently uses 300-second startup/useful-progress grace with short 30-second notification leases. Only verified work or a fixed, durable sealed-transfer/retry episode can extend custody; heartbeats and repeated failed bytes cannot reset the episode. Transport declares a 30-second connection bound, 120-second control-request bound, six-hour payload bound and 120-second curl low-speed window; that rate window is not an exact socket-idle timeout. Transfer episode bounds include associated control requests and settlement. The Pi's existing thirteen-hour service bound limits a controller attempt, while the independent source/bridge continuity must be proved for a healthy long v2 job. Legacy v1 requests retain their original deadline semantics.
 

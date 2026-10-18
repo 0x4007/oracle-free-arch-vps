@@ -66,7 +66,10 @@ import {
   BackupV2Spool,
   createBackupV2FileSpoolStorage,
 } from "./backup-v2-spool.ts";
-import { BACKUP_V2_LIMITS } from "./backup-v2-profile.ts";
+import {
+  BACKUP_V2_LIMITS,
+  BACKUP_V2_PRODUCTION_WRITER_MARGIN_BYTES,
+} from "./backup-v2-profile.ts";
 import {
   BackupV2Store,
   BackupV2TransportError,
@@ -124,7 +127,10 @@ import {
   validateReleaseManifest,
 } from "./backblaze-file-backup.ts";
 import { runBackupV2SourcePruner } from "./backup-v2-source-pruner.ts";
-import { createBackupV2PruneRuntime } from "./backup-v2-prune-runtime.ts";
+import {
+  BACKUP_V2_PRUNE_TRANSACTIONS,
+  createBackupV2PruneRuntime,
+} from "./backup-v2-prune-runtime.ts";
 
 export const BACKUP_V2_STATUS_FILE = "status.json";
 export const BACKUP_V2_RESULT_FILE = "result.json";
@@ -1072,51 +1078,116 @@ async function previousSealedRoles(
   );
 }
 
-/** Actual workspace and deleted-handle accounting, scoped to this unit only.
- * Numeric margins are initial implementation bounds; live capacity acceptance
- * must validate them under the preserved current host/ancestor resource caps. */
-async function capacity(
+export interface BackupV2CapacityIO {
+  lstat(path: string): Promise<{
+    blocks: bigint;
+    dev: bigint;
+    ino: bigint;
+    isSymbolicLink(): boolean;
+    isDirectory(): boolean;
+  }>;
+  entries(path: string): AsyncIterable<string>;
+  statfs(
+    path: string,
+  ): Promise<{ bavail: bigint; bsize: bigint; ffree: bigint }>;
+  deleted: typeof backupV2DeletedHandleBytes;
+}
+const capacityIO: BackupV2CapacityIO = {
+  lstat: (path) => lstat(path, { bigint: true }),
+  async *entries(path) {
+    for await (const entry of Deno.readDir(path)) yield entry.name;
+  },
+  statfs: (path) => statfs(path, { bigint: true }),
+  deleted: backupV2DeletedHandleBytes,
+};
+/** Only exact active roots, never the entire retained protection inventory. */
+export function backupV2CapacityRoots(
+  directory: string,
+  additionalRoots: readonly string[] = [],
+): string[] {
+  const roots = [...new Set([directory, ...additionalRoots])];
+  if (
+    roots.some((path) =>
+      !/^\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+$/.test(path) ||
+      path.split("/").some((part) => part === "." || part === "..")
+    )
+  ) fail();
+  return roots.filter((path) =>
+    !roots.some((parent) => parent !== path && path.startsWith(parent + "/"))
+  );
+}
+/** Allocated blocks plus all unlinked files held by this managed cgroup.
+ * Outside-gate unlinked files are conservatively charged once to workspace;
+ * their original source counter also retains its independent safety check. */
+export async function observeBackupV2Capacity(
   directory: string,
   cgroup: string,
+  additionalRoots: readonly string[] = [],
+  io: BackupV2CapacityIO = capacityIO,
 ): Promise<BackupV2CapacityObservation> {
-  let allocated = 0,
-    entries = 0,
-    workspaceHeldDeletedBytes = 0,
-    sourceHeldDeletedBytes = 0;
+  let allocated = 0, entries = 0;
+  const seen = new Set<string>();
+  const primary = await io.lstat(directory);
+  if (!primary.isDirectory() || primary.isSymbolicLink()) fail();
   const walk = async (path: string, depth: number): Promise<void> => {
     if (++entries > 10_000 || depth > 32) fail();
-    const info = await lstat(path, { bigint: true });
+    const info = await io.lstat(path);
+    if (info.isSymbolicLink() || info.dev !== primary.dev || info.blocks < 0n) {
+      fail();
+    }
+    const key = `${info.dev}:${info.ino}`;
+    if (seen.has(key)) return;
+    seen.add(key);
     allocated += Number(info.blocks * 512n);
-    if (info.isSymbolicLink()) fail();
+    if (!Number.isSafeInteger(allocated)) fail();
     if (info.isDirectory()) {
-      for await (const child of Deno.readDir(path)) {
-        await walk(`${path}/${child.name}`, depth + 1);
+      for await (const child of io.entries(path)) {
+        if (!child || child.includes("/") || child === "." || child === "..") {
+          fail();
+        }
+        await walk(`${path}/${child}`, depth + 1);
       }
     }
   };
-  await walk(directory, 0);
-  try {
-    await walk(BACKUP_V2_PROTECTION_SOURCE_BASE, 0);
-  } catch (error) {
-    if (
-      !(error instanceof Deno.errors.NotFound) &&
-      !(error instanceof Error && "code" in error && error.code === "ENOENT")
-    ) throw error;
+  for (const root of backupV2CapacityRoots(directory, additionalRoots)) {
+    try {
+      // A registered future root may not exist yet; disappearing descendants
+      // or any other failed observation remain unknown and fail closed.
+      await io.lstat(root);
+    } catch (error) {
+      if (
+        root !== directory && (error instanceof Deno.errors.NotFound ||
+          error instanceof Error && "code" in error && error.code === "ENOENT")
+      ) continue;
+      throw error;
+    }
+    await walk(root, 0);
   }
   const {
     workspaceHeldDeletedBytes: workspaceDeleted,
     sourceHeldDeletedBytes: sourceDeleted,
-  } = await backupV2DeletedHandleBytes(directory, cgroup);
-  workspaceHeldDeletedBytes = workspaceDeleted;
-  sourceHeldDeletedBytes = sourceDeleted;
-  const fs = await statfs(directory, { bigint: true });
+  } = await io.deleted(directory, cgroup);
+  if (
+    ![workspaceDeleted, sourceDeleted].every((value) =>
+      Number.isSafeInteger(value) && value >= 0
+    )
+  ) fail();
+  const workspaceHeldDeletedBytes = workspaceDeleted + sourceDeleted;
+  const fs = await io.statfs(directory);
+  const availableBytes = Number(fs.bavail * fs.bsize),
+    freeInodes = Number(fs.ffree);
+  if (
+    ![allocated + workspaceHeldDeletedBytes, availableBytes, freeInodes].every((
+      value,
+    ) => Number.isSafeInteger(value) && value >= 0)
+  ) fail();
   return {
     observedMonotonicMs: performance.now(),
-    availableBytes: Number(fs.bavail * fs.bsize),
-    freeInodes: Number(fs.ffree),
+    availableBytes,
+    freeInodes,
     allocatedWorkspaceBytes: allocated + workspaceHeldDeletedBytes,
     workspaceHeldDeletedBytes,
-    sourceHeldDeletedBytes,
+    sourceHeldDeletedBytes: sourceDeleted,
   };
 }
 async function drainDiagnostics(
@@ -1235,6 +1306,12 @@ export async function runBackupV2RemoteWorker(
       work = new BackupV2WorkerProgress(),
       notifier = createBackupV2Notifier();
     const startedAtUtc = new Date().toISOString();
+    const activeRoots = new Set<string>([`${runtime}/deno-cache`]);
+    if (pruneInput) {
+      activeRoots.add(
+        `${BACKUP_V2_PRUNE_TRANSACTIONS}/${pruneInput.transactionId}`,
+      );
+    }
     let last: BackupV2Status | null = null,
       terminal = false,
       stopping: Promise<never> | null = null;
@@ -1290,14 +1367,18 @@ export async function runBackupV2RemoteWorker(
       notificationGraceMs: 30_000,
       observationTimeoutMs: 5000,
       maximumObservationAgeMs: 5000,
-      productionWriterMarginBytes: 512 * 1024 * 1024,
+      productionWriterMarginBytes: BACKUP_V2_PRODUCTION_WRITER_MARGIN_BYTES,
       minimumFreeInodes: 256,
       maximumSourceHeldDeletedBytes: BACKUP_V2_LIMITS.workspaceBytes,
     }, {
       now: () => performance.now(),
       notifier,
       async observe() {
-        const sample = await capacity(directory, gate.custody!.cgroup);
+        const sample = await observeBackupV2Capacity(
+          directory,
+          gate.custody!.cgroup,
+          [...activeRoots],
+        );
         return {
           identity: gate.custody!,
           progress: work.snapshot(sample.observedMonotonicMs),
@@ -1592,6 +1673,8 @@ export async function runBackupV2RemoteWorker(
       } else if (kind === "verify") {
         if (!verifyInput) fail();
         const publicHome = `${PUBLIC_HOME_BASE}/${request.captureId}`;
+        activeRoots.add(publicHome);
+        await supervise();
         await ensurePublicHome(publicHome, run);
         const importChild = await spawnBackupV2GpgDecrypt(processes, [
           "--no-options",
@@ -1777,6 +1860,8 @@ export async function runBackupV2RemoteWorker(
         const graphDirectory = backupV2ProtectionSourceDirectory(
           graph.descriptor.manifestSha256,
         );
+        activeRoots.add(graphDirectory);
+        await supervise();
         await rootDirectory(graphDirectory);
         for (const page of graph.pages) {
           await atomicArtifact(
@@ -1785,6 +1870,7 @@ export async function runBackupV2RemoteWorker(
             page.value,
             true,
           );
+          await supervise();
         }
         await atomicArtifact(
           graphDirectory,
@@ -1792,12 +1878,14 @@ export async function runBackupV2RemoteWorker(
           graph.manifest,
           true,
         );
+        await supervise();
         await atomicArtifact(
           graphDirectory,
           "descriptor.json",
           graph.descriptor,
           true,
         );
+        await supervise();
         result = { ...result, protectedGraph: graph.descriptor };
       }
       terminal = true;
