@@ -549,6 +549,8 @@ async function nativeFixture(
     missingExit?: boolean;
     unresolved?: boolean;
     reused?: boolean;
+    noChildren?: boolean;
+    omitNoPrivateMount?: boolean;
   } = {},
 ) {
   const base = fixture();
@@ -580,12 +582,14 @@ async function nativeFixture(
         hostInode: "1000",
       },
     },
-    { type: "CHILD", identity: child },
   ];
-  if (!options.liveChild && !options.missingExit) {
+  if (!options.noChildren) records.push({ type: "CHILD", identity: child });
+  if (!options.noChildren && !options.liveChild && !options.missingExit) {
     records.push({ type: "EXIT", identity: child, code: 0, signal: null });
   }
-  if (!options.privateMount && !options.unresolved) {
+  if (
+    !options.privateMount && !options.unresolved && !options.omitNoPrivateMount
+  ) {
     records.push({ type: "NO_PRIVATE_MOUNT" });
   }
   const body = records.map((record) => JSON.stringify(record)).join("\n") +
@@ -638,7 +642,9 @@ async function nativeFixture(
       return Promise.resolve(
         ok(
           "1\0" + (base.state.main ? "123\0" : "") +
-            (options.liveChild || options.reused ? "124\0" : ""),
+            (!options.noChildren && (options.liveChild || options.reused)
+              ? "124\0"
+              : ""),
         ),
       );
     }
@@ -676,7 +682,12 @@ async function nativeFixture(
       !base.state.absent
     ) {
       return Promise.resolve(
-        ok("123\n" + (options.liveChild && !options.escaped ? "124\n" : "")),
+        ok(
+          "123\n" +
+            (!options.noChildren && options.liveChild && !options.escaped
+              ? "124\n"
+              : ""),
+        ),
       );
     }
     return base.run(command, args);
@@ -895,6 +906,108 @@ Deno.test("kernel cancellation proves fresh physical settlement after RUNNING st
       cancellationStopProof: f.proof,
     })).tree?.pendingOperations,
     0,
+  );
+});
+
+Deno.test("kernel cancellation settles a zero-child preflight without fabricating a mount record", async () => {
+  const f = await cancelledFixture({
+    liveChild: true,
+    noChildren: true,
+    omitNoPrivateMount: true,
+  });
+  const after = await observeBackupV2Kernel(gate, f.after, {
+    cancellationStopProof: f.proof,
+  });
+  equal(after.unit, "ABSENT");
+  equal(after.nativeCustodySha256, f.digest);
+  equal([
+    after.tree?.descendants,
+    after.tree?.namespaceReferences,
+    after.managerNamespaceReferences,
+    after.tree?.pendingOperations,
+  ], [0, 0, 0, 0]);
+  f.base.state.load = "loaded";
+  f.base.state.sub = "exited";
+  f.base.state.invocation = gate.custody!.invocationId;
+  equal(
+    (await observeBackupV2Kernel(gate, f.after)).tree?.namespaceReferences,
+    null,
+  );
+});
+
+Deno.test("kernel exact cancellation settles a retained failed unit only after physical exit", async () => {
+  const f = await cancelledFixture({
+    liveChild: true,
+    noChildren: true,
+    omitNoPrivateMount: true,
+  });
+  f.base.state.load = "loaded";
+  f.base.state.active = "failed";
+  f.base.state.sub = "failed";
+  f.base.state.result = "exit-code";
+  f.base.state.invocation = gate.custody!.invocationId;
+  const unproved = await observeBackupV2Kernel(gate, f.after);
+  equal(unproved.unit, "FAILED");
+  equal(unproved.tree?.descendants, null);
+  equal(unproved.tree?.namespaceReferences, null);
+  const after = await observeBackupV2Kernel(gate, f.after, {
+    cancellationStopProof: f.proof,
+  });
+  equal(after.unit, "ABSENT");
+  equal([
+    after.tree?.mainPid,
+    after.tree?.controlPid,
+    after.tree?.cgroupPopulated,
+    after.tree?.descendants,
+    after.tree?.namespaceReferences,
+    after.managerNamespaceReferences,
+  ], [0, 0, false, 0, 0, 0]);
+  f.base.state.invocation = "f".repeat(32);
+  equal(
+    (await observeBackupV2Kernel(gate, f.after, {
+      cancellationStopProof: f.proof,
+    })).identity,
+    null,
+  );
+});
+
+Deno.test("kernel zero-child cancellation exception rejects child history, live main and journal changes", async () => {
+  const child = await cancelledFixture({
+    liveChild: true,
+    omitNoPrivateMount: true,
+  });
+  equal(
+    (await observeBackupV2Kernel(gate, child.after, {
+      cancellationStopProof: child.proof,
+    })).tree?.namespaceReferences,
+    null,
+  );
+  const f = await cancelledFixture({
+    liveChild: true,
+    noChildren: true,
+    omitNoPrivateMount: true,
+  });
+  const live: BackupV2KernelCommand = (command, args) =>
+    command === "/usr/bin/cat" && args.at(-1) === "/proc/123/stat"
+      ? Promise.resolve(ok(stat(123)))
+      : f.after(command, args);
+  equal(
+    (await observeBackupV2Kernel(gate, live, {
+      cancellationStopProof: f.proof,
+    })).tree,
+    null,
+  );
+  let hashes = 0;
+  const changed: BackupV2KernelCommand = (command, args) =>
+    command === "/usr/bin/sha256sum" && args.at(-1) === f.journal &&
+      ++hashes === 2
+      ? Promise.resolve(ok(`${"f".repeat(64)}  ${f.journal}\n`))
+      : f.after(command, args);
+  equal(
+    (await observeBackupV2Kernel(gate, changed, {
+      cancellationStopProof: f.proof,
+    })).tree?.namespaceReferences,
+    null,
   );
 });
 
