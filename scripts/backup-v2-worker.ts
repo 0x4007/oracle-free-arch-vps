@@ -79,6 +79,13 @@ import {
   GATE_SOURCE_LOCK_PATH,
 } from "./backblaze-controller-contract.ts";
 import { withBackupLock } from "./backup-lock.ts";
+import {
+  BACKUP_V2_NATIVE_CUSTODY_FILE,
+  backupV2NativeCustodyBytes,
+  type BackupV2NativeCustodyRecord,
+  parseBackupV2NativeCustody,
+  validateBackupV2NativeCustodyRecord,
+} from "./backup-v2-native-custody.ts";
 import { createBackupV2MetadataRunner } from "./backup-v2-metadata.ts";
 import {
   BACKUP_BASE,
@@ -362,6 +369,7 @@ export interface BackupV2VerifiedResult extends BackupV2Execution {
   receipt: BackupV2Receipt;
   receiptReference: BackupV2ManifestRef;
   finishedAtUtc: string;
+  nativeCustodySha256?: string;
 }
 export async function verifyBackupV2Worker(
   settingsInput: BackupV2WorkerSettings,
@@ -432,6 +440,7 @@ export function validateBackupV2VerifiedResult(
       "receipt",
       "receiptReference",
       "finishedAtUtc",
+      ...(Object.hasOwn(value,"nativeCustodySha256")?["nativeCustodySha256"]:[]),
     ];
   if (
     Object.keys(r).length !== fields.length ||
@@ -459,6 +468,7 @@ export function validateBackupV2VerifiedResult(
     r.finishedAtUtc < receipt.verifiedAtUtc
   ) fail();
   const receiptReference = validateBackupV2ManifestRef(r.receiptReference);
+  if(Object.hasOwn(r,"nativeCustodySha256")&&(typeof r.nativeCustodySha256!=="string"||!/^[a-f0-9]{64}$/.test(r.nativeCustodySha256)))fail();
   return {
     schemaVersion: 2,
     format: "backup-v2-verified",
@@ -469,6 +479,7 @@ export function validateBackupV2VerifiedResult(
     receipt,
     receiptReference,
     finishedAtUtc: r.finishedAtUtc,
+    ...(Object.hasOwn(r,"nativeCustodySha256")?{nativeCustodySha256:r.nativeCustodySha256 as string}:{}),
   };
 }
 
@@ -617,6 +628,39 @@ async function rootDirectory(path: string): Promise<void> {
     if (!(error instanceof Deno.errors.AlreadyExists)) throw error;
   }
   await assertBackupV2Directory(path);
+}
+/** One per-invocation append file. Registration resolves only after the exact
+ * facts are durable; an uncertain write poisons later registration. */
+export async function openBackupV2NativeCustody(directory: string, gate: BackupV2Gate) {
+  await assertBackupV2Directory(directory);
+  const path = `${directory}/${BACKUP_V2_NATIVE_CUSTODY_FILE}`;
+  const file = await Deno.open(path, { createNew: true, read: true, write: true, mode: 0o600 });
+  const identity = await file.stat();
+  let bytesWritten = 0, serial = Promise.resolve(), poisoned: unknown, closed = false;
+  const append = (input: BackupV2NativeCustodyRecord): Promise<void> => {
+    const next = serial.then(async () => {
+      if (poisoned !== undefined) throw poisoned;
+      if (closed) fail();
+      const record = validateBackupV2NativeCustodyRecord(input, gate), bytes = backupV2NativeCustodyBytes(record);
+      if (bytes.length > 16 * 1024 || bytesWritten + bytes.length > BACKUP_V2_LIMITS.journalBytes) fail();
+      const current = await Deno.lstat(path);
+      if (!current.isFile || current.isSymlink || current.uid !== 0 || current.nlink !== 1 || current.mode === null || (current.mode & 0o777) !== 0o600 || current.dev !== identity.dev || current.ino !== identity.ino || current.size !== bytesWritten) fail();
+      let at = 0;
+      while (at < bytes.length) { const count = await file.write(bytes.subarray(at)); if (count <= 0 || count > bytes.length - at) fail(); at += count; }
+      await file.sync(); bytesWritten += bytes.length;
+    }).catch((error) => { poisoned ??= error; throw error; });
+    serial = next.catch(() => {}); return next;
+  };
+  const flush = async () => {
+    await serial; if (poisoned !== undefined) throw poisoned;
+    const encoded=await rootRead(path, BACKUP_V2_LIMITS.journalBytes);
+    return {...parseBackupV2NativeCustody(encoded, gate),sha256:backupV2ArtifactSha256(encoded)};
+  };
+  try {
+    await append({ type: "BOUND", schemaVersion: 1, gate });
+    using parent = await Deno.open(directory, { read: true }); await parent.sync();
+  } catch (error) { file.close(); throw error; }
+  return { append, flush, async close() { await serial; if (!closed) { closed = true; file.close(); } if (poisoned !== undefined) throw poisoned; } };
 }
 async function atomicArtifact(
   directory: string,
@@ -895,6 +939,7 @@ export async function runBackupV2RemoteWorker(
     for (const path of [stage, spoolDirectory, journalDirectory]) {
       await rootDirectory(path);
     }
+    const nativeCustody = await openBackupV2NativeCustody(directory, gate);
     const spool = new BackupV2Spool(
         await createBackupV2FileSpoolStorage(spoolDirectory),
       ),
@@ -1319,6 +1364,9 @@ export async function runBackupV2RemoteWorker(
       terminal = true;
       loopAbort.abort();
       await monitor;
+      const nativeFacts = await nativeCustody.flush();
+      if (nativeFacts.children.some(child => child.exit === null) || nativeFacts.unresolvedNamespaceLeaders.length) fail();
+      result={...result,nativeCustodySha256:nativeFacts.sha256};
       const resultSha256 = await atomicArtifact(
         directory,
         BACKUP_V2_RESULT_FILE,
@@ -1328,6 +1376,7 @@ export async function runBackupV2RemoteWorker(
       work.phase = kind === "worker" ? "CLOUD_COMPLETE" : "ACCEPTED";
       const status = await writeStatus(new Date().toISOString(), resultSha256);
       journal.close();
+      await nativeCustody.close();
       notifier.close(); // No STOPPING: retain active/exited custody.
       return status;
     } catch (error) {

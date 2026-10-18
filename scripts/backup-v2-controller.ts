@@ -116,6 +116,7 @@ export interface BackupV2ControllerObservation {
   identity: BackupV2SupervisorIdentity | null;
   status: unknown | null;
   resultBytes: Uint8Array | null;
+  nativeCustodySha256?: string | null;
   /** Independent collector, never inferred from a source status or missing unit. */
   tree: BackupV2TreeObservation | null;
 }
@@ -145,7 +146,7 @@ export interface BackupV2ControllerCapabilities {
   acknowledge(gate: BackupV2Gate): Promise<void>;
   verifierInput(job: BackupV2ControllerJob): Promise<void>;
   /** Must freshly reconcile the exact retained invocation immediately before stop. */
-  stop(gate: BackupV2Gate): Promise<void>;
+  stop(gate: BackupV2Gate, expected?: {resultSha256:string;nativeCustodySha256:string}): Promise<void>;
   cancel(gate: BackupV2Gate): Promise<"SETTLED" | "CANCELLATION_BLOCKED">;
   bridge: {
     ensure(
@@ -386,6 +387,14 @@ export function backupV2TreeSettled(
   observation: BackupV2ControllerObservation,
   retainedTerminalProof = false,
 ): boolean {
+  return backupV2ProcessesSettled(gate,observation,retainedTerminalProof)&&observation.tree!.namespaceReferences===0;
+}
+/** A retained unit may pin its own mount namespace after all work is gone.
+ * Preserve this actual process proof before stopping that exact invocation;
+ * only a separate fresh namespace-zero proof permits gate removal. */
+export function backupV2ProcessesSettled(
+  gate:BackupV2Gate,observation:BackupV2ControllerObservation,retainedTerminalProof=false,
+):boolean {
   const tree = observation.tree;
   if (
     !gate.custody || !tree || observation.sourceBootId !== gate.sourceBootId ||
@@ -396,7 +405,7 @@ export function backupV2TreeSettled(
   same(tree.identity, gate.custody);
   return tree.mainPid === 0 && tree.controlPid === 0 &&
     tree.cgroupPopulated === false && tree.descendants === 0 &&
-    tree.escapedProcesses === 0 && tree.namespaceReferences === 0 &&
+    tree.escapedProcesses === 0 && tree.namespaceReferences !== null && Number.isSafeInteger(tree.namespaceReferences) && tree.namespaceReferences >= 0 &&
     tree.openPipelineHandles === 0 && tree.pendingOperations === 0 &&
     tree.sourceLockFree === true;
 }
@@ -493,7 +502,7 @@ export async function stepBackupV2Controller(
     if (live !== null) {
       same(validateBackupV2Gate(live), gate);
       if (
-        !backupV2TreeSettled(gate, await deps.observe(gate)) &&
+        !backupV2ProcessesSettled(gate, await deps.observe(gate)) &&
         !await deps.gate.cleared(gate)
       ) {
         job.phase = "CANCELLATION_BLOCKED";
@@ -503,7 +512,9 @@ export async function stepBackupV2Controller(
         job.phase = "CANCELLATION_BLOCKED";
         return await save();
       }
-      await deps.stop(gate);
+      const terminal=kind==="worker"?job.workerStatus!:job.verifierStatus!,output=kind==="worker"?job.workerResult!:job.verified!;
+      if(!output.nativeCustodySha256)fail();
+      await deps.stop(gate,{resultSha256:terminal.resultSha256!,nativeCustodySha256:output.nativeCustodySha256});
       await deps.gate.replace(gate, null);
     } else {
       if (!await deps.gate.cleared(gate)) {
@@ -623,7 +634,7 @@ export async function stepBackupV2Controller(
   if (status.finishedAtUtc === null) return await save();
   if (["RUNNING", "STARTING"].includes(observation.unit)) return await save();
   if (
-    !backupV2TreeSettled(gate, observation) || !observation.resultBytes ||
+    !backupV2ProcessesSettled(gate, observation) || !observation.resultBytes ||
     backupV2ArtifactSha256(observation.resultBytes) !== status.resultSha256
   ) {
     job.phase = "CANCELLATION_BLOCKED";
@@ -632,6 +643,7 @@ export async function stepBackupV2Controller(
   const result = JSON.parse(
     new TextDecoder("utf-8", { fatal: true }).decode(observation.resultBytes),
   );
+  if(typeof result?.nativeCustodySha256!=="string"||result.nativeCustodySha256!==observation.nativeCustodySha256){job.phase="CANCELLATION_BLOCKED";return await save();}
   if (kind === "worker") {
     job.workerResult = validateBackupV2Result(result, gate);
     job.workerResultBytes = [...observation.resultBytes];
@@ -1037,12 +1049,16 @@ export function realBackupV2ControllerCapabilities(
     observeBackupV2Source(gate, deps.remote);
   const retainedProof = async (gate: BackupV2Gate): Promise<boolean> => {
     const saved = await deps.private.read<
-      { gate: unknown; proof: BackupV2ControllerObservation }
+      { gate: unknown; proof: BackupV2ControllerObservation; cancellation?:boolean; artifacts?:{resultSha256:string;nativeCustodySha256:string} }
     >(pathForClear(gate));
     if (!saved) return false;
     same(saved.gate, gate);
-    if (!backupV2TreeSettled(gate, saved.proof, true)) fail();
-    return backupV2TreeSettled(gate, await observe(gate), true);
+    if(saved.cancellation){if(saved.proof.sourceBootId!==gate.sourceBootId)fail();same(saved.proof.identity,gate.custody);}
+    else if (!backupV2ProcessesSettled(gate, saved.proof, false)) fail();
+    const current=await observe(gate);
+    if(!backupV2TreeSettled(gate,current,true))return false;
+    if(saved.artifacts&&(!current.resultBytes||backupV2ArtifactSha256(current.resultBytes)!==saved.artifacts.resultSha256||current.nativeCustodySha256!==saved.artifacts.nativeCustodySha256))return false;
+    return true;
   };
   return {
     now: deps.now,
@@ -1239,16 +1255,18 @@ export function realBackupV2ControllerCapabilities(
           workerResultBytes: job.workerResultBytes,
         },
       ),
-    async stop(gate) {
+    async stop(gate,expected) {
       const actual = await observe(gate);
       if (actual.unit === "ABSENT") {
         if (!await retainedProof(gate)) fail();
         return;
       }
-      if (!backupV2TreeSettled(gate, actual)) fail();
-      await deps.private.write(pathForClear(gate), {
+      if (!backupV2ProcessesSettled(gate, actual)) fail();
+      if(expected&&(!actual.resultBytes||backupV2ArtifactSha256(actual.resultBytes)!==expected.resultSha256||actual.nativeCustodySha256!==expected.nativeCustodySha256))fail();
+      if(!await deps.private.read(pathForClear(gate)))await deps.private.write(pathForClear(gate), {
         gate,
-        proof: actual,
+        proof: {...actual,resultBytes:null},
+        ...(expected?{artifacts:expected}:{}),
         recordedAtUtc: deps.now().toISOString(),
       });
       const script = `test "$(cat /proc/sys/kernel/random/boot_id)" = ${
@@ -1275,6 +1293,7 @@ export function realBackupV2ControllerCapabilities(
           const before = await observe(gate);
           same(before.identity, gate.custody);
           if (before.sourceBootId !== gate.sourceBootId) fail();
+          if(!await deps.private.read(pathForClear(gate)))await deps.private.write(pathForClear(gate),{gate,proof:{...before,resultBytes:null},cancellation:true,recordedAtUtc:deps.now().toISOString()});
           if (
             (await deps.remote.root(
               `test "$(systemctl show --value --property=InvocationID ${
@@ -1291,9 +1310,10 @@ export function realBackupV2ControllerCapabilities(
         if (!backupV2TreeSettled(gate, proof, true)) {
           return "CANCELLATION_BLOCKED";
         }
-        await deps.private.write(pathForClear(gate), {
+        if(!await deps.private.read(pathForClear(gate)))await deps.private.write(pathForClear(gate), {
           gate,
-          proof,
+          proof:{...proof,resultBytes:null},
+          cancellation:true,
           recordedAtUtc: deps.now().toISOString(),
         });
       }
