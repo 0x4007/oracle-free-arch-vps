@@ -1,5 +1,6 @@
 import {
   backupV2DeletedHandleBytes,
+  type BackupV2KernelCancellationStopProof,
   type BackupV2KernelCommand,
   type BackupV2KernelCommandResult,
   BackupV2KernelEvidenceError,
@@ -697,5 +698,139 @@ Deno.test("kernel malformed exact-stop proof and another invocation cannot autho
   await rejects(
     () => observeBackupV2Kernel(gate, f.run, { retainedTerminalProof: proof }),
     "CUSTODY",
+  );
+});
+
+async function cancelledFixture(
+  options: Parameters<typeof nativeFixture>[0] = { liveChild: true },
+) {
+  const f = await nativeFixture(options),
+    before = await observeBackupV2Kernel(gate, f.run);
+  const proof: BackupV2KernelCancellationStopProof = {
+    gate,
+    observation: before,
+    exactStop: {
+      unitName: gate.unitName,
+      invocationId: gate.custody!.invocationId,
+      sourceBootId: gate.sourceBootId,
+      completed: true,
+      code: 0,
+    },
+  };
+  f.base.state.main = 0;
+  f.base.state.load = "not-found";
+  f.base.state.invocation = "";
+  f.base.state.absent = true;
+  const run: BackupV2KernelCommand = (command, args) => {
+    if (command === "/usr/bin/find" && args[0] === "/proc") {
+      return Promise.resolve(ok("1\0"));
+    }
+    if (
+      command === "/usr/bin/cat" &&
+      ["/proc/123/stat", "/proc/124/stat"].includes(args.at(-1)!)
+    ) return Promise.resolve(missing());
+    return f.run(command, args);
+  };
+  return { ...f, proof, after: run, before };
+}
+
+Deno.test("kernel cancellation proves fresh physical settlement after RUNNING stop without EXIT frames", async () => {
+  const f = await cancelledFixture();
+  equal(f.before.unit, "RUNNING");
+  equal(f.before.tree?.mainPid, 123);
+  equal((await observeBackupV2Kernel(gate, f.after)).tree, null);
+  const after = await observeBackupV2Kernel(gate, f.after, {
+    cancellationStopProof: f.proof,
+  });
+  equal([after.unit, after.identity, after.nativeCustodySha256], [
+    "ABSENT",
+    gate.custody,
+    f.digest,
+  ]);
+  equal([
+    after.tree?.mainPid,
+    after.tree?.controlPid,
+    after.tree?.descendants,
+    after.tree?.escapedProcesses,
+    after.tree?.namespaceReferences,
+    after.tree?.openPipelineHandles,
+    after.tree?.pendingOperations,
+    after.tree?.sourceLockFree,
+  ], [0, 0, 0, 0, 0, 0, 0, true]);
+  // The same valid partial journal remains incomplete for ordinary success.
+  f.base.state.load = "loaded";
+  f.base.state.sub = "exited";
+  f.base.state.invocation = gate.custody!.invocationId;
+  equal(
+    (await observeBackupV2Kernel(gate, f.after)).tree?.pendingOperations,
+    null,
+  );
+  f.base.state.active = "inactive";
+  f.base.state.sub = "dead";
+  equal(
+    (await observeBackupV2Kernel(gate, f.after, {
+      cancellationStopProof: f.proof,
+    })).tree?.pendingOperations,
+    0,
+  );
+});
+
+Deno.test("kernel cancellation rejects mismatched stop/boot and never hides a live escaped actor", async () => {
+  const f = await cancelledFixture();
+  const bad = structuredClone(f.proof);
+  bad.exactStop.invocationId = "f".repeat(32);
+  await rejects(
+    () => observeBackupV2Kernel(gate, f.after, { cancellationStopProof: bad }),
+    "CUSTODY",
+  );
+  const boot = structuredClone(f.proof);
+  boot.exactStop.sourceBootId = GATE;
+  await rejects(
+    () => observeBackupV2Kernel(gate, f.after, { cancellationStopProof: boot }),
+    "CUSTODY",
+  );
+  const escaped: BackupV2KernelCommand = (command, args) => {
+    if (command === "/usr/bin/find" && args[0] === "/proc") {
+      return Promise.resolve(ok("1\0" + "124\0"));
+    }
+    if (command === "/usr/bin/cat" && args.at(-1) === "/proc/124/stat") {
+      return Promise.resolve(ok(stat(124, "789")));
+    }
+    if (command === "/usr/bin/cat" && args.at(-1) === "/proc/124/cgroup") {
+      return Promise.resolve(ok("0::/user.slice/session-999.scope\n"));
+    }
+    return f.after(command, args);
+  };
+  const blocked = await observeBackupV2Kernel(gate, escaped, {
+    cancellationStopProof: f.proof,
+  });
+  equal(blocked.tree?.escapedProcesses, 1);
+  equal(blocked.tree?.pendingOperations, null);
+  const unknown = await cancelledFixture({
+    unresolved: true,
+    missingExit: true,
+  });
+  equal(
+    (await observeBackupV2Kernel(gate, unknown.after, {
+      cancellationStopProof: unknown.proof,
+    })).tree?.namespaceReferences,
+    null,
+  );
+  f.base.state.load = "loaded";
+  f.base.state.active = "inactive";
+  f.base.state.sub = "dead";
+  f.base.state.invocation = "f".repeat(32);
+  equal(
+    (await observeBackupV2Kernel(gate, f.after, {
+      cancellationStopProof: f.proof,
+    })).identity,
+    null,
+  );
+  f.base.state.boot = GATE;
+  equal(
+    (await observeBackupV2Kernel(gate, f.after, {
+      cancellationStopProof: f.proof,
+    })).identity,
+    null,
   );
 });

@@ -48,6 +48,17 @@ export interface BackupV2KernelRetainedTerminalProof {
 export interface BackupV2KernelObservationOptions {
   expectedCustodySha256?: string;
   retainedTerminalProof?: BackupV2KernelRetainedTerminalProof;
+  cancellationStopProof?: BackupV2KernelCancellationStopProof;
+}
+export interface BackupV2KernelCancellationStopProof {
+  /** Process settlement only. Cloud intents and missing exit outcomes remain
+   * unchanged and must be reconciled independently before any acceptance. */
+  gate: BackupV2Gate;
+  observation: Pick<
+    BackupV2KernelObservation,
+    "sourceBootId" | "unit" | "identity" | "tree"
+  >;
+  exactStop: BackupV2KernelRetainedTerminalProof["exactStop"] & { code: 0 };
 }
 function outputLimit(command: string, args: string[]): number {
   return command === "/usr/bin/cat" && JOURNAL_PATH.test(args.at(-1) ?? "")
@@ -566,6 +577,34 @@ function numbers(text: string, descriptors = false): number[] {
     ),
   ];
 }
+function cancellation(
+  gate: BackupV2Gate,
+  options: BackupV2KernelObservationOptions,
+): BackupV2KernelCancellationStopProof | null {
+  const proof = options.cancellationStopProof;
+  if (!proof) return null;
+  if (options.retainedTerminalProof || !gate.custody) fail("CUSTODY");
+  validateBackupV2NativeCustodyRecord({
+    type: "BOUND",
+    schemaVersion: 1,
+    gate: proof.gate,
+  }, gate);
+  const before = proof.observation, tree = before.tree, stop = proof.exactStop;
+  if (
+    before.sourceBootId !== gate.sourceBootId ||
+    !["RUNNING", "STARTING", "EXITED", "FAILED"].includes(before.unit) ||
+    !before.identity || !sameIdentity(before.identity, gate.custody) || !tree ||
+    !sameIdentity(tree.identity, gate.custody) ||
+    ![0, gate.custody.mainPid].includes(tree.mainPid) ||
+    ["RUNNING", "STARTING"].includes(before.unit) &&
+      tree.mainPid !== gate.custody.mainPid ||
+    stop.completed !== true || stop.code !== 0 ||
+    stop.unitName !== gate.unitName ||
+    stop.invocationId !== gate.custody.invocationId ||
+    stop.sourceBootId !== gate.sourceBootId
+  ) fail("CUSTODY");
+  return proof;
+}
 async function namespaceId(
   path: string,
   run: BackupV2KernelCommand,
@@ -634,6 +673,7 @@ async function custodyFacts(
   command: BackupV2KernelCommand,
   options: BackupV2KernelObservationOptions,
   proof: BackupV2KernelRetainedTerminalProof | null,
+  cancelled = false,
 ): Promise<CustodyFacts> {
   const facts: CustodyFacts = {
     hash: null,
@@ -697,7 +737,7 @@ async function custodyFacts(
     for (let at = 0; at < known.length; at++) {
       const entry = known[at];
       let exists = false;
-      if (present.has(entry.identity.pid)) {
+      if (present.has(entry.identity.pid) || cancelled) {
         try {
           exists = fields(
             result(
@@ -714,7 +754,7 @@ async function custodyFacts(
       }
       if (at === 0) facts.mainGone = !exists;
       if (!exists) {
-        if (at !== 0 && !entry.exit) complete = false;
+        if (at !== 0 && !entry.exit && !cancelled) complete = false;
         continue;
       }
       if (entry.exit) complete = false;
@@ -780,7 +820,7 @@ async function custodyFacts(
     facts.handles = handles;
     if (
       facts.mainGone && live.size === 0 && descendants === 0 &&
-      journal.children.every((child) => child.exit !== null)
+      (cancelled || journal.children.every((child) => child.exit !== null))
     ) facts.pending = 0;
     const host = await namespaceId("/proc/1/ns/mnt", command);
     if (
@@ -842,7 +882,9 @@ export async function observeBackupV2Kernel(
       16_384,
       2 * BACKUP_V2_LIMITS.journalBytes + 8 * MAX_BYTES,
     ),
-    proof = retained(gate, options);
+    proof = retained(gate, options),
+    cancelled = cancellation(gate, options),
+    stopped = proof !== null || cancelled !== null;
   const sourceBootId = result(
     await run("/usr/bin/cat", ["--", "/proc/sys/kernel/random/boot_id"]),
   ).trim();
@@ -857,7 +899,10 @@ export async function observeBackupV2Kernel(
   if (response.code !== 0 && props.LoadState !== "not-found") {
     fail("UNREADABLE");
   }
-  const unit = props.LoadState === "not-found"
+  const unit = props.LoadState === "not-found" ||
+      stopped && props.LoadState === "loaded" &&
+        props.ActiveState === "inactive" && props.SubState === "dead" &&
+        props.MainPID === "0" && props.ControlPID === "0"
     ? "ABSENT"
     : props.ActiveState === "failed"
     ? "FAILED"
@@ -874,7 +919,11 @@ export async function observeBackupV2Kernel(
     nativeCustodySha256: null,
     managerNamespaceReferences: null,
   } as const;
-  if (sourceBootId !== gate.sourceBootId || unit === "ABSENT" && !proof) {
+  if (
+    sourceBootId !== gate.sourceBootId || unit === "ABSENT" && !stopped ||
+    stopped && props.InvocationID &&
+      props.InvocationID !== gate.custody?.invocationId
+  ) {
     return unknown;
   }
   if (!/^[0-9]+$/.test(props.MainPID) || !/^[0-9]+$/.test(props.ControlPID)) {
@@ -910,7 +959,7 @@ export async function observeBackupV2Kernel(
     props.InvocationID === gate.custody.invocationId &&
     ["EXITED", "FAILED"].includes(unit)
   ) identity = gate.custody;
-  else if (unit === "ABSENT" && proof) identity = gate.custody;
+  else if (unit === "ABSENT" && stopped) identity = gate.custody;
   if (!identity) return unknown;
   let descendants: number | null = null, cgroupPopulated: boolean | null = null;
   try {
@@ -929,7 +978,7 @@ export async function observeBackupV2Kernel(
       absent(error) &&
       (unit === "EXITED" && props.Result === "success" &&
           props.InvocationID === identity.invocationId ||
-        unit === "ABSENT" && proof !== null) &&
+        unit === "ABSENT" && stopped) &&
       mainPid === 0 &&
       controlPid === 0
     ) {
@@ -952,10 +1001,12 @@ export async function observeBackupV2Kernel(
     run,
     options,
     proof,
+    cancelled !== null,
   );
   if (
     unit === "ABSENT" &&
-    (!facts.mainGone || facts.hash !== proof!.observation.nativeCustodySha256)
+    (!facts.mainGone || !facts.hash ||
+      proof !== null && facts.hash !== proof.observation.nativeCustodySha256)
   ) return unknown;
   return {
     sourceBootId,
