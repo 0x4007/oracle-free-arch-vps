@@ -406,13 +406,20 @@ export async function backupV2DeletedHandleBytes(
           membership !== `0::${cgroup}` &&
           !membership.startsWith(`0::${cgroup}/`)
         ) fail("CUSTODY");
+        // Observer-created pipes can close before the next metadata read.
+        // Only unlinked regular files can contribute retained disk blocks.
         const descriptors = result(
           await run("/usr/bin/find", [
+            "-L",
             `/proc/${current}/fd`,
             "-mindepth",
             "1",
             "-maxdepth",
             "1",
+            "-type",
+            "f",
+            "-links",
+            "0",
             "-printf",
             "%f\\0",
           ]),

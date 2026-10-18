@@ -162,7 +162,7 @@ function fixture() {
       }
     }
     if (command === "/usr/bin/find") {
-      if (args[0].endsWith("/fd")) {
+      if (args[0] === "-L" && args[1].endsWith("/fd")) {
         return Promise.resolve(ok("3\0" + "4\0" + "5\0"));
       }
       return Promise.resolve(
@@ -341,6 +341,82 @@ Deno.test("kernel deleted handles count physical blocks once and preserve newlin
       command === "/usr/bin/stat" && args.includes("-L")
     ),
   );
+});
+
+Deno.test("kernel deleted census selects only unlinked regular FDs and never reads observer pipes or linked files", async () => {
+  const f = fixture(), targets: string[] = [];
+  const onlyDeleted: BackupV2KernelCommand = (command, args) => {
+    if (command === "/usr/bin/find" && args[0] === "-L") {
+      equal(args, [
+        "-L",
+        "/proc/123/fd",
+        "-mindepth",
+        "1",
+        "-maxdepth",
+        "1",
+        "-type",
+        "f",
+        "-links",
+        "0",
+        "-printf",
+        "%f\\0",
+      ]);
+      // Real GNU find contract: deleted regular fd3 survives; observer pipes,
+      // sockets/devices and linked regular files do not enter the later reads.
+      return Promise.resolve(ok("3\0"));
+    }
+    if (command === "/usr/bin/stat" && args.includes("-L")) {
+      targets.push(...args.slice(args.indexOf("--") + 1));
+      return Promise.resolve(ok("1:5:8:0:regular file\0"));
+    }
+    if (command === "/usr/bin/readlink") {
+      targets.push(...args.slice(args.indexOf("--") + 1));
+      return Promise.resolve(ok(`${directory}/spool/deleted (deleted)\0`));
+    }
+    return f.run(command, args);
+  };
+  equal(await backupV2DeletedHandleBytes(directory, cgroup, onlyDeleted), {
+    workspaceHeldDeletedBytes: 4096,
+    sourceHeldDeletedBytes: 0,
+  });
+  equal(targets, Array(3).fill("/proc/123/fd/3"));
+});
+
+Deno.test("kernel empty filtered FD result requires successful enumeration and unchanged process identity", async () => {
+  for (const fault of ["none", "denied", "reused"] as const) {
+    const f = fixture();
+    let statReads = 0, enumerations = 0;
+    const empty: BackupV2KernelCommand = (command, args) => {
+      if (command === "/usr/bin/find" && args[0] === "-L") {
+        enumerations++;
+        return Promise.resolve(
+          fault === "denied"
+            ? { code: 1, stdout: "", stderr: "Permission denied" }
+            : ok(""),
+        );
+      }
+      if (command === "/usr/bin/cat" && args.at(-1) === "/proc/123/stat") {
+        return Promise.resolve(
+          ok(stat(123, ++statReads > 1 && fault === "reused" ? "999" : "456")),
+        );
+      }
+      return f.run(command, args);
+    };
+    if (fault === "none") {
+      equal(await backupV2DeletedHandleBytes(directory, cgroup, empty), {
+        workspaceHeldDeletedBytes: 0,
+        sourceHeldDeletedBytes: 0,
+      });
+      equal(statReads, 2);
+    } else {
+      await rejects(
+        () => backupV2DeletedHandleBytes(directory, cgroup, empty),
+        fault === "denied" ? "UNREADABLE" : "CUSTODY",
+      );
+    }
+    equal(enumerations, 1);
+    assert(!f.calls.some(([command]) => command === "/usr/bin/readlink"));
+  }
 });
 
 Deno.test("kernel deleted accounting restarts the complete census after a disappearing child", async () => {
@@ -669,7 +745,7 @@ Deno.test("kernel FD replacement, excessive enumeration and unavailable group bl
     "CUSTODY",
   );
   const many: BackupV2KernelCommand = (command, args) =>
-    command === "/usr/bin/find" && args[0].endsWith("/fd")
+    command === "/usr/bin/find" && args[0] === "-L" && args[1].endsWith("/fd")
       ? Promise.resolve(
         ok(Array.from({ length: 4097 }, (_, n) => `${n}\0`).join("")),
       )
