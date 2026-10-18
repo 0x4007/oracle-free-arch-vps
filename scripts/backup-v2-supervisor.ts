@@ -588,13 +588,55 @@ export interface BackupV2TreeObservation {
 }
 export interface BackupV2CancellationCapabilities {
   now(): number;
-  observe(signal: AbortSignal): Promise<BackupV2TreeObservation>;
+  observe(signal: AbortSignal): Promise<BackupV2TreeObservation | null>;
+  wait?(milliseconds: number, signal: AbortSignal): Promise<void>;
   /** Reconcile the exact invocation again immediately before mutation; never
    * stop a replacement invocation sharing the unit name. */
   stop(
     identity: BackupV2SupervisorIdentity,
     signal: AbortSignal,
   ): Promise<void>;
+}
+
+/** Fresh observations only; an unknown sample never becomes settlement proof.
+ * The caller must already have completed the exact stop before using this. */
+export async function pollBackupV2Settlement(
+  observe: (signal: AbortSignal) => Promise<boolean>,
+  timeoutMs = 30_000,
+  now: () => number = () => performance.now(),
+  wait: (milliseconds: number, signal: AbortSignal) => Promise<void> = (
+    milliseconds,
+    signal,
+  ) =>
+    new Promise((resolve, reject) => {
+      const abort = () => {
+        clearTimeout(timer);
+        reject(signal.reason);
+      };
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", abort);
+        resolve();
+      }, milliseconds);
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+    }),
+): Promise<boolean> {
+  finite(timeoutMs, 1, 30_000);
+  let sampled = finite(now());
+  const deadline = sampled + timeoutMs;
+  const remaining = () => {
+    sampled = finite(now(), sampled);
+    return deadline - sampled;
+  };
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const available = remaining();
+    if (available <= 0) return false;
+    if (await bounded(observe, available)) return true;
+    const left = remaining();
+    if (attempt === 5 || left <= 0) return false;
+    await bounded((signal) => wait(Math.min(250, left), signal), left);
+  }
+  return false;
 }
 export type BackupV2CancellationResult = {
   state: "SETTLED" | "CANCELLATION_BLOCKED";
@@ -621,6 +663,7 @@ export async function settleBackupV2Cancellation(
       (signal) => capabilities.observe(signal),
       remaining(),
     );
+    if (proof === null) return null;
     if (!sameIdentity(expected, proof.identity)) {
       throw new Error("Cancellation identity changed");
     }
@@ -645,12 +688,23 @@ export async function settleBackupV2Cancellation(
     proof.sourceLockFree === true;
   try {
     const before = await read();
+    if (before === null) throw new Error("Cancellation custody is unknown");
     if (!settled(before)) {
       await bounded(
         (signal) => capabilities.stop(expected, signal),
         remaining(),
       );
-      if (!settled(await read())) {
+      if (
+        !await pollBackupV2Settlement(
+          async () => {
+            const proof = await read();
+            return proof !== null && settled(proof);
+          },
+          remaining(),
+          capabilities.now,
+          capabilities.wait,
+        )
+      ) {
         throw new Error("Cancellation tree is not settled");
       }
     }
