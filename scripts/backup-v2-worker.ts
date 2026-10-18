@@ -22,8 +22,8 @@ import {
   BACKUP_V2_ROLES,
   type BackupV2ManifestRef,
   type BackupV2ObjectRef,
-  type BackupV2PutIntent,
   type BackupV2Progress,
+  type BackupV2PutIntent,
   type BackupV2Receipt,
   type BackupV2RoleManifest,
   type BackupV2TransferEpisode,
@@ -57,8 +57,8 @@ import {
 import type { BackupV2UploadIdentity } from "./backup-v2-upload.ts";
 import type { BackupV2UploadRetryEpisode } from "./backup-v2-upload.ts";
 import {
-  createBackupV2UploadPacer,
   BackupV2UploadJournal,
+  createBackupV2UploadPacer,
   openBackupV2UploadJournal,
 } from "./backup-v2-upload.ts";
 import {
@@ -67,7 +67,11 @@ import {
   createBackupV2FileSpoolStorage,
 } from "./backup-v2-spool.ts";
 import { BACKUP_V2_LIMITS } from "./backup-v2-profile.ts";
-import { BackupV2Store, BackupV2TransportError, createCurlBackupV2Wire } from "./backup-v2-store.ts";
+import {
+  BackupV2Store,
+  BackupV2TransportError,
+  createCurlBackupV2Wire,
+} from "./backup-v2-store.ts";
 import { createBackupV2FileObjectReader } from "./backup-v2-recovery.ts";
 import {
   type BackupV2CapacityObservation,
@@ -95,15 +99,17 @@ import { createBackupV2NativeProcessStarter } from "./backup-v2-native-process.t
 import { spawnBackupV2GpgDecrypt } from "./backup-v2-decrypt.ts";
 import {
   backupV2DeletedHandleBytes,
+  type BackupV2KernelObservationOptions,
+  observeBackupV2Kernel,
   readBackupV2KernelText,
 } from "./backup-v2-kernel.ts";
 import {
-  type BackupV2ProtectionDescriptor,
-  type BackupV2PruneInput,
-  type BackupV2PruneResult,
   BACKUP_V2_PROTECTION_SOURCE_BASE,
+  type BackupV2ProtectionDescriptor,
   backupV2ProtectionPageName,
   backupV2ProtectionSourceDirectory,
+  type BackupV2PruneInput,
+  type BackupV2PruneResult,
   buildBackupV2Protection,
   validateBackupV2ProtectionDescriptor,
 } from "./backup-v2-protection.ts";
@@ -114,8 +120,8 @@ import {
   makeStreamDecryptArchive,
   PUBLIC_HOME_BASE,
   RELEASES_ROOT,
-  validateReleaseManifest,
   validateCatalogEntry,
+  validateReleaseManifest,
 } from "./backblaze-file-backup.ts";
 import { runBackupV2SourcePruner } from "./backup-v2-source-pruner.ts";
 import { createBackupV2PruneRuntime } from "./backup-v2-prune-runtime.ts";
@@ -462,8 +468,10 @@ export function validateBackupV2VerifiedResult(
       "receipt",
       "receiptReference",
       "finishedAtUtc",
-      ...(Object.hasOwn(value,"nativeCustodySha256")?["nativeCustodySha256"]:[]),
-      ...(Object.hasOwn(value,"protectedGraph")?["protectedGraph"]:[]),
+      ...(Object.hasOwn(value, "nativeCustodySha256")
+        ? ["nativeCustodySha256"]
+        : []),
+      ...(Object.hasOwn(value, "protectedGraph") ? ["protectedGraph"] : []),
     ];
   if (
     Object.keys(r).length !== fields.length ||
@@ -491,9 +499,15 @@ export function validateBackupV2VerifiedResult(
     r.finishedAtUtc < receipt.verifiedAtUtc
   ) fail();
   const receiptReference = validateBackupV2ManifestRef(r.receiptReference);
-  const protectedGraph = Object.hasOwn(r,"protectedGraph") ? validateBackupV2ProtectionDescriptor(r.protectedGraph) : undefined;
+  const protectedGraph = Object.hasOwn(r, "protectedGraph")
+    ? validateBackupV2ProtectionDescriptor(r.protectedGraph)
+    : undefined;
   if (protectedGraph) same(protectedGraph.root, worker.selectedRoot.reference);
-  if(Object.hasOwn(r,"nativeCustodySha256")&&(typeof r.nativeCustodySha256!=="string"||!/^[a-f0-9]{64}$/.test(r.nativeCustodySha256)))fail();
+  if (
+    Object.hasOwn(r, "nativeCustodySha256") &&
+    (typeof r.nativeCustodySha256 !== "string" ||
+      !/^[a-f0-9]{64}$/.test(r.nativeCustodySha256))
+  ) fail();
   return {
     schemaVersion: 2,
     format: "backup-v2-verified",
@@ -504,8 +518,10 @@ export function validateBackupV2VerifiedResult(
     receipt,
     receiptReference,
     finishedAtUtc: r.finishedAtUtc,
-    ...(Object.hasOwn(r,"nativeCustodySha256")?{nativeCustodySha256:r.nativeCustodySha256 as string}:{}),
-    ...(protectedGraph ? {protectedGraph} : {}),
+    ...(Object.hasOwn(r, "nativeCustodySha256")
+      ? { nativeCustodySha256: r.nativeCustodySha256 as string }
+      : {}),
+    ...(protectedGraph ? { protectedGraph } : {}),
   };
 }
 
@@ -570,7 +586,10 @@ export class BackupV2WorkerProgress {
   }
   retention(inventoryMembers: number): void {
     this.phase = "PRUNING";
-    this.#values.inventoryMembers += this.#advance("retention",inventoryMembers);
+    this.#values.inventoryMembers += this.#advance(
+      "retention",
+      inventoryMembers,
+    );
   }
   snapshot(observedMonotonicMs: number): BackupV2Progress {
     return { phase: this.phase, observedMonotonicMs, ...this.#values };
@@ -634,23 +653,46 @@ export async function discoverBackupV2SourceGates(): Promise<BackupV2Gate[]> {
   return gates;
 }
 /** Read-only intent census. No failed or missing receipt erases a durable PUT. */
-export async function discoverBackupV2UnresolvedPuts(): Promise<BackupV2PutIntent[]> {
-  const intents = new Map<string,BackupV2PutIntent>();
+export async function discoverBackupV2UnresolvedPuts(): Promise<
+  BackupV2PutIntent[]
+> {
+  const intents = new Map<string, BackupV2PutIntent>();
   let total = 0;
   for (const gate of await discoverBackupV2SourceGates()) {
     const path = `${backupV2GateDirectory(gate)}/journal/upload-journal.ndjson`;
     let bytes: Uint8Array;
-    try {bytes = await rootRead(path,BACKUP_V2_LIMITS.journalBytes);}
-    catch (error) {if (error instanceof Deno.errors.NotFound) continue;throw error;}
+    try {
+      bytes = await rootRead(path, BACKUP_V2_LIMITS.journalBytes);
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) continue;
+      throw error;
+    }
     total += bytes.length;
     if (total > BACKUP_V2_LIMITS.journalBytes) fail();
-    const text = new TextDecoder("utf-8",{fatal:true}).decode(bytes);
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     if (text && !text.endsWith("\n")) fail();
-    const records = text ? text.slice(0,-1).split("\n").map((line) => JSON.parse(line)) : [];
-    const journal = new BackupV2UploadJournal(gate.envelope.request.captureId, () => Promise.reject(new Error("Read-only journal")), records);
-    const reclaimed = new Set(journal.snapshot().filter((entry) => entry.type === "reclaimed").map((entry) => entry.name));
-    for (const record of journal.snapshot()) if (record.type === "intent" && !reclaimed.has(record.intent.name)) intents.set(record.intent.name,record.intent);
-    if (backupV2ArtifactBytes([...intents.values()]).length > BACKUP_V2_LIMITS.controlResponseBytes) fail();
+    const records = text
+      ? text.slice(0, -1).split("\n").map((line) => JSON.parse(line))
+      : [];
+    const journal = new BackupV2UploadJournal(
+      gate.envelope.request.captureId,
+      () => Promise.reject(new Error("Read-only journal")),
+      records,
+    );
+    const reclaimed = new Set(
+      journal.snapshot().flatMap((entry) =>
+        entry.type === "reclaimed" ? [entry.name] : []
+      ),
+    );
+    for (const record of journal.snapshot()) {
+      if (record.type === "intent" && !reclaimed.has(record.intent.name)) {
+        intents.set(record.intent.name, record.intent);
+      }
+    }
+    if (
+      backupV2ArtifactBytes([...intents.values()]).length >
+        BACKUP_V2_LIMITS.controlResponseBytes
+    ) fail();
   }
   return [...intents.values()];
 }
@@ -672,6 +714,130 @@ async function rootRead(
   ) fail();
   return bytes;
 }
+/** Only ephemeral decoder/producer scratch is removed. Native/upload journals,
+ * source results, checkpoints and protected graph copies are retained. */
+export interface BackupV2ScratchCleanupReceipt {
+  schemaVersion: 2;
+  format: "backup-v2-scratch-cleanup";
+  requestSha256: string;
+  gates: BackupV2Gate[];
+  entriesRemoved: number;
+  logicalBytesRemoved: number;
+  completedAtUtc: string;
+}
+export async function cleanupBackupV2Scratch(
+  proofs: { gate: BackupV2Gate; options: BackupV2KernelObservationOptions }[],
+  managedGate: BackupV2Gate,
+): Promise<BackupV2ScratchCleanupReceipt> {
+  if (
+    managedGate.kind !== "prune" || !managedGate.custody ||
+    managedGate.custody.mainPid !== Deno.pid
+  ) fail();
+  same((await ownExecution(managedGate)).custody, managedGate.custody);
+  if (
+    proofs.length !== 2 ||
+    new Set(proofs.map((proof) => proof.gate.kind)).size !== 2
+  ) fail();
+  const gates = proofs.map(({ gate }) => validateBackupV2Gate(gate));
+  if (
+    !gates.some((gate) => gate.kind === "worker") ||
+    !gates.some((gate) => gate.kind === "verify")
+  ) fail();
+  same(gates[0].envelope, gates[1].envelope);
+  same(gates[0].envelope, managedGate.envelope);
+  let entries = 0, logicalBytesRemoved = 0;
+  const paths: { path: string; info: Deno.FileInfo }[] = [];
+  // The managed pruner caller already holds the source lock.
+  const prove = async () => {
+    for (const proof of proofs) {
+      if (
+        !proof.options.retainedTerminalProof ||
+        !proof.options.expectedCustodySha256
+      ) fail();
+      const observed = await observeBackupV2Kernel(
+          proof.gate,
+          undefined,
+          proof.options,
+        ),
+        tree = observed.tree;
+      if (
+        observed.sourceBootId !== proof.gate.sourceBootId ||
+        observed.nativeCustodySha256 !== proof.options.expectedCustodySha256 ||
+        !tree || tree.mainPid !== 0 || tree.controlPid !== 0 ||
+        tree.cgroupPopulated !== false || tree.descendants !== 0 ||
+        tree.escapedProcesses !== 0 || tree.namespaceReferences !== 0 ||
+        tree.openPipelineHandles !== 0 || tree.pendingOperations !== 0
+      ) fail();
+      same(observed.identity, proof.gate.custody);
+    }
+  };
+  await prove();
+  const walk = async (path: string, depth: number): Promise<void> => {
+    if (++entries > 10_000 || depth > 32) fail();
+    const info = await Deno.lstat(path);
+    if (
+      info.isSymlink || info.uid !== 0 ||
+      !info.isDirectory && !info.isFile && !info.isFifo || info.mode === null ||
+      (info.mode & 0o077) !== 0 || !info.isDirectory && info.nlink !== 1
+    ) fail();
+    if (info.isDirectory) {
+      for await (const child of Deno.readDir(path)) {
+        await walk(`${path}/${child.name}`, depth + 1);
+      }
+    } else {
+      logicalBytesRemoved += info.size;
+      if (logicalBytesRemoved > BACKUP_V2_LIMITS.workspaceBytes) fail();
+    }
+    paths.push({ path, info });
+  };
+  for (const gate of gates) {
+    for (const name of ["stage", "spool", "read-slots"]) {
+      const path = `${backupV2GateDirectory(gate)}/${name}`;
+      try {
+        await Deno.lstat(path);
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) {
+          throw error;
+        }
+        continue;
+      }
+      await walk(path, 0);
+    }
+  }
+  await prove();
+  for (const entry of paths) {
+    const actual = await Deno.lstat(entry.path);
+    if (
+      actual.isSymlink || actual.dev !== entry.info.dev ||
+      actual.ino !== entry.info.ino || actual.uid !== entry.info.uid ||
+      actual.mode !== entry.info.mode ||
+      !actual.isDirectory &&
+        (actual.size !== entry.info.size || actual.nlink !== 1)
+    ) fail();
+    await Deno.remove(entry.path);
+  }
+  for (const gate of gates) {
+    for (const name of ["stage", "spool", "read-slots"]) {
+      try {
+        await Deno.lstat(`${backupV2GateDirectory(gate)}/${name}`);
+        fail();
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) {
+          throw error;
+        }
+      }
+    }
+  }
+  return {
+    schemaVersion: 2,
+    format: "backup-v2-scratch-cleanup",
+    requestSha256: gates[0].envelope.requestSha256,
+    gates,
+    entriesRemoved: paths.length,
+    logicalBytesRemoved,
+    completedAtUtc: new Date().toISOString(),
+  };
+}
 async function rootDirectory(path: string): Promise<void> {
   try {
     await Deno.mkdir(path, { mode: 0o700 });
@@ -682,36 +848,84 @@ async function rootDirectory(path: string): Promise<void> {
 }
 /** One per-invocation append file. Registration resolves only after the exact
  * facts are durable; an uncertain write poisons later registration. */
-export async function openBackupV2NativeCustody(directory: string, gate: BackupV2Gate) {
+export async function openBackupV2NativeCustody(
+  directory: string,
+  gate: BackupV2Gate,
+) {
   await assertBackupV2Directory(directory);
   const path = `${directory}/${BACKUP_V2_NATIVE_CUSTODY_FILE}`;
-  const file = await Deno.open(path, { createNew: true, read: true, write: true, mode: 0o600 });
+  const file = await Deno.open(path, {
+    createNew: true,
+    read: true,
+    write: true,
+    mode: 0o600,
+  });
   const identity = await file.stat();
-  let bytesWritten = 0, serial = Promise.resolve(), poisoned: unknown, closed = false;
+  let bytesWritten = 0,
+    serial = Promise.resolve(),
+    poisoned: unknown,
+    closed = false;
   const append = (input: BackupV2NativeCustodyRecord): Promise<void> => {
     const next = serial.then(async () => {
       if (poisoned !== undefined) throw poisoned;
       if (closed) fail();
-      const record = validateBackupV2NativeCustodyRecord(input, gate), bytes = backupV2NativeCustodyBytes(record);
-      if (bytes.length > 16 * 1024 || bytesWritten + bytes.length > BACKUP_V2_LIMITS.journalBytes) fail();
+      const record = validateBackupV2NativeCustodyRecord(input, gate),
+        bytes = backupV2NativeCustodyBytes(record);
+      if (
+        bytes.length > 16 * 1024 ||
+        bytesWritten + bytes.length > BACKUP_V2_LIMITS.journalBytes
+      ) fail();
       const current = await Deno.lstat(path);
-      if (!current.isFile || current.isSymlink || current.uid !== 0 || current.nlink !== 1 || current.mode === null || (current.mode & 0o777) !== 0o600 || current.dev !== identity.dev || current.ino !== identity.ino || current.size !== bytesWritten) fail();
+      if (
+        !current.isFile || current.isSymlink || current.uid !== 0 ||
+        current.nlink !== 1 || current.mode === null ||
+        (current.mode & 0o777) !== 0o600 || current.dev !== identity.dev ||
+        current.ino !== identity.ino || current.size !== bytesWritten
+      ) fail();
       let at = 0;
-      while (at < bytes.length) { const count = await file.write(bytes.subarray(at)); if (count <= 0 || count > bytes.length - at) fail(); at += count; }
-      await file.sync(); bytesWritten += bytes.length;
-    }).catch((error) => { poisoned ??= error; throw error; });
-    serial = next.catch(() => {}); return next;
+      while (at < bytes.length) {
+        const count = await file.write(bytes.subarray(at));
+        if (count <= 0 || count > bytes.length - at) fail();
+        at += count;
+      }
+      await file.sync();
+      bytesWritten += bytes.length;
+    }).catch((error) => {
+      poisoned ??= error;
+      throw error;
+    });
+    serial = next.catch(() => {});
+    return next;
   };
   const flush = async () => {
-    await serial; if (poisoned !== undefined) throw poisoned;
-    const encoded=await rootRead(path, BACKUP_V2_LIMITS.journalBytes);
-    return {...parseBackupV2NativeCustody(encoded, gate),sha256:backupV2ArtifactSha256(encoded)};
+    await serial;
+    if (poisoned !== undefined) throw poisoned;
+    const encoded = await rootRead(path, BACKUP_V2_LIMITS.journalBytes);
+    return {
+      ...parseBackupV2NativeCustody(encoded, gate),
+      sha256: backupV2ArtifactSha256(encoded),
+    };
   };
   try {
     await append({ type: "BOUND", schemaVersion: 1, gate });
-    using parent = await Deno.open(directory, { read: true }); await parent.sync();
-  } catch (error) { file.close(); throw error; }
-  return { append, flush, async close() { await serial; if (!closed) { closed = true; file.close(); } if (poisoned !== undefined) throw poisoned; } };
+    using parent = await Deno.open(directory, { read: true });
+    await parent.sync();
+  } catch (error) {
+    file.close();
+    throw error;
+  }
+  return {
+    append,
+    flush,
+    async close() {
+      await serial;
+      if (!closed) {
+        closed = true;
+        file.close();
+      }
+      if (poisoned !== undefined) throw poisoned;
+    },
+  };
 }
 async function atomicArtifact(
   directory: string,
@@ -762,9 +976,10 @@ async function atomicArtifact(
 async function ownExecution(gate: BackupV2Gate): Promise<BackupV2Gate> {
   const boot = (await readBackupV2KernelText("/proc/sys/kernel/random/boot_id"))
     .trim();
-  const cgroup = (await readBackupV2KernelText(`/proc/${Deno.pid}/cgroup`)).trim().split(
-    "\n",
-  ).find((line) => line.startsWith("0::"))?.slice(3);
+  const cgroup = (await readBackupV2KernelText(`/proc/${Deno.pid}/cgroup`))
+    .trim().split(
+      "\n",
+    ).find((line) => line.startsWith("0::"))?.slice(3);
   const process = await readBackupV2KernelText(`/proc/${Deno.pid}/stat`),
     mainStartTicks = process.slice(process.lastIndexOf(")") + 2).split(" ")[19];
   const invocationId = Deno.env.get("INVOCATION_ID");
@@ -876,10 +1091,18 @@ async function capacity(
     }
   };
   await walk(directory, 0);
-  try { await walk(BACKUP_V2_PROTECTION_SOURCE_BASE, 0); }
-  catch (error) { if (!(error instanceof Deno.errors.NotFound) && !(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error; }
-  const { workspaceHeldDeletedBytes: workspaceDeleted, sourceHeldDeletedBytes: sourceDeleted } =
-    await backupV2DeletedHandleBytes(directory, cgroup);
+  try {
+    await walk(BACKUP_V2_PROTECTION_SOURCE_BASE, 0);
+  } catch (error) {
+    if (
+      !(error instanceof Deno.errors.NotFound) &&
+      !(error instanceof Error && "code" in error && error.code === "ENOENT")
+    ) throw error;
+  }
+  const {
+    workspaceHeldDeletedBytes: workspaceDeleted,
+    sourceHeldDeletedBytes: sourceDeleted,
+  } = await backupV2DeletedHandleBytes(directory, cgroup);
   workspaceHeldDeletedBytes = workspaceDeleted;
   sourceHeldDeletedBytes = sourceDeleted;
   const fs = await statfs(directory, { bigint: true });
@@ -892,11 +1115,15 @@ async function capacity(
     sourceHeldDeletedBytes,
   };
 }
-async function drainDiagnostics(stream: ReadableStream<Uint8Array>): Promise<void> {
+async function drainDiagnostics(
+  stream: ReadableStream<Uint8Array>,
+): Promise<void> {
   let bytes = 0;
   for await (const part of stream) {
     bytes += part.length;
-    if (bytes > 64 * 1024) throw new Error("Document diagnostics exceeded bound");
+    if (bytes > 64 * 1024) {
+      throw new Error("Document diagnostics exceeded bound");
+    }
   }
 }
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -950,23 +1177,35 @@ export async function runBackupV2RemoteWorker(
   let prunePath: string | undefined;
   if (kind === "prune") {
     prunePath = `${runtime}/prune-execute-request.json`;
-    try { await rootRead(prunePath); }
-    catch (error) { if (!(error instanceof Deno.errors.NotFound)) throw error; prunePath = `${runtime}/prune-plan-request.json`; }
+    try {
+      await rootRead(prunePath);
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+      prunePath = `${runtime}/prune-plan-request.json`;
+    }
   }
   const readPrune = async (): Promise<BackupV2PruneInput> => {
     if (!prunePath) fail();
-    const input = JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(await rootRead(prunePath))) as BackupV2PruneInput;
+    const input = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(
+        await rootRead(prunePath),
+      ),
+    ) as BackupV2PruneInput;
     const expected = validateBackupV2Gate(input.gate);
     if (expected.kind !== "prune") fail();
     same(expected.envelope, settings.envelope);
-    return {...input, gate: await ownExecution(expected)};
+    return { ...input, gate: await ownExecution(expected) };
   };
   let pruneInput = kind === "prune" ? await readPrune() : null;
   const gate = await ownExecution(
-      pruneInput ? pruneInput.gate : kind === "worker" ? settings.workerGate : settings.verifierGate,
+      pruneInput
+        ? pruneInput.gate
+        : kind === "worker"
+        ? settings.workerGate
+        : settings.verifierGate,
     ),
     directory = backupV2GateDirectory(gate);
-  if (pruneInput) pruneInput = {...pruneInput,gate};
+  if (pruneInput) pruneInput = { ...pruneInput, gate };
   await rootDirectory(BACKUP_BASE);
   await rootDirectory(`${BACKUP_BASE}/${request.captureId}`);
   await rootDirectory(`${BACKUP_BASE}/${request.captureId}/v2-${gate.gateId}`);
@@ -1062,8 +1301,15 @@ export async function runBackupV2RemoteWorker(
         };
       },
     });
-    const processes = createBackupV2NativeProcessStarter({ gate, append: nativeCustody.append, cancel });
-    const store = new BackupV2Store(settings.B2Settings, createCurlBackupV2Wire(undefined, processes.spawn));
+    const processes = createBackupV2NativeProcessStarter({
+      gate,
+      append: nativeCustody.append,
+      cancel,
+    });
+    const store = new BackupV2Store(
+      settings.B2Settings,
+      createCurlBackupV2Wire(undefined, processes.spawn),
+    );
     const native = {
       async assertManaged() {
         const actual = await ownExecution(gate);
@@ -1071,9 +1317,15 @@ export async function runBackupV2RemoteWorker(
       },
       cancel,
       spawn: (command: string, args: string[]) => {
-        const kind = command === "unshare" || command === "gpg" || command === "zstd" || command === "tar"
-          ? command : "metadata";
-        return processes.spawn(kind, command, args, { signal: supervisor.signal, env: { TZ: "UTC", TMPDIR: stage } });
+        const kind =
+          command === "unshare" || command === "gpg" || command === "zstd" ||
+            command === "tar"
+            ? command
+            : "metadata";
+        return processes.spawn(kind, command, args, {
+          signal: supervisor.signal,
+          env: { TZ: "UTC", TMPDIR: stage },
+        });
       },
       registerNamespace: processes.registerNamespace,
       registerChild: processes.registerChild,
@@ -1105,16 +1357,25 @@ export async function runBackupV2RemoteWorker(
       [];
     const protectedObjects = new Map<string, BackupV2ObjectRef>();
     const remember = (input: BackupV2ObjectRef) => {
-      const object = validateBackupV2ObjectRef(input), old = protectedObjects.get(object.fileId);
+      const object = validateBackupV2ObjectRef(input),
+        old = protectedObjects.get(object.fileId);
       if (old) same(old, object);
       protectedObjects.set(object.fileId, object);
       if (protectedObjects.size > BACKUP_V2_LIMITS.pruneCandidates) fail();
     };
     const encrypt = async (plaintext: Uint8Array, signal: AbortSignal) => {
       await native.assertManaged();
-      const child = await processes.spawn("gpg", "gpg", gpgArgs(
-        `${stage}/gpg-public-home`, settings.captureSettings.recipientFile, "-", "-",
-      ), { signal });
+      const child = await processes.spawn(
+        "gpg",
+        "gpg",
+        gpgArgs(
+          `${stage}/gpg-public-home`,
+          settings.captureSettings.recipientFile,
+          "-",
+          "-",
+        ),
+        { signal },
+      );
       const input = (async () => {
         const writer = child.stdin.getWriter();
         try {
@@ -1164,7 +1425,10 @@ export async function runBackupV2RemoteWorker(
             mayHaveCommitted: error instanceof BackupV2TransportError &&
               error.putMayHaveCommitted,
           }),
-          onVerified: (chunk) => {remember(chunk.object); work.verifiedObject();},
+          onVerified: (chunk) => {
+            remember(chunk.object);
+            work.verifiedObject();
+          },
           onRetryEpisode,
           onTransferEpisode,
           onTransferComplete,
@@ -1257,8 +1521,15 @@ export async function runBackupV2RemoteWorker(
         }
       }
       const run = createBackupV2MetadataRunner(stage, native);
-      if (kind !== "prune") await prepareRecipient(settings.captureSettings, stage, run);
-      let result: BackupV2Result | BackupV2VerifiedResult | BackupV2PruneResult;
+      if (kind !== "prune") {
+        await prepareRecipient(settings.captureSettings, stage, run);
+      }
+      let result:
+        | BackupV2Result
+        | BackupV2VerifiedResult
+        | (BackupV2PruneResult & {
+          scratchCleanup?: BackupV2ScratchCleanupReceipt;
+        });
       if (kind === "worker") {
         const checkpoints = await previousSealedRoles(
           settings,
@@ -1267,7 +1538,9 @@ export async function runBackupV2RemoteWorker(
         );
         for (const checkpoint of checkpoints) {
           remember(checkpoint.reference.object);
-          for (const page of checkpoint.manifest.pages) remember(page.manifest.object);
+          for (const page of checkpoint.manifest.pages) {
+            remember(page.manifest.object);
+          }
           for (const chunk of checkpoint.capture.chunks) remember(chunk.object);
           for (const object of checkpoint.manifest.metadata) remember(object);
         }
@@ -1317,17 +1590,40 @@ export async function runBackupV2RemoteWorker(
         const publicHome = `${PUBLIC_HOME_BASE}/${request.captureId}`;
         await ensurePublicHome(publicHome, run);
         const importChild = await spawnBackupV2GpgDecrypt(processes, [
-          "--no-options", "--no-autostart", "--batch", "--no-tty", "--homedir", publicHome, "--import",
+          "--no-options",
+          "--no-autostart",
+          "--batch",
+          "--no-tty",
+          "--homedir",
+          publicHome,
+          "--import",
         ], supervisor.signal);
-        const publicBytes = await rootRead(settings.captureSettings.recipientFile, 64 * 1024);
+        const publicBytes = await rootRead(
+          settings.captureSettings.recipientFile,
+          64 * 1024,
+        );
         const imported = await Promise.all([
-          new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(publicBytes); controller.close(); } }).pipeTo(importChild.stdin),
-          drainDiagnostics(importChild.stdout), drainDiagnostics(importChild.stderr), importChild.status,
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(publicBytes);
+              controller.close();
+            },
+          }).pipeTo(importChild.stdin),
+          drainDiagnostics(importChild.stdout),
+          drainDiagnostics(importChild.stderr),
+          importChild.status,
         ]);
         if (!imported[3].success) fail();
         const decrypt = makeStreamDecryptArchive(publicHome, {
-          async command(args) { const result = await run("sudo", args); return {success: result.code === 0, stdout: encoder.encode(result.stdout)}; },
-          spawn: (args) => spawnBackupV2GpgDecrypt(processes, args, supervisor.signal),
+          async command(args) {
+            const result = await run("sudo", args);
+            return {
+              success: result.code === 0,
+              stdout: encoder.encode(result.stdout),
+            };
+          },
+          spawn: (args) =>
+            spawnBackupV2GpgDecrypt(processes, args, supervisor.signal),
         });
         work.phase = "VERIFYING";
         let readSerial = 0;
@@ -1399,7 +1695,10 @@ export async function runBackupV2RemoteWorker(
             verification: {
               decrypt,
               native: {
-                spawn: (command, args) => processes.spawn(command, `/usr/bin/${command}`, args, {signal: supervisor.signal}),
+                spawn: (command, args) =>
+                  processes.spawn(command, `/usr/bin/${command}`, args, {
+                    signal: supervisor.signal,
+                  }),
                 temporaryDirectory: stage,
                 progress: (value) => {
                   work.verification(value);
@@ -1426,36 +1725,96 @@ export async function runBackupV2RemoteWorker(
         );
       } else {
         if (!pruneInput) fail();
+        const scratchCleanup = pruneInput.stage === "PLAN"
+          ? await cleanupBackupV2Scratch(
+            JSON.parse(
+              new TextDecoder("utf-8", { fatal: true }).decode(
+                await rootRead(`${runtime}/prune-cleanup-proofs.json`),
+              ),
+            ),
+            gate,
+          )
+          : undefined;
+        if (scratchCleanup) {
+          await atomicArtifact(
+            directory,
+            "scratch-cleanup.json",
+            scratchCleanup,
+            true,
+          );
+        }
         const caps = await createBackupV2PruneRuntime(pruneInput, {
           exactStore: store,
-          async observeFresh() { await native.assertManaged(); return await readPrune(); },
+          async observeFresh() {
+            await native.assertManaged();
+            return await readPrune();
+          },
           validateLegacy: validateCatalogEntry,
-          async progress(value) {work.retention(value.inventoryMembers); await supervise();},
-          now: () => new Date(), signal: supervisor.signal,
+          async progress(value) {
+            work.retention(value.inventoryMembers);
+            await supervise();
+          },
+          now: () => new Date(),
+          signal: supervisor.signal,
         });
-        result = await runBackupV2SourcePruner(pruneInput,caps);
+        result = {
+          ...await runBackupV2SourcePruner(pruneInput, caps),
+          ...(scratchCleanup ? { scratchCleanup } : {}),
+        };
       }
       if ("selectedRoot" in result) {
-        for (const record of journal.snapshot()) if (record.type === "selected") remember(record.object);
-        const graph = buildBackupV2Protection(result.selectedRoot.reference, [...protectedObjects.values()]);
+        for (const record of journal.snapshot()) {
+          if (record.type === "selected") remember(record.object);
+        }
+        const graph = buildBackupV2Protection(result.selectedRoot.reference, [
+          ...protectedObjects.values(),
+        ]);
         await rootDirectory(BACKUP_V2_PROTECTION_SOURCE_BASE);
-        const graphDirectory = backupV2ProtectionSourceDirectory(graph.descriptor.manifestSha256);
+        const graphDirectory = backupV2ProtectionSourceDirectory(
+          graph.descriptor.manifestSha256,
+        );
         await rootDirectory(graphDirectory);
-        for (const page of graph.pages) await atomicArtifact(graphDirectory, backupV2ProtectionPageName(page.value.pageIndex), page.value, true);
-        await atomicArtifact(graphDirectory, "manifest.json", graph.manifest, true);
-        await atomicArtifact(graphDirectory, "descriptor.json", graph.descriptor, true);
-        result = {...result, protectedGraph: graph.descriptor};
+        for (const page of graph.pages) {
+          await atomicArtifact(
+            graphDirectory,
+            backupV2ProtectionPageName(page.value.pageIndex),
+            page.value,
+            true,
+          );
+        }
+        await atomicArtifact(
+          graphDirectory,
+          "manifest.json",
+          graph.manifest,
+          true,
+        );
+        await atomicArtifact(
+          graphDirectory,
+          "descriptor.json",
+          graph.descriptor,
+          true,
+        );
+        result = { ...result, protectedGraph: graph.descriptor };
       }
       terminal = true;
       loopAbort.abort();
       await monitor;
       let nativeFacts = await nativeCustody.flush();
-      if (!unitNamespace.privateMount && !nativeFacts.mounts.some((mount) => mount.scope === "PRODUCER")) {
+      if (
+        !unitNamespace.privateMount &&
+        !nativeFacts.mounts.some((mount) => mount.scope === "PRODUCER")
+      ) {
         await processes.recordNoPrivateMount();
         nativeFacts = await nativeCustody.flush();
       }
-      if (nativeFacts.children.some(child => child.exit === null) || nativeFacts.unresolvedNamespaceLeaders.length) fail();
-      const completedResult={...result,nativeCustodySha256:nativeFacts.sha256};
+      if (
+        nativeFacts.children.some((child) => child.exit === null) ||
+        nativeFacts.unresolvedNamespaceLeaders.length
+      ) fail();
+      const completedResult = {
+        ...result,
+        nativeCustodySha256: nativeFacts.sha256,
+      };
       const resultSha256 = await atomicArtifact(
         directory,
         BACKUP_V2_RESULT_FILE,
@@ -1463,8 +1822,17 @@ export async function runBackupV2RemoteWorker(
         true,
       );
       const partial = "state" in result && result.state === "PARTIAL";
-      work.phase = kind === "worker" ? "CLOUD_COMPLETE" : kind === "verify" ? "ACCEPTED" : partial ? "FAILED" : "CLEANED";
-      const status = await writeStatus(new Date().toISOString(), partial ? null : resultSha256);
+      work.phase = kind === "worker"
+        ? "CLOUD_COMPLETE"
+        : kind === "verify"
+        ? "ACCEPTED"
+        : partial
+        ? "FAILED"
+        : "CLEANED";
+      const status = await writeStatus(
+        new Date().toISOString(),
+        partial ? null : resultSha256,
+      );
       journal.close();
       await nativeCustody.close();
       notifier.close(); // No STOPPING: retain active/exited custody.
@@ -1475,10 +1843,18 @@ export async function runBackupV2RemoteWorker(
   });
 }
 
-export type BackupV2PruneWorkerResult = BackupV2PruneResult & {nativeCustodySha256: string};
+export type BackupV2PruneWorkerResult = BackupV2PruneResult & {
+  nativeCustodySha256: string;
+  scratchCleanup?: BackupV2ScratchCleanupReceipt;
+};
 
 // Maintenance uses the existing private JSON convention and no new CLI flag.
 if (import.meta.main) {
-  const status = await runBackupV2RemoteWorker(Deno.cwd().split("/").at(-1)!, "prune");
-  if (status.phase === "FAILED" || status.phase === "CANCELLATION_BLOCKED") Deno.exitCode = 1;
+  const status = await runBackupV2RemoteWorker(
+    Deno.cwd().split("/").at(-1)!,
+    "prune",
+  );
+  if (status.phase === "FAILED" || status.phase === "CANCELLATION_BLOCKED") {
+    Deno.exitCode = 1;
+  }
 }

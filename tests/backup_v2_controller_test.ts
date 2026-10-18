@@ -52,15 +52,20 @@ import {
   backupV2ObservationProgram,
   backupV2PeriodSatisfied,
   backupV2PiReleaseRoot,
+  type BackupV2RetentionControl,
   collectBackupV2Release,
   copyBackupV2Protection,
   realBackupV2ControllerCapabilities,
   resumeBackupV2ControllerJob,
+  runBackupV2RetentionCycle,
   stepBackupV2Controller,
   validateBackupV2ControllerState,
 } from "../scripts/backup-v2-controller.ts";
 import { createBackupV2InventorySummary } from "../scripts/backup-v2-inventory.ts";
-import { backupV2ProtectionPageName, buildBackupV2Protection } from "../scripts/backup-v2-protection.ts";
+import {
+  backupV2ProtectionPageName,
+  buildBackupV2Protection,
+} from "../scripts/backup-v2-protection.ts";
 
 function assert(value: unknown, message = "Assertion failed"): asserts value {
   if (!value) throw new Error(message);
@@ -391,7 +396,9 @@ function fixture() {
     verifierInput: async () => {
       calls.push("verifier-input");
     },
-    preserveProtection: async () => {calls.push("protect");},
+    preserveProtection: async () => {
+      calls.push("protect");
+    },
     stop: async () => {
       calls.push("stop");
     },
@@ -552,7 +559,10 @@ Deno.test("complete cloud receipt waits for bridge closure and accepted period n
       receiptReference: reference("receipt"),
       finishedAtUtc: END,
       nativeCustodySha256: SHA,
-      protectedGraph: buildBackupV2Protection(w.selectedRoot.reference, [reference("receipt").object, ...w.selectedRoot.root.roles.map((role) => role.manifest.object)]).descriptor,
+      protectedGraph: buildBackupV2Protection(w.selectedRoot.reference, [
+        reference("receipt").object,
+        ...w.selectedRoot.root.roles.map((role) => role.manifest.object),
+      ]).descriptor,
     };
   f.observation = completeObservation(g, verified, "ACCEPTED");
   state = await stepBackupV2Controller(state, f.deps);
@@ -589,7 +599,10 @@ Deno.test("bridge closure failure keeps verifier gate and no accepted catalog", 
     receiptReference: reference("receipt"),
     finishedAtUtc: END,
     nativeCustodySha256: SHA,
-    protectedGraph: buildBackupV2Protection(w.selectedRoot.reference, [reference("receipt").object, ...w.selectedRoot.root.roles.map((role) => role.manifest.object)]).descriptor,
+    protectedGraph: buildBackupV2Protection(w.selectedRoot.reference, [
+      reference("receipt").object,
+      ...w.selectedRoot.root.roles.map((role) => role.manifest.object),
+    ]).descriptor,
   };
   f.observation = completeObservation(g, verified, "ACCEPTED");
   state = await stepBackupV2Controller(state, f.deps);
@@ -621,9 +634,18 @@ Deno.test("actual generated source launch is finite notify custody with pinned s
   const program = backupV2ObservationProgram(active);
   new AsyncFunction(program);
   assert(program.includes("observeBackupV2Kernel(gate,undefined,options)"));
-  assert(program.includes(`${s.envelope.request.sourceRevision}/scripts/backup-v2-kernel.ts`));
-  assert(!program.includes('Deno.readTextFile("/proc') && !program.includes('Deno.readDir("/proc'));
-  assert(!argv.find((arg) => arg.startsWith("--allow-read="))!.includes("/proc"));
+  assert(
+    program.includes(
+      `${s.envelope.request.sourceRevision}/scripts/backup-v2-kernel.ts`,
+    ),
+  );
+  assert(
+    !program.includes('Deno.readTextFile("/proc') &&
+      !program.includes('Deno.readDir("/proc'),
+  );
+  assert(
+    !argv.find((arg) => arg.startsWith("--allow-read="))!.includes("/proc"),
+  );
 });
 Deno.test("worker progress rejects reused counters and invocation paths retain old attempts", async () => {
   const p = new BackupV2WorkerProgress(),
@@ -712,7 +734,12 @@ Deno.test("real stop adapter retains terminal proof before unload and clears exa
       root: async (script: string) => {
         if (script.includes("\nsystemctl stop ")) {
           events.push("stop");
-          current = { ...current, unit: "ABSENT", managerNamespaceReferences: 0, tree:{...current.tree!,namespaceReferences:0} };
+          current = {
+            ...current,
+            unit: "ABSENT",
+            managerNamespaceReferences: 0,
+            tree: { ...current.tree!, namespaceReferences: 0 },
+          };
           return { code: 0, stdout: "", stderr: "" };
         }
         return {
@@ -757,52 +784,298 @@ Deno.test("explicit verifier resume preserves selected cloud root and original i
   equal(failed.job!.phase, "FAILED");
 });
 
-Deno.test("post-stop namespace holders or changed native journal retain the exact gate",async()=>{
-  for(const issue of ["namespace","journal"] as const){
-    const gate=bound(settings().workerGate),files=new Map<string,unknown>([[GATE_PATH,gate]]);
-    let current=completeObservation(gate,workerResult(gate),"CLOUD_COMPLETE");current.tree!.namespaceReferences=1;current.managerNamespaceReferences=1;
-    const expected={resultSha256:backupV2ArtifactSha256(current.resultBytes!),nativeCustodySha256:SHA};
-    const deps={now:()=>new Date(END),private:{read:async(path:string)=>files.get(path),write:async(path:string,value:unknown)=>{files.set(path,structuredClone(value));}},remote:{root:async(script:string)=>{if(script.includes("\nsystemctl stop ")){current={...current,unit:"ABSENT",managerNamespaceReferences:0,tree:{...current.tree!,namespaceReferences:issue==="namespace"?1:0},nativeCustodySha256:issue==="journal"?"e".repeat(64):SHA};return {code:0,stdout:"",stderr:""};}return {code:0,stdout:JSON.stringify({...current,resultBytes:current.resultBytes?[...current.resultBytes]:null}),stderr:""};}}} as unknown as PiDeps;
-    const caps=realBackupV2ControllerCapabilities(deps,fixture().deps.bridge,async(path)=>{files.delete(path);});await caps.stop(gate,expected);
-    await rejects(()=>caps.gate.replace(gate,null));assert(files.has(GATE_PATH));
+Deno.test("post-stop namespace holders or changed native journal retain the exact gate", async () => {
+  for (const issue of ["namespace", "journal"] as const) {
+    const gate = bound(settings().workerGate),
+      files = new Map<string, unknown>([[GATE_PATH, gate]]);
+    let current = completeObservation(
+      gate,
+      workerResult(gate),
+      "CLOUD_COMPLETE",
+    );
+    current.tree!.namespaceReferences = 1;
+    current.managerNamespaceReferences = 1;
+    const expected = {
+      resultSha256: backupV2ArtifactSha256(current.resultBytes!),
+      nativeCustodySha256: SHA,
+    };
+    const deps = {
+      now: () => new Date(END),
+      private: {
+        read: async (path: string) => files.get(path),
+        write: async (path: string, value: unknown) => {
+          files.set(path, structuredClone(value));
+        },
+      },
+      remote: {
+        root: async (script: string) => {
+          if (script.includes("\nsystemctl stop ")) {
+            current = {
+              ...current,
+              unit: "ABSENT",
+              managerNamespaceReferences: 0,
+              tree: {
+                ...current.tree!,
+                namespaceReferences: issue === "namespace" ? 1 : 0,
+              },
+              nativeCustodySha256: issue === "journal" ? "e".repeat(64) : SHA,
+            };
+            return { code: 0, stdout: "", stderr: "" };
+          }
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              ...current,
+              resultBytes: current.resultBytes
+                ? [...current.resultBytes]
+                : null,
+            }),
+            stderr: "",
+          };
+        },
+      },
+    } as unknown as PiDeps;
+    const caps = realBackupV2ControllerCapabilities(
+      deps,
+      fixture().deps.bridge,
+      async (path) => {
+        files.delete(path);
+      },
+    );
+    await caps.stop(gate, expected);
+    await rejects(() => caps.gate.replace(gate, null));
+    assert(files.has(GATE_PATH));
   }
 });
 
 Deno.test("only manager-held namespaces permit the exact successful unit stop", async () => {
-  const gate = bound(settings().workerGate), current = completeObservation(gate,workerResult(gate),"CLOUD_COMPLETE");
+  const gate = bound(settings().workerGate),
+    current = completeObservation(gate, workerResult(gate), "CLOUD_COMPLETE");
   current.tree!.namespaceReferences = 1;
   current.managerNamespaceReferences = 0;
   const writes: unknown[] = [];
-  const deps = {now: () => new Date(END), private: {read: async () => undefined, write: async (_path: string, value: unknown) => {writes.push(value);}}, remote: {root: async () => ({code: 0, stdout: JSON.stringify({...current,resultBytes:[...current.resultBytes!]}),stderr:""})}} as unknown as PiDeps;
+  const deps = {
+    now: () => new Date(END),
+    private: {
+      read: async () => undefined,
+      write: async (_path: string, value: unknown) => {
+        writes.push(value);
+      },
+    },
+    remote: {
+      root: async () => ({
+        code: 0,
+        stdout: JSON.stringify({
+          ...current,
+          resultBytes: [...current.resultBytes!],
+        }),
+        stderr: "",
+      }),
+    },
+  } as unknown as PiDeps;
   const caps = realBackupV2ControllerCapabilities(deps, fixture().deps.bridge);
   await rejects(() => caps.stop(gate));
   equal(writes, []);
 });
 
 Deno.test("failed exact stop never records completed custody or permits gate release", async () => {
-  const gate = bound(settings().workerGate), current = completeObservation(gate,workerResult(gate),"CLOUD_COMPLETE");
-  const files = new Map<string,unknown>([[GATE_PATH,gate]]);
-  const deps = {now: () => new Date(END), private: {read: async (path: string) => files.get(path), write: async (path: string,value: unknown) => {files.set(path,structuredClone(value));}},remote: {root: async (script: string) => script.includes("\nsystemctl stop ") ? {code:1,stdout:"",stderr:"stop failed"} : {code:0,stdout:JSON.stringify({...current,resultBytes:[...current.resultBytes!]}),stderr:""}}} as unknown as PiDeps;
-  const caps = realBackupV2ControllerCapabilities(deps,fixture().deps.bridge);
+  const gate = bound(settings().workerGate),
+    current = completeObservation(gate, workerResult(gate), "CLOUD_COMPLETE");
+  const files = new Map<string, unknown>([[GATE_PATH, gate]]);
+  const deps = {
+    now: () => new Date(END),
+    private: {
+      read: async (path: string) => files.get(path),
+      write: async (path: string, value: unknown) => {
+        files.set(path, structuredClone(value));
+      },
+    },
+    remote: {
+      root: async (script: string) =>
+        script.includes("\nsystemctl stop ")
+          ? { code: 1, stdout: "", stderr: "stop failed" }
+          : {
+            code: 0,
+            stdout: JSON.stringify({
+              ...current,
+              resultBytes: [...current.resultBytes!],
+            }),
+            stderr: "",
+          },
+    },
+  } as unknown as PiDeps;
+  const caps = realBackupV2ControllerCapabilities(deps, fixture().deps.bridge);
   await rejects(() => caps.stop(gate));
-  await rejects(() => caps.gate.replace(gate,null));
-  assert([...files.values()].every((value) => !(value as {exactStop?:unknown}).exactStop));
+  await rejects(() => caps.gate.replace(gate, null));
+  assert(
+    [...files.values()].every((value) =>
+      !(value as { exactStop?: unknown }).exactStop
+    ),
+  );
   assert(files.has(GATE_PATH));
 });
 
 Deno.test("protected graph copy checks every bounded page and complete direct references before descriptor publication", async () => {
-  const selected = workerResult(bound(settings().workerGate)).selectedRoot, receiptReference = reference("receipt");
-  const objects = [receiptReference.object, ...selected.root.roles.map((role) => role.manifest.object), ...Array.from({length: 110}, (_, ordinal) => reference("manifest", ordinal + 50).object)];
-  for (const defect of [null,"hash","receipt"] as const) {
-    const graph = buildBackupV2Protection(selected.reference, defect === "receipt" ? objects.filter((object) => object.fileId !== receiptReference.object.fileId) : objects);
-    const files = new Map<string,Uint8Array>([["manifest.json",graph.manifestBytes],...graph.pages.map((page) => [backupV2ProtectionPageName(page.value.pageIndex),page.bytes] as [string,Uint8Array])]);
-    const copied = new Map<string,Uint8Array>();
-    const verified = {selectedRoot:selected,receiptReference,protectedGraph:graph.descriptor} as BackupV2VerifiedResult;
-    const operation = () => copyBackupV2Protection(verified, {
-      read(name) {const bytes=files.get(name);if(!bytes)throw Error("Missing graph page");return Promise.resolve(defect === "hash" && name.endsWith("00000001.json") ? new Uint8Array([1]) : bytes);},
-      write(name,bytes) {copied.set(name,bytes.slice());return Promise.resolve();},
-    });
-    if (defect) {await rejects(operation);assert(!copied.has("descriptor.json"));}
-    else {equal(await operation(),graph.descriptor);assert(copied.size === graph.pages.length + 2);equal([...copied.get("manifest.json")!],[...graph.manifestBytes]);}
+  const selected = workerResult(bound(settings().workerGate)).selectedRoot,
+    receiptReference = reference("receipt");
+  const objects = [
+    receiptReference.object,
+    ...selected.root.roles.map((role) => role.manifest.object),
+    ...Array.from(
+      { length: 110 },
+      (_, ordinal) => reference("manifest", ordinal + 50).object,
+    ),
+  ];
+  for (const defect of [null, "hash", "receipt"] as const) {
+    const graph = buildBackupV2Protection(
+      selected.reference,
+      defect === "receipt"
+        ? objects.filter((object) =>
+          object.fileId !== receiptReference.object.fileId
+        )
+        : objects,
+    );
+    const files = new Map<string, Uint8Array>([
+      ["manifest.json", graph.manifestBytes],
+      ...graph.pages.map((page) =>
+        [backupV2ProtectionPageName(page.value.pageIndex), page.bytes] as [
+          string,
+          Uint8Array,
+        ]
+      ),
+    ]);
+    const copied = new Map<string, Uint8Array>();
+    const verified = {
+      selectedRoot: selected,
+      receiptReference,
+      protectedGraph: graph.descriptor,
+    } as BackupV2VerifiedResult;
+    const operation = () =>
+      copyBackupV2Protection(verified, {
+        read(name) {
+          const bytes = files.get(name);
+          if (!bytes) throw Error("Missing graph page");
+          return Promise.resolve(
+            defect === "hash" && name.endsWith("00000001.json")
+              ? new Uint8Array([1])
+              : bytes,
+          );
+        },
+        write(name, bytes) {
+          copied.set(name, bytes.slice());
+          return Promise.resolve();
+        },
+      });
+    if (defect) {
+      await rejects(operation);
+      assert(!copied.has("descriptor.json"));
+    } else {
+      equal(await operation(), graph.descriptor);
+      assert(copied.size === graph.pages.length + 2);
+      equal([...copied.get("manifest.json")!], [...graph.manifestBytes]);
+    }
   }
+});
+
+Deno.test("managed retention persists launch intent once and binds cold source custody before ACK", async () => {
+  const s = settings(),
+    pending = {
+      ...s.workerGate,
+      kind: "prune" as const,
+      unitName: s.workerGate.unitName.replace("-worker-", "-prune-"),
+    };
+  const f = fixture(), calls: string[] = [];
+  let live: BackupV2Gate | null = null;
+  let control = {
+    schemaVersion: 2,
+    format: "backup-v2-retention-controller",
+    phase: "REQUESTED",
+    gate: pending,
+    result: null,
+    input: {
+      schemaVersion: 2,
+      format: "backup-v2-prune",
+      gate: pending,
+      transactionId: uuid(18),
+      stage: "PLAN",
+      plan: null,
+      graphs: [],
+      snapshot: {
+        catalog: [],
+        custody: {
+          lockId: GATE_SOURCE_LOCK_PATH,
+          sourceBootId: pending.sourceBootId,
+          sourceSettled: true,
+        },
+        receipts: [],
+        protection: {
+          acceptedRoots: [],
+          activeObjects: [],
+          sealedRoleManifests: [],
+          unresolvedPuts: [],
+        },
+      },
+    },
+  } as BackupV2RetentionControl;
+  // Acceptance is upstream; this fixture isolates the managed-stage crash seam.
+  const state = {
+    job: { phase: "COMPLETE", settings: s, verified: { protectedGraph: {} } },
+    catalog: [{}, {}, {}, {}],
+  } as unknown as BackupV2ControllerState;
+  let observed = {
+    sourceBootId: pending.sourceBootId,
+    unit: "ABSENT",
+    identity: null,
+    status: null,
+    resultBytes: null,
+    tree: null,
+  } as BackupV2ControllerObservation;
+  const pi = {
+    now: () => new Date(END),
+    private: {
+      read: async () => structuredClone(control),
+      write: async (_path: string, value: unknown) => {
+        control = structuredClone(value) as BackupV2RetentionControl;
+        calls.push(`save:${control.phase}`);
+      },
+    },
+    remote: {
+      root: async (script: string) => {
+        calls.push(script.includes("systemd-run") ? "launch" : "install");
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    },
+  } as unknown as PiDeps;
+  const caps: BackupV2ControllerCapabilities = {
+    ...f.deps,
+    gate: {
+      read: async () => live,
+      replace: async (expected, next) => {
+        equal(live, expected);
+        live = next;
+        calls.push(next?.custody ? "bind" : "gate");
+      },
+      cleared: async () => false,
+    },
+    observe: async () => observed,
+    acknowledge: async () => {
+      calls.push("ack");
+    },
+  };
+  await runBackupV2RetentionCycle(state, pi, caps);
+  equal(calls, ["install", "gate", "save:RUNNING", "launch"]);
+  observed = { ...observed, unit: "STARTING" };
+  assert((await runBackupV2RetentionCycle(state, pi, caps))!.healthy);
+  equal(calls.filter((call) => call === "launch").length, 1);
+  observed = observation(pending);
+  await runBackupV2RetentionCycle(state, pi, caps);
+  assert(control.gate.custody !== null);
+  assert(calls.indexOf("bind") < calls.indexOf("ack"));
+  equal(calls.filter((call) => call === "launch").length, 1);
+  const argv = backupV2LaunchArguments(s, "prune", pending);
+  assert(argv.at(-1)!.endsWith("/scripts/backup-v2-worker.ts"));
+  assert(
+    argv.includes("--property=Type=notify") &&
+      argv.includes("--property=CPUWeight=1"),
+  );
 });

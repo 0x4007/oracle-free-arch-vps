@@ -20,7 +20,10 @@ import {
   validateBackupV2Root,
 } from "./backup-v2-contract.ts";
 import { BACKUP_V2_LIMITS, BACKUP_V2_PROFILE_ID } from "./backup-v2-profile.ts";
-import { type BackupV2ProtectionDescriptor, validateBackupV2ProtectionDescriptor } from "./backup-v2-protection.ts";
+import {
+  type BackupV2ProtectionDescriptor,
+  validateBackupV2ProtectionDescriptor,
+} from "./backup-v2-protection.ts";
 import {
   canonicalUtcMillis,
   GATE_BACKUP_CGROUP_ROOT,
@@ -389,15 +392,23 @@ export function validateBackupV2Result(
     ...EXECUTION_KEYS,
     "finishedAtUtc",
     "selectedRoot",
-    ...(value&&typeof value==="object"&&Object.hasOwn(value,"nativeCustodySha256")?["nativeCustodySha256"]:[]),
-    ...(value&&typeof value==="object"&&Object.hasOwn(value,"protectedGraph")?["protectedGraph"]:[]),
+    ...(value && typeof value === "object" &&
+        Object.hasOwn(value, "nativeCustodySha256")
+      ? ["nativeCustodySha256"]
+      : []),
+    ...(value && typeof value === "object" &&
+        Object.hasOwn(value, "protectedGraph")
+      ? ["protectedGraph"]
+      : []),
   ]);
   version(r);
   const envelope = validateBackupV2RequestEnvelope(r.envelope),
     identity = execution(r),
     finishedAtUtc = utc(r.finishedAtUtc);
   const selected = selectedRoot(r.selectedRoot, envelope.request);
-  const protectedGraph = Object.hasOwn(r,"protectedGraph") ? validateBackupV2ProtectionDescriptor(r.protectedGraph) : undefined;
+  const protectedGraph = Object.hasOwn(r, "protectedGraph")
+    ? validateBackupV2ProtectionDescriptor(r.protectedGraph)
+    : undefined;
   if (protectedGraph) equal(protectedGraph.root, selected.reference);
   if (
     finishedAtUtc < envelope.request.requestedAtUtc ||
@@ -413,8 +424,10 @@ export function validateBackupV2Result(
     ...identity,
     finishedAtUtc,
     selectedRoot: selected,
-    ...(Object.hasOwn(r,"nativeCustodySha256")?{nativeCustodySha256:hash(r.nativeCustodySha256)}:{}),
-    ...(protectedGraph ? {protectedGraph} : {}),
+    ...(Object.hasOwn(r, "nativeCustodySha256")
+      ? { nativeCustodySha256: hash(r.nativeCustodySha256) }
+      : {}),
+    ...(protectedGraph ? { protectedGraph } : {}),
   });
 }
 /** Gate presence always blocks competing work, including PENDING, unknown
