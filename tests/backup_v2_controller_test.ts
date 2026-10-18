@@ -614,6 +614,14 @@ Deno.test("bridge closure failure keeps verifier gate and no accepted catalog", 
 });
 Deno.test("actual generated source launch is finite notify custody with pinned scoped FFI", () => {
   const s = settings(), argv = backupV2LaunchArguments(s, "worker");
+  for (const kind of ["worker", "verify"] as const) {
+    equal(
+      backupV2LaunchArguments(s, kind).filter((arg) =>
+        arg.startsWith("--allow-sys")
+      ),
+      ["--allow-sys=statfs"],
+    );
+  }
   for (
     const part of [
       "--property=Type=notify",
@@ -1113,6 +1121,10 @@ Deno.test("managed retention persists launch intent once and binds cold source c
   assert(calls.indexOf("bind") < calls.indexOf("ack"));
   equal(calls.filter((call) => call === "launch").length, 1);
   const argv = backupV2LaunchArguments(s, "prune", pending);
+  equal(
+    argv.filter((arg) => arg.startsWith("--allow-sys")),
+    ["--allow-sys=statfs"],
+  );
   assert(argv.at(-1)!.endsWith("/scripts/backup-v2-worker.ts"));
   assert(
     argv.includes("--property=Type=notify") &&
