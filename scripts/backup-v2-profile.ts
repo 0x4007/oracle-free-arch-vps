@@ -4,10 +4,10 @@ const GIB = 1024 ** 3;
 export const BACKUP_V2_PROFILE_ID = "backup-v2-20261018";
 export const BACKUP_V2_NAMESPACE = "restic/backup-v2/";
 export const BACKUP_V2_SLOT_COUNT = 2;
+export const BACKUP_V2_PRODUCTION_WRITER_MARGIN_BYTES = 512 * MIB;
 export const BACKUP_V2_LIMITS = Object.freeze({
   slotBytes: 64 * MIB,
-  workspaceBytes: 2 * GIB,
-  protectedReserveBytes: 5.5 * GIB,
+  workspaceBytes: 768 * MIB,
   journalBytes: 64 * MIB,
   manifestBytes: MIB,
   descriptorBytes: 1024,
@@ -38,15 +38,15 @@ export const BACKUP_V2_LIMITS = Object.freeze({
 });
 export const BACKUP_V2_WORKSPACE = Object.freeze({
   slots: 128 * MIB,
-  journal: 64 * MIB,
-  activeInventory: 256 * MIB,
-  preflight: 256 * MIB,
+  // Upload, native custody and document-binding append files.
+  journal: 192 * MIB,
+  checkpoints: 32 * MIB,
+  // New protection graph; payload slots are drained before publication.
   retention: 256 * MIB,
-  recoveryTools: 512 * MIB,
-  control: 64 * MIB,
-  diagnostics: 32 * MIB,
-  subprocessTemporary: 128 * MIB,
-  filesystemMargin: 352 * MIB,
+  control: 16 * MIB,
+  diagnostics: 24 * MIB,
+  subprocessTemporary: 64 * MIB,
+  filesystemMargin: 56 * MIB,
 });
 export type BackupV2Budget = keyof typeof BACKUP_V2_LIMITS;
 
@@ -75,8 +75,8 @@ export function backupV2RequiredFreeBytes(
   ) {
     throw new Error("Backup v2 production writer margin is invalid");
   }
-  const required = BACKUP_V2_LIMITS.protectedReserveBytes +
-    BACKUP_V2_LIMITS.workspaceBytes - allocatedWorkspaceBytes +
+  // statfs.bavail already excludes the filesystem's reserved blocks.
+  const required = BACKUP_V2_LIMITS.workspaceBytes - allocatedWorkspaceBytes +
     productionWriterMarginBytes;
   if (!Number.isSafeInteger(required)) {
     throw new Error("Backup v2 free-space total overflows");

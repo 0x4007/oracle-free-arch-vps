@@ -12,7 +12,10 @@ import {
   pollBackupV2Settlement,
   settleBackupV2Cancellation,
 } from "../scripts/backup-v2-supervisor.ts";
-import { BACKUP_V2_LIMITS } from "../scripts/backup-v2-profile.ts";
+import {
+  BACKUP_V2_LIMITS,
+  BACKUP_V2_PRODUCTION_WRITER_MARGIN_BYTES,
+} from "../scripts/backup-v2-profile.ts";
 import {
   type BackupV2TransferEpisode,
   backupV2TransferWindowMs,
@@ -416,8 +419,7 @@ Deno.test("supervisor capacity includes held-deleted blocks and inode/production
   ) {
     const { state, supervisor } = fixture();
     if (fault === "blocks") {
-      state.sample.capacity.availableBytes =
-        BACKUP_V2_LIMITS.protectedReserveBytes;
+      state.sample.capacity.availableBytes = BACKUP_V2_LIMITS.workspaceBytes;
     }
     if (fault === "inodes") state.sample.capacity.freeInodes = 99;
     if (fault === "workspace-held") {
@@ -439,9 +441,26 @@ Deno.test("supervisor capacity includes held-deleted blocks and inode/production
     BACKUP_V2_LIMITS.workspaceBytes;
   state.sample.capacity.workspaceHeldDeletedBytes =
     BACKUP_V2_LIMITS.workspaceBytes;
-  state.sample.capacity.availableBytes =
-    BACKUP_V2_LIMITS.protectedReserveBytes + 4096;
+  state.sample.capacity.availableBytes = 4096;
   equal((await supervisor.poll()).action, "renew"); // Held blocks are already in allocated workspace, never credited as free.
+});
+
+Deno.test("production capacity admits exactly 1.25 GiB and preserves allocated workspace credit", async () => {
+  for (
+    const allocated of [0, 128 * 1024 ** 2, BACKUP_V2_LIMITS.workspaceBytes]
+  ) {
+    for (const short of [false, true]) {
+      const f = fixture();
+      f.state.sample.capacity.allocatedWorkspaceBytes = allocated;
+      f.state.sample.capacity.availableBytes = 1.25 * 1024 ** 3 - allocated -
+        Number(short);
+      const supervisor = new BackupV2Supervisor(identity, {
+        ...f.options,
+        productionWriterMarginBytes: BACKUP_V2_PRODUCTION_WRITER_MARGIN_BYTES,
+      }, f.capabilities);
+      equal((await supervisor.poll()).action, short ? "cancel" : "renew");
+    }
+  }
 });
 
 Deno.test("supervisor aborts a stuck observer and cannot create overlapping renewers", async () => {

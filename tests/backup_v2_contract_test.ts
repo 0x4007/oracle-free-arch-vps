@@ -28,6 +28,7 @@ import {
 import {
   assertBackupV2Budget,
   BACKUP_V2_LIMITS,
+  BACKUP_V2_PRODUCTION_WRITER_MARGIN_BYTES,
   BACKUP_V2_PROFILE_ID,
   BACKUP_V2_SLOT_COUNT,
   BACKUP_V2_WORKSPACE,
@@ -199,10 +200,14 @@ Deno.test("v2 profile bounds allocated workspace separately from required free r
     Object.values(BACKUP_V2_WORKSPACE).reduce((sum, value) => sum + value, 0),
     BACKUP_V2_LIMITS.workspaceBytes,
   );
-  equal(backupV2RequiredFreeBytes(0, 0), 8_053_063_680);
+  equal(backupV2RequiredFreeBytes(0, 0), 768 * 1024 ** 2);
+  equal(
+    backupV2RequiredFreeBytes(0, BACKUP_V2_PRODUCTION_WRITER_MARGIN_BYTES),
+    1.25 * 1024 ** 3,
+  );
   equal(
     backupV2RequiredFreeBytes(BACKUP_V2_LIMITS.workspaceBytes, 100),
-    BACKUP_V2_LIMITS.protectedReserveBytes + 100,
+    100,
   );
   for (const bad of [-1, NaN, Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
     throws(() => assertBackupV2Budget("slotBytes", bad));
