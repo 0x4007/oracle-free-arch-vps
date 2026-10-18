@@ -99,6 +99,64 @@ function fixture() {
   };
 }
 
+Deno.test("supervisor fixed initialization window is independent of short notification renewals", async () => {
+  const f = fixture();
+  const supervisor = new BackupV2Supervisor(identity, {
+    ...f.options,
+    notificationGraceMs: 30_000,
+    startupGraceMs: 300_000,
+    progressGraceMs: 300_000,
+  }, f.capabilities);
+  equal((await supervisor.poll()).action, "renew");
+  f.state.advance(240_000);
+  equal((await supervisor.poll()).action, "renew");
+  f.state.advance(299_999);
+  const last = await supervisor.poll();
+  assert(last.action === "renew");
+  equal(last.absoluteDeadlineMs, 300_000);
+  equal(last.extendUsec, 1000);
+  f.state.advance(300_000);
+  equal((await supervisor.poll()).action, "cancel");
+  throws(() =>
+    new BackupV2Supervisor(
+      identity,
+      { ...f.options, startupGraceMs: 99 },
+      f.capabilities,
+    )
+  );
+});
+Deno.test("supervisor adopts the original durable retry window without sliding it on repeat", async () => {
+  const f = fixture();
+  await f.supervisor.poll();
+  f.state.advance(10);
+  f.state.sample.progress.sourceBytes = 10;
+  await f.supervisor.poll();
+  const original = {
+    sealedObjectIdentity: "sealed-object",
+    retainedBytes: 64,
+    retryableTransport: true as const,
+    startedAtMs: 10,
+    expiresAtMs: 10 + BACKUP_V2_LIMITS.blockedTransportMs,
+  };
+  equal(f.supervisor.beginRetryEpisode(original).retryEpisode, {
+    startedAtMs: original.startedAtMs,
+    expiresAtMs: original.expiresAtMs,
+  });
+  f.state.advance(20);
+  await f.supervisor.poll();
+  equal(f.supervisor.beginRetryEpisode(original).retryEpisode, {
+    startedAtMs: original.startedAtMs,
+    expiresAtMs: original.expiresAtMs,
+  });
+  throws(() =>
+    f.supervisor.beginRetryEpisode({
+      ...original,
+      startedAtMs: 20,
+      expiresAtMs: original.expiresAtMs + 10,
+    })
+  );
+});
+
 Deno.test("supervisor notification encoding is bounded, whitelisted and singly NUL terminated", () => {
   const decoder = new TextDecoder();
   equal(

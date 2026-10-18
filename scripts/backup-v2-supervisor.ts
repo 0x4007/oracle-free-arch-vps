@@ -175,6 +175,8 @@ export interface BackupV2SupervisorObservation {
 export interface BackupV2SupervisorOptions {
   progressGraceMs: number;
   notificationGraceMs: number;
+  /** One fixed initialization window, independent of each short notification. */
+  startupGraceMs?: number;
   observationTimeoutMs: number;
   maximumObservationAgeMs: number;
   productionWriterMarginBytes: number;
@@ -311,7 +313,14 @@ export class BackupV2Supervisor {
     this.#options = Object.freeze({ ...options });
     this.#caps = capabilities;
     this.#lastNow = finite(capabilities.now());
-    this.#startupDeadline = this.#lastNow + options.notificationGraceMs;
+    const startupGraceMs = options.startupGraceMs ??
+      options.notificationGraceMs;
+    finite(
+      startupGraceMs,
+      options.notificationGraceMs,
+      BACKUP_V2_LIMITS.blockedTransportMs,
+    );
+    this.#startupDeadline = this.#lastNow + startupGraceMs;
     this.#window = {
       observedMonotonicMs: this.#lastNow,
       usefulProgressAtMs: 0,
@@ -338,6 +347,9 @@ export class BackupV2Supervisor {
       sealedObjectIdentity: string;
       retainedBytes: number;
       retryableTransport: true;
+      /** Same-process durable uploader window; never shifted by later attempts. */
+      startedAtMs?: number;
+      expiresAtMs?: number;
     },
   ): BackupV2LeaseWindow {
     if (
@@ -352,6 +364,20 @@ export class BackupV2Supervisor {
     count(evidence.retainedBytes);
     finite(evidence.retainedBytes, 1, BACKUP_V2_LIMITS.slotBytes);
     const now = this.#now();
+    if (
+      (evidence.startedAtMs === undefined) !==
+        (evidence.expiresAtMs === undefined)
+    ) throw new Error("Incomplete retry episode window");
+    const startedAtMs = evidence.startedAtMs ?? now;
+    const expiresAtMs = evidence.expiresAtMs ??
+      startedAtMs + BACKUP_V2_LIMITS.blockedTransportMs;
+    finite(startedAtMs, 0, now);
+    finite(
+      expiresAtMs,
+      now + Number.EPSILON,
+      startedAtMs + BACKUP_V2_LIMITS.blockedTransportMs,
+    );
+    if (expiresAtMs <= now) throw new Error("Retry episode expired");
     if (
       evaluateBackupV2Lease(
         this.#window,
@@ -370,9 +396,15 @@ export class BackupV2Supervisor {
       }
       this.#episodeSerial = this.#serial;
       this.#window.retryEpisode = {
-        startedAtMs: now,
-        expiresAtMs: now + BACKUP_V2_LIMITS.blockedTransportMs,
+        startedAtMs,
+        expiresAtMs,
       };
+    } else if (
+      evidence.startedAtMs !== undefined &&
+      (this.#window.retryEpisode.startedAtMs !== startedAtMs ||
+        this.#window.retryEpisode.expiresAtMs !== expiresAtMs)
+    ) {
+      throw new Error("Retry episode window changed");
     }
     this.#window.observedMonotonicMs = now;
     return this.window();
