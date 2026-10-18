@@ -867,7 +867,12 @@ async function custodyFacts(
       ) return { ...facts, namespaces: null, manager: null };
     }
     if (privateIds.size === 0) {
-      if (journal.noPrivateMountProved) {
+      if (
+        journal.noPrivateMountProved ||
+        cancelled && facts.mainGone && live.size === 0 && descendants === 0 &&
+          journal.children.length === 0 && journal.mounts.length === 1 &&
+          journal.mounts[0].scope === "UNIT"
+      ) {
         facts.namespaces = 0;
         facts.manager = 0;
       }
@@ -927,8 +932,11 @@ export async function observeBackupV2Kernel(
   }
   const unit = props.LoadState === "not-found" ||
       stopped && props.LoadState === "loaded" &&
-        props.ActiveState === "inactive" && props.SubState === "dead" &&
-        props.MainPID === "0" && props.ControlPID === "0"
+        props.MainPID === "0" && props.ControlPID === "0" &&
+        (props.ActiveState === "inactive" && props.SubState === "dead" ||
+          cancelled !== null && props.ActiveState === "failed" &&
+            props.SubState === "failed" &&
+            props.InvocationID === gate.custody?.invocationId)
     ? "ABSENT"
     : props.ActiveState === "failed"
     ? "FAILED"
