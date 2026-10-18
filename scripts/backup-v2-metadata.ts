@@ -7,13 +7,21 @@ import {
   type InitialState,
   type RecoveryMetadataParams,
   ROLE_ORDER,
+  swapfileRecreation,
   validateCaptureSettings,
+  validateSources,
 } from "./backblaze-capture.ts";
 import {
   BACKUP_V2_BOOT_SAMPLES,
   type BackupV2SampleExpectation,
+  validateBackupV2ChunkPage,
 } from "./backup-v2-contract.ts";
-import { BACKUP_V2_PROFILE_ID } from "./backup-v2-profile.ts";
+import {
+  assertBackupV2Budget,
+  BACKUP_V2_PROFILE_ID,
+} from "./backup-v2-profile.ts";
+import { validateBackupV2InventorySummary } from "./backup-v2-inventory.ts";
+import type { BackupV2CapturedRole } from "./backup-v2-capture.ts";
 
 const encoder = new TextEncoder();
 export const BACKUP_V2_RECOVERY_BYTES = 8 * 1024 * 1024;
@@ -213,4 +221,267 @@ export async function collectBackupV2RecoveryMetadata<Archive>(
     })),
   };
   return { ...encodeBackupV2RecoveryMetadata(manifest), bootSamples, manifest };
+}
+
+export type BackupV2RoleRecoveryMetadata =
+  | {
+    role: "root";
+    initial: InitialState;
+    tools: Record<string, string>;
+    bootBytes: number[];
+  }
+  | {
+    role: "staging-boot";
+    beforeHashes: string;
+    afterHashes: string;
+    beforeBytes: string;
+    afterBytes: string;
+  }
+  | { role: "oracle-root"; swapfileStat: string }
+  | { role: "efi" | "staging-efi" | "oracle-oled" }
+  | { role: "recovery"; text: string; sha256: string };
+export interface BackupV2ReusedRole {
+  capture: BackupV2CapturedRole;
+  recovery: BackupV2RoleRecoveryMetadata;
+}
+
+function rejected(): never {
+  throw new Error("Backup v2 reused role or original metadata is invalid");
+}
+function canonical(value: unknown): string {
+  const order = (item: unknown): unknown =>
+    Array.isArray(item)
+      ? item.map(order)
+      : item !== null && typeof item === "object"
+      ? Object.fromEntries(
+        Object.entries(item).sort(([a], [b]) => a.localeCompare(b)).map((
+          [key, val],
+        ) => [key, order(val)]),
+      )
+      : item;
+  return JSON.stringify(order(value));
+}
+function exact(value: unknown, keys: string[]) {
+  if (
+    !value || typeof value !== "object" || Array.isArray(value) ||
+    canonical(Object.keys(value).sort()) !== canonical(keys.sort())
+  ) rejected();
+}
+function timestamp(value: string): number {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value) {
+    rejected();
+  }
+  return parsed;
+}
+function sizes(text: string): number[] {
+  if (!/^[1-9][0-9]*\n[1-9][0-9]*\n$/.test(text)) rejected();
+  const result = text.trim().split("\n").map(Number);
+  if (result.some((value) => !Number.isSafeInteger(value))) rejected();
+  return result;
+}
+
+/** Cloud-object readback/custody belongs to the caller; these are current-source gates. */
+export function validateBackupV2ReusedRoles(
+  values: readonly BackupV2ReusedRole[],
+  settings: CaptureSettings,
+  before: InitialState,
+  tools: Record<string, string>,
+  bootBytes: readonly number[],
+  observedAtUtc: string,
+): Map<string, BackupV2ReusedRole> {
+  if (!Array.isArray(values) || values.length > 7) rejected();
+  const result = new Map<string, BackupV2ReusedRole>();
+  const compatibility = backupV2CompatibilitySha256(settings, before);
+  for (const entry of values) {
+    exact(entry, ["capture", "recovery"]);
+    const role = entry.capture, metadata = entry.recovery;
+    if (
+      !role || !metadata || result.has(role.role) ||
+      ![...ROLE_ORDER, "recovery"].includes(role.role) ||
+      role.captureId !== settings.generation ||
+      role.sourceConfigSha256 !== backupV2SourceConfigSha256(settings) ||
+      role.compatibilitySha256 !== compatibility ||
+      role.recipientSha256 !== settings.recipientSha256 ||
+      role.recipientFingerprint !== settings.recipientFingerprint ||
+      metadata.role !== role.role ||
+      role.format !==
+        (role.role === "recovery" ? "json.zst.gpg" : "tar.zst.gpg") ||
+      !/^[0-9a-f]{64}$/.test(role.ciphertextSha256)
+    ) rejected();
+    const start = timestamp(role.captureStartedAtUtc),
+      finish = timestamp(role.captureFinishedAtUtc),
+      upload = timestamp(role.uploadStartedAtUtc),
+      uploaded = timestamp(role.uploadFinishedAtUtc);
+    if (
+      start >= finish || upload < start || uploaded < finish ||
+      upload > uploaded || uploaded > timestamp(observedAtUtc)
+    ) rejected();
+    assertBackupV2Budget("ciphertextBytes", role.ciphertextBytes);
+    assertBackupV2Budget("logicalObjects", role.chunks.length);
+    if (!role.ciphertextBytes || !role.chunks.length) rejected();
+    for (let index = 0; index < role.chunks.length; index += 256) {
+      const first = role.chunks[index];
+      validateBackupV2ChunkPage({
+        schemaVersion: 2,
+        captureId: role.captureId,
+        attemptId: role.attemptId,
+        role: role.role,
+        pageIndex: index / 256,
+        startOrdinal: index,
+        startOffset: first.offset,
+        chunks: role.chunks.slice(index, index + 256),
+      });
+    }
+    let offset = 0;
+    for (const [index, chunk] of role.chunks.entries()) {
+      if (chunk.ordinal !== index || chunk.offset !== offset) rejected();
+      offset += chunk.object.contentLength;
+    }
+    if (
+      offset !== role.ciphertextBytes || role.producer.zstdExitCode !== 0 ||
+      role.producer.gpgExitCode !== 0 ||
+      ![0, 1].includes(role.producer.tarExitCode) ||
+      !/^[0-9a-f]{64}$/.test(role.producer.driftSha256)
+    ) rejected();
+    assertBackupV2Budget("members", role.producer.driftRecords);
+    if (
+      role.producer.tarExitCode === 1 &&
+      (role.role !== "root" || !role.producer.driftRecords)
+    ) rejected();
+    if (
+      role.role === "recovery"
+        ? role.inventory !== null
+        : !role.inventory?.members
+    ) rejected();
+    if (role.inventory) validateBackupV2InventorySummary(role.inventory);
+    if (metadata.role === "root") {
+      exact(metadata, ["role", "initial", "tools", "bootBytes"]);
+      exact(metadata.initial, ["layout", "pacman", "bootHashes"]);
+      validateSources(settings.sources, metadata.initial.layout);
+      if (
+        backupV2CompatibilitySha256(settings, metadata.initial) !==
+          compatibility ||
+        canonical(metadata.tools) !== canonical(tools) ||
+        metadata.initial.pacman !== before.pacman ||
+        metadata.initial.bootHashes !== before.bootHashes ||
+        canonical(metadata.bootBytes) !== canonical(bootBytes)
+      ) rejected();
+    } else if (metadata.role === "staging-boot") {
+      exact(metadata, [
+        "role",
+        "beforeHashes",
+        "afterHashes",
+        "beforeBytes",
+        "afterBytes",
+      ]);
+      backupV2BootSamples(
+        before.bootHashes,
+        metadata.beforeHashes,
+        bootBytes,
+        sizes(metadata.beforeBytes),
+      );
+      backupV2BootSamples(
+        before.bootHashes,
+        metadata.afterHashes,
+        bootBytes,
+        sizes(metadata.afterBytes),
+      );
+    } else if (metadata.role === "oracle-root") {
+      exact(metadata, ["role", "swapfileStat"]);
+      if (metadata.swapfileStat.length > 256) rejected();
+      swapfileRecreation(metadata.swapfileStat);
+    } else if (metadata.role === "recovery") {
+      exact(metadata, ["role", "text", "sha256"]);
+      if (
+        typeof metadata.text !== "string" ||
+        metadata.text.length > BACKUP_V2_RECOVERY_BYTES
+      ) rejected();
+      const encoded = encodeBackupV2RecoveryMetadata(JSON.parse(metadata.text));
+      if (
+        new TextDecoder().decode(encoded.bytes) !== metadata.text ||
+        encoded.sha256 !== metadata.sha256
+      ) rejected();
+    } else exact(metadata, ["role"]);
+    if (metadata.role !== "recovery") {
+      assertBackupV2Budget(
+        "metadataRecordBytes",
+        encoder.encode(JSON.stringify(metadata)).length,
+      );
+    }
+    result.set(role.role, structuredClone(entry));
+  }
+  if (result.has("recovery") && ROLE_ORDER.some((role) => !result.has(role))) {
+    rejected();
+  }
+  return result;
+}
+
+/** Reuse complete original bytes only, after matching all original role descriptors. */
+export function restoreBackupV2RecoveryMetadata<Archive>(
+  original: Extract<BackupV2RoleRecoveryMetadata, { role: "recovery" }>,
+  settings: CaptureSettings,
+  before: InitialState,
+  archives: Archive[],
+  bootSamples: (BackupV2SampleExpectation & { bytes: number })[],
+): Awaited<ReturnType<typeof collectBackupV2RecoveryMetadata<Archive>>> {
+  const value = JSON.parse(original.text);
+  const encoded = encodeBackupV2RecoveryMetadata(value);
+  const required = [
+    "startedAtUtc",
+    "finishedAtUtc",
+    "consistency",
+    "sourceShutdown",
+    "machineBootRestoreProved",
+    "captureMethod",
+    "sources",
+    "blockLayouts",
+    "mountMetadata",
+    "findmnt",
+    "partitionTables",
+    "lvm",
+    "packages",
+    "bootHashes",
+    "finalChecks",
+    "exclusions",
+    "swapRecreation",
+    "procCmdline",
+    "fstab",
+    "tools",
+    "archiveOptions",
+    "archives",
+    "recipient",
+    "efivars",
+    "bootSamples",
+  ];
+  if (
+    encoded.sha256 !== original.sha256 ||
+    new TextDecoder().decode(encoded.bytes) !== original.text ||
+    required.some((key) => !(key in value)) ||
+    value.consistency !== "live-file-copy" || value.sourceShutdown !== false ||
+    value.machineBootRestoreProved !== false ||
+    value.packages !== before.pacman ||
+    value.bootHashes?.root !== before.bootHashes ||
+    canonical(value.blockLayouts?.initial) !== canonical(before.layout) ||
+    value.schemaVersion !== 2 || value.format !== "backup-v2-recovery" ||
+    value.generation !== settings.generation ||
+    value.sourceConfigSha256 !== backupV2SourceConfigSha256(settings) ||
+    value.compatibilitySha256 !==
+      backupV2CompatibilitySha256(settings, before) ||
+    value.recipient?.fingerprint !== settings.recipientFingerprint ||
+    value.recipient?.publicSha256 !== settings.recipientSha256 ||
+    canonical(value.archives) !== canonical(archives) ||
+    canonical(value.bootSamples) !==
+      canonical(
+        bootSamples.map((sample) => ({
+          ...sample,
+          member: new TextDecoder().decode(sample.member),
+        })),
+      )
+  ) rejected();
+  return {
+    ...encoded,
+    bootSamples: structuredClone(bootSamples),
+    manifest: value,
+  };
 }
