@@ -65,6 +65,15 @@ export interface B2Object {
 
 export type B2Fetcher = typeof fetch;
 
+// Pure policy checks shared with the separately versioned, bounded v2 wire adapter.
+export {
+  assertBackblazeUrl as validateB2ApiUrl,
+  assertUploadUrl as validateB2UploadUrl,
+  basicAuthorization as b2BasicAuthorization,
+  validateSettings as validateB2Settings,
+  verifyAllowedScope as validateB2AllowedScope,
+};
+
 interface AuthorizedScope {
   token: string;
   apiUrl: string;
