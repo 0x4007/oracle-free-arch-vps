@@ -21,12 +21,14 @@ import {
 import {
   BACKUP_V2_ROLES,
   type BackupV2ManifestRef,
+  type BackupV2ObjectRef,
   type BackupV2Progress,
   type BackupV2Receipt,
   type BackupV2RoleManifest,
   type BackupV2TransferEpisode,
   backupV2TransferWindowMs,
   validateBackupV2ManifestRef,
+  validateBackupV2ObjectRef,
   validateBackupV2Receipt,
   validateBackupV2RoleManifest,
   validateBackupV2Root,
@@ -93,6 +95,14 @@ import {
   backupV2DeletedHandleBytes,
   readBackupV2KernelText,
 } from "./backup-v2-kernel.ts";
+import {
+  type BackupV2ProtectionDescriptor,
+  BACKUP_V2_PROTECTION_SOURCE_BASE,
+  backupV2ProtectionPageName,
+  backupV2ProtectionSourceDirectory,
+  buildBackupV2Protection,
+  validateBackupV2ProtectionDescriptor,
+} from "./backup-v2-protection.ts";
 import {
   BACKUP_BASE,
   ensurePublicHome,
@@ -374,6 +384,7 @@ export interface BackupV2VerifiedResult extends BackupV2Execution {
   receiptReference: BackupV2ManifestRef;
   finishedAtUtc: string;
   nativeCustodySha256?: string;
+  protectedGraph?: BackupV2ProtectionDescriptor;
 }
 export async function verifyBackupV2Worker(
   settingsInput: BackupV2WorkerSettings,
@@ -445,6 +456,7 @@ export function validateBackupV2VerifiedResult(
       "receiptReference",
       "finishedAtUtc",
       ...(Object.hasOwn(value,"nativeCustodySha256")?["nativeCustodySha256"]:[]),
+      ...(Object.hasOwn(value,"protectedGraph")?["protectedGraph"]:[]),
     ];
   if (
     Object.keys(r).length !== fields.length ||
@@ -472,6 +484,8 @@ export function validateBackupV2VerifiedResult(
     r.finishedAtUtc < receipt.verifiedAtUtc
   ) fail();
   const receiptReference = validateBackupV2ManifestRef(r.receiptReference);
+  const protectedGraph = Object.hasOwn(r,"protectedGraph") ? validateBackupV2ProtectionDescriptor(r.protectedGraph) : undefined;
+  if (protectedGraph) same(protectedGraph.root, worker.selectedRoot.reference);
   if(Object.hasOwn(r,"nativeCustodySha256")&&(typeof r.nativeCustodySha256!=="string"||!/^[a-f0-9]{64}$/.test(r.nativeCustodySha256)))fail();
   return {
     schemaVersion: 2,
@@ -484,6 +498,7 @@ export function validateBackupV2VerifiedResult(
     receiptReference,
     finishedAtUtc: r.finishedAtUtc,
     ...(Object.hasOwn(r,"nativeCustodySha256")?{nativeCustodySha256:r.nativeCustodySha256 as string}:{}),
+    ...(protectedGraph ? {protectedGraph} : {}),
   };
 }
 
@@ -829,6 +844,8 @@ async function capacity(
     }
   };
   await walk(directory, 0);
+  try { await walk(BACKUP_V2_PROTECTION_SOURCE_BASE, 0); }
+  catch (error) { if (!(error instanceof Deno.errors.NotFound) && !(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error; }
   const { workspaceHeldDeletedBytes: workspaceDeleted, sourceHeldDeletedBytes: sourceDeleted } =
     await backupV2DeletedHandleBytes(directory, cgroup);
   workspaceHeldDeletedBytes = workspaceDeleted;
@@ -1038,6 +1055,13 @@ export async function runBackupV2RemoteWorker(
       });
     const documents: import("./backup-v2-index.ts").BackupV2DocumentBinding[] =
       [];
+    const protectedObjects = new Map<string, BackupV2ObjectRef>();
+    const remember = (input: BackupV2ObjectRef) => {
+      const object = validateBackupV2ObjectRef(input), old = protectedObjects.get(object.fileId);
+      if (old) same(old, object);
+      protectedObjects.set(object.fileId, object);
+      if (protectedObjects.size > BACKUP_V2_LIMITS.pruneCandidates) fail();
+    };
     const encrypt = async (plaintext: Uint8Array, signal: AbortSignal) => {
       await native.assertManaged();
       const child = await processes.spawn("gpg", "gpg", gpgArgs(
@@ -1092,7 +1116,7 @@ export async function runBackupV2RemoteWorker(
             mayHaveCommitted: error instanceof BackupV2TransportError &&
               error.putMayHaveCommitted,
           }),
-          onVerified: () => work.verifiedObject(),
+          onVerified: (chunk) => {remember(chunk.object); work.verifiedObject();},
           onRetryEpisode,
           onTransferEpisode,
           onTransferComplete,
@@ -1193,6 +1217,12 @@ export async function runBackupV2RemoteWorker(
           gate,
           directory,
         );
+        for (const checkpoint of checkpoints) {
+          remember(checkpoint.reference.object);
+          for (const page of checkpoint.manifest.pages) remember(page.manifest.object);
+          for (const chunk of checkpoint.capture.chunks) remember(chunk.object);
+          for (const object of checkpoint.manifest.metadata) remember(object);
+        }
         if (checkpoints.length) {
           await atomicArtifact(directory, BACKUP_V2_CHECKPOINT_FILE, {
             envelope: settings.envelope,
@@ -1295,6 +1325,7 @@ export async function runBackupV2RemoteWorker(
             await onTransferEpisode(episode);
             await pace(object.contentLength);
             const slot = await store.getExactToFile(...args);
+            remember(object);
             work.verifiedObject();
             await onTransferComplete(operationId);
             return slot;
@@ -1346,6 +1377,15 @@ export async function runBackupV2RemoteWorker(
           },
         );
       }
+      for (const record of journal.snapshot()) if (record.type === "selected") remember(record.object);
+      const graph = buildBackupV2Protection(result.selectedRoot.reference, [...protectedObjects.values()]);
+      await rootDirectory(BACKUP_V2_PROTECTION_SOURCE_BASE);
+      const graphDirectory = backupV2ProtectionSourceDirectory(graph.descriptor.manifestSha256);
+      await rootDirectory(graphDirectory);
+      for (const page of graph.pages) await atomicArtifact(graphDirectory, backupV2ProtectionPageName(page.value.pageIndex), page.value, true);
+      await atomicArtifact(graphDirectory, "manifest.json", graph.manifest, true);
+      await atomicArtifact(graphDirectory, "descriptor.json", graph.descriptor, true);
+      result = {...result, protectedGraph: graph.descriptor};
       terminal = true;
       loopAbort.abort();
       await monitor;
