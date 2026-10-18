@@ -12,6 +12,10 @@ import {
   settleBackupV2Cancellation,
 } from "../scripts/backup-v2-supervisor.ts";
 import { BACKUP_V2_LIMITS } from "../scripts/backup-v2-profile.ts";
+import {
+  type BackupV2TransferEpisode,
+  backupV2TransferWindowMs,
+} from "../scripts/backup-v2-contract.ts";
 
 function assert(value: unknown): asserts value {
   if (!value) throw new Error("Assertion failed");
@@ -157,6 +161,65 @@ Deno.test("supervisor adopts the original durable retry window without sliding i
   );
 });
 
+Deno.test("sealed transfer grants bounded pending wait without fake work or retry-based deadline refresh", async () => {
+  const f = fixture();
+  await f.supervisor.poll();
+  const transfer: BackupV2TransferEpisode = {
+    kind: "SEALED_TRANSFER",
+    operationId: "sealed/PUT",
+    phase: "PUT",
+    sealedObjectIdentity: "sealed",
+    retainedBytes: 64,
+    startedAtMs: 0,
+    expiresAtMs: backupV2TransferWindowMs("PUT"),
+  };
+  f.supervisor.beginTransferEpisode(transfer);
+  f.state.advance(5000);
+  const pending = await f.supervisor.poll();
+  assert(pending.action === "renew");
+  equal(pending.absoluteDeadlineMs, transfer.expiresAtMs);
+  assert(pending.extendUsec <= 100_000);
+  equal(f.state.sample.progress.sourceBytes, 0);
+  throws(() =>
+    f.supervisor.beginTransferEpisode({
+      ...transfer,
+      expiresAtMs: transfer.expiresAtMs + 1,
+    })
+  );
+  f.state.advance(transfer.expiresAtMs);
+  equal((await f.supervisor.poll()).action, "cancel");
+});
+Deno.test("real durable PUT-to-readback transition owns a separate fixed window and completion releases it", async () => {
+  const f = fixture();
+  await f.supervisor.poll();
+  const put: BackupV2TransferEpisode = {
+    kind: "SEALED_TRANSFER",
+    operationId: "sealed/PUT",
+    phase: "PUT",
+    sealedObjectIdentity: "sealed",
+    retainedBytes: 64,
+    startedAtMs: 0,
+    expiresAtMs: backupV2TransferWindowMs("PUT"),
+  };
+  f.supervisor.beginTransferEpisode(put);
+  f.state.advance(20);
+  await f.supervisor.poll();
+  const read: BackupV2TransferEpisode = {
+    ...put,
+    operationId: "sealed/READBACK",
+    phase: "READBACK",
+    startedAtMs: 20,
+    expiresAtMs: 20 + backupV2TransferWindowMs("READBACK"),
+  };
+  f.supervisor.beginTransferEpisode(read);
+  equal(f.supervisor.window().transferEpisode, read);
+  f.state.advance(30);
+  f.state.sample.progress.verifiedChunks = 1;
+  await f.supervisor.poll();
+  f.supervisor.completeTransferEpisode(read.operationId);
+  equal(f.supervisor.window().transferEpisode, null);
+  equal((await f.supervisor.poll()).action, "renew");
+});
 Deno.test("supervisor notification encoding is bounded, whitelisted and singly NUL terminated", () => {
   const decoder = new TextDecoder();
   equal(

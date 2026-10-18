@@ -9,6 +9,9 @@ import {
   type BackupV2PutIntent,
   type BackupV2Role,
   type BackupV2SealedSlot,
+  type BackupV2TransferEpisode,
+  type BackupV2TransferPhase,
+  backupV2TransferWindowMs,
   validateBackupV2ObjectRef,
   validateBackupV2PutIntent,
   validateBackupV2VersionPage,
@@ -34,6 +37,12 @@ type RecordEntry =
   | { type: "candidate" | "selected"; name: string; object: BackupV2ObjectRef }
   | { type: "verify" | "reclaimed"; name: string }
   | { type: "episode"; key: string; startedAtUtc: string }
+  | {
+    type: "transfer";
+    key: string;
+    phase: BackupV2TransferPhase;
+    startedAtUtc: string;
+  }
   | { type: "scan" }
   | {
     type: "eof";
@@ -88,6 +97,7 @@ export class BackupV2UploadJournal {
   private intents = new Map<string, BackupV2PutIntent>();
   private begun = new Set<string>();
   private episodes = new Map<string, string>();
+  private transfers = new Map<string, string>();
   private bytes = 0;
   private puts = 0;
   private putBytes = 0;
@@ -203,6 +213,18 @@ export class BackupV2UploadJournal {
         ) fail("retry episode is invalid");
         this.episodes.set(record.key, record.startedAtUtc);
         break;
+      case "transfer": {
+        const item = this.logical.get(record.key),
+          key = `${record.key}/${record.phase}`;
+        if (
+          !item || !["PUT", "READBACK"].includes(record.phase) ||
+          this.transfers.has(key) ||
+          !Number.isFinite(Date.parse(record.startedAtUtc)) ||
+          record.phase === "READBACK" && item.verifies < 1
+        ) fail("transfer episode is invalid");
+        this.transfers.set(key, record.startedAtUtc);
+        break;
+      }
       case "scan":
         if (++this.scans > BACKUP_V2_LIMITS.pruneCandidates) {
           fail("reconciliation page budget exceeded");
@@ -260,6 +282,13 @@ export class BackupV2UploadJournal {
   }
   snapshot(): readonly RecordEntry[] {
     return structuredClone(this.entries);
+  }
+  transfer(
+    i: BackupV2UploadIdentity,
+    ordinal: number,
+    phase: BackupV2TransferPhase,
+  ): string | undefined {
+    return this.transfers.get(`${keyFor(i, ordinal)}/${phase}`);
   }
 }
 
@@ -361,6 +390,10 @@ export interface BackupV2UploadContext {
   onRetryEpisode?: (
     episode: BackupV2UploadRetryEpisode,
   ) => void | Promise<void>;
+  onTransferEpisode?: (
+    episode: BackupV2TransferEpisode,
+  ) => void | Promise<void>;
+  onTransferComplete?: (operationId: string) => void | Promise<void>;
 }
 export interface BackupV2UploadRetryEpisode {
   sealedObjectIdentity: string;
@@ -461,6 +494,44 @@ export async function uploadSealedBackupV2Object(
       });
     }
   };
+  const transferWindows = new Map<
+    BackupV2TransferPhase,
+    BackupV2TransferEpisode
+  >();
+  let currentTransfer: BackupV2TransferEpisode | undefined;
+  const beginTransfer = async (phase: BackupV2TransferPhase) => {
+    let episode = transferWindows.get(phase);
+    if (!episode) {
+      const duration = backupV2TransferWindowMs(phase),
+        old = context.journal.transfer(i, ordinal, phase);
+      let startedAtMs = mono();
+      if (old) {
+        const elapsed = now().getTime() - Date.parse(old);
+        if (elapsed < 0 || elapsed >= duration) {
+          fail("sealed transfer wait expired or clock regressed");
+        }
+        startedAtMs -= elapsed;
+      } else {await context.journal.append({
+          type: "transfer",
+          key: keyFor(i, ordinal),
+          phase,
+          startedAtUtc: now().toISOString(),
+        });}
+      episode = {
+        kind: "SEALED_TRANSFER",
+        operationId: `${keyFor(i, ordinal)}/${phase}`,
+        phase,
+        sealedObjectIdentity: keyFor(i, ordinal),
+        retainedBytes: slot.bytes,
+        startedAtMs,
+        expiresAtMs: startedAtMs + duration,
+      };
+      transferWindows.set(phase, episode);
+    }
+    if (mono() >= episode.expiresAtMs) fail("sealed transfer wait expired");
+    currentTransfer = episode;
+    await context.onTransferEpisode?.(episode);
+  };
   for (
     let iteration = 0;
     iteration < BACKUP_V2_LIMITS.putsPerObject;
@@ -471,6 +542,7 @@ export async function uploadSealedBackupV2Object(
       fail("retry episode expired");
     }
     await notifyEpisode();
+    if (currentTransfer) await context.onTransferEpisode?.(currentTransfer);
     let candidate: BackupV2ObjectRef | undefined;
     let wireError: unknown;
     try {
@@ -495,6 +567,7 @@ export async function uploadSealedBackupV2Object(
           ),
         });
         await context.journal.append({ type: "intent", intent });
+        await beginTransfer("PUT");
         await pace(slot.bytes);
         try {
           candidate = match(
@@ -524,6 +597,7 @@ export async function uploadSealedBackupV2Object(
       if (!matching) fail("candidate has no durable intent");
       match(candidate, { ...selectedIntent.intent, name: matching });
       await context.journal.append({ type: "verify", name: matching });
+      await beginTransfer("READBACK");
       await pace(candidate.contentLength);
       await context.store.verifyExactReadback(candidate, context.signal);
       await context.journal.append({
@@ -536,6 +610,7 @@ export async function uploadSealedBackupV2Object(
       }
       await context.spool.reclaim(slot);
       await context.journal.append({ type: "reclaimed", name: matching });
+      await context.onTransferComplete?.(currentTransfer!.operationId);
       return candidate;
     } catch (error) {
       if (!context.classifyFailure(error).retryable) throw error;

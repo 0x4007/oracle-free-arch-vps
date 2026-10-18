@@ -2,6 +2,10 @@
 // deno-lint-ignore-file require-await
 import { BACKUP_V2_LIMITS } from "../scripts/backup-v2-profile.ts";
 import {
+  type BackupV2TransferEpisode,
+  backupV2TransferWindowMs,
+} from "../scripts/backup-v2-contract.ts";
+import {
   BackupV2Spool,
   type BackupV2SpoolStorage,
   createBackupV2FileSpoolStorage,
@@ -265,6 +269,51 @@ Deno.test("journal fsync failure prevents the first wire PUT and preserves origi
   });
   await rejects(() => uploadBackupV2Stream(f.source(), f.context));
   assert(f.calls().putCalls === 0 && f.files.size > 0);
+});
+Deno.test("first physical PUT and readback get fsynced distinct transfer windows before wire calls", async () => {
+  const f = fixture(),
+    seen: BackupV2TransferEpisode[] = [],
+    completed: string[] = [];
+  f.context.onTransferEpisode = (episode) => {
+    assert(
+      f.context.journal.snapshot().some((record) =>
+        record.type === "transfer" && record.phase === episode.phase
+      ),
+    );
+    assert(
+      f.context.journal.snapshot().some((record) => record.type === "intent"),
+    );
+    seen.push({ ...episode });
+  };
+  f.context.onTransferComplete = (id) => {
+    assert(
+      f.context.journal.snapshot().some((record) => record.type === "selected"),
+    );
+    completed.push(id);
+  };
+  await uploadBackupV2Stream(f.source(), f.context);
+  assert(seen.length >= 2 && completed.length > 0);
+  for (const episode of seen) {
+    assert(
+      episode.expiresAtMs - episode.startedAtMs ===
+        backupV2TransferWindowMs(episode.phase),
+    );
+  }
+  assert(seen[0].phase === "PUT" && seen[1].phase === "READBACK");
+});
+Deno.test("transfer fsync failure prevents physical PUT and never advertises a wait lease", async () => {
+  const f = fixture();
+  let notified = 0;
+  f.context.onTransferEpisode = () => {
+    notified++;
+  };
+  f.context.journal = new BackupV2UploadJournal(CAPTURE, async (bytes) => {
+    if (JSON.parse(new TextDecoder().decode(bytes)).type === "transfer") {
+      throw Error("transfer fsync failed");
+    }
+  });
+  await rejects(() => uploadBackupV2Stream(f.source(), f.context));
+  assert(f.calls().putCalls === 0 && notified === 0 && f.files.size > 0);
 });
 Deno.test("retry episode and physical attempt budgets terminate failure without discarding bytes", async () => {
   const f = fixture("always");
