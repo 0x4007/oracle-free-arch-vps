@@ -73,7 +73,18 @@ import {
   validateGate,
 } from "./backblaze-controller-contract.ts";
 import { shellQuote } from "./backup-guest.ts";
+import { validateBackupV2ObjectRef } from "./backup-v2-contract.ts";
 import type { BackupV2KernelObservationOptions, BackupV2KernelObservation } from "./backup-v2-kernel.ts";
+import {
+  type BackupV2ProtectionDescriptor,
+  BACKUP_V2_PROTECTION_SOURCE_BASE,
+  backupV2ProtectionControlDirectory,
+  backupV2ProtectionPageName,
+  backupV2ProtectionSourceDirectory,
+  parseBackupV2ProtectionManifest,
+  parseBackupV2ProtectionPage,
+  validateBackupV2ProtectionDescriptor,
+} from "./backup-v2-protection.ts";
 
 export type BackupV2ControllerPhase =
   | "REQUESTED"
@@ -147,6 +158,7 @@ export interface BackupV2ControllerCapabilities {
   observe(gate: BackupV2Gate): Promise<BackupV2ControllerObservation>;
   acknowledge(gate: BackupV2Gate): Promise<void>;
   verifierInput(job: BackupV2ControllerJob): Promise<void>;
+  preserveProtection(verified: BackupV2VerifiedResult): Promise<void>;
   /** Must freshly reconcile the exact retained invocation immediately before stop. */
   stop(gate: BackupV2Gate, expected?: {resultSha256:string;nativeCustodySha256:string}): Promise<void>;
   cancel(gate: BackupV2Gate): Promise<"SETTLED" | "CANCELLATION_BLOCKED">;
@@ -534,6 +546,8 @@ export async function stepBackupV2Controller(
       return await save();
     }
     const verified = job.verified!;
+    if (!verified.protectedGraph) fail();
+    await deps.preserveProtection(verified);
     const entry = validateBackupV2CatalogEntry({
       schemaVersion: 2,
       format: "backup-v2",
@@ -883,6 +897,31 @@ export async function installBackupV2PiRelease(
 }
 
 /** Existing immutable wrapper names, with an explicit version-specific import. */
+export async function copyBackupV2Protection(
+  verified: BackupV2VerifiedResult,
+  io: { read(name: string): Promise<Uint8Array>; write(name: string, bytes: Uint8Array): Promise<void> },
+): Promise<BackupV2ProtectionDescriptor> {
+  const descriptor = validateBackupV2ProtectionDescriptor(verified.protectedGraph);
+  same(descriptor.root, verified.selectedRoot.reference);
+  const manifestBytes = await io.read("manifest.json"), manifest = parseBackupV2ProtectionManifest(manifestBytes, descriptor);
+  const objects = new Map<string, ReturnType<typeof validateBackupV2ObjectRef>>();
+  for (const page of manifest.pages) {
+    const name = backupV2ProtectionPageName(page.pageIndex), bytes = await io.read(name), checked = parseBackupV2ProtectionPage(bytes, manifest, page.pageIndex);
+    for (const object of checked.objects) {
+      if (objects.has(object.fileId)) fail();
+      objects.set(object.fileId, object);
+    }
+    await io.write(name, bytes);
+  }
+  for (const required of [descriptor.root.object, verified.receiptReference.object, ...verified.selectedRoot.root.roles.map((role) => role.manifest.object), ...verified.selectedRoot.root.metadata]) {
+    same(objects.get(required.fileId), required);
+  }
+  if (objects.size !== descriptor.objectCount) fail();
+  await io.write("manifest.json", manifestBytes);
+  await io.write("descriptor.json", backupV2ArtifactBytes(descriptor));
+  return descriptor;
+}
+
 export function backupV2Entrypoint(
   jobId: string,
   revision: string,
@@ -947,8 +986,8 @@ export function backupV2LaunchArguments(
     "--no-config",
     "--no-lock",
     "--cached-only",
-    `--allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${publicHome}`,
-    `--allow-write=${BACKUP_BASE},${PUBLIC_HOME_BASE}`,
+    `--allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${publicHome},${BACKUP_V2_PROTECTION_SOURCE_BASE}`,
+    `--allow-write=${BACKUP_BASE},${PUBLIC_HOME_BASE},${BACKUP_V2_PROTECTION_SOURCE_BASE}`,
     "--allow-env=INVOCATION_ID,NOTIFY_SOCKET",
     "--allow-ffi=/usr/lib/libsystemd.so.0",
     "--allow-run=/usr/bin/bash,/usr/bin/unshare,/usr/bin/gpg,/usr/bin/zstd,/usr/bin/tar,/usr/bin/mkfifo,/usr/bin/curl,/usr/bin/sudo,/usr/bin/cat,/usr/bin/chown,/usr/bin/find,/usr/bin/stat,/usr/bin/readlink",
@@ -958,7 +997,7 @@ export function backupV2LaunchArguments(
 
 /** Root-only bounded control read; payload and private keys never cross this seam. */
 function remoteProgram(program: string): string {
-  return `printf '%s' ${shellQuote(program)} | /usr/local/bin/deno run --no-prompt --no-config --no-lock --cached-only --allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT} --allow-run=/usr/bin/systemctl,/usr/bin/flock,/usr/bin/cat,/usr/bin/find,/usr/bin/stat,/usr/bin/readlink,/usr/bin/sha256sum -`;
+  return `printf '%s' ${shellQuote(program)} | /usr/local/bin/deno run --no-prompt --no-config --no-lock --cached-only --allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${BACKUP_V2_PROTECTION_SOURCE_BASE} --allow-run=/usr/bin/systemctl,/usr/bin/flock,/usr/bin/cat,/usr/bin/find,/usr/bin/stat,/usr/bin/readlink,/usr/bin/sha256sum -`;
 }
 export function backupV2ObservationProgram(gateInput: BackupV2Gate, options: BackupV2KernelObservationOptions = {}): string {
   const gate = validateBackupV2Gate(gateInput);
@@ -1263,6 +1302,29 @@ export function realBackupV2ControllerCapabilities(
           workerResultBytes: job.workerResultBytes,
         },
       ),
+    async preserveProtection(verified) {
+      const descriptor = validateBackupV2ProtectionDescriptor(verified.protectedGraph), source = backupV2ProtectionSourceDirectory(descriptor.manifestSha256), target = backupV2ProtectionControlDirectory(descriptor.manifestSha256);
+      const write = async (path: string, bytes: Uint8Array) => {
+        const old = await deps.private.readBytes(path, BACKUP_V2_LIMITS.controlResponseBytes);
+        if (old) same([...old], [...bytes]);
+        else await deps.private.writeBytes(path, bytes);
+        const actual = await deps.private.readBytes(path, BACKUP_V2_LIMITS.controlResponseBytes);
+        if (!actual || backupV2ArtifactSha256(actual) !== backupV2ArtifactSha256(bytes)) fail();
+      };
+      await copyBackupV2Protection(verified, {
+        async read(name) {
+          if (name !== "manifest.json" && !/^page-[0-9]{8}\.json$/.test(name)) fail();
+          const path = `${source}/${name}`;
+          const program = `const path=${JSON.stringify(path)},parent=path.slice(0,path.lastIndexOf("/")),dir=await Deno.lstat(parent);if(!dir.isDirectory||dir.isSymlink||dir.uid!==0||(dir.mode&511)!==448||await Deno.realPath(parent)!==parent)throw Error("Unsafe graph parent");const before=await Deno.lstat(path);if(!before.isFile||before.isSymlink||before.uid!==0||before.nlink!==1||(before.mode&511)!==384||before.size>${BACKUP_V2_LIMITS.controlResponseBytes})throw Error("Unsafe graph");const bytes=await Deno.readFile(path),after=await Deno.lstat(path);if(bytes.length!==before.size||before.dev!==after.dev||before.ino!==after.ino||before.size!==after.size)throw Error("Changed graph");let at=0;while(at<bytes.length){const count=await Deno.stdout.write(bytes.subarray(at));if(count<=0)throw Error("Short graph read");at+=count;}`;
+          const result = await deps.remote.root(remoteProgram(program));
+          const bytes = new TextEncoder().encode(result.stdout);
+          if (result.code !== 0 || bytes.length > BACKUP_V2_LIMITS.controlResponseBytes) fail();
+          return bytes;
+        },
+        write: (name, bytes) => write(`${target}/${name}`, bytes),
+      });
+      await write(`${target.slice(0,target.lastIndexOf("/"))}/roots/${descriptor.root.plaintextSha256}.json`, backupV2ArtifactBytes(descriptor));
+    },
     async stop(gate,expected) {
       const actual = await observe(gate);
       if (actual.unit === "ABSENT") {

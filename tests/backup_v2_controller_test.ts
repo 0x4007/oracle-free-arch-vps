@@ -53,12 +53,14 @@ import {
   backupV2PeriodSatisfied,
   backupV2PiReleaseRoot,
   collectBackupV2Release,
+  copyBackupV2Protection,
   realBackupV2ControllerCapabilities,
   resumeBackupV2ControllerJob,
   stepBackupV2Controller,
   validateBackupV2ControllerState,
 } from "../scripts/backup-v2-controller.ts";
 import { createBackupV2InventorySummary } from "../scripts/backup-v2-inventory.ts";
+import { backupV2ProtectionPageName, buildBackupV2Protection } from "../scripts/backup-v2-protection.ts";
 
 function assert(value: unknown, message = "Assertion failed"): asserts value {
   if (!value) throw new Error(message);
@@ -389,6 +391,7 @@ function fixture() {
     verifierInput: async () => {
       calls.push("verifier-input");
     },
+    preserveProtection: async () => {calls.push("protect");},
     stop: async () => {
       calls.push("stop");
     },
@@ -549,6 +552,7 @@ Deno.test("complete cloud receipt waits for bridge closure and accepted period n
       receiptReference: reference("receipt"),
       finishedAtUtc: END,
       nativeCustodySha256: SHA,
+      protectedGraph: buildBackupV2Protection(w.selectedRoot.reference, [reference("receipt").object, ...w.selectedRoot.root.roles.map((role) => role.manifest.object)]).descriptor,
     };
   f.observation = completeObservation(g, verified, "ACCEPTED");
   state = await stepBackupV2Controller(state, f.deps);
@@ -556,6 +560,7 @@ Deno.test("complete cloud receipt waits for bridge closure and accepted period n
   state = await stepBackupV2Controller(state, f.deps);
   equal(state.job!.phase, "COMPLETE");
   equal(state.catalog.length, 1);
+  assert(f.calls.includes("protect"));
   const accepted = state.catalog[0];
   assert(backupV2PeriodSatisfied(state, new Date(END)));
   state = await stepBackupV2Controller(state, f.deps);
@@ -584,6 +589,7 @@ Deno.test("bridge closure failure keeps verifier gate and no accepted catalog", 
     receiptReference: reference("receipt"),
     finishedAtUtc: END,
     nativeCustodySha256: SHA,
+    protectedGraph: buildBackupV2Protection(w.selectedRoot.reference, [reference("receipt").object, ...w.selectedRoot.root.roles.map((role) => role.manifest.object)]).descriptor,
   };
   f.observation = completeObservation(g, verified, "ACCEPTED");
   state = await stepBackupV2Controller(state, f.deps);
@@ -782,4 +788,21 @@ Deno.test("failed exact stop never records completed custody or permits gate rel
   await rejects(() => caps.gate.replace(gate,null));
   assert([...files.values()].every((value) => !(value as {exactStop?:unknown}).exactStop));
   assert(files.has(GATE_PATH));
+});
+
+Deno.test("protected graph copy checks every bounded page and complete direct references before descriptor publication", async () => {
+  const selected = workerResult(bound(settings().workerGate)).selectedRoot, receiptReference = reference("receipt");
+  const objects = [receiptReference.object, ...selected.root.roles.map((role) => role.manifest.object), ...Array.from({length: 110}, (_, ordinal) => reference("manifest", ordinal + 50).object)];
+  for (const defect of [null,"hash","receipt"] as const) {
+    const graph = buildBackupV2Protection(selected.reference, defect === "receipt" ? objects.filter((object) => object.fileId !== receiptReference.object.fileId) : objects);
+    const files = new Map<string,Uint8Array>([["manifest.json",graph.manifestBytes],...graph.pages.map((page) => [backupV2ProtectionPageName(page.value.pageIndex),page.bytes] as [string,Uint8Array])]);
+    const copied = new Map<string,Uint8Array>();
+    const verified = {selectedRoot:selected,receiptReference,protectedGraph:graph.descriptor} as BackupV2VerifiedResult;
+    const operation = () => copyBackupV2Protection(verified, {
+      read(name) {const bytes=files.get(name);if(!bytes)throw Error("Missing graph page");return Promise.resolve(defect === "hash" && name.endsWith("00000001.json") ? new Uint8Array([1]) : bytes);},
+      write(name,bytes) {copied.set(name,bytes.slice());return Promise.resolve();},
+    });
+    if (defect) {await rejects(operation);assert(!copied.has("descriptor.json"));}
+    else {equal(await operation(),graph.descriptor);assert(copied.size === graph.pages.length + 2);equal([...copied.get("manifest.json")!],[...graph.manifestBytes]);}
+  }
 });
