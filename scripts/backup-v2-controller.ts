@@ -1052,6 +1052,7 @@ export function backupV2LaunchArguments(
     `--allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${publicHome},${BACKUP_RUNTIME_BASE}`,
     `--allow-write=${BACKUP_BASE},${PUBLIC_HOME_BASE},${BACKUP_V2_PROTECTION_SOURCE_BASE}`,
     "--allow-env=INVOCATION_ID,NOTIFY_SOCKET",
+    "--allow-sys=statfs",
     "--allow-ffi=/usr/lib/libsystemd.so.0",
     "--allow-run=/bin/sh,/usr/bin/systemctl,/usr/bin/sha256sum,/usr/bin/flock,/usr/bin/bash,/usr/bin/unshare,/usr/bin/gpg,/usr/bin/zstd,/usr/bin/tar,/usr/bin/mkfifo,/usr/bin/curl,/usr/bin/sudo,/usr/bin/cat,/usr/bin/chown,/usr/bin/find,/usr/bin/stat,/usr/bin/readlink",
     kind === "prune"
