@@ -77,6 +77,7 @@ export interface BackupV2Result extends BackupV2Execution {
   envelope: BackupV2RequestEnvelope;
   finishedAtUtc: string;
   selectedRoot: BackupV2SelectedRoot;
+  nativeCustodySha256?: string;
 }
 export interface BackupV2Gate {
   schemaVersion: 2;
@@ -386,6 +387,7 @@ export function validateBackupV2Result(
     ...EXECUTION_KEYS,
     "finishedAtUtc",
     "selectedRoot",
+    ...(value&&typeof value==="object"&&Object.hasOwn(value,"nativeCustodySha256")?["nativeCustodySha256"]:[]),
   ]);
   version(r);
   const envelope = validateBackupV2RequestEnvelope(r.envelope),
@@ -406,6 +408,7 @@ export function validateBackupV2Result(
     ...identity,
     finishedAtUtc,
     selectedRoot: selected,
+    ...(Object.hasOwn(r,"nativeCustodySha256")?{nativeCustodySha256:hash(r.nativeCustodySha256)}:{}),
   });
 }
 /** Gate presence always blocks competing work, including PENDING, unknown

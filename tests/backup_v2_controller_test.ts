@@ -171,6 +171,7 @@ function observation(gate: BackupV2Gate): BackupV2ControllerObservation {
     identity: active.custody,
     status: status(active, "PREFLIGHT"),
     resultBytes: null,
+    nativeCustodySha256: SHA,
     tree: {
       identity: active.custody!,
       observedMonotonicMs: 10,
@@ -255,6 +256,7 @@ function workerResult(gate: BackupV2Gate): BackupV2Result {
     sourceBootId: gate.sourceBootId,
     custody: gate.custody!,
     finishedAtUtc: END,
+    nativeCustodySha256: SHA,
     selectedRoot: {
       reference: reference(),
       root: {
@@ -545,6 +547,7 @@ Deno.test("complete cloud receipt waits for bridge closure and accepted period n
       receipt: receipt(w),
       receiptReference: reference("receipt"),
       finishedAtUtc: END,
+      nativeCustodySha256: SHA,
     };
   f.observation = completeObservation(g, verified, "ACCEPTED");
   state = await stepBackupV2Controller(state, f.deps);
@@ -579,6 +582,7 @@ Deno.test("bridge closure failure keeps verifier gate and no accepted catalog", 
     receipt: receipt(w),
     receiptReference: reference("receipt"),
     finishedAtUtc: END,
+    nativeCustodySha256: SHA,
   };
   f.observation = completeObservation(g, verified, "ACCEPTED");
   state = await stepBackupV2Controller(state, f.deps);
@@ -681,6 +685,7 @@ Deno.test("real stop adapter retains terminal proof before unload and clears exa
     files = new Map<string, unknown>([[GATE_PATH, g]]),
     events: string[] = [];
   let current = completeObservation(g, workerResult(g), "CLOUD_COMPLETE");
+  current.tree!.namespaceReferences = 1;
   const pi = {
     now: () => new Date(END),
     private: {
@@ -694,7 +699,7 @@ Deno.test("real stop adapter retains terminal proof before unload and clears exa
       root: async (script: string) => {
         if (script.includes("\nsystemctl stop ")) {
           events.push("stop");
-          current = { ...current, unit: "ABSENT" };
+          current = { ...current, unit: "ABSENT", tree:{...current.tree!,namespaceReferences:0} };
           return { code: 0, stdout: "", stderr: "" };
         }
         return {
@@ -737,4 +742,15 @@ Deno.test("explicit verifier resume preserves selected cloud root and original i
   equal(next.job!.workerResult, root);
   equal(next.job!.workerResultBytes, failed.job!.workerResultBytes);
   equal(failed.job!.phase, "FAILED");
+});
+
+Deno.test("post-stop namespace holders or changed native journal retain the exact gate",async()=>{
+  for(const issue of ["namespace","journal"] as const){
+    const gate=bound(settings().workerGate),files=new Map<string,unknown>([[GATE_PATH,gate]]);
+    let current=completeObservation(gate,workerResult(gate),"CLOUD_COMPLETE");current.tree!.namespaceReferences=1;
+    const expected={resultSha256:backupV2ArtifactSha256(current.resultBytes!),nativeCustodySha256:SHA};
+    const deps={now:()=>new Date(END),private:{read:async(path:string)=>files.get(path),write:async(path:string,value:unknown)=>{files.set(path,structuredClone(value));}},remote:{root:async(script:string)=>{if(script.includes("\nsystemctl stop ")){current={...current,unit:"ABSENT",tree:{...current.tree!,namespaceReferences:issue==="namespace"?1:0},nativeCustodySha256:issue==="journal"?"e".repeat(64):SHA};return {code:0,stdout:"",stderr:""};}return {code:0,stdout:JSON.stringify({...current,resultBytes:current.resultBytes?[...current.resultBytes]:null}),stderr:""};}}} as unknown as PiDeps;
+    const caps=realBackupV2ControllerCapabilities(deps,fixture().deps.bridge,async(path)=>{files.delete(path);});await caps.stop(gate,expected);
+    await rejects(()=>caps.gate.replace(gate,null));assert(files.has(GATE_PATH));
+  }
 });
