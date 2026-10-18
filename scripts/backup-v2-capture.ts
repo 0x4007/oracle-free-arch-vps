@@ -783,9 +783,12 @@ export async function captureBackupV2Generation(
       compatibilitySha256,
       producer,
     }, context);
+    await assertMountGuards(settings, context.stage, `guard:v2:${role}`, run);
+    if (role === "staging-boot") {
+      await assertStagingBootParity(context.stage, before);
+    }
     roles.push(result);
     await context.onRole?.(result);
-    await assertMountGuards(settings, context.stage, `guard:v2:${role}`, run);
   };
   for (const role of ROLE_ORDER) await capture(role);
   await assertStagingBootParity(context.stage, before);
