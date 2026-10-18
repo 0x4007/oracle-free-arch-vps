@@ -342,6 +342,129 @@ Deno.test("kernel deleted handles count physical blocks once and preserve newlin
   );
 });
 
+Deno.test("kernel deleted accounting restarts the complete census after a disappearing child", async () => {
+  const f = fixture();
+  let samples = 0, metadata = 0;
+  const churn: BackupV2KernelCommand = (command, args) => {
+    if (command === "/usr/bin/cat" && args.at(-1)!.endsWith("/cgroup.procs")) {
+      return Promise.resolve(ok(++samples === 1 ? "123\n124\n" : "123\n"));
+    }
+    if (command === "/usr/bin/cat" && args.at(-1) === "/proc/124/stat") {
+      return Promise.resolve(missing());
+    }
+    if (command === "/usr/bin/cat" && args.at(-1) === "/proc/123/stat") {
+      metadata++;
+    }
+    return f.run(command, args);
+  };
+  equal(await backupV2DeletedHandleBytes(directory, cgroup, churn), {
+    workspaceHeldDeletedBytes: 1024,
+    sourceHeldDeletedBytes: 4096,
+  });
+  equal(samples, 3);
+  equal(metadata, 4); // Earlier successful rows are sampled again, never reused.
+});
+
+Deno.test("kernel deleted accounting excludes only the exact reader PID even when it changes each sample", async () => {
+  const f = fixture();
+  let samples = 0;
+  const readers: BackupV2KernelCommand = (command, args) => {
+    if (command === "/usr/bin/cat" && args.at(-1)!.endsWith("/cgroup.procs")) {
+      const reader = 9000 + ++samples;
+      return Promise.resolve(ok(`123\n${reader}\n`, reader));
+    }
+    return f.run(command, args);
+  };
+  equal(await backupV2DeletedHandleBytes(directory, cgroup, readers), {
+    workspaceHeldDeletedBytes: 1024,
+    sourceHeldDeletedBytes: 4096,
+  });
+  equal(samples, 2);
+  assert(!f.calls.some(([, args]) => /^\/proc\/900[12]\//.test(args.at(-1)!)));
+});
+
+Deno.test("kernel deleted accounting retries a silent readlink failure only after proving its child exited", async () => {
+  const f = fixture();
+  let exited = false, samples = 0;
+  const churn: BackupV2KernelCommand = (command, args) => {
+    const path = args.at(-1)!;
+    if (command === "/usr/bin/cat" && path.endsWith("/cgroup.procs")) {
+      samples++;
+      return Promise.resolve(ok(exited ? "123\n" : "123\n124\n"));
+    }
+    if (command === "/usr/bin/cat" && path === "/proc/124/stat") {
+      return Promise.resolve(ok(stat(124)));
+    }
+    if (command === "/usr/bin/cat" && path === "/proc/124/cgroup") {
+      return Promise.resolve(ok(`0::${cgroup}\n`));
+    }
+    if (command === "/usr/bin/readlink" && path.startsWith("/proc/124/fd/")) {
+      exited = true;
+      return Promise.resolve({ code: 1, stdout: "", stderr: "" });
+    }
+    return f.run(command, args);
+  };
+  equal(await backupV2DeletedHandleBytes(directory, cgroup, churn), {
+    workspaceHeldDeletedBytes: 1024,
+    sourceHeldDeletedBytes: 4096,
+  });
+  equal(samples, 4);
+});
+
+Deno.test("kernel deleted accounting retries a changed final PID list but bounds persistent churn", async () => {
+  for (const persistent of [false, true]) {
+    const f = fixture();
+    let samples = 0, completed = 0;
+    const churn: BackupV2KernelCommand = (command, args) => {
+      if (
+        command === "/usr/bin/cat" && args.at(-1)!.endsWith("/cgroup.procs")
+      ) {
+        samples++;
+        const changed = samples % 2 === 0 && (persistent || samples === 2);
+        return Promise.resolve(ok(changed ? "123\n124\n" : "123\n"));
+      }
+      if (command === "/usr/bin/readlink") completed++;
+      return f.run(command, args);
+    };
+    if (persistent) {
+      await rejects(
+        () => backupV2DeletedHandleBytes(directory, cgroup, churn),
+        "CUSTODY",
+      );
+      equal(samples, 6);
+      equal(completed, 3);
+    } else {
+      equal(await backupV2DeletedHandleBytes(directory, cgroup, churn), {
+        workspaceHeldDeletedBytes: 1024,
+        sourceHeldDeletedBytes: 4096,
+      });
+      equal(samples, 4);
+      equal(completed, 2);
+    }
+  }
+});
+
+Deno.test("kernel deleted accounting never retries permission failure as a topology race", async () => {
+  const f = fixture();
+  let denied = 0;
+  const unreadable: BackupV2KernelCommand = (command, args) => {
+    if (command === "/usr/bin/cat" && args.at(-1) === "/proc/123/stat") {
+      denied++;
+      return Promise.resolve({
+        code: 1,
+        stdout: "",
+        stderr: "Permission denied",
+      });
+    }
+    return f.run(command, args);
+  };
+  await rejects(
+    () => backupV2DeletedHandleBytes(directory, cgroup, unreadable),
+    "UNREADABLE",
+  );
+  equal(denied, 1);
+});
+
 Deno.test("kernel deleted accounting rejects another generation or gate before scanning", async () => {
   const f = fixture();
   await rejects(

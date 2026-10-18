@@ -363,90 +363,116 @@ export async function backupV2DeletedHandleBytes(
   if (!owner || workspace[1] !== owner[2] || workspace[2] !== owner[3]) {
     fail("CUSTODY");
   }
+  // Child exit and our bounded metadata readers can change a live census.
+  // Start over with fresh facts, sharing one original time/call/byte budget;
+  // exhausted or unreadable observations never become an accounting zero.
   const run = bounded(command),
-    processes = await pids(cgroup, run),
-    held = new Map<string, { bytes: number; workspace: boolean }>();
-  for (const current of processes) {
-    const before = result(
-      await run("/usr/bin/cat", ["--", `/proc/${current}/stat`]),
-    );
-    const start = fields(before, current).start;
-    const membership = result(
-      await run("/usr/bin/cat", ["--", `/proc/${current}/cgroup`]),
-    ).trim();
-    if (
-      membership !== `0::${cgroup}` && !membership.startsWith(`0::${cgroup}/`)
-    ) fail("CUSTODY");
-    const descriptors = result(
-      await run("/usr/bin/find", [
-        `/proc/${current}/fd`,
-        "-mindepth",
-        "1",
-        "-maxdepth",
-        "1",
-        "-printf",
-        "%f\\0",
-      ]),
-    ).split("\0");
-    if (
-      descriptors.pop() !== "" || descriptors.length > MAX_FDS ||
-      descriptors.some((fd) => !/^[0-9]{1,10}$/.test(fd))
-    ) fail("BOUNDED");
-    if (descriptors.length === 0) {
-      if (
-        fields(
-          result(await run("/usr/bin/cat", ["--", `/proc/${current}/stat`])),
-          current,
-        ).start !== start
-      ) fail("CUSTODY");
-      continue;
-    }
-    const paths = descriptors.map((fd) => `/proc/${current}/fd/${fd}`);
-    const statArgs = ["-L", "--printf=%d:%i:%b:%h:%F\\0", "--", ...paths];
-    const first = stats(result(await run("/usr/bin/stat", statArgs)));
-    const targets = result(
-      await run("/usr/bin/readlink", ["-z", "--", ...paths]),
-    ).split("\0");
-    if (
-      targets.pop() !== "" || targets.length !== descriptors.length ||
-      first.length !== descriptors.length
-    ) fail("MALFORMED");
-    const after = stats(result(await run("/usr/bin/stat", statArgs)));
-    if (
-      after.length !== first.length ||
-      fields(
-          result(await run("/usr/bin/cat", ["--", `/proc/${current}/stat`])),
-          current,
-        ).start !== start
-    ) fail("CUSTODY");
-    for (let index = 0; index < first.length; index++) {
-      const info = after[index];
-      if (!info.regular || info.links !== 0) continue;
-      if (first[index].key !== info.key || !first[index].regular) {
-        fail("CUSTODY");
+    changed = new BackupV2KernelEvidenceError("CUSTODY");
+  for (let attempt = 0;; attempt++) {
+    let processes: number[] | undefined;
+    try {
+      processes = await pids(cgroup, run);
+      const held = new Map<string, { bytes: number; workspace: boolean }>();
+      for (const current of processes) {
+        const before = result(
+          await run("/usr/bin/cat", ["--", `/proc/${current}/stat`]),
+        );
+        const start = fields(before, current).start;
+        const membership = result(
+          await run("/usr/bin/cat", ["--", `/proc/${current}/cgroup`]),
+        ).trim();
+        if (
+          membership !== `0::${cgroup}` &&
+          !membership.startsWith(`0::${cgroup}/`)
+        ) fail("CUSTODY");
+        const descriptors = result(
+          await run("/usr/bin/find", [
+            `/proc/${current}/fd`,
+            "-mindepth",
+            "1",
+            "-maxdepth",
+            "1",
+            "-printf",
+            "%f\\0",
+          ]),
+        ).split("\0");
+        if (
+          descriptors.pop() !== "" || descriptors.length > MAX_FDS ||
+          descriptors.some((fd) => !/^[0-9]{1,10}$/.test(fd))
+        ) fail("BOUNDED");
+        if (descriptors.length === 0) {
+          if (
+            fields(
+              result(
+                await run("/usr/bin/cat", ["--", `/proc/${current}/stat`]),
+              ),
+              current,
+            ).start !== start
+          ) fail("CUSTODY");
+          continue;
+        }
+        const paths = descriptors.map((fd) => `/proc/${current}/fd/${fd}`);
+        const statArgs = ["-L", "--printf=%d:%i:%b:%h:%F\\0", "--", ...paths];
+        const first = stats(result(await run("/usr/bin/stat", statArgs)));
+        const targets = result(
+          await run("/usr/bin/readlink", ["-z", "--", ...paths]),
+        ).split("\0");
+        if (
+          targets.pop() !== "" || targets.length !== descriptors.length ||
+          first.length !== descriptors.length
+        ) fail("MALFORMED");
+        const after = stats(result(await run("/usr/bin/stat", statArgs)));
+        if (
+          after.length !== first.length ||
+          fields(
+              result(
+                await run("/usr/bin/cat", ["--", `/proc/${current}/stat`]),
+              ),
+              current,
+            ).start !== start
+        ) fail("CUSTODY");
+        for (let index = 0; index < first.length; index++) {
+          const info = after[index];
+          if (!info.regular || info.links !== 0) continue;
+          if (first[index].key !== info.key || !first[index].regular) {
+            fail("CUSTODY");
+          }
+          const workspace = targets[index].startsWith(directory + "/");
+          const prior = held.get(info.key);
+          if (prior && prior.bytes !== info.blocks) fail("CUSTODY");
+          held.set(info.key, {
+            bytes: info.blocks,
+            workspace: workspace || prior?.workspace === true,
+          });
+        }
       }
-      const workspace = targets[index].startsWith(directory + "/");
-      const prior = held.get(info.key);
-      if (prior && prior.bytes !== info.blocks) fail("CUSTODY");
-      held.set(info.key, {
-        bytes: info.blocks,
-        workspace: workspace || prior?.workspace === true,
-      });
+      const after = await pids(cgroup, run);
+      if (JSON.stringify(after) !== JSON.stringify(processes)) throw changed;
+      let workspaceHeldDeletedBytes = 0, sourceHeldDeletedBytes = 0;
+      for (const value of held.values()) {
+        if (value.workspace) workspaceHeldDeletedBytes += value.bytes;
+        else sourceHeldDeletedBytes += value.bytes;
+      }
+      if (
+        ![workspaceHeldDeletedBytes, sourceHeldDeletedBytes].every(
+          Number.isSafeInteger,
+        )
+      ) fail("BOUNDED");
+      return { workspaceHeldDeletedBytes, sourceHeldDeletedBytes };
+    } catch (error) {
+      if (attempt >= 2) throw error;
+      if (error !== changed && !absent(error)) {
+        // readlink may report only exit 1 when its process vanishes. A fresh
+        // changed PID list proves that race; ordinary permission failures stay
+        // unknown rather than being ignored or repeatedly sampled as zero.
+        if (
+          !processes || !(error instanceof BackupV2KernelEvidenceError) ||
+          error.kind !== "UNREADABLE" ||
+          JSON.stringify(await pids(cgroup, run)) === JSON.stringify(processes)
+        ) throw error;
+      }
     }
   }
-  const after = await pids(cgroup, run);
-  if (JSON.stringify(after) !== JSON.stringify(processes)) fail("CUSTODY");
-  let workspaceHeldDeletedBytes = 0, sourceHeldDeletedBytes = 0;
-  for (const value of held.values()) {
-    if (value.workspace) workspaceHeldDeletedBytes += value.bytes;
-    else sourceHeldDeletedBytes += value.bytes;
-  }
-  if (
-    ![workspaceHeldDeletedBytes, sourceHeldDeletedBytes].every(
-      Number.isSafeInteger,
-    )
-  ) fail("BOUNDED");
-  return { workspaceHeldDeletedBytes, sourceHeldDeletedBytes };
 }
 function properties(text: string): Record<string, string> {
   return Object.fromEntries(
