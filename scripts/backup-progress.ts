@@ -403,10 +403,13 @@ export function assessBackupV2Progress(
     "compressionInputBytes",
     "verifiedChunks",
     "decryptedBytes",
+    "decodedBytes",
     "inventoryMembers",
   ] as const;
   if (
-    fields.some((key) => status.progress[key] < previous.progress[key]) ||
+    fields.some((key) =>
+      (status.progress[key] ?? 0) < (previous.progress[key] ?? 0)
+    ) ||
     sample.uploadedBytes !== null && old.uploadedBytes !== null &&
       sample.uploadedBytes < old.uploadedBytes
   ) {
@@ -414,7 +417,9 @@ export function assessBackupV2Progress(
     return report;
   }
   const changed =
-    fields.some((key) => status.progress[key] > previous.progress[key]) ||
+    fields.some((key) =>
+      (status.progress[key] ?? 0) > (previous.progress[key] ?? 0)
+    ) ||
     sample.uploadedBytes !== null && old.uploadedBytes !== null &&
       sample.uploadedBytes > old.uploadedBytes;
   report.lastProgressAtUtc = changed

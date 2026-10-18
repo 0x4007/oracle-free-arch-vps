@@ -200,6 +200,7 @@ const counters = [
   "compressionInputBytes",
   "verifiedChunks",
   "decryptedBytes",
+  "decodedBytes",
   "inventoryMembers",
 ] as const;
 const useful: Partial<Record<BackupV2Progress["phase"], readonly string[]>> = {
@@ -214,7 +215,7 @@ const useful: Partial<Record<BackupV2Progress["phase"], readonly string[]>> = {
   VERIFYING: [
     "verifiedChunks",
     "decryptedBytes",
-    "compressionInputBytes",
+    "decodedBytes",
     "inventoryMembers",
   ],
 };
@@ -432,12 +433,14 @@ export class BackupV2BridgeKeeper {
     if (this.#previous) {
       if (
         progress.observedMonotonicMs < this.#previous.observedMonotonicMs ||
-        counters.some((field) => progress[field] < this.#previous![field])
+        counters.some((field) =>
+          (progress[field] ?? 0) < (this.#previous![field] ?? 0)
+        )
       ) {
         return this.#fail("PROGRESS_REGRESSED");
       }
       const changed = counters.filter((field) =>
-        progress[field] > this.#previous![field]
+        (progress[field] ?? 0) > (this.#previous![field] ?? 0)
       );
       if (changed.some((field) => !allowed.includes(field))) {
         return this.#fail("PROGRESS_WRONG_PHASE");

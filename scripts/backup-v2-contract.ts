@@ -250,6 +250,8 @@ export interface BackupV2Progress {
   compressionInputBytes: number;
   verifiedChunks: number;
   decryptedBytes: number;
+  /** Cumulative tar-decoder output across at most three verification passes. */
+  decodedBytes?: number;
   inventoryMembers: number;
 }
 export interface BackupV2LeaseWindow {
@@ -986,6 +988,10 @@ export function validateBackupV2Progress(value: unknown): BackupV2Progress {
     "verifiedChunks",
     "decryptedBytes",
     "inventoryMembers",
+    ...(value && typeof value === "object" &&
+        Object.hasOwn(value, "decodedBytes")
+      ? ["decodedBytes"]
+      : []),
   ]);
   const phases: BackupV2Phase[] = [
     "PREFLIGHT",
@@ -1008,7 +1014,18 @@ export function validateBackupV2Progress(value: unknown): BackupV2Progress {
       BACKUP_V2_LIMITS.logicalSourceBytes,
     ),
     verifiedChunks: integer(r.verifiedChunks, BACKUP_V2_LIMITS.logicalObjects),
-    decryptedBytes: integer(r.decryptedBytes, BACKUP_V2_LIMITS.ciphertextBytes),
+    decryptedBytes: integer(
+      r.decryptedBytes,
+      BACKUP_V2_LIMITS.decryptionWorkBytes,
+    ),
+    ...(Object.hasOwn(r, "decodedBytes")
+      ? {
+        decodedBytes: integer(
+          r.decodedBytes,
+          BACKUP_V2_LIMITS.decoderWorkBytes,
+        ),
+      }
+      : {}),
     inventoryMembers: integer(r.inventoryMembers, BACKUP_V2_LIMITS.members),
   };
 }

@@ -28,6 +28,9 @@ export const BACKUP_V2_LIMITS = Object.freeze({
   metadataRecordBytes: MIB,
   depth: 256,
   logicalSourceBytes: 1024 * GIB,
+  // The streaming verifier may replay twice for linked boot samples.
+  decoderWorkBytes: 3 * 1024 * GIB,
+  decryptionWorkBytes: 3 * 256 * GIB,
   inventoryBytes: 512 * MIB,
   pruneCandidates: 100_000,
   decoderMemoryBytes: 128 * MIB,
