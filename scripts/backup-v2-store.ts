@@ -30,6 +30,10 @@ import {
   BACKUP_V2_NAMESPACE,
 } from "./backup-v2-profile.ts";
 import type { BackupV2NativeSpawn } from "./backup-v2-native-process.ts";
+import {
+  type BackupV2KernelCommand,
+  realBackupV2KernelCommand,
+} from "./backup-v2-kernel.ts";
 
 const AUTH = "https://api.backblazeb2.com/b2api/v4/b2_authorize_account";
 const API = "/b2api/v3/";
@@ -473,15 +477,70 @@ async function jsonBody(
   }
 }
 
-async function safeParent(path: string): Promise<void> {
+type AncestorInfo = Pick<
+  Deno.FileInfo,
+  "isDirectory" | "isSymlink" | "uid" | "mode"
+>;
+export interface BackupV2AncestorIO {
+  lstat(path: string): Promise<AncestorInfo>;
+  metadata: BackupV2KernelCommand;
+}
+const ancestorIO: BackupV2AncestorIO = {
+  lstat: Deno.lstat,
+  metadata: realBackupV2KernelCommand,
+};
+async function ancestorInfo(
+  path: string,
+  io: BackupV2AncestorIO,
+): Promise<AncestorInfo> {
+  try {
+    return await io.lstat(path);
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotCapable)) throw error;
+  }
+  // No -L: preserve lstat semantics and reject a symlink at this exact path.
+  // This command reads metadata only, under the existing bounded stat grant.
+  const result = await io.metadata("/usr/bin/stat", [
+    "--printf=%u\\0%f\\0%n\\0",
+    "--",
+    path,
+  ]);
+  require(
+    result.code === 0 && result.stderr === "" &&
+      encoder.encode(result.stdout).length <= encoder.encode(path).length + 128,
+    "slot parent metadata unavailable",
+  );
+  const parts = result.stdout.split("\0");
+  require(
+    parts.length === 4 && parts[3] === "" && parts[2] === path &&
+      /^[0-9]+$/.test(parts[0]) && /^[0-9a-f]{1,8}$/.test(parts[1]),
+    "slot parent metadata binding rejected",
+  );
+  const uid = Number(parts[0]), mode = parseInt(parts[1], 16);
+  require(
+    Number.isSafeInteger(uid) && uid >= 0 && mode <= 0o177777,
+    "slot parent metadata values rejected",
+  );
+  return {
+    uid,
+    mode,
+    isDirectory: (mode & 0o170000) === 0o040000,
+    isSymlink: (mode & 0o170000) === 0o120000,
+  };
+}
+export async function assertBackupV2SlotParents(
+  path: string,
+  io: BackupV2AncestorIO = ancestorIO,
+): Promise<void> {
   require(isAbsolute(path) && resolve(path) === path, "invalid slot path");
   let parent = dirname(path);
   while (parent !== "/") {
-    const info = await Deno.lstat(parent);
+    const info = await ancestorInfo(parent, io);
     const stickyTemporary = ["/tmp", "/var/tmp"].includes(parent) &&
       (info.mode! & 0o1000) !== 0;
     require(
       info.isDirectory && !info.isSymlink && info.uid === 0 &&
+        info.mode !== null &&
         ((info.mode! & 0o022) === 0 || stickyTemporary),
       "slot parent is not controlled",
     );
@@ -514,9 +573,12 @@ async function hashes(
   }
   return { bytes, sha1: first.digest("hex"), sha256: second.digest("hex") };
 }
-async function verifySlot(slot: BackupV2SealedSlot): Promise<void> {
+async function verifySlot(
+  slot: BackupV2SealedSlot,
+  io: BackupV2AncestorIO,
+): Promise<void> {
   validateBackupV2SealedSlot(slot);
-  await safeParent(slot.path);
+  await assertBackupV2SlotParents(slot.path, io);
   const before = await identity(slot.path);
   require(
     before.dev === slot.device && before.ino === slot.inode &&
@@ -544,11 +606,13 @@ async function verifySlot(slot: BackupV2SealedSlot): Promise<void> {
 export class BackupV2Store implements BackupV2ExactObjectStore {
   readonly #settings: B2Settings;
   readonly #wire: BackupV2Wire;
+  readonly #ancestors: BackupV2AncestorIO;
   readonly #usedPuts = new Set<string>();
   #scope?: Promise<{ token: string; api: string; download: string }>;
   constructor(
     settings: B2Settings,
     wire: BackupV2Wire = createCurlBackupV2Wire(),
+    metadata: BackupV2KernelCommand = realBackupV2KernelCommand,
   ) {
     validateB2Settings(settings);
     for (
@@ -560,6 +624,7 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
     ) text(value);
     this.#settings = { ...settings };
     this.#wire = wire;
+    this.#ancestors = { ...ancestorIO, metadata };
   }
   async #request(
     url: string,
@@ -632,7 +697,7 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
     signal?: AbortSignal,
   ): Promise<BackupV2ObjectRef> {
     const intent = validateBackupV2PutIntent(value);
-    await verifySlot(intent.slot);
+    await verifySlot(intent.slot, this.#ancestors);
     const scope = await this.#authorized(signal);
     const target = await this.#request(
       `${scope.api}${API}b2_get_upload_url`,
@@ -676,7 +741,7 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
           body.contentSha1 === intent.slot.sha1 && body.action === "upload",
         "PUT response binding mismatch",
       );
-      await verifySlot(intent.slot);
+      await verifySlot(intent.slot, this.#ancestors);
       return validateBackupV2ObjectRef({
         fileId: body.fileId,
         fileName: body.fileName,
@@ -781,7 +846,7 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
   ): Promise<BackupV2SealedSlot> {
     const object = validateBackupV2ObjectRef(value);
     require(target.index === 0 || target.index === 1, "invalid target index");
-    await safeParent(target.path);
+    await assertBackupV2SlotParents(target.path, this.#ancestors);
     try {
       using file = await Deno.open(target.path, {
         createNew: true,
