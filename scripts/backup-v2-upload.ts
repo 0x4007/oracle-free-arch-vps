@@ -356,6 +356,17 @@ export interface BackupV2UploadContext {
   monotonicNow?: () => number;
   newPutId?: () => string;
   onVerified?: (chunk: BackupV2Chunk) => void | Promise<void>;
+  /** Called only after the journal's retry episode is durable. The original
+   * monotonic endpoints remain fixed across all subsequent attempts. */
+  onRetryEpisode?: (
+    episode: BackupV2UploadRetryEpisode,
+  ) => void | Promise<void>;
+}
+export interface BackupV2UploadRetryEpisode {
+  sealedObjectIdentity: string;
+  retainedBytes: number;
+  startedAtMs: number;
+  expiresAtMs: number;
 }
 export function createBackupV2UploadPacer(): (bytes: number) => Promise<void> {
   return createTransferPacer();
@@ -429,6 +440,7 @@ export async function uploadSealedBackupV2Object(
         }));
   await context.spool.read(slot, () => {});
   let episodeDeadline: number | undefined;
+  let episodeStarted: number | undefined;
   const previousEpisode = context.journal.episode(i, ordinal);
   if (previousEpisode) {
     const remaining = Date.parse(previousEpisode) +
@@ -437,7 +449,18 @@ export async function uploadSealedBackupV2Object(
       fail("retry episode expired or clock regressed");
     }
     episodeDeadline = mono() + remaining;
+    episodeStarted = episodeDeadline - BACKUP_V2_LIMITS.blockedTransportMs;
   }
+  const notifyEpisode = async () => {
+    if (episodeDeadline !== undefined && episodeStarted !== undefined) {
+      await context.onRetryEpisode?.({
+        sealedObjectIdentity: keyFor(i, ordinal),
+        retainedBytes: slot.bytes,
+        startedAtMs: episodeStarted,
+        expiresAtMs: episodeDeadline,
+      });
+    }
+  };
   for (
     let iteration = 0;
     iteration < BACKUP_V2_LIMITS.putsPerObject;
@@ -447,6 +470,7 @@ export async function uploadSealedBackupV2Object(
     if (episodeDeadline !== undefined && mono() >= episodeDeadline) {
       fail("retry episode expired");
     }
+    await notifyEpisode();
     let candidate: BackupV2ObjectRef | undefined;
     let wireError: unknown;
     try {
@@ -516,13 +540,15 @@ export async function uploadSealedBackupV2Object(
     } catch (error) {
       if (!context.classifyFailure(error).retryable) throw error;
       if (episodeDeadline === undefined) {
+        episodeStarted = mono();
         await context.journal.append({
           type: "episode",
           key: keyFor(i, ordinal),
           startedAtUtc: now().toISOString(),
         });
-        episodeDeadline = mono() + BACKUP_V2_LIMITS.blockedTransportMs;
+        episodeDeadline = episodeStarted + BACKUP_V2_LIMITS.blockedTransportMs;
       }
+      await notifyEpisode();
       const delay = iteration < 2 ? 1000 * (iteration + 1) : 30 * 60_000;
       if (
         iteration + 1 >= BACKUP_V2_LIMITS.putsPerObject ||

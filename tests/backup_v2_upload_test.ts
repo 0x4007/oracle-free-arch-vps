@@ -1,5 +1,6 @@
 // Async capability fakes intentionally complete synchronously without native IO.
 // deno-lint-ignore-file require-await
+import { BACKUP_V2_LIMITS } from "../scripts/backup-v2-profile.ts";
 import {
   BackupV2Spool,
   type BackupV2SpoolStorage,
@@ -275,6 +276,45 @@ Deno.test("retry episode and physical attempt budgets terminate failure without 
     f.context.journal.snapshot().filter((r) => r.type === "episode").length ===
       1,
   );
+});
+Deno.test("retry callback follows durable episode and retains one fixed window and sealed identity", async () => {
+  const f = fixture("always"),
+    windows: {
+      startedAtMs: number;
+      expiresAtMs: number;
+      sealedObjectIdentity: string;
+      retainedBytes: number;
+    }[] = [];
+  f.context.onRetryEpisode = (episode) => {
+    assert(
+      f.context.journal.snapshot().some((record) => record.type === "episode"),
+    );
+    assert(f.files.size > 0 && episode.retainedBytes > 0);
+    windows.push({ ...episode });
+  };
+  await rejects(() => uploadBackupV2Stream(f.source(), f.context));
+  assert(windows.length > 2);
+  for (const value of windows) {
+    assert(JSON.stringify(value) === JSON.stringify(windows[0]));
+  }
+  assert(
+    windows[0].expiresAtMs - windows[0].startedAtMs ===
+      BACKUP_V2_LIMITS.blockedTransportMs,
+  );
+});
+Deno.test("failed retry-episode durability never invokes supervisor notification", async () => {
+  const f = fixture("always");
+  let notified = 0;
+  f.context.onRetryEpisode = () => {
+    notified++;
+  };
+  f.context.journal = new BackupV2UploadJournal(CAPTURE, async (bytes) => {
+    if (JSON.parse(new TextDecoder().decode(bytes)).type === "episode") {
+      throw Error("episode fsync failed");
+    }
+  });
+  await rejects(() => uploadBackupV2Stream(f.source(), f.context));
+  assert(notified === 0 && f.files.size > 0);
 });
 Deno.test("journal replay retains old unresolved intents and blocks producer-attempt restart", async () => {
   const f = fixture();
