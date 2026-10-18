@@ -495,7 +495,9 @@ export class BackupV2BridgeKeeper {
       if (!this.#notifierClosed) {
         this.#notifierClosed = true;
         try {
-          this.#caps.notifier.stopping();
+          // STOPPING starts systemd's stop path and bypasses RemainAfterExit.
+          // A successful terminal helper exits normally to retain custody.
+          if (this.#reason !== "TERMINAL") this.#caps.notifier.stopping();
         } catch { /* Still close stdin. */ }
         try {
           this.#caps.notifier.close();

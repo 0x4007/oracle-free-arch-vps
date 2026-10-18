@@ -285,6 +285,9 @@ Deno.test("bridge terminal or cancellation observation closes without releasing 
     equal(status.state, "CLOSED");
     equal(status.reason, gate);
     equal(status.binding.gateId, binding.gateId);
+    equal(f.events.includes("stopping"), gate === "CANCELLED");
+    assert(f.events.includes("notifier-close"));
+    assert(f.events.includes("stdin-eof-and-exit"));
   }
 });
 
