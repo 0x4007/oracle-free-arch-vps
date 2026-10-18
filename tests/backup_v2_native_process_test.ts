@@ -337,7 +337,13 @@ Deno.test({
     payload.set(encoder.encode("START\n"));
     await Deno.writeFile(source + "/binary", payload, { mode: 0o640 });
     await Deno.link(source + "/binary", source + "/hard");
-    await Deno.symlink("binary", source + "/sym");
+    const linked = await realBackupV2KernelCommand("/usr/bin/ln", [
+      "-s",
+      "--",
+      "binary",
+      source + "/sym",
+    ]);
+    assert(linked.code === 0);
     await Deno.utime(
       source + "/binary",
       new Date("2026-10-18T00:00:00Z"),
