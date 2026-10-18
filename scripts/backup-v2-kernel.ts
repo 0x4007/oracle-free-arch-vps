@@ -414,8 +414,10 @@ export async function backupV2DeletedHandleBytes(
         const paths = descriptors.map((fd) => `/proc/${current}/fd/${fd}`);
         const statArgs = ["-L", "--printf=%d:%i:%b:%h:%F\\0", "--", ...paths];
         const first = stats(result(await run("/usr/bin/stat", statArgs)));
+        // GNU readlink is otherwise silent when an FD closes in a live PID.
+        // Verbose ENOENT reaches the existing bounded whole-census retry.
         const targets = result(
-          await run("/usr/bin/readlink", ["-z", "--", ...paths]),
+          await run("/usr/bin/readlink", ["-z", "-v", "--", ...paths]),
         ).split("\0");
         if (
           targets.pop() !== "" || targets.length !== descriptors.length ||
