@@ -681,3 +681,39 @@ Deno.test("v2 progress bytes require readback selection, dedupe replay, and igno
     equal(rejected, true);
   }
 });
+
+Deno.test("v2 progress accepts real transfer records without counting attempted bytes", async () => {
+  const { captureId, records } = journalFixture();
+  const intent = records[0].intent!;
+  const transfer = {
+    type: "transfer",
+    key:
+      `${intent.captureId}/${intent.attemptId}/${intent.role}/${intent.kind}/${intent.ordinal}`,
+    phase: "PUT",
+    startedAtUtc: start.toISOString(),
+  };
+  equal(
+    await verifiedBackupV2JournalBytes(
+      journalChunks([records[0], transfer]),
+      captureId,
+    ),
+    0,
+  );
+  equal(
+    await verifiedBackupV2JournalBytes(
+      journalChunks([records[0], transfer, ...records.slice(1)]),
+      captureId,
+    ),
+    17,
+  );
+  let rejected = false;
+  try {
+    await verifiedBackupV2JournalBytes(
+      journalChunks([records[0], { ...transfer, phase: "UNKNOWN" }]),
+      captureId,
+    );
+  } catch {
+    rejected = true;
+  }
+  equal(rejected, true);
+});

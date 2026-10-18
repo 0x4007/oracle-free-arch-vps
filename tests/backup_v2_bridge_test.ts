@@ -199,6 +199,28 @@ Deno.test("bridge snapshots retain only the bounded custody fields", () => {
   assert(JSON.stringify(bridge.status()).length < 4096);
 });
 
+Deno.test("bridge retains a bounded first transfer without heartbeat-only extension", async () => {
+  const f = fixture(), bridge = f.make();
+  f.sample.sourceWait = {
+    retryEpisode: null,
+    transferEpisode: {
+      kind: "SEALED_TRANSFER",
+      operationId: "read-one",
+      phase: "READBACK",
+      sealedObjectIdentity: "sealed-one",
+      retainedBytes: 64,
+      startedAtMs: 0,
+      expiresAtMs: 5000,
+    },
+  };
+  equal((await bridge.start()).state, "ACTIVE");
+  f.advance(500);
+  equal((await bridge.poll()).state, "ACTIVE");
+  equal(bridge.status().lease.transferEpisode!.expiresAtMs, 5000);
+  f.advance(5000);
+  equal((await bridge.poll()).state, "CLOSED");
+});
+
 Deno.test("bridge heartbeat cannot renew useful work and expired work cannot revive", async () => {
   const f = fixture(), bridge = f.make();
   await bridge.start();

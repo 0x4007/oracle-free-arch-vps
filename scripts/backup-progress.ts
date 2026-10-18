@@ -462,7 +462,9 @@ export async function verifiedBackupV2JournalBytes(
       string,
       { bytes: number; sha1: string; sha256: string; verified: boolean }
     >(),
-    selected = new Map<string, string>();
+    selected = new Map<string, string>(),
+    logical = new Set<string>(),
+    transfers = new Set<string>();
   for await (const chunk of chunks) {
     if (chunk.length > 64 * 1024) {
       throw Error("V2 journal read chunk exceeded bound");
@@ -486,6 +488,9 @@ export async function verifiedBackupV2JournalBytes(
           i.captureId !== captureId ||
           intents.size >= BACKUP_V2_LIMITS.physicalPuts
         ) throw Error("V2 journal identity differs");
+        logical.add(
+          `${i.captureId}/${i.attemptId}/${i.role}/${i.kind}/${i.ordinal}`,
+        );
         intents.set(i.name, {
           bytes: i.slot.bytes,
           sha1: i.slot.sha1,
@@ -521,6 +526,18 @@ export async function verifiedBackupV2JournalBytes(
           selected.size > BACKUP_V2_LIMITS.logicalObjects || !finite(total) ||
           total > BACKUP_V2_LIMITS.ciphertextBytes
         ) throw Error("V2 selected bytes exceed bound");
+      } else if (r.type === "transfer") {
+        if (
+          typeof r.key !== "string" || !logical.has(r.key) ||
+          transfers.has(`${r.key}/${r.phase}`) ||
+          !["PUT", "READBACK"].includes(r.phase) ||
+          typeof r.startedAtUtc !== "string" ||
+          !Number.isFinite(Date.parse(r.startedAtUtc)) ||
+          Object.keys(r).sort().join(",") !== "key,phase,startedAtUtc,type"
+        ) {
+          throw Error("Invalid V2 transfer record");
+        }
+        transfers.add(`${r.key}/${r.phase}`);
       } else if (
         !["begin", "candidate", "reclaimed", "episode", "scan", "eof"].includes(
           r.type,

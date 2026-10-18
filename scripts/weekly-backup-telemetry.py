@@ -12,7 +12,16 @@ import time
 
 STATE = pathlib.Path('/var/lib/weekly-backup-telemetry')
 CGROUP_ROOT = pathlib.Path('/sys/fs/cgroup')
-UNIT_RE = re.compile(r'^arch-vps-b2-(worker|verify)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.service$')
+UNIT_RE = re.compile(r'^arch-vps-b2-(?:v2-)?(worker|verify|prune)-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?:-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}))?\.service$')
+def unit_match(name):
+    match = UNIT_RE.fullmatch(name)
+    if not match or bool(match[3]) != name.startswith('arch-vps-b2-v2-'):
+        return None
+    if match[1] == 'prune' and not match[3]:
+        return None
+    return match
+
+
 MAX_SAMPLE_BYTES = 8 * 1024 * 1024
 MAX_RECORDS = 48
 RETENTION_SECONDS = 90 * 86400
@@ -252,9 +261,11 @@ def prune():
 def collect():
     output = command(['systemctl', 'list-units', '--all', '--plain', '--no-legend',
                       '--no-pager', '--type=service',
-                      'arch-vps-b2-worker-*.service', 'arch-vps-b2-verify-*.service'])
+                      'arch-vps-b2-worker-*.service', 'arch-vps-b2-verify-*.service',
+                      'arch-vps-b2-v2-worker-*.service', 'arch-vps-b2-v2-verify-*.service',
+                      'arch-vps-b2-v2-prune-*.service'])
     units = [line.split()[0] for line in output.splitlines()
-             if line.split() and UNIT_RE.fullmatch(line.split()[0])]
+             if line.split() and unit_match(line.split()[0])]
     if not units:
         prune()
         return
@@ -264,7 +275,7 @@ def collect():
     for block in output.strip().split('\n\n'):
         raw = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
         unit = raw.get('Id', '')
-        match = UNIT_RE.fullmatch(unit)
+        match = unit_match(unit)
         if not match or not raw.get('InvocationID'):
             continue
         props = {key: value(raw.get(key)) for key in PROPERTIES}
