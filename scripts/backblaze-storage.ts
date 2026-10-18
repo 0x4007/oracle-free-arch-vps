@@ -442,7 +442,7 @@ function listedObject(
   const item = expectRecord(operation, value);
   const fileName = requiredString(operation, item, "fileName");
   // Any item outside the exact namespace fails the whole listing.
-  assertObjectName(fileName,prefix);
+  assertObjectName(fileName, prefix);
   const fileId = requiredString(operation, item, "fileId");
   const action = requiredString(operation, item, "action");
   if (action !== "upload" && action !== "hide" && action !== "start") {
@@ -749,7 +749,9 @@ export class B2Store {
 
   /** Read-only inventory of one exact backup namespace. Writes stay v1-only. */
   async versions(prefix = DIRECT_PREFIX): Promise<B2Object[]> {
-    if (prefix !== DIRECT_PREFIX && prefix !== BACKUP_V2_NAMESPACE) throw new Error("versions failed: namespace rejected");
+    if (prefix !== DIRECT_PREFIX && prefix !== BACKUP_V2_NAMESPACE) {
+      throw new Error("versions failed: namespace rejected");
+    }
     const scope = await this.#authorizeOnce();
     const operation = "b2_list_file_versions";
     const found: B2Object[] = [];
@@ -780,8 +782,13 @@ export class B2Store {
         throw invalidResponse(operation, "files");
       }
       for (const item of filesValue) {
-        found.push(listedObject(operation, this.#settings.bucketId, item, prefix));
-        if (prefix === BACKUP_V2_NAMESPACE && found.length > BACKUP_V2_LIMITS.pruneCandidates) throw operationError(operation,"version inventory bound");
+        found.push(
+          listedObject(operation, this.#settings.bucketId, item, prefix),
+        );
+        if (
+          prefix === BACKUP_V2_NAMESPACE &&
+          found.length > BACKUP_V2_LIMITS.pruneCandidates
+        ) throw operationError(operation, "version inventory bound");
       }
       const nextFileName = body["nextFileName"];
       const nextFileId = body["nextFileId"];
@@ -792,7 +799,7 @@ export class B2Store {
       if (!hasNext || !hasNextId) {
         throw operationError(operation, "incomplete continuation");
       }
-      assertObjectName(nextFileName as string,prefix);
+      assertObjectName(nextFileName as string, prefix);
       if (pages >= MAX_LIST_PAGES) {
         throw operationError(operation, "more than 10000 pages");
       }

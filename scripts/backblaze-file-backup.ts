@@ -3171,33 +3171,45 @@ export interface StreamDecryptProcesses {
     status: Promise<Deno.CommandStatus>;
   }>;
 }
-export function makeStreamDecryptArchive(publicHome: string, processes?: StreamDecryptProcesses) {
+export function makeStreamDecryptArchive(
+  publicHome: string,
+  processes?: StreamDecryptProcesses,
+) {
   return async (
     ciphertext: ReadableStream<Uint8Array>,
     destination: Pick<Deno.FsFile, "write">,
   ): Promise<{ integrityChecked: true }> => {
-    const command = processes?.command ?? ((args: string[]) => new Deno.Command("sudo", {
-      ...backupChildProcessOptions(),
-      args,
-      stdout: "piped",
-      stderr: "piped",
-    }).output());
+    const command = processes?.command ??
+      ((args: string[]) =>
+        new Deno.Command("sudo", {
+          ...backupChildProcessOptions(),
+          args,
+          stdout: "piped",
+          stderr: "piped",
+        }).output());
     const socketResult = await command([
-        "-n",
-        "-u",
-        "codex",
-        "gpgconf",
-        "--homedir",
-        publicHome,
-        "--list-dirs",
-        "agent-socket",
-      ]);
+      "-n",
+      "-u",
+      "codex",
+      "gpgconf",
+      "--homedir",
+      publicHome,
+      "--list-dirs",
+      "agent-socket",
+    ]);
     if (!socketResult.success) {
       throw new Error("Custom agent socket resolution failed");
     }
     const agentSocket = new TextDecoder().decode(socketResult.stdout).trim()
       .split("\n").at(-1) ?? "";
-    const defaultResult = await command(["-n", "-u", "codex", "gpgconf", "--list-dirs", "agent-socket"]);
+    const defaultResult = await command([
+      "-n",
+      "-u",
+      "codex",
+      "gpgconf",
+      "--list-dirs",
+      "agent-socket",
+    ]);
     if (!defaultResult.success) {
       throw new Error("Default agent socket resolution failed");
     }
@@ -3219,22 +3231,24 @@ export function makeStreamDecryptArchive(publicHome: string, processes?: StreamD
       if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
     const decryptArgs = [
-        "--no-options",
-        "--no-autostart",
-        "--batch",
-        "--no-tty",
-        "--homedir",
-        publicHome,
-        "--status-fd=2",
-        "--decrypt",
-      ];
-    const child = processes ? await processes.spawn(decryptArgs) : new Deno.Command("sudo", {
-      ...backupChildProcessOptions(),
-      args: ["-n", "-u", "codex", "gpg", ...decryptArgs],
-      stdin: "piped",
-      stdout: "piped",
-      stderr: "piped",
-    }).spawn();
+      "--no-options",
+      "--no-autostart",
+      "--batch",
+      "--no-tty",
+      "--homedir",
+      publicHome,
+      "--status-fd=2",
+      "--decrypt",
+    ];
+    const child = processes
+      ? await processes.spawn(decryptArgs)
+      : new Deno.Command("sudo", {
+        ...backupChildProcessOptions(),
+        args: ["-n", "-u", "codex", "gpg", ...decryptArgs],
+        stdin: "piped",
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn();
     let statusText = "";
     let overflow = false;
     const diagnostics = (async () => {
@@ -3314,7 +3328,10 @@ export async function importRecipient(
   if (!output.success) throw new Error("Public recipient import failed");
 }
 
-export async function ensurePublicHome(publicHome: string, command?: (name: string, args: string[]) => Promise<{ code: number }>): Promise<void> {
+export async function ensurePublicHome(
+  publicHome: string,
+  command?: (name: string, args: string[]) => Promise<{ code: number }>,
+): Promise<void> {
   try {
     const info = await Deno.lstat(publicHome);
     if (info.isSymlink || !info.isDirectory) {
@@ -3327,11 +3344,15 @@ export async function ensurePublicHome(publicHome: string, command?: (name: stri
     if (!(error instanceof Deno.errors.NotFound)) throw error;
     await Deno.mkdir(publicHome, { mode: 0o700, recursive: true });
     const parent = publicHome.slice(0, publicHome.lastIndexOf("/"));
-    const chown = command ? await command("chown", ["codex:codex", publicHome]) : await new Deno.Command("chown", {
-      ...backupChildProcessOptions(),
-      args: ["codex:codex", publicHome],
-    }).output();
-    if (chown.code !== 0) throw new Error("Source public key home ownership failed");
+    const chown = command
+      ? await command("chown", ["codex:codex", publicHome])
+      : await new Deno.Command("chown", {
+        ...backupChildProcessOptions(),
+        args: ["codex:codex", publicHome],
+      }).output();
+    if (chown.code !== 0) {
+      throw new Error("Source public key home ownership failed");
+    }
     const real = await Deno.realPath(parent);
     void real;
     await Deno.chmod(publicHome, 0o700);
