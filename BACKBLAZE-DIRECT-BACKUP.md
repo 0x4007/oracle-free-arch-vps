@@ -16,7 +16,39 @@ database consistency. Package and boot-file checks detect relevant changes
 during capture. Exclusions are in `config/restic-excludes.txt`; they apply
 relative to each filesystem root.
 
-## Recovery evidence
+## Streaming v2 contract, October 18, 2026
+
+The `backup-v2` source contract retains the per-role `tar.zst.gpg` format and the separate encrypted recovery-metadata payload. It replaces size-proportional archive staging with `tar → zstd → GPG → two ciphertext slots → B2`. Each slot holds at most 64 MiB; when both are occupied, awaited backpressure stops upstream work. Neither capture nor independent verification may hide a complete compressed, ciphertext or plaintext archive in another workspace, cache or temporary path. This section describes the candidate contract and its required acceptance; it does not establish production deployment or a new accepted due-period point.
+
+A slot is sealed and hashed, and a fresh physical PUT intent is durably recorded before each wire request. A successful upload response is only a candidate. The complete selected exact B2 version must pass length, SHA-1 and SHA-256 readback, and its selected reference must be durably journaled before reclaiming the slot. Ambiguous success retains its intent and sealed bytes for exact-version reconciliation. New physical PUT attempts have distinct recorded identities; they do not silently overwrite or forget an uncertain attempt. Payload upload, readback and later verification stay directly between VPS and B2. The Pi carries control records and task-owned GPG-agent operations, with private keys kept off the VPS and outside Git.
+
+Independent verification starts from trusted cloud references and an off-VPS accepted-root digest, without source mounts or capture caches. It checks bounded exact-object slots before feeding the ordered ciphertext to a continuous GPG stream, drains GPG and zstd completely, verifies inventory and all four boot samples, and collects every final process/integrity status. A successful tar listing alone is insufficient. No complete plaintext archive is written. A dead producer starts a new active-role attempt after settlement; ciphertext from a new GPG process is never appended to an old partial stream. Only compatible cloud-sealed roles may be reused, retaining their original capture intervals.
+
+The declared profile in [backup-v2-profile.ts](scripts/backup-v2-profile.ts) is a finite admission envelope, not a measured capacity guarantee:
+
+| Dimension | Declared bound |
+| --- | --- |
+| Ciphertext payload slots | Two × 64 MiB, 128 MiB total |
+| Aggregate workspace, including metadata, temporary/cache files and overhead | 2 GiB |
+| Protected free-space reserve | 5.5 GiB plus unallocated workspace and production-writer margin |
+| Journal / individual manifest | 64 MiB / 1 MiB |
+| Logical source / capture ciphertext / physical PUT bytes | 1 TiB / 256 GiB / 512 GiB |
+| Logical objects / physical PUT attempts / attempts per object | 5,000 / 16,384 / 16 |
+| Members / aggregate path bytes / inventory stream | 2,000,000 / 128 MiB / 512 MiB |
+
+Admission counts already allocated workspace once and observes free blocks, inodes and held-deleted files. The source currently adds a 512 MiB production-writer margin. The full profile also bounds hardlinks, directory listings, sparse extents, extended metadata, decoder memory and pruning candidates. Exceeding a bound fails closed without dropping source data. Fixed payload slots do not imply constant metadata, GNU tar RAM, runtime or cumulative disk I/O. This remains a weekly full-capture design, without incremental transfer or cross-generation deduplication; complete source reading, compression/encryption, upload/readback and independent cloud verification still consume work proportional to the selected data and metadata.
+
+V2 requests have no inherited twelve-hour whole-job deadline. Source and bridge lifetime instead require finite managed leases bound to the exact gate, boot, invocation, PID/start and cgroup. Source code currently uses 300-second startup/useful-progress grace with short 30-second notification leases. Only verified work or a fixed, durable sealed-transfer/retry episode can extend custody; heartbeats and repeated failed bytes cannot reset the episode. Transport declares a 30-second connection bound, 120-second control-request bound, six-hour payload bound and 120-second curl low-speed window; that rate window is not an exact socket-idle timeout. Transfer episode bounds include associated control requests and settlement. The Pi's existing thirteen-hour service bound limits a controller attempt, while the independent source/bridge continuity must be proved for a healthy long v2 job. Legacy v1 requests retain their original deadline semantics.
+
+Cancellation is separate from successful archive verification. An exact observed invocation and successful exact-unit stop must be followed by fresh process/start, cgroup, namespace, FD and source-lock evidence. Independently dead children can establish cancellation settlement even when the interrupted journal lacks EXIT records; no record, exit status, result or receipt is invented. Missing/malformed custody, a live escape, unresolved namespace, contradictory identity or uncertain closure remains `CANCELLATION_BLOCKED`, retaining ownership and preventing overlapping work or cleanup. Ambiguous upload/delete intents remain for later reconciliation. A missing unit alone proves nothing.
+
+V1 indexes, readers, original requests, FAILED statuses, receipts and timestamps remain preserved behind strict version dispatch. Retention keeps at least four accepted points and protects every exact reference reachable from retained roots, reused roles, metadata, receipts and recovery tools, plus active and unresolved operations. A bounded dry-run plan and fresh protection/custody checks precede exact-version deletion. An old failed-attempt prefix can contain reused data and must never be swept wholesale. The B2 pruner does not own the Oracle recovery pair or unrelated Restic data.
+
+The schedule contract remains Sunday 00:05 America/New_York with fifteen-minute/startup rechecks and one current due period. A completed capture in that period satisfies it; migration must not manufacture a second generation. Required acceptance includes retained-v1 streaming recovery, real failure/cancellation/fidelity and capacity fixtures, one genuine all-role due-period v2 capture with independent complete cloud verification, hash-matched Pi/VPS and recovery-tool releases, safe retention/cleanup, settled gates/units/locks/tunnels, current timers and unchanged production continuity. Pi keeper continuity across the source transfer/startup windows remains part of that acceptance. A later natural weekly cycle is separate repeatability evidence. New archive verification may establish `decryptedRestoreProved=true`; `machineBootRestoreProved` stays false without a separately approved boot drill. Historical boot proof below does not transfer to a new capture.
+
+The owner-controlled charter and [ONLINE-BACKUP-CONTRACT.md](ONLINE-BACKUP-CONTRACT.md) still require routine production operation online: no instance stop, reboot or freeze, and no required-service interruption. Resource authority is unchanged. October 18 operator evidence establishes the shared one-CPU, 6 GiB, zero-swap and preserved-IO envelope; a post-exit leaf sample establishes neither the application nor an override of its requested running limit. Earlier retained-v1 live leaf/ancestor evidence remains separate. Source currently declares `CPUQuota=100%`, `CPUWeight=1`, `Nice=19`, no soft memory ceiling and no swap, with the approved per-direction disk/network ceilings. Its `MemoryMax=6G` declaration is 6,442,450,944 bytes, distinct from the October 2 owner record of 6,255,601,664 bytes. Installation acceptance must reconcile authority and actual unit/ancestor values; this document does not approve a limit increase or infer protection from a unit file alone.
+
+## Historical recovery evidence
 
 On 2026-09-06, two generations passed the following real checks:
 
@@ -68,7 +100,9 @@ stable identity. Treat the staging boot and Arch root as one recovery unit.
 Recreate excluded swap from metadata, then perform a real boot and service check
 before claiming machine restoration.
 
-## Automation status
+## Historical automation notes
+
+The following notes preserve earlier rollout observations, including explicitly dated September 2026 counts and timer checks. They are historical context, not a current inventory, current timer readback or a v2 deployment claim. Later dated decisions and the streaming-v2 contract above define the candidate behavior and its acceptance requirements.
 
 The source worker, recovery module, decrypted verifier, shared controller gate,
 and Pi controller are integrated. The Pi has a separate verification keyring
