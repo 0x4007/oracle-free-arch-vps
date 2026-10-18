@@ -9,6 +9,7 @@ import {
   createBackupV2Notifier,
   encodeBackupV2Notification,
   evaluateBackupV2Lease,
+  pollBackupV2Settlement,
   settleBackupV2Cancellation,
 } from "../scripts/backup-v2-supervisor.ts";
 import { BACKUP_V2_LIMITS } from "../scripts/backup-v2-profile.ts";
@@ -546,6 +547,88 @@ Deno.test("supervisor cancellation blocks on wrong identity without stopping ano
   });
   equal(result.state, "CANCELLATION_BLOCKED");
   assert(!stopped);
+});
+
+Deno.test("cancellation retries transient unknown after exactly one stop", async () => {
+  let now = 0, reads = 0, stops = 0;
+  const result = await settleBackupV2Cancellation(identity, {
+    now: () => now,
+    observe: () => {
+      reads++;
+      return Promise.resolve(
+        reads === 1
+          ? { ...tree(now), mainPid: identity.mainPid, cgroupPopulated: true }
+          : reads === 2
+          ? null
+          : tree(now),
+      );
+    },
+    stop: () => {
+      stops++;
+      return Promise.resolve();
+    },
+    wait: (ms) => {
+      now += ms;
+      return Promise.resolve();
+    },
+  });
+  equal(result.state, "SETTLED");
+  equal(stops, 1);
+  equal(reads, 3);
+});
+
+Deno.test("cancellation never retries a changed identity after stop", async () => {
+  let stops = 0, reads = 0;
+  const result = await settleBackupV2Cancellation(identity, {
+    now: () => 0,
+    observe: () => {
+      reads++;
+      return Promise.resolve(
+        stops
+          ? { ...tree(), identity: { ...identity, mainStartTicks: "999" } }
+          : { ...tree(), mainPid: identity.mainPid },
+      );
+    },
+    stop: () => {
+      stops++;
+      return Promise.resolve();
+    },
+  });
+  equal(result.state, "CANCELLATION_BLOCKED");
+  equal(stops, 1);
+  equal(reads, 2);
+});
+
+Deno.test("settlement polling has one finite budget and never converts unknown to success", async () => {
+  let now = 0, reads = 0;
+  const proved = await pollBackupV2Settlement(
+    () => {
+      reads++;
+      return Promise.resolve(false);
+    },
+    300,
+    () => now,
+    (ms) => {
+      now += ms;
+      return Promise.resolve();
+    },
+  );
+  equal(proved, false);
+  equal(now, 300);
+  equal(reads, 2);
+  let aborted = false;
+  try {
+    await pollBackupV2Settlement((signal) =>
+      new Promise((resolve) => {
+        signal.addEventListener("abort", () => {
+          aborted = true;
+          resolve(false);
+        }, { once: true });
+      }), 5);
+    throw new Error("Expected observation deadline");
+  } catch {
+    assert(aborted);
+  }
 });
 
 Deno.test("supervisor cancellation never equates MainPID zero with full settlement", async () => {

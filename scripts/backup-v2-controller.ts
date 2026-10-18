@@ -63,6 +63,7 @@ import {
   type BackupV2SupervisorIdentity,
   backupV2SupervisorUnitProperties,
   type BackupV2TreeObservation,
+  pollBackupV2Settlement,
   settleBackupV2Cancellation,
 } from "./backup-v2-supervisor.ts";
 import {
@@ -1179,7 +1180,10 @@ export function realBackupV2ControllerCapabilities(
     }
     return await observeBackupV2Source(gate, deps.remote, options);
   };
-  const retainedProof = async (gate: BackupV2Gate): Promise<boolean> => {
+  const retainedProof = async (
+    gate: BackupV2Gate,
+    timeoutMs = 30_000,
+  ): Promise<boolean> => {
     const saved = await deps.private.read<
       StopProof
     >(pathForClear(gate));
@@ -1189,16 +1193,24 @@ export function realBackupV2ControllerCapabilities(
       if (saved.proof.sourceBootId !== gate.sourceBootId) fail();
       same(saved.proof.identity, gate.custody);
     } else if (!backupV2ProcessesSettled(gate, saved.proof, false)) fail();
-    const current = await observe(gate);
-    if (!backupV2TreeSettled(gate, current, true)) return false;
-    if (
-      saved.artifacts &&
-      (!current.resultBytes ||
-        backupV2ArtifactSha256(current.resultBytes) !==
-          saved.artifacts.resultSha256 ||
-        current.nativeCustodySha256 !== saved.artifacts.nativeCustodySha256)
-    ) return false;
-    return true;
+    return await pollBackupV2Settlement(async () => {
+      const current = await observe(gate);
+      if (
+        current.sourceBootId !== null &&
+        current.sourceBootId !== gate.sourceBootId
+      ) fail();
+      if (current.identity !== null) same(current.identity, gate.custody);
+      if (!backupV2TreeSettled(gate, current, true)) return false;
+      if (saved.artifacts) {
+        if (!current.resultBytes || !current.nativeCustodySha256) return false;
+        if (
+          backupV2ArtifactSha256(current.resultBytes) !==
+            saved.artifacts.resultSha256 ||
+          current.nativeCustodySha256 !== saved.artifacts.nativeCustodySha256
+        ) fail();
+      }
+      return true;
+    }, timeoutMs);
   };
   return {
     now: deps.now,
@@ -1498,11 +1510,14 @@ export function realBackupV2ControllerCapabilities(
     },
     async cancel(gate) {
       if (!gate.custody) return "CANCELLATION_BLOCKED";
+      const deadline = performance.now() + 30_000;
       const settled = await settleBackupV2Cancellation(gate.custody, {
         now: () => performance.now(),
         observe: async () => {
           const value = await observe(gate);
-          if (!value.tree || value.sourceBootId !== gate.sourceBootId) fail();
+          if (value.sourceBootId === null) return null;
+          if (value.sourceBootId !== gate.sourceBootId) fail();
+          if (value.identity !== null) same(value.identity, gate.custody);
           return value.tree;
         },
         stop: async () => {
@@ -1545,17 +1560,9 @@ test "$(systemctl show --value --property=InvocationID ${
         },
       });
       if (settled.state === "SETTLED") {
-        const proof = await observe(gate);
-        if (!backupV2TreeSettled(gate, proof, true)) {
+        const remaining = deadline - performance.now();
+        if (remaining <= 0 || !await retainedProof(gate, remaining)) {
           return "CANCELLATION_BLOCKED";
-        }
-        if (!await deps.private.read(pathForClear(gate))) {
-          await deps.private.write(pathForClear(gate), {
-            gate,
-            proof: { ...proof, resultBytes: null },
-            cancellation: true,
-            recordedAtUtc: deps.now().toISOString(),
-          });
         }
       }
       return settled.state;
