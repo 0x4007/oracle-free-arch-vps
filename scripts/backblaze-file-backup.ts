@@ -6016,10 +6016,10 @@ async function piMain(): Promise<void> {
 }
 
 if (import.meta.main) {
-  try {
-    await piMain();
-  } catch (error) {
+  // Finish evaluating this shared module before the v2 controller imports it
+  // back for the existing Pi capabilities. A top-level await creates a cycle.
+  void piMain().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     Deno.exitCode = 1;
-  }
+  });
 }
