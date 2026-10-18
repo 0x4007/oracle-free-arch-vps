@@ -17,6 +17,7 @@ import {
 } from "./backblaze-machine-restore.ts";
 import type { B2Settings } from "./backblaze-storage.ts";
 import { validateCatalogEntry } from "./backblaze-file-backup.ts";
+import { validateBackupRuntimeCatalogEntry } from "./backup-v2-runtime-contract.ts";
 import {
   type DiskPreparationBinding,
   type DiskPreparationPlan,
@@ -67,6 +68,38 @@ const MAX_CONTROL_FILE_BYTES = 512 * 1024;
 const MAX_CONTROL_BYTES = 2 * 1024 * 1024;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES = 256 * 1024;
+
+/** Dispatch before touching legacy index fields. The off-VPS catalog is the
+ * trust anchor carried in the existing hash-bound target control input. */
+export function recoveryCatalogSelection(input: unknown) {
+  const tag = input as { schemaVersion?: unknown; format?: unknown } | null;
+  const selected = tag?.schemaVersion === 2 || tag?.format === "backup-v2" ||
+      tag?.format === "backup-v1"
+    ? validateBackupRuntimeCatalogEntry(input, validateCatalogEntry)
+    : {
+      schemaVersion: 1 as const,
+      format: "backup-v1" as const,
+      entry: validateCatalogEntry(input),
+    };
+  if (selected.schemaVersion === 2) {
+    return {
+      schemaVersion: 2 as const,
+      catalog: selected,
+      generation: selected.selectedRoot.root.captureId,
+      indexSha256: selected.selectedRoot.reference.plaintextSha256,
+      recipientSha256: selected.selectedRoot.root.recipientSha256,
+      recipientFingerprint: selected.selectedRoot.root.recipientFingerprint,
+    };
+  }
+  return {
+    schemaVersion: 1 as const,
+    catalog: selected.entry,
+    generation: selected.entry.index.generation,
+    indexSha256: machineRestoreIndexSha256(selected.entry.index),
+    recipientSha256: selected.entry.index.recipientSha256,
+    recipientFingerprint: selected.entry.index.recipientFingerprint,
+  };
+}
 
 export interface RecoveryTargetFile {
   path: string;
@@ -323,6 +356,25 @@ function assertBundle(bundle: RecoveryTargetBundle): void {
   }
 }
 
+/** Include literal static, dynamic, side-effect and re-export dependencies. */
+export function recoveryRelativeImports(
+  relative: string,
+  source: string,
+): string[] {
+  if (!safeSourcePath(relative)) throw Error("Recovery source path is unsafe");
+  const imported = new Set<string>();
+  const pattern = /(?:\bfrom\s*|\bimport\s*(?:\(\s*)?)["'](\.[^"']+)["']/g;
+  for (const match of source.matchAll(pattern)) {
+    const path = match[1];
+    const resolved = new URL(path, `file:///${relative}`).pathname.slice(1);
+    if (path.includes("%") || !safeSourcePath(resolved)) {
+      throw Error("Recovery source import is outside hashed scripts");
+    }
+    imported.add(resolved);
+  }
+  return [...imported];
+}
+
 /** Build the source dependency closure without copying any archive payload. */
 export async function buildRecoveryTargetBundle(
   options: RecoveryTargetSourceBundleOptions,
@@ -343,8 +395,8 @@ export async function buildRecoveryTargetBundle(
   if (release.sourceRevision !== options.sourceRevision || !release.hashes) {
     throw Error("Recovery source revision differs from the installed release");
   }
-  const catalog = validateCatalogEntry(options.input.catalog);
-  if (sha256(options.recipientBytes) !== catalog.index.recipientSha256) {
+  const selected = recoveryCatalogSelection(options.input.catalog);
+  if (sha256(options.recipientBytes) !== selected.recipientSha256) {
     throw Error(
       "Recovery public recipient differs from the selected generation",
     );
@@ -353,7 +405,6 @@ export async function buildRecoveryTargetBundle(
   const queue = [entry];
   const seen = new Set<string>();
   const sourceFiles: RecoveryTargetFile[] = [];
-  const importPattern = /(?:from\s*|import\s*\(\s*)["'](\.[^"']+\.ts)["']/g;
   while (queue.length > 0) {
     const relative = queue.shift()!;
     if (seen.has(relative)) continue;
@@ -374,12 +425,7 @@ export async function buildRecoveryTargetBundle(
     }
     sourceFiles.push(fileFromBytes(relative, "0644", bytes));
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    for (const match of text.matchAll(importPattern)) {
-      const imported = match[1];
-      const resolved = imported.replace(/^\.\//, "scripts/");
-      if (!safeSourcePath(resolved)) {
-        throw Error(`Recovery source import is outside scripts: ${imported}`);
-      }
+    for (const resolved of recoveryRelativeImports(relative, text)) {
       if (!seen.has(resolved)) queue.push(resolved);
     }
   }
@@ -390,6 +436,7 @@ export async function buildRecoveryTargetBundle(
     files: sourceFiles.map(({ path, sha256 }) => ({ path, sha256 })),
   };
   const input = structuredClone(options.input);
+  input.catalog = selected.catalog;
   const targetInput = JSON.stringify(input);
   const files = [
     ...sourceFiles,
@@ -458,6 +505,11 @@ if (accounts.length !== 1 || groups.length !== 1 || accounts[0][2] !== String(ow
 const inputFile = payload.files.filter(file => file.path === ".private/backblaze-machine-restore.json");
 if (inputFile.length !== 1 || !Array.isArray(inputFile[0].data) || inputFile[0].data.length > 524288) throw new Error("Missing bounded target control input");
 const restore = JSON.parse(new TextDecoder("utf-8", {fatal:true}).decode(Uint8Array.from(inputFile[0].data)));
+const selectedCatalog = restore.catalog;
+const isV2 = selectedCatalog?.schemaVersion === 2 && selectedCatalog?.format === "backup-v2";
+const selectedRecipient = isV2 ? selectedCatalog.selectedRoot?.root : selectedCatalog?.index;
+if (!selectedRecipient || !/^[a-f0-9]{64}$/.test(selectedRecipient.recipientSha256) || !/^[A-F0-9]{40}$/.test(selectedRecipient.recipientFingerprint)) throw new Error("Recovery catalog recipient is malformed");
+if (isV2 && (await digest(new TextEncoder().encode(JSON.stringify(selectedRecipient))) !== selectedCatalog.selectedRoot.reference?.plaintextSha256 || JSON.stringify(selectedCatalog.receipt?.root) !== JSON.stringify(selectedCatalog.selectedRoot.reference))) throw new Error("Recovery v2 trust anchor differs");
 if (restore.requestId !== payload.requestId || restore.target?.targetId !== payload.instanceId || restore.publicHome !== payload.publicHome || restore.target.workDirectory !== "/run/uos-recovery" || !/^[a-f0-9]{64}$/.test(restore.rescueManifestSha256)) throw new Error("Installer target binding differs");
 const boot = (await Deno.readTextFile("/proc/sys/kernel/random/boot_id")).trim();
 if (boot !== payload.expectedRamBootId || boot === restore.loaderBootId) throw new Error("Installer RAM boot differs from pinned SSH evidence");
@@ -523,11 +575,11 @@ for (const required of [".private/backblaze-machine-restore.json", ".private/b2-
 const recipient = root + "/.private/file-backup/recipient.asc";
 const recipientText = new TextDecoder("utf-8", { fatal: true }).decode(await Deno.readFile(recipient));
 if (!recipientText.includes("-----BEGIN PGP PUBLIC KEY BLOCK-----") || recipientText.includes("PRIVATE KEY")) throw new Error("Recovery recipient is not public-only");
-if (await digest(await Deno.readFile(recipient)) !== restore.catalog?.index?.recipientSha256) throw new Error("Recovery recipient differs from the selected generation");
+if (await digest(await Deno.readFile(recipient)) !== selectedRecipient.recipientSha256) throw new Error("Recovery recipient differs from the selected generation");
 const shown = await new Deno.Command("sudo", {args:["-n","-u","codex","gpg","--no-options","--no-autostart","--no-keyring","--homedir",payload.publicHome,"--with-colons","--show-keys",recipient],stdout:"piped",stderr:"piped"}).output();
 if (!shown.success || shown.stdout.length > 65536 || shown.stderr.length > 65536) throw new Error("Recovery public recipient inspection failed");
 const records = new TextDecoder().decode(shown.stdout).split("\n");
-if (records.filter(line => line.startsWith("pub:")).length !== 1 || records.some(line => line.startsWith("sec:") || line.startsWith("ssb:")) || records.find(line => line.startsWith("fpr:"))?.split(":")[9] !== restore.catalog.index.recipientFingerprint) throw new Error("Recovery recipient is not the selected public key");
+if (records.filter(line => line.startsWith("pub:")).length !== 1 || records.some(line => line.startsWith("sec:") || line.startsWith("ssb:")) || records.find(line => line.startsWith("fpr:"))?.split(":")[9] !== selectedRecipient.recipientFingerprint) throw new Error("Recovery recipient is not the selected public key");
 assertApproval();
 const imported = await new Deno.Command("sudo", { args: ["-n", "-u", "codex", "gpg", "--no-options", "--no-autostart", "--batch", "--no-tty", "--homedir", payload.publicHome, "--import", recipient], stdout: "piped", stderr: "piped" }).output();
 if (!imported.success) throw new Error("Recovery public recipient import failed");
@@ -547,6 +599,8 @@ export function defaultProcessFactory(
     stdin: "piped",
     stdout: "piped",
     stderr: "piped",
+    clearEnv: true,
+    env: { PATH: "/usr/bin:/bin" },
   }).spawn();
   let finished = false;
   let stopping = false;
@@ -1014,7 +1068,7 @@ export async function continueReplacementRestoration(
     )?.data ?? [],
   ))) as RecoveryTargetControlInput;
   assertRequestIdentity(input);
-  const catalog = validateCatalogEntry(input.catalog);
+  const catalog = recoveryCatalogSelection(input.catalog);
   const machine = input.target;
   if (
     input.requestId !== preparation.requestId ||
@@ -1038,8 +1092,8 @@ export async function continueReplacementRestoration(
     requestId: input.requestId,
     instanceId: machine.targetId,
     bootId: preparation.bootId,
-    generation: catalog.index.generation,
-    indexSha256: machineRestoreIndexSha256(catalog.index),
+    generation: catalog.generation,
+    indexSha256: catalog.indexSha256,
     bootDiskPath: machine.bootDiskPath,
     rootDiskPath: machine.rootDiskPath,
     bootDiskSerial: machine.bootDiskSerial,
