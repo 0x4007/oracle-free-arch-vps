@@ -355,8 +355,9 @@ export function assessBackupV2Progress(
   }
   if (["CLOUD_COMPLETE", "ACCEPTED", "CLEANED"].includes(status.phase)) {
     report.state = "BASELINE";
-    report.detail =
-      "Source terminal artifact exists; accepted catalog and settlement proof remain controller-owned";
+    report.detail = status.kind === "prune"
+      ? "Source retention stage finished; controller cleanup completion remains separate"
+      : "Source terminal artifact exists; accepted catalog and settlement proof remain controller-owned";
     return report;
   }
   if (
@@ -369,8 +370,9 @@ export function assessBackupV2Progress(
     return report;
   }
   report.state = "BASELINE";
-  report.detail =
-    "First bound v2 work observation; capture and upload may overlap";
+  report.detail = status.kind === "prune"
+    ? "First bound source retention work observation"
+    : "First bound v2 work observation; capture and upload may overlap";
   report.lastProgressAtUtc = sample.observedAtUtc;
   const old = prior?.sample;
   let previous: BackupV2Status;
@@ -429,7 +431,9 @@ export function assessBackupV2Progress(
     ? "STALLED"
     : "BASELINE";
   report.detail = changed
-    ? "Bound v2 source/compressor/verified-byte/decrypt/inventory work advanced; capture/upload overlap has no finalized total ETA"
+    ? status.kind === "prune"
+      ? "Bound source retention inventory work advanced; controller cleanup completion remains separate"
+      : "Bound v2 source/compressor/verified-byte/decrypt/inventory work advanced; capture/upload overlap has no finalized total ETA"
     : waiting
     ? "Fixed source retry episode is active; no new useful work is claimed"
     : report.state === "STALLED"
@@ -559,7 +563,7 @@ async function json(
 
 /** Permit only named backup units and a fixed set of cgroup controls. */
 export function isBackupCgroupControlPath(path: string): boolean {
-  return /^\/sys\/fs\/cgroup\/(?:system\.slice|weekly\.slice\/weekly-backup\.slice)\/arch-vps-b2-(?:v2-)?(?:worker|verify)-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?:-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})?\.service\/(cgroup\.events|cgroup\.procs|cpu\.stat|io\.stat|cpu\.max|cpu\.weight|memory\.max|memory\.high|memory\.swap\.max|io\.max)$/
+  return /^\/sys\/fs\/cgroup\/(?:system\.slice|weekly\.slice\/weekly-backup\.slice)\/arch-vps-b2-(?:v2-)?(?:worker|verify|prune)-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?:-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})?\.service\/(cgroup\.events|cgroup\.procs|cpu\.stat|io\.stat|cpu\.max|cpu\.weight|memory\.max|memory\.high|memory\.swap\.max|io\.max)$/
     .test(path);
 }
 

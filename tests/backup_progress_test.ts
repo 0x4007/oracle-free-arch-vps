@@ -463,6 +463,46 @@ Deno.test("v2 source completion is separate from catalog acceptance and blocked 
     );
   }
 });
+
+Deno.test("source retention work and stage completion remain distinct from backup completion", () => {
+  const first = v2Sample(),
+    later = new Date(start.getTime() + 60000),
+    next = v2Sample(later);
+  for (const current of [first, next]) {
+    current.phase = "PRUNING";
+    current.v2Status!.kind = "prune";
+    current.v2Status!.phase = "PRUNING";
+    current.v2Status!.progress.phase = "PRUNING";
+    current.v2Status!.activeRoleAttempt = null;
+  }
+  next.v2Status!.progress.inventoryMembers++;
+  const report = assessProgress(
+    next,
+    assessProgress(first, null, start),
+    later,
+  );
+  equal(report.state, "PROGRESSING");
+  equal(report.detail.includes("retention"), true);
+  next.phase = "CLEANED";
+  next.v2Status!.phase = "CLEANED";
+  next.v2Status!.progress.phase = "CLEANED";
+  next.v2Status!.finishedAtUtc = later.toISOString();
+  next.v2Status!.resultSha256 = "d".repeat(64);
+  equal(assessProgress(next, null, later).state, "BASELINE");
+  equal(
+    assessProgress(next, null, later).detail.includes(
+      "cleanup completion remains separate",
+    ),
+    true,
+  );
+  const unit = `arch-vps-b2-v2-prune-${V2_ID}-${V2_ATTEMPT}.service`;
+  equal(
+    isBackupCgroupControlPath(
+      `/sys/fs/cgroup/weekly.slice/weekly-backup.slice/${unit}/cpu.stat`,
+    ),
+    true,
+  );
+});
 Deno.test("v2 process binding requires boot, PID start, live cgroup membership and exact group", () => {
   const status = v2Sample().v2Status!,
     fields = ["S", ...Array(18).fill("0"), "456", "0"],
