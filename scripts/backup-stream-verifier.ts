@@ -338,7 +338,12 @@ async function runPass(
     ((name) => nativeSelection(deps.temporaryDirectory, name));
   try {
     for (const target of targets) selections.push(await selectionsFor(target));
-    const zstd = start("zstd", ["-d", "-c", "-M128", "--no-pass-through"]);
+    const zstd = start("zstd", [
+      "-d",
+      "-c",
+      "--memory=128MiB",
+      "--no-pass-through",
+    ]);
     const isTar = descriptor.format === "tar.zst.gpg";
     const listing = isTar
       ? start("tar", [

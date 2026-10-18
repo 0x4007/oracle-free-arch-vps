@@ -3,6 +3,7 @@ import assert, {
   rejects as assertRejects,
 } from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { BACKUP_V2_LIMITS } from "../scripts/backup-v2-profile.ts";
 import {
   type BackupStreamProcess,
   fanoutBackupStream,
@@ -86,10 +87,19 @@ const decrypt = async (
 
 Deno.test("stream verifier fully binds ciphertext, compressed bytes and native inventory", async () => {
   const events: number[] = [];
+  const native = tools();
   const result = await verifyBackupStreamArchive(descriptor, {
     ciphertext: () => stream(payload),
     decrypt,
-    spawn: tools(),
+    spawn(command, args) {
+      if (command === "zstd") {
+        assertEquals(
+          args[2],
+          `--memory=${BACKUP_V2_LIMITS.decoderMemoryBytes / (1024 * 1024)}MiB`,
+        );
+      }
+      return native(command);
+    },
     progress(event) {
       events.push(event.bytes);
       return Promise.resolve();
