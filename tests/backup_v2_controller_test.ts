@@ -698,7 +698,7 @@ Deno.test("verification exports decompression work after compressed input ends",
   });
   const after = progress.snapshot(2);
   equal(after.decryptedBytes, before.decryptedBytes);
-  equal(after.compressionInputBytes - before.compressionInputBytes, 100000);
+  equal(after.decodedBytes! - before.decodedBytes!, 100000);
 });
 
 Deno.test("immutable release closure includes dynamic/type-only imports and refuses unpinned modules", async () => {
@@ -1118,4 +1118,26 @@ Deno.test("managed retention persists launch intent once and binds cold source c
     argv.includes("--property=Type=notify") &&
       argv.includes("--property=CPUWeight=1"),
   );
+});
+
+Deno.test("verification work bounds cover replay without enlarging source admission", () => {
+  const progress = new BackupV2WorkerProgress(), gib = 1024 ** 3;
+  for (const pass of [1, 2]) {
+    progress.verification({
+      role: "root",
+      pass,
+      kind: "compressedPlaintext",
+      bytes: 200 * gib,
+    });
+    progress.verification({
+      role: "root",
+      pass,
+      kind: "decoded",
+      bytes: 600 * gib,
+    });
+  }
+  const value = progress.snapshot(1);
+  equal(value.decodedBytes, 1200 * gib);
+  equal(value.decryptedBytes, 400 * gib);
+  equal(value.compressionInputBytes, 0);
 });

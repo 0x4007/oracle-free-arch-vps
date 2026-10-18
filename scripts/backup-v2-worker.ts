@@ -535,6 +535,7 @@ export class BackupV2WorkerProgress {
     compressionInputBytes: 0,
     verifiedChunks: 0,
     decryptedBytes: 0,
+    decodedBytes: 0,
     inventoryMembers: 0,
   };
   readonly #observed = new Map<string, number>();
@@ -581,7 +582,7 @@ export class BackupV2WorkerProgress {
       this.#values.decryptedBytes += delta;
     }
     if (value.kind === "decoded") {
-      this.#values.compressionInputBytes += delta;
+      this.#values.decodedBytes += delta;
     }
   }
   verifiedObject(): void {

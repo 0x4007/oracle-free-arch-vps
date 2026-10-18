@@ -262,6 +262,7 @@ const counters = [
   "compressionInputBytes",
   "verifiedChunks",
   "decryptedBytes",
+  "decodedBytes",
   "inventoryMembers",
 ] as const;
 const useful: Partial<
@@ -277,7 +278,7 @@ const useful: Partial<
   VERIFYING: [
     "verifiedChunks",
     "decryptedBytes",
-    "compressionInputBytes",
+    "decodedBytes",
     "inventoryMembers",
   ],
   PRUNING: ["inventoryMembers"],
@@ -492,12 +493,14 @@ export class BackupV2Supervisor {
       if (this.#previous) {
         if (
           progress.observedMonotonicMs < this.#previous.observedMonotonicMs ||
-          counters.some((field) => progress[field] < this.#previous![field])
+          counters.some((field) =>
+            (progress[field] ?? 0) < (this.#previous![field] ?? 0)
+          )
         ) {
           return this.cancel("PROGRESS_REGRESSED");
         }
         const changed = counters.filter((field) =>
-          progress[field] > this.#previous![field]
+          (progress[field] ?? 0) > (this.#previous![field] ?? 0)
         );
         if (changed.some((field) => !fields.includes(field))) {
           return this.cancel("PROGRESS_WRONG_PHASE");
