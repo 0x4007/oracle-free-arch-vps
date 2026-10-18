@@ -8,14 +8,17 @@ import {
   buildRestoreLayout,
   type MachineMetadataArchive,
   type MachineRecoveryMetadata,
+  machineRestoreBootHashes,
   machineRestoreIndexSha256,
   type MachineRestoreInput,
   type MachineRestoreTarget,
+  type MachineRestoreV2Source,
   type MachineSourceRecord,
   restoreMachine,
   restoreTarArgs,
   rewriteSfdiskDump,
   scopeTargetMountEntries,
+  validateMachineRestoreSource,
   validateRestoreMountBindings,
 } from "../scripts/backblaze-machine-restore.ts";
 import {
@@ -27,6 +30,15 @@ import {
   generationChunkName,
   UPLOAD_ROLE_ORDER,
 } from "../scripts/backblaze-upload.ts";
+import {
+  BACKUP_V2_BOOT_SAMPLES,
+  BACKUP_V2_ROLES,
+  type BackupV2ObjectKind,
+  backupV2ObjectName,
+  validateBackupV2Receipt,
+  validateBackupV2Root,
+} from "../scripts/backup-v2-contract.ts";
+import { BACKUP_V2_PROFILE_ID } from "../scripts/backup-v2-profile.ts";
 
 function assert(value: unknown, message?: string): asserts value {
   if (!value) throw new Error(message ?? "Assertion failed");
@@ -271,6 +283,228 @@ function metadata(index: RecoveryIndex): MachineRecoveryMetadata {
     procCmdline: "root=UUID=e61e7a3e-996d-418a-831b-09f09e827e0a rw\n",
   };
 }
+
+function v2Input() {
+  const legacy = makeIndex(),
+    config = "cc".repeat(32),
+    attempt = "00000000-0000-4000-8000-000000000001",
+    put = "00000000-0000-4000-8000-000000000002";
+  const reference = (
+    kind: BackupV2ObjectKind,
+    ordinal: number,
+    body = "fixture",
+  ) => {
+    const data = new TextEncoder().encode(body);
+    return {
+      object: {
+        fileId: `fixture-${kind}-${ordinal}`,
+        fileName: backupV2ObjectName(GENERATION, attempt, kind, ordinal, put),
+        contentLength: data.length,
+        contentSha1: sha1(data),
+        sha256: sha256(data),
+        uploadTimestamp: 1,
+        action: "upload" as const,
+      },
+      plaintextSha256: sha256(data),
+    };
+  };
+  const root = validateBackupV2Root({
+    schemaVersion: 2 as const,
+    format: "backup-v2" as const,
+    profile: BACKUP_V2_PROFILE_ID,
+    captureId: GENERATION,
+    periodKey: "2026-10-18",
+    sourceRevision: "c".repeat(40),
+    sourceConfigSha256: config,
+    recipientSha256: RECIPIENT_SHA,
+    recipientFingerprint: FINGERPRINT,
+    metadata: [],
+    roles: BACKUP_V2_ROLES.map((role, index) => ({
+      role,
+      attemptId: attempt,
+      manifest: reference("manifest", index),
+      captureStartedAtUtc: "2026-10-18T04:00:00.000Z",
+      captureFinishedAtUtc: "2026-10-18T04:01:00.000Z",
+    })),
+  });
+  const meta: MachineRecoveryMetadata = {
+    ...metadata(legacy),
+    schemaVersion: 2,
+    format: "backup-v2-recovery",
+    sourceConfigSha256: config,
+    archives: legacy.archives.filter((item) => item.role !== "recovery").map((
+      item,
+    ) => ({
+      role: item.role as MachineMetadataArchive["role"],
+      format: "tar.zst.gpg",
+      ciphertextBytes: item.bytes,
+      ciphertextSha256: item.sha256,
+    })),
+  };
+  const receipt = validateBackupV2Receipt({
+    schemaVersion: 2,
+    format: "backup-v2",
+    captureId: GENERATION,
+    root: reference("manifest", 99, JSON.stringify(root)),
+    verifiedAtUtc: "2026-10-18T04:02:00.000Z",
+    recipientSha256: RECIPIENT_SHA,
+    recipientFingerprint: FINGERPRINT,
+    verifierRevision: "c".repeat(40),
+    configurationSha256: config,
+    tools: { tar: "1.35", zstd: "1.5.7", gpg: "2.4" },
+    archives: legacy.archives.map((item) => ({
+      role: item.role,
+      format: item.format,
+      ciphertextBytes: item.bytes,
+      ciphertextSha256: item.sha256,
+      compressedBytes: item.bytes,
+      compressedSha256: item.sha256,
+      inventory: item.role === "recovery" ? null : {
+        encoding: "backup-v2-inventory-1",
+        members: 1,
+        pathBytes: 2,
+        encodedBytes: 10,
+        sha256: "a".repeat(64),
+      },
+      inputComplete: true,
+      integrityChecked: true,
+      decompressionComplete: true,
+      gpgExitCode: 0,
+      zstdExitCode: 0,
+      tarExitCode: 0,
+    })),
+    bootSamples: BACKUP_V2_BOOT_SAMPLES.map((sample, index) => ({
+      ...sample,
+      bytes: 1,
+      sha256: (index % 2 === 0 ? "aa" : "bb").repeat(32),
+    })),
+    metadataSha256: sha256(new TextEncoder().encode(JSON.stringify(meta))),
+    sourceIndependent: true,
+    decryptedRestoreProved: true,
+    machineBootRestoreProved: false,
+  });
+  const source: MachineRestoreV2Source = {
+    schemaVersion: 2,
+    format: "backup-v2",
+    generation: GENERATION,
+    root,
+    reference: receipt.root,
+    receipt,
+    receiptReference: reference("receipt", 0, JSON.stringify(receipt)),
+  };
+  return {
+    source,
+    metadata: meta,
+    legacy,
+    archives: receipt.archives.filter((item) => item.role !== "recovery").map((
+      item,
+    ) => ({
+      role: item.role as MachineMetadataArchive["role"],
+      bytes: item.compressedBytes,
+      sha256: item.compressedSha256,
+      ciphertextBytes: item.ciphertextBytes,
+      ciphertextSha256: item.ciphertextSha256,
+      verifierChecked: true as const,
+    })),
+  };
+}
+
+Deno.test("v2 machine source uses real root anchor and preserves the shared serial-bound layout", () => {
+  const input = v2Input();
+  assert(validateMachineRestoreSource(input.source).schemaVersion === 2);
+  assert(
+    machineRestoreIndexSha256(input.source) ===
+      input.source.reference.plaintextSha256,
+  );
+  assert(
+    JSON.stringify(buildRestoreLayout(input.source, input.metadata, TARGET)) ===
+      JSON.stringify(
+        buildRestoreLayout(input.legacy, metadata(input.legacy), TARGET),
+      ),
+  );
+  assert(
+    machineRestoreBootHashes(input.source, input.metadata).kernelSha256 ===
+      "aa".repeat(32),
+  );
+  assert(!("archives" in input.source));
+});
+
+Deno.test("v2 machine source rejects root, metadata and compressed proof drift before commands", async () => {
+  const input = v2Input();
+  let calls = 0;
+  const run = () => {
+    calls++;
+    return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+  };
+  const changedRoot = structuredClone(input.source);
+  changedRoot.root.sourceRevision = "d".repeat(40);
+  await rejects(
+    restoreMachine(
+      {
+        index: changedRoot,
+        indexSha256: input.source.reference.plaintextSha256,
+        metadata: input.metadata,
+        archives: input.archives,
+        target: TARGET,
+      },
+      run,
+      () => Promise.resolve(),
+    ),
+    "source:v2-binding",
+  );
+  const changedMetadata = structuredClone(input.metadata);
+  changedMetadata.fstab = "tampered";
+  await rejects(
+    restoreMachine(
+      {
+        index: input.source,
+        indexSha256: input.source.reference.plaintextSha256,
+        metadata: changedMetadata,
+        archives: input.archives,
+        target: TARGET,
+      },
+      run,
+      () => Promise.resolve(),
+    ),
+    "metadata:binding",
+  );
+  const changedArchives = structuredClone(input.archives);
+  changedArchives[0].sha256 = "00".repeat(32);
+  await rejects(
+    restoreMachine(
+      {
+        index: input.source,
+        indexSha256: input.source.reference.plaintextSha256,
+        metadata: input.metadata,
+        archives: changedArchives,
+        target: TARGET,
+      },
+      run,
+      () => Promise.resolve(),
+    ),
+    "archives:binding",
+  );
+  assert(calls === 0);
+});
+
+Deno.test("v2 wrong target remains refused before machine commands or filesystem work", async () => {
+  const input = v2Input();
+  let calls = 0;
+  await rejects(
+    restoreMachine({
+      index: input.source,
+      indexSha256: input.source.reference.plaintextSha256,
+      metadata: input.metadata,
+      archives: input.archives,
+      target: { ...TARGET, rootDiskPath: TARGET.bootDiskPath },
+    }, () => {
+      calls++;
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }),
+    "target",
+  );
+  assert(calls === 0);
+});
 
 Deno.test("m02 refuses a wrong target before any command", async () => {
   const index = makeIndex();

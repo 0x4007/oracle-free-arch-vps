@@ -4,10 +4,10 @@ import { createHash } from "node:crypto";
 import { copiedRootIsolationFiles } from "./drill-offline-preparation.ts";
 import {
   buildRestoreLayout,
+  machineRestoreBootHashes,
   machineRestoreIndexSha256,
   type MachineRestoreInput,
 } from "./backblaze-machine-restore.ts";
-import { validateRecoveryMetadata } from "./backblaze-verifier.ts";
 import type { DiskPreparationBinding } from "./pi-recovery-disk-preparation.ts";
 import { rescueManifestSha256 } from "./pi-recovery-bootstrap.ts";
 import { hostKeyConsoleCommand } from "./pi-recovery-ssh.ts";
@@ -71,7 +71,7 @@ export function recoveryIsolationPlan(
       }) !== binding.rescueManifestSha256
   ) throw Error("Copied-root isolation differs from the accepted replacement");
   const layout = buildRestoreLayout(input.index, input.metadata, input.target);
-  const boot = validateRecoveryMetadata(input.metadata, input.index);
+  const boot = machineRestoreBootHashes(input.index, input.metadata);
   const rules = copiedRootIsolationFiles(isolation.controllerIpv4);
   const rootUuid = layout.filesystems.find((fs) => fs.role === "root")!.uuid;
   const stagingUuid =
