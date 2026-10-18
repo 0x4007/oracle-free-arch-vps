@@ -99,6 +99,7 @@ import {
   verifyDecryptedGeneration,
 } from "./backblaze-verifier.ts";
 import { withBackupLock } from "./backup-lock.ts";
+import { backupV2ChildEnvironment } from "./backup-v2-supervisor.ts";
 import { shellQuote } from "./backup-guest.ts";
 import type { CommandResult } from "./oci.ts";
 import { readPrivateJson, writePrivateJson } from "./oci.ts";
@@ -1162,8 +1163,25 @@ export type RemoteRunner = (
   input?: Uint8Array,
 ) => Promise<CommandResult>;
 
+/** Child processes receive no supervisor/agent/proxy environment implicitly.
+ * SSH keeps its existing argv/config/key-file lookup and GPG uses --homedir. */
+export function backupChildProcessOptions(): Pick<
+  Deno.CommandOptions,
+  "clearEnv" | "env"
+> {
+  return {
+    clearEnv: true,
+    env: backupV2ChildEnvironment({
+      PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      LC_ALL: "C",
+      LANG: "C",
+    }),
+  };
+}
+
 export const realRemoteRunner: RemoteRunner = async (command, args, input) => {
   const child = new Deno.Command(command, {
+    ...backupChildProcessOptions(),
     args,
     stdin: input === undefined ? "null" : "piped",
     stdout: "piped",
@@ -1565,8 +1583,9 @@ export interface TunnelChild {
 
 export type TunnelChildFactory = (args: string[]) => TunnelChild;
 
-function defaultTunnelChildFactory(args: string[]): TunnelChild {
+export function defaultTunnelChildFactory(args: string[]): TunnelChild {
   const child = new Deno.Command("ssh", {
+    ...backupChildProcessOptions(),
     args,
     stdin: "piped",
     stdout: "piped",
@@ -3149,6 +3168,7 @@ export function makeStreamDecryptArchive(publicHome: string) {
     destination: Pick<Deno.FsFile, "write">,
   ): Promise<{ integrityChecked: true }> => {
     const socketResult = await new Deno.Command("sudo", {
+      ...backupChildProcessOptions(),
       args: [
         "-n",
         "-u",
@@ -3168,6 +3188,7 @@ export function makeStreamDecryptArchive(publicHome: string) {
     const agentSocket = new TextDecoder().decode(socketResult.stdout).trim()
       .split("\n").at(-1) ?? "";
     const defaultResult = await new Deno.Command("sudo", {
+      ...backupChildProcessOptions(),
       args: ["-n", "-u", "codex", "gpgconf", "--list-dirs", "agent-socket"],
       stdout: "piped",
       stderr: "piped",
@@ -3193,6 +3214,7 @@ export function makeStreamDecryptArchive(publicHome: string) {
       if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
     const child = new Deno.Command("sudo", {
+      ...backupChildProcessOptions(),
       args: [
         "-n",
         "-u",
@@ -3257,6 +3279,7 @@ export async function importRecipient(
 ): Promise<void> {
   // Idempotent public-only import as codex; the keyring never holds secrets.
   const child = new Deno.Command("sudo", {
+    ...backupChildProcessOptions(),
     args: [
       "-n",
       "-u",
@@ -3303,6 +3326,7 @@ export async function ensurePublicHome(publicHome: string): Promise<void> {
     await Deno.mkdir(publicHome, { mode: 0o700, recursive: true });
     const parent = publicHome.slice(0, publicHome.lastIndexOf("/"));
     const chown = await new Deno.Command("chown", {
+      ...backupChildProcessOptions(),
       args: ["codex:codex", publicHome],
     }).output();
     void chown;

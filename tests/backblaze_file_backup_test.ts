@@ -62,12 +62,14 @@ import {
   type ControllerPhase,
   type ControllerState,
   decideGpgStatus,
+  defaultTunnelChildFactory,
   deriveVerifierGate,
   entryVerifyText,
   entryWorkerText,
   type GateSeam,
   generationPrefixes,
   JOBS_RUNTIME_ROOT,
+  makeStreamDecryptArchive,
   type MetadataStore,
   newJobState,
   type ObservedUnit,
@@ -78,6 +80,7 @@ import {
   pumpGpgStdout,
   readVerifierAvailBytes,
   realPrivateSeam,
+  realRemoteRunner,
   realRemoteSeam,
   realTunnelSeam,
   type RemoteRunner,
@@ -199,6 +202,98 @@ const SOURCE_CONFIG_SHA256 = sourceConfigSha256({
   recipientSha256: RECIPIENT_SHA256,
   recipientFingerprint: RECIPIENT_FINGERPRINT,
   exclusionsText: EXCLUSIONS_TEXT,
+});
+
+Deno.test("child environment: actual SSH gpgconf and decrypt factories isolate notification credentials", async () => {
+  const originalCommand = Object.getOwnPropertyDescriptor(Deno, "Command")!;
+  const originalReadDir = Object.getOwnPropertyDescriptor(Deno, "readDir")!;
+  const observed: { command: string; options: Deno.CommandOptions }[] = [];
+  const bytes = (text: string) =>
+    new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode(text));
+        c.close();
+      },
+    });
+  class CommandFixture {
+    constructor(
+      readonly command: string,
+      readonly options: Deno.CommandOptions,
+    ) {
+      observed.push({ command, options });
+    }
+    output() {
+      const socket = this.options.args?.includes("--homedir")
+        ? "/run/user/1002/custom/S.gpg-agent"
+        : "/run/user/1002/default/S.gpg-agent";
+      return Promise.resolve({
+        success: true,
+        code: 0,
+        signal: null,
+        stdout: new TextEncoder().encode(socket + "\n"),
+        stderr: new Uint8Array(),
+      });
+    }
+    spawn() {
+      return {
+        stdin: new WritableStream<Uint8Array>({ write() {} }),
+        stdout: bytes("plaintext"),
+        stderr: bytes("[GNUPG:] DECRYPTION_OKAY\n[GNUPG:] GOODMDC\n"),
+        status: Promise.resolve({ success: true, code: 0, signal: null }),
+        output: () => this.output(),
+      };
+    }
+  }
+  try {
+    Object.defineProperty(Deno, "Command", {
+      configurable: originalCommand.configurable,
+      enumerable: originalCommand.enumerable,
+      writable: true,
+      value: CommandFixture,
+    });
+    Object.defineProperty(Deno, "readDir", {
+      configurable: originalReadDir.configurable,
+      enumerable: originalReadDir.enumerable,
+      writable: true,
+      value: () => ({
+        async *[Symbol.asyncIterator]() {
+          yield* [];
+        },
+      }),
+    });
+    await realRemoteRunner("gpgconf", ["--list-dirs", "agent-extra-socket"]);
+    defaultTunnelChildFactory(["-o", "BatchMode=yes", "fixture"]);
+    let received = 0;
+    await makeStreamDecryptArchive("/fixture/public-only")(
+      bytes("ciphertext"),
+      {
+        write(part) {
+          received += part.length;
+          return Promise.resolve(part.length);
+        },
+      },
+    );
+    assert(received === 9, "the real decrypt seam still drains plaintext");
+    assert(
+      observed.length === 5,
+      "runner, SSH, two socket resolvers and decrypt all ran through the command boundary",
+    );
+    for (const { options } of observed) {
+      assert(
+        options.clearEnv === true,
+        "child must not inherit parent environment",
+      );
+      assert(
+        Object.keys(options.env ?? {}).sort().join(",") === "LANG,LC_ALL,PATH",
+        "only fixed approved variables reach children",
+      );
+      assert(!Object.hasOwn(options.env ?? {}, "NOTIFY_SOCKET"));
+      assert(!Object.hasOwn(options.env ?? {}, "SSH_AUTH_SOCK"));
+    }
+  } finally {
+    Object.defineProperty(Deno, "Command", originalCommand);
+    Object.defineProperty(Deno, "readDir", originalReadDir);
+  }
 });
 
 /** 2026-09-06 is a Sunday; local 00:05 is 04:05 UTC (EDT). */
