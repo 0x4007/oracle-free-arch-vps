@@ -224,6 +224,23 @@ Deno.test("failure evidence drops exception text, private fields and unclassifie
   });
 });
 
+Deno.test("failure evidence classifies exact builtin filesystem errors without retaining their messages", () => {
+  const secret = "PRIVATE_PATH_OR_TOKEN";
+  for (
+    const error of [
+      new Deno.errors.NotCapable(secret),
+      new Deno.errors.NotFound(secret),
+      new Deno.errors.PermissionDenied(secret),
+      new Deno.errors.BadResource(secret),
+    ]
+  ) {
+    const classified = classifyBackupV2Failure(error);
+    equal(classified.errorClass, error.constructor.name);
+    assert(!JSON.stringify(classified).includes(secret));
+    equal(classified.kind, null);
+  }
+});
+
 Deno.test("supervisor fixed initialization window is independent of short notification renewals", async () => {
   const f = fixture();
   const supervisor = new BackupV2Supervisor(identity, {

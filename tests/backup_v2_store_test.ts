@@ -3,7 +3,9 @@
 import { createHash } from "node:crypto";
 import type { BackupV2TrackedProcess } from "../scripts/backup-v2-native-process.ts";
 import {
+  assertBackupV2SlotParents,
   BACKUP_V2_TRANSPORT_BOUNDS,
+  type BackupV2AncestorIO,
   BackupV2Store,
   BackupV2TransportError,
   type BackupV2Wire,
@@ -35,9 +37,175 @@ const attemptId = "22222222-2222-4222-8222-222222222222";
 const putId = "33333333-3333-4333-8333-333333333333";
 const name = backupV2ObjectName(captureId, attemptId, "data", 0, putId);
 const native = Deno.args.includes("--native");
+const ancestorSlotPath =
+  "/var/tmp/arch-vps-file-backup/generation-fixture/spool/slot-0.cipher";
+function ancestorFixture() {
+  const calls: string[] = [];
+  const metadata = new Map([
+    ["/var/tmp", { uid: 0, mode: 0o041777 }],
+    ["/var", { uid: 0, mode: 0o040755 }],
+  ]);
+  const io: BackupV2AncestorIO = {
+    lstat(path) {
+      if (metadata.has(path)) {
+        return Promise.reject(
+          new Deno.errors.NotCapable("restricted parent metadata"),
+        );
+      }
+      return Promise.resolve({
+        isDirectory: true,
+        isSymlink: false,
+        uid: 0,
+        mode: 0o040700,
+      });
+    },
+    metadata(command, args) {
+      assert(command === "/usr/bin/stat");
+      assert(
+        JSON.stringify(args.slice(0, 2)) ===
+          JSON.stringify(["--printf=%u\\0%f\\0%n\\0", "--"]),
+      );
+      assert(args.length === 3 && !args.includes("-L"));
+      const path = args[2], info = metadata.get(path)!;
+      calls.push(path);
+      return Promise.resolve({
+        code: 0,
+        stdout: `${info.uid}\0${info.mode.toString(16)}\0${path}\0`,
+        stderr: "",
+      });
+    },
+  };
+  return { io, calls, metadata };
+}
 function assert(value: unknown, message = "assertion failed"): asserts value {
   if (!value) throw new Error(message);
 }
+
+Deno.test("v2 parent validation uses bounded stat metadata only for restricted ancestors and preserves sticky temporary roots", async () => {
+  const f = ancestorFixture();
+  await assertBackupV2SlotParents(ancestorSlotPath, f.io);
+  assert(JSON.stringify(f.calls) === JSON.stringify(["/var/tmp", "/var"]));
+});
+
+Deno.test("v2 restricted ancestor metadata cannot relax owner mode type or exact-path checks", async () => {
+  for (
+    const fault of [
+      "owner",
+      "writable",
+      "symlink",
+      "regular",
+      "sticky-other",
+      "binding",
+      "failed",
+      "malformed",
+    ]
+  ) {
+    const f = ancestorFixture(), command = f.io.metadata;
+    if (fault === "owner") {
+      f.metadata.set("/var/tmp", { uid: 1000, mode: 0o041777 });
+    }
+    if (fault === "writable") {
+      f.metadata.set("/var/tmp", { uid: 0, mode: 0o040777 });
+    }
+    if (fault === "symlink") {
+      f.metadata.set("/var/tmp", { uid: 0, mode: 0o120777 });
+    }
+    if (fault === "regular") {
+      f.metadata.set("/var/tmp", { uid: 0, mode: 0o100755 });
+    }
+    if (fault === "sticky-other") {
+      f.metadata.set("/var", { uid: 0, mode: 0o041777 });
+    }
+    f.io.metadata = async (tool, args) => {
+      const result = await command(tool, args);
+      if (fault === "binding") {
+        result.stdout = result.stdout.replace(args[2], "/foreign");
+      }
+      if (fault === "failed") result.code = 1;
+      if (fault === "malformed") {
+        result.stdout = "0\0not-a-mode\0" + args[2] + "\0";
+      }
+      return result;
+    };
+    await rejects(assertBackupV2SlotParents(ancestorSlotPath, f.io));
+  }
+});
+
+Deno.test("v2 parent metadata fallback is exclusive to NotCapable and never overrides a visible unsafe parent", async () => {
+  for (
+    const error of [
+      new Deno.errors.PermissionDenied("private"),
+      new Deno.errors.NotFound("private"),
+      new Error("private"),
+    ]
+  ) {
+    const f = ancestorFixture(), lstat = f.io.lstat;
+    f.io.lstat = (path) =>
+      path === "/var/tmp" ? Promise.reject(error) : lstat(path);
+    assert(
+      await rejects(assertBackupV2SlotParents(ancestorSlotPath, f.io)) ===
+        error,
+    );
+    assert(f.calls.length === 0);
+  }
+  const f = ancestorFixture();
+  f.io.lstat = () =>
+    Promise.resolve({
+      isDirectory: true,
+      isSymlink: false,
+      uid: 1000,
+      mode: 0o040700,
+    });
+  await rejects(assertBackupV2SlotParents(ancestorSlotPath, f.io));
+  assert(f.calls.length === 0);
+});
+
+Deno.test({
+  name:
+    "v2 unsafe slot ancestors are rejected before authorization or any PUT wire request",
+  permissions: { read: false, run: false },
+  fn: async () => {
+    let calls = 0, metadata = 0;
+    const store = new BackupV2Store(settings, () => {
+      calls++;
+      throw Error("wire must not run");
+    }, (_tool, args) => {
+      metadata++;
+      return Promise.resolve({
+        code: 0,
+        stdout: `1000\0${(0o040700).toString(16)}\0${args.at(-1)}\0`,
+        stderr: "",
+      });
+    });
+    const slot: BackupV2SealedSlot = {
+      index: 0,
+      path: ancestorSlotPath,
+      device: 1,
+      inode: 1,
+      bytes: data.length,
+      sha1: hash(data, "sha1"),
+      sha256: hash(data),
+      uid: 0,
+      mode: 0o600,
+      links: 1,
+    };
+    await rejects(
+      store.putFileOnce({
+        captureId,
+        role: "root",
+        attemptId,
+        kind: "data",
+        ordinal: 0,
+        offset: 0,
+        putId,
+        createdAtUtc: "2026-10-18T00:00:00.000Z",
+        slot,
+        name,
+      }),
+    );
+    assert(calls === 0 && metadata === 1);
+  },
+});
 async function rejects(action: Promise<unknown>, pattern?: RegExp) {
   try {
     await action;
