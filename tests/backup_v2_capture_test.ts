@@ -436,6 +436,29 @@ Deno.test("v2 one-filesystem boundaries do not count as drift or mask fatal diag
   }
 });
 
+Deno.test("exact socket warnings are intentional filesystem omissions, never drift or fatal-error allowances", () => {
+  const socket = 'tar: "./runtime.sock": socket ignored\n';
+  for (const role of ROLE_ORDER) {
+    const proof = classifyBackupV2TarDiagnostics(role, 0, socket);
+    equals(proof.driftRecords, 0);
+    equals(proof.driftSha256, hash(""));
+    throws(() => classifyBackupV2TarDiagnostics(role, 1, socket));
+    throws(() => classifyBackupV2TarDiagnostics(role, 2, socket));
+    for (
+      const fatal of [
+        "tar: ./file: File shrank by 1 byte; padding with zeros\n",
+        "tar: ./file: Cannot open: Permission denied\n",
+        "tar: ./file: Cannot stat: No such file or directory\n",
+        "tar: ./file: socket ignored: read error\n",
+        "unclassified\n",
+      ]
+    ) {
+      throws(() => classifyBackupV2TarDiagnostics(role, 0, socket + fatal));
+    }
+  }
+  throws(() => classifyBackupV2TarDiagnostics("recovery", 0, socket));
+});
+
 Deno.test("v2 pump waits for downstream writes and propagates input/write failures", async () => {
   let release!: () => void, written = 0, pulled = 0;
   const gate = new Promise<void>((resolve) => {
