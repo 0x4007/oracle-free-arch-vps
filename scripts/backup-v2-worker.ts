@@ -554,6 +554,10 @@ export class BackupV2WorkerProgress {
     inventoryMembers: 0,
   };
   readonly #observed = new Map<string, number>();
+  #statusObservation: {
+    progress: BackupV2Progress;
+    activeRoleAttempt: BackupV2Status["activeRoleAttempt"];
+  } | null = null;
   #advance(key: string, value: number): number {
     if (
       !Number.isSafeInteger(value) || value < (this.#observed.get(key) ?? 0)
@@ -612,6 +616,40 @@ export class BackupV2WorkerProgress {
   }
   snapshot(observedMonotonicMs: number): BackupV2Progress {
     return { phase: this.phase, observedMonotonicMs, ...this.#values };
+  }
+  observe(observedMonotonicMs: number): BackupV2Progress {
+    const progress = this.snapshot(observedMonotonicMs);
+    this.#statusObservation = {
+      progress,
+      activeRoleAttempt: structuredClone(this.activeRoleAttempt),
+    };
+    return progress;
+  }
+  status(observedMonotonicMs: number): Pick<
+    BackupV2Status,
+    "phase" | "activeRoleAttempt" | "progress"
+  > {
+    const working = [
+      "PREFLIGHT",
+      "CAPTURING_AND_UPLOADING",
+      "VERIFYING",
+      "PRUNING",
+    ]
+      .includes(this.phase);
+    if (working && !this.#statusObservation) fail();
+    // Useful work may advance while poll persists its finite lease. Publish
+    // only the counters/phase/attempt observed by that poll, so the next poll
+    // cannot look like a lease-only advance. Settled/cancelled writes never
+    // renew and must retain the final actual counters instead.
+    const sample = working ? this.#statusObservation! : {
+      progress: this.snapshot(observedMonotonicMs),
+      activeRoleAttempt: this.activeRoleAttempt,
+    };
+    return {
+      phase: sample.progress.phase,
+      activeRoleAttempt: structuredClone(sample.activeRoleAttempt),
+      progress: { ...sample.progress, observedMonotonicMs },
+    };
   }
 }
 
@@ -1394,12 +1432,10 @@ export async function runBackupV2RemoteWorker(
           envelope: settings.envelope,
           ...execution(gate),
           kind,
-          phase: work.phase,
-          activeRoleAttempt: work.activeRoleAttempt,
+          ...work.status(now),
           startedAtUtc,
           updatedAtUtc: new Date().toISOString(),
           finishedAtUtc,
-          progress: work.snapshot(now),
           lease,
           resultSha256,
         }, gate);
@@ -1468,7 +1504,7 @@ export async function runBackupV2RemoteWorker(
         );
         lastObservation = {
           identity: gate.custody!,
-          progress: work.snapshot(sample.observedMonotonicMs),
+          progress: work.observe(sample.observedMonotonicMs),
           capacity: sample,
         };
         return lastObservation;

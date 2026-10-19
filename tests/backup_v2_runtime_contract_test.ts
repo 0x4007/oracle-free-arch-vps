@@ -27,6 +27,8 @@ import {
   GATE_REMOTE_HOST,
   GATE_SOURCE_LOCK_PATH,
 } from "../scripts/backblaze-controller-contract.ts";
+import { BackupV2WorkerProgress } from "../scripts/backup-v2-worker.ts";
+import { BackupV2Supervisor } from "../scripts/backup-v2-supervisor.ts";
 
 function assert(value: unknown): asserts value {
   if (!value) throw new Error("Assertion failed");
@@ -428,6 +430,159 @@ Deno.test("runtime status transitions preserve failed history and reject replay 
       updatedAtUtc: "2026-10-18T04:02:00.000Z",
     })
   );
+});
+Deno.test("runtime status keeps progress paired with its lease when work advances during persistence", async () => {
+  const template = status(), work = new BackupV2WorkerProgress();
+  const active = template.activeRoleAttempt;
+  work.capture(
+    { role: "root", kind: "source", bytes: 100, members: 0 },
+    active,
+  );
+  let now = 10, advanced = false;
+  const supervisor = new BackupV2Supervisor(template.custody, {
+    progressGraceMs: 1000,
+    notificationGraceMs: 100,
+    observationTimeoutMs: 20,
+    maximumObservationAgeMs: 100,
+    productionWriterMarginBytes: 4096,
+    minimumFreeInodes: 100,
+    maximumSourceHeldDeletedBytes: 1024,
+  }, {
+    now: () => now,
+    notifier: {
+      ready() {},
+      extend() {},
+      stopping() {},
+      close() {},
+    },
+    observe: () =>
+      Promise.resolve({
+        identity: template.custody,
+        progress: work.observe(now),
+        capacity: {
+          observedMonotonicMs: now,
+          availableBytes: 10 * 1024 ** 3,
+          freeInodes: 10_000,
+          allocatedWorkspaceBytes: 0,
+          workspaceHeldDeletedBytes: 0,
+          sourceHeldDeletedBytes: 0,
+        },
+      }),
+    persistRuntimeLease: () => {
+      if (!advanced) {
+        work.capture(
+          { role: "root", kind: "source", bytes: 101, members: 0 },
+          active,
+        );
+        advanced = true;
+        now++;
+      }
+      return Promise.resolve();
+    },
+  });
+  const publish = () =>
+    validateBackupV2Status({
+      ...template,
+      ...work.status(now),
+      lease: { ...supervisor.window(), observedMonotonicMs: now },
+    });
+  equal((await supervisor.poll()).action, "renew");
+  const first = publish();
+  now = 20;
+  equal((await supervisor.poll()).action, "renew");
+  const second = publish();
+  assertBackupV2StatusTransition(first, second);
+  equal(first.progress.sourceBytes, 100);
+  equal(second.progress.sourceBytes, 101);
+  const expiry = second.lease.usefulProgressExpiresAtMs;
+  now = 30;
+  equal((await supervisor.poll()).action, "renew");
+  const heartbeat = publish();
+  assertBackupV2StatusTransition(second, heartbeat);
+  equal(heartbeat.lease.usefulProgressExpiresAtMs, expiry);
+  work.capture(
+    { role: "root", kind: "source", bytes: 102, members: 0 },
+    active,
+  );
+  supervisor.cancel();
+  work.phase = "CANCELLATION_BLOCKED";
+  const cancelled = publish();
+  assertBackupV2StatusTransition(heartbeat, cancelled);
+  equal(cancelled.progress.sourceBytes, 102);
+  equal(cancelled.lease.usefulProgressExpiresAtMs, expiry);
+});
+Deno.test("terminal and cancellation status preserve final counters instead of the prior observation", () => {
+  for (
+    const phase of [
+      "CLOUD_COMPLETE",
+      "ACCEPTED",
+      "CLEANED",
+      "FAILED",
+      "CANCELLATION_BLOCKED",
+    ] as const
+  ) {
+    const work = new BackupV2WorkerProgress(),
+      active = status().activeRoleAttempt;
+    work.capture(
+      { role: "root", kind: "source", bytes: 100, members: 0 },
+      active,
+    );
+    work.observe(10);
+    work.capture(
+      { role: "root", kind: "source", bytes: 101, members: 0 },
+      active,
+    );
+    work.phase = phase;
+    const final = work.status(20);
+    equal(final.phase, phase);
+    equal(final.progress.phase, phase);
+    equal(final.progress.sourceBytes, 101);
+  }
+});
+function verificationStatus(): BackupV2Status {
+  const value = status();
+  value.kind = "verify";
+  value.phase = "VERIFYING";
+  value.progress.phase = "VERIFYING";
+  value.activeRoleAttempt = null;
+  value.custody.unitName = value.custody.unitName.replace(
+    "-worker-",
+    "-verify-",
+  );
+  value.custody.cgroup = `${GATE_BACKUP_CGROUP_ROOT}/${value.custody.unitName}`;
+  return value;
+}
+Deno.test("runtime verification accepts decoded-only useful progress with an optional legacy zero", () => {
+  for (const previous of [undefined, 100]) {
+    const before = verificationStatus(), after = structuredClone(before);
+    if (previous !== undefined) before.progress.decodedBytes = previous;
+    after.progress.decodedBytes = (previous ?? 0) + 1;
+    after.progress.observedMonotonicMs++;
+    after.lease.observedMonotonicMs++;
+    after.lease.usefulProgressAtMs++;
+    after.lease.usefulProgressExpiresAtMs++;
+    assertBackupV2StatusTransition(before, after);
+  }
+});
+Deno.test("runtime verification rejects decoded regression including disappearance", () => {
+  for (const next of [99, undefined]) {
+    const before = verificationStatus(), after = structuredClone(before);
+    before.progress.decodedBytes = 100;
+    if (next !== undefined) after.progress.decodedBytes = next;
+    after.progress.observedMonotonicMs++;
+    after.lease.observedMonotonicMs++;
+    rejects(() => assertBackupV2StatusTransition(before, after));
+  }
+});
+Deno.test("runtime verification still rejects an unchanged heartbeat renewing its lease", () => {
+  const before = verificationStatus();
+  before.progress.decodedBytes = 100;
+  const after = structuredClone(before);
+  after.progress.observedMonotonicMs++;
+  after.lease.observedMonotonicMs++;
+  after.lease.usefulProgressAtMs++;
+  after.lease.usefulProgressExpiresAtMs++;
+  rejects(() => assertBackupV2StatusTransition(before, after));
 });
 Deno.test("runtime result binds selected root identity and preserves reused role capture intervals", () => {
   const r = result();
