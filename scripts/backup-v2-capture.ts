@@ -142,7 +142,7 @@ export function classifyBackupV2TarDiagnostics(
   for (const line of text.split("\n").filter(Boolean)) {
     if (role === "root" && /^tar: .+: file changed as we read it$/.test(line)) {
       drift.push(line);
-    } else if (role === "root" && /^tar: .+: socket ignored$/.test(line)) {
+    } else if (role !== "recovery" && /^tar: .+: socket ignored$/.test(line)) {
       // Sockets have no persistent payload; their warning is not drift proof.
     } else if (
       role !== "recovery" &&
@@ -679,6 +679,12 @@ export async function createBackupV2RoleProducer(
       },
       release() {
         return released ??= (async () => {
+          let primaryFailed = false;
+          let primaryFailure: unknown;
+          let result: {
+            inventory: BackupV2InventorySummary | null;
+            producer: BackupV2ProducerProof;
+          } | undefined;
           try {
             await completion;
             if (namespace) {
@@ -720,12 +726,20 @@ export async function createBackupV2RoleProducer(
                 members,
               });
             }
-            return { inventory: summary?.inventory ?? null, producer };
+            result = { inventory: summary?.inventory ?? null, producer };
           } catch (error) {
-            await cancel(error);
-            await releaseIndexOpen();
-            throw error;
-          } finally {
+            primaryFailed = true;
+            primaryFailure = error;
+            try {
+              await cancel(error);
+              await releaseIndexOpen();
+            } catch {
+              console.error(
+                "Backup v2 capture cleanup failed after primary failure",
+              );
+            }
+          }
+          try {
             await Promise.allSettled(tasks);
             params.signal?.removeEventListener("abort", aborted);
             if (indexPath && indexIdentity) {
@@ -736,7 +750,14 @@ export async function createBackupV2RoleProducer(
               ) fail("FIFO replaced");
               await Deno.remove(indexPath);
             }
+          } catch (error) {
+            if (!primaryFailed) throw error;
+            console.error(
+              "Backup v2 capture cleanup failed after primary failure",
+            );
           }
+          if (primaryFailed) throw primaryFailure;
+          return result!;
         })();
       },
     };
