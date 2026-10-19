@@ -120,13 +120,13 @@ Deno.test("READY precedes persisted reload lease and persistence time is subtrac
       signal.throwIfAborted();
       equal(deadline, 100);
       state.messages.push("persisted");
-      state.advance(30);
+      state.advance(10);
       return Promise.resolve();
     },
   });
   const decision = await supervisor.poll();
-  equal(state.messages, ["ready", "persisted", 70_000]);
-  assert(decision.action === "renew" && decision.extendUsec === 70_000);
+  equal(state.messages, ["ready", "persisted", 90_000]);
+  assert(decision.action === "renew" && decision.extendUsec === 90_000);
 });
 
 Deno.test("failed or expired persistence cannot send an extension or acquire a fresh grace", async () => {

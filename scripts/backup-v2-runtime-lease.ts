@@ -6,8 +6,13 @@ import {
   type BackupV2SupervisorIdentity,
 } from "./backup-v2-supervisor.ts";
 import {
+  type BackupV2KernelCommand,
+  type BackupV2KernelDiagnostic,
+  backupV2KernelDiagnostic,
+  backupV2KernelSettlement,
   readBackupV2KernelText,
   realBackupV2KernelCommand,
+  tagBackupV2KernelFailure,
 } from "./backup-v2-kernel.ts";
 import { GATE_BACKUP_CGROUP_ROOT } from "./backblaze-controller-contract.ts";
 
@@ -56,8 +61,29 @@ export interface BackupV2RuntimeLeaseObservation {
 export interface BackupV2RuntimeLeaseCapabilities {
   now(): number;
   kernelNowUsec(): bigint;
-  observe(): Promise<BackupV2RuntimeLeaseObservation>;
-  persist(text: string, signal: AbortSignal): Promise<void>;
+  observe(
+    context?: BackupV2LeaseObservationContext,
+  ): Promise<BackupV2RuntimeLeaseObservation>;
+  persist(
+    text: string,
+    signal: AbortSignal,
+    context?: BackupV2LeaseObservationContext,
+  ): Promise<void>;
+}
+export interface BackupV2LeaseObservationContext {
+  phase: "BEFORE_WRITE" | "BEFORE_COMMIT";
+  signal: AbortSignal;
+  budget: { deadlineMs: number; retried: boolean };
+}
+function checkObservationBudget(
+  context: BackupV2LeaseObservationContext | undefined,
+  now: number,
+): void {
+  if (
+    context && (context.signal.aborted || !Number.isFinite(now) || now < 0 ||
+      !Number.isFinite(context.budget.deadlineMs) ||
+      now >= context.budget.deadlineMs)
+  ) throw new Error("Runtime lease observation budget expired");
 }
 
 /** Process-relative useful-progress times are projected conservatively onto
@@ -77,10 +103,28 @@ export function createBackupV2RuntimeLease(
     }
     return lastNow = value;
   };
-  return async (deadlineMs: number, signal: AbortSignal): Promise<void> => {
+  return async (
+    deadlineMs: number,
+    signal: AbortSignal,
+    observationDeadlineMs?: number,
+  ): Promise<void> => {
     if (poisoned) throw new Error("Runtime lease is poisoned");
     try {
       const began = now();
+      if (
+        observationDeadlineMs !== undefined &&
+        (!Number.isFinite(observationDeadlineMs) ||
+          observationDeadlineMs <= began ||
+          observationDeadlineMs > began + 5000)
+      ) {
+        throw new Error("Runtime lease observation budget invalid");
+      }
+      const context: BackupV2LeaseObservationContext | undefined =
+        observationDeadlineMs === undefined ? undefined : {
+          phase: "BEFORE_WRITE",
+          signal,
+          budget: { deadlineMs: observationDeadlineMs, retried: false },
+        };
       if (
         !Number.isFinite(deadlineMs) || deadlineMs <= began ||
         deadlineMs > began + BACKUP_V2_MAX_NOTIFICATION_MS
@@ -89,7 +133,8 @@ export function createBackupV2RuntimeLease(
       // lease, or mistake the previous activation's timestamp for this one.
       for (;;) {
         signal.throwIfAborted();
-        const sample = await caps.observe();
+        const sample = await caps.observe(context);
+        checkObservationBudget(context, now());
         if (JSON.stringify(sample.identity) !== JSON.stringify(identity)) {
           throw new Error("Runtime lease invocation changed");
         }
@@ -121,8 +166,9 @@ export function createBackupV2RuntimeLease(
       if (new TextEncoder().encode(text).length > MAX_FILE_BYTES) {
         throw new Error("Runtime lease metadata exceeded bound");
       }
-      await caps.persist(text, signal);
+      await caps.persist(text, signal, context);
       signal.throwIfAborted();
+      checkObservationBudget(context, now());
       if (now() >= deadlineMs) {
         throw new Error("Runtime lease deadline expired");
       }
@@ -174,39 +220,103 @@ async function readOwned(
   );
   return info;
 }
-async function observe(
+export async function observeBackupV2RuntimeLease(
   identity: BackupV2SupervisorIdentity,
+  context?: BackupV2LeaseObservationContext,
+  run: BackupV2KernelCommand = realBackupV2KernelCommand,
+  now: () => number = () => performance.now(),
 ): Promise<BackupV2RuntimeLeaseObservation> {
-  const [unit, stat, cgroup] = await Promise.all([
-    realBackupV2KernelCommand("/usr/bin/systemctl", [
-      "show",
-      identity.unitName,
-      "--no-pager",
-      "--property=MainPID,InvocationID,ControlGroup,ActiveState,SubState,ActiveEnterTimestampMonotonic",
-    ]),
-    readBackupV2KernelText(`/proc/${identity.mainPid}/stat`),
-    readBackupV2KernelText(`/proc/${identity.mainPid}/cgroup`),
-  ]);
-  const fields = Object.fromEntries(
-    unit.stdout.trim().split("\n").map((line) => {
-      const at = line.indexOf("=");
-      return [line.slice(0, at), line.slice(at + 1)];
-    }),
-  );
-  const ticks = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
-  if (
-    unit.code !== 0 || fields.MainPID !== String(identity.mainPid) ||
-    fields.InvocationID !== identity.invocationId ||
-    fields.ControlGroup !== identity.cgroup ||
-    ticks !== identity.mainStartTicks ||
-    cgroup.trim() !== `0::${identity.cgroup}` ||
-    !/^[0-9]{1,20}$/.test(fields.ActiveEnterTimestampMonotonic)
-  ) throw new Error("Runtime lease live custody unproved");
-  return {
-    identity,
-    running: fields.ActiveState === "active" && fields.SubState === "running",
-    activeEnterUsec: BigInt(fields.ActiveEnterTimestampMonotonic),
+  const tagged = async <T>(
+    helper: BackupV2KernelDiagnostic["helper"],
+    call: () => Promise<T>,
+  ): Promise<T> => {
+    try {
+      return await call();
+    } catch (error) {
+      tagBackupV2KernelFailure(error, helper, context?.phase ?? "UNKNOWN");
+      throw error;
+    }
   };
+  const attempt = async (): Promise<BackupV2RuntimeLeaseObservation> => {
+    checkObservationBudget(context, now());
+    const results = await Promise.allSettled([
+      tagged("UNIT_SHOW", () =>
+        run("/usr/bin/systemctl", [
+          "show",
+          identity.unitName,
+          "--no-pager",
+          "--property=MainPID,InvocationID,ControlGroup,ActiveState,SubState,ActiveEnterTimestampMonotonic",
+        ])),
+      tagged(
+        "PROC_STAT",
+        () => readBackupV2KernelText(`/proc/${identity.mainPid}/stat`, run),
+      ),
+      tagged(
+        "PROC_CGROUP",
+        () => readBackupV2KernelText(`/proc/${identity.mainPid}/cgroup`, run),
+      ),
+    ]);
+    const unit = results[0].status === "fulfilled" ? results[0].value : null;
+    const stat = results[1].status === "fulfilled" ? results[1].value : null;
+    const cgroup = results[2].status === "fulfilled" ? results[2].value : null;
+    const fields = Object.fromEntries(
+      (unit?.stdout ?? "").trim().split("\n").map((line) => {
+        const at = line.indexOf("=");
+        return [line.slice(0, at), line.slice(at + 1)];
+      }),
+    );
+    const ticks = stat?.slice(stat.lastIndexOf(")") + 2).trim().split(
+      /\s+/,
+    )[19];
+    if (
+      unit && (unit.code !== 0 || fields.MainPID !== String(identity.mainPid) ||
+          fields.InvocationID !== identity.invocationId ||
+          fields.ControlGroup !== identity.cgroup ||
+          !/^[0-9]{1,20}$/.test(fields.ActiveEnterTimestampMonotonic)) ||
+      stat !== null && ticks !== identity.mainStartTicks ||
+      cgroup !== null && cgroup.trim() !== `0::${identity.cgroup}`
+    ) throw new Error("Runtime lease live custody unproved");
+    const failures = results.filter((value) => value.status === "rejected").map(
+      (value) => value.reason,
+    );
+    if (failures.length) {
+      const first = failures[0];
+      if (
+        !context || context.budget.retried || failures.some((error) => {
+          const detail = backupV2KernelDiagnostic(error);
+          return detail?.bound !== "DEADLINE" || detail.helper === "UNKNOWN" ||
+            !backupV2KernelSettlement(error);
+        })
+      ) throw first;
+      context.signal.throwIfAborted();
+      const remaining = context.budget.deadlineMs - now() - 2000;
+      if (!Number.isFinite(remaining) || remaining <= 0) throw first;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const settled = await Promise.race([
+        Promise.all(failures.map((error) => backupV2KernelSettlement(error)!))
+          .then((values) => values.every(Boolean)),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), remaining);
+        }),
+      ]).finally(() => clearTimeout(timer));
+      if (
+        !settled || context.signal.aborted ||
+        context.budget.deadlineMs - now() <= 2000
+      ) throw first;
+      context.budget.retried = true;
+      return await attempt();
+    }
+    if (!unit || !stat || !cgroup) {
+      throw new Error("Runtime lease observation incomplete");
+    }
+    checkObservationBudget(context, now());
+    return {
+      identity,
+      running: fields.ActiveState === "active" && fields.SubState === "running",
+      activeEnterUsec: BigInt(fields.ActiveEnterTimestampMonotonic),
+    };
+  };
+  return await attempt();
 }
 
 export function openBackupV2RuntimeLease(identity: BackupV2SupervisorIdentity) {
@@ -218,8 +328,8 @@ export function openBackupV2RuntimeLease(identity: BackupV2SupervisorIdentity) {
     clock_gettime: { parameters: ["i32", "buffer"], result: "i32" },
   });
   let activation: bigint | null = null;
-  const current = async () => {
-    const sample = await observe(identity);
+  const current = async (context?: BackupV2LeaseObservationContext) => {
+    const sample = await observeBackupV2RuntimeLease(identity, context);
     if (sample.running && sample.activeEnterUsec > 0n) {
       if (activation !== null && sample.activeEnterUsec !== activation) {
         throw new Error("Runtime lease activation changed");
@@ -239,7 +349,7 @@ export function openBackupV2RuntimeLease(identity: BackupV2SupervisorIdentity) {
       return value[0] * 1_000_000n + value[1] / 1000n;
     },
     observe: current,
-    async persist(text, signal) {
+    async persist(text, signal, context) {
       try {
         await Deno.mkdir(path, { mode: 0o700 });
       } catch (error) {
@@ -270,13 +380,16 @@ export function openBackupV2RuntimeLease(identity: BackupV2SupervisorIdentity) {
         file.close();
         await directory(path);
         const replacement = await readOwned(target, identity),
-          live = await current();
+          live = await current(
+            context ? { ...context, phase: "BEFORE_COMMIT" } : undefined,
+          );
         if (
           !live.running || live.activeEnterUsec <= 0n ||
           replacement?.ino !== previous?.ino ||
           replacement?.dev !== previous?.dev
         ) throw new Error("Runtime lease custody changed before commit");
         signal.throwIfAborted();
+        checkObservationBudget(context, performance.now());
         await Deno.rename(temporary, target);
         using parent = await Deno.open(path, { read: true });
         await parent.sync();
