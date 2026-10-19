@@ -46,7 +46,25 @@ V1 indexes, readers, original requests, FAILED statuses, receipts and timestamps
 
 The schedule contract remains Sunday 00:05 America/New_York with fifteen-minute/startup rechecks and one current due period. A completed capture in that period satisfies it; migration must not manufacture a second generation. Required acceptance includes retained-v1 streaming recovery, real failure/cancellation/fidelity and capacity fixtures, one genuine all-role due-period v2 capture with independent complete cloud verification, hash-matched Pi/VPS and recovery-tool releases, safe retention/cleanup, settled gates/units/locks/tunnels, current timers and unchanged production continuity. Pi keeper continuity across the source transfer/startup windows remains part of that acceptance. A later natural weekly cycle is separate repeatability evidence. New archive verification may establish `decryptedRestoreProved=true`; `machineBootRestoreProved` stays false without a separately approved boot drill. Historical boot proof below does not transfer to a new capture.
 
-The owner-controlled charter and [ONLINE-BACKUP-CONTRACT.md](ONLINE-BACKUP-CONTRACT.md) still require routine production operation online: no instance stop, reboot or freeze, and no required-service interruption. Resource authority is unchanged. October 18 operator evidence establishes the shared one-CPU, 6 GiB, zero-swap and preserved-IO envelope; a post-exit leaf sample establishes neither the application nor an override of its requested running limit. Earlier retained-v1 live leaf/ancestor evidence remains separate. Source currently declares `CPUQuota=100%`, `CPUWeight=1`, `Nice=19`, no soft memory ceiling and no swap, with the approved per-direction disk/network ceilings. Its `MemoryMax=6G` declaration is 6,442,450,944 bytes, distinct from the October 2 owner record of 6,255,601,664 bytes. Installation acceptance must reconcile authority and actual unit/ancestor values; this document does not approve a limit increase or infer protection from a unit file alone.
+The owner-controlled charter and [ONLINE-BACKUP-CONTRACT.md](ONLINE-BACKUP-CONTRACT.md) still require routine production operation online: no instance stop, reboot or freeze, and no required-service interruption. Resource authority is unchanged. The v2 launcher declares the October 2 owner-approved `MemoryMax=6255601664`, with `MemoryHigh=infinity` and `MemorySwapMax=0`. `CPUQuota=100%`, `CPUWeight=1`, `Nice=19` and the existing ancestor disk/network budgets remain. October 18 evidence of a shared 6 GiB envelope and earlier retained-v1 leaf/ancestor evidence are historical measurements, not proof of the corrected v2 leaf limit.
+
+### Persistent v2 memory budget, October 19, 2026
+
+The dedicated [v2 prefix drop-in](config/arch-vps-b2-v2-.service.d/zz-weekly-backup-budget.conf) covers v2 worker, verifier and pruner unit names. Its `zz-` filename sorts after the existing `/etc/systemd/system/service.d/99-unlimited-resources.conf`, which can otherwise override transient leaf declarations. It changes only the memory controls; the shared ancestor budgets remain in force.
+
+The sole authorized live operator must reconcile current job custody and existing drop-ins before installing from the accepted source checkout:
+
+```sh
+sudo install -D -o root -g root -m 0644 \
+  config/arch-vps-b2-v2-.service.d/zz-weekly-backup-budget.conf \
+  /etc/systemd/system/arch-vps-b2-v2-.service.d/zz-weekly-backup-budget.conf
+sudo systemctl daemon-reload
+sudo cmp -- \
+  config/arch-vps-b2-v2-.service.d/zz-weekly-backup-budget.conf \
+  /etc/systemd/system/arch-vps-b2-v2-.service.d/zz-weekly-backup-budget.conf
+```
+
+For the exact v2 unit under acceptance, inspect `systemctl cat <unit>` and `systemctl show <unit> -p DropInPaths -p MemoryHigh -p MemoryMax -p MemorySwapMax -p MainPID -p ControlGroup`. While its bound MainPID is alive, verify `/proc/<pid>/cgroup` matches that unit, then read `memory.high`, `memory.max` and `memory.swap.max` in its actual `/sys/fs/cgroup<ControlGroup>` directory and each ancestor. The leaf must report `max`, `6255601664` and `0`, respectively; the effective hard ceilings are the minima across the hierarchy. Preserve the exact source/config hashes, invocation, PID/start and readback. Reloaded configuration or a post-exit sample alone does not prove the running limit. Existing jobs remain under the live operator's custody; this installation procedure does not start or restart them.
 
 ## Historical recovery evidence
 
