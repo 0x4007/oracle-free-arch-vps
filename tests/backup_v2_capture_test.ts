@@ -342,6 +342,46 @@ Deno.test("v2 drift classification rejects shrink, unreadable, unknown and cold-
     0,
   );
 });
+Deno.test("v2 one-filesystem boundaries do not count as drift or mask fatal diagnostics", () => {
+  const boundary = [
+    'tar: "./efi/": file is on a different filesystem; not dumped',
+    'tar: "./var/lib/docker/rootfs/overlayfs/example/": file is on a different filesystem; not dumped',
+  ].join("\n") + "\n";
+  const changed = 'tar: "./live-data": file changed as we read it\n';
+  const socket = 'tar: "./runtime.sock": socket ignored\n';
+  for (const role of ROLE_ORDER) {
+    const proof = classifyBackupV2TarDiagnostics(role, 0, boundary);
+    equals(proof.driftRecords, 0);
+    equals(proof.driftSha256, hash(""));
+    throws(() => classifyBackupV2TarDiagnostics(role, 1, boundary));
+    throws(() => classifyBackupV2TarDiagnostics(role, 2, boundary + changed));
+    if (role !== "root") {
+      throws(() => classifyBackupV2TarDiagnostics(role, 0, boundary + changed));
+      throws(() => classifyBackupV2TarDiagnostics(role, 1, boundary + changed));
+    }
+  }
+  const live = classifyBackupV2TarDiagnostics(
+    "root",
+    1,
+    changed + socket + boundary,
+  );
+  equals(live.driftRecords, 1);
+  equals(live.driftSha256, hash(changed));
+  throws(() => classifyBackupV2TarDiagnostics("recovery", 0, boundary));
+  for (
+    const fatal of [
+      "tar: ./missing: Cannot stat: No such file or directory\n",
+      "tar: ./private: Cannot open: Permission denied\n",
+      "tar: ./file: File shrank by 1 byte; padding with zeros\n",
+      "tar: ./mount: file is on a different filesystem; not dumped: read error\n",
+      "unclassified\n",
+    ]
+  ) {
+    throws(() =>
+      classifyBackupV2TarDiagnostics("root", 1, changed + boundary + fatal)
+    );
+  }
+});
 
 Deno.test("v2 pump waits for downstream writes and propagates input/write failures", async () => {
   let release!: () => void, written = 0, pulled = 0;
