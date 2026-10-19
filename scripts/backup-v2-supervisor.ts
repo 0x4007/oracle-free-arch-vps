@@ -10,6 +10,11 @@ import {
   BACKUP_V2_LIMITS,
   backupV2RequiredFreeBytes,
 } from "./backup-v2-profile.ts";
+import {
+  type BackupV2KernelDiagnostic,
+  backupV2KernelDiagnostic,
+  validateBackupV2KernelDiagnostic,
+} from "./backup-v2-kernel.ts";
 
 /** Internal service plumbing only; m08 must grant this exact FFI path, never -A. */
 export const BACKUP_V2_NOTIFY_LIBRARY = "/usr/lib/libsystemd.so.0";
@@ -191,7 +196,11 @@ export interface BackupV2SupervisorCapabilities {
   notifier: BackupV2Notifier;
   /** Persist this same short deadline before EXTEND, including a processed
    * READY barrier. Failure must leave the previous finite lease in force. */
-  persistRuntimeLease?(deadlineMs: number, signal: AbortSignal): Promise<void>;
+  persistRuntimeLease?(
+    deadlineMs: number,
+    signal: AbortSignal,
+    observationDeadlineMs?: number,
+  ): Promise<void>;
   /** Bounded collector: independently check work, cgroup and filesystem/FD
    * accounting; counters are cumulative within the exact invocation. */
   observe(signal: AbortSignal): Promise<BackupV2SupervisorObservation>;
@@ -256,6 +265,7 @@ export interface BackupV2SupervisorFailure {
   stage: typeof failureStages[number];
   errorClass: string;
   kind: string | null;
+  kernelEvidence?: BackupV2KernelDiagnostic;
 }
 class BackupV2CapacityGuardError extends Error {
   constructor(readonly kind: string) {
@@ -263,7 +273,11 @@ class BackupV2CapacityGuardError extends Error {
   }
 }
 /** Never retain message, stack, URLs, headers or arbitrary exception fields. */
-export function classifyBackupV2Failure(error: unknown) {
+export function classifyBackupV2Failure(error: unknown): {
+  errorClass: string;
+  kind: string | null;
+  kernelEvidence?: BackupV2KernelDiagnostic;
+} {
   let errorClass = "UNKNOWN", kind: string | null = null;
   try {
     if (error instanceof Error) {
@@ -281,7 +295,8 @@ export function classifyBackupV2Failure(error: unknown) {
   } catch {
     return { errorClass: "UNKNOWN", kind: null };
   }
-  return { errorClass, kind };
+  const kernelEvidence = backupV2KernelDiagnostic(error);
+  return { errorClass, kind, ...(kernelEvidence ? { kernelEvidence } : {}) };
 }
 export function backupV2FailureEvidence(input: {
   identity: BackupV2SupervisorIdentity;
@@ -352,6 +367,14 @@ export function backupV2FailureEvidence(input: {
     kind: classified.kind !== null && failureKinds.includes(classified.kind)
       ? classified.kind
       : null,
+    ...(classified.kernelEvidence &&
+        validateBackupV2KernelDiagnostic(classified.kernelEvidence)
+      ? {
+        kernelEvidence: validateBackupV2KernelDiagnostic(
+          classified.kernelEvidence,
+        ),
+      }
+      : {}),
     observation,
   };
 }
@@ -710,15 +733,27 @@ export class BackupV2Supervisor {
         now + this.#options.notificationGraceMs,
         decision.absoluteDeadlineMs,
       );
+      let observationDeadlineMs: number | undefined;
       if (this.#caps.persistRuntimeLease) {
+        observationDeadlineMs = this.#now() +
+          this.#options.observationTimeoutMs;
         await bounded(
-          (signal) => this.#caps.persistRuntimeLease!(deadlineMs, signal),
+          (signal) =>
+            this.#caps.persistRuntimeLease!(
+              deadlineMs,
+              signal,
+              observationDeadlineMs,
+            ),
           this.#options.observationTimeoutMs,
           this.signal,
         );
       }
       const extendUsec = Math.floor((deadlineMs - this.#now()) * 1000);
       if (extendUsec <= 0) return this.cancel("LEASE_EXPIRED");
+      if (
+        observationDeadlineMs !== undefined &&
+        this.#now() >= observationDeadlineMs
+      ) throw new Error("Supervisor persistence budget expired");
       this.#caps.notifier.extend(extendUsec);
       return { ...decision, extendUsec };
     } catch (error) {

@@ -106,6 +106,87 @@ export class BackupV2KernelEvidenceError extends Error {
     super(`Backup kernel evidence ${kind.toLowerCase()}`);
   }
 }
+const kernelHelpers = [
+  "UNIT_SHOW",
+  "PROC_STAT",
+  "PROC_CGROUP",
+  "UNKNOWN",
+] as const;
+const leasePhases = ["BEFORE_WRITE", "BEFORE_COMMIT", "UNKNOWN"] as const;
+const kernelBounds = [
+  "DEADLINE",
+  "STDOUT_LIMIT",
+  "STDERR_LIMIT",
+  "CONCURRENCY",
+  "UNSETTLED",
+] as const;
+export interface BackupV2KernelDiagnostic {
+  helper: typeof kernelHelpers[number];
+  leasePhase: typeof leasePhases[number];
+  bound: typeof kernelBounds[number];
+  elapsedMs: number;
+  stdoutBytes: number;
+  stderrBytes: number;
+  commandsInFlight: number;
+  childSettled: boolean;
+  readersSettled: boolean;
+}
+const kernelFaults = new WeakMap<object, {
+  detail: BackupV2KernelDiagnostic;
+  settlement: Promise<boolean>;
+}>();
+export function backupV2KernelDiagnostic(
+  error: unknown,
+): BackupV2KernelDiagnostic | undefined {
+  if (!error || typeof error !== "object") return;
+  const detail = kernelFaults.get(error)?.detail;
+  return detail ? validateBackupV2KernelDiagnostic(detail) : undefined;
+}
+export function validateBackupV2KernelDiagnostic(
+  value: unknown,
+): BackupV2KernelDiagnostic | undefined {
+  if (!value || typeof value !== "object") return;
+  const v = value as BackupV2KernelDiagnostic;
+  if (
+    !kernelHelpers.includes(v.helper) || !leasePhases.includes(v.leasePhase) ||
+    !kernelBounds.includes(v.bound) || !Number.isFinite(v.elapsedMs) ||
+    v.elapsedMs < 0 || v.elapsedMs > 86_400_000 ||
+    ![v.stdoutBytes, v.stderrBytes, v.commandsInFlight].every((n) =>
+      Number.isSafeInteger(n) && n >= 0 && n <= Number.MAX_SAFE_INTEGER
+    ) ||
+    typeof v.childSettled !== "boolean" || typeof v.readersSettled !== "boolean"
+  ) return;
+  return {
+    helper: v.helper,
+    leasePhase: v.leasePhase,
+    bound: v.bound,
+    elapsedMs: v.elapsedMs,
+    stdoutBytes: v.stdoutBytes,
+    stderrBytes: v.stderrBytes,
+    commandsInFlight: v.commandsInFlight,
+    childSettled: v.childSettled,
+    readersSettled: v.readersSettled,
+  };
+}
+export function tagBackupV2KernelFailure(
+  error: unknown,
+  helper: BackupV2KernelDiagnostic["helper"],
+  leasePhase: BackupV2KernelDiagnostic["leasePhase"],
+): void {
+  if (!kernelHelpers.includes(helper) || !leasePhases.includes(leasePhase)) {
+    return;
+  }
+  if (!error || typeof error !== "object") return;
+  const fault = kernelFaults.get(error);
+  if (fault) Object.assign(fault.detail, { helper, leasePhase });
+}
+export function backupV2KernelSettlement(
+  error: unknown,
+): Promise<boolean> | null {
+  return error && typeof error === "object"
+    ? kernelFaults.get(error)?.settlement ?? null
+    : null;
+}
 function fail(kind: BackupV2KernelEvidenceError["kind"]): never {
   throw new BackupV2KernelEvidenceError(kind);
 }
@@ -113,80 +194,167 @@ function absent(error: unknown): boolean {
   return error instanceof BackupV2KernelEvidenceError &&
     error.kind === "ABSENT";
 }
-let commandsInFlight = 0, unsettledFailure = false;
+export interface BackupV2KernelBackend {
+  spawn(
+    command: string,
+    args: string[],
+  ): {
+    pid: number;
+    stdout: ReadableStream<Uint8Array>;
+    stderr: ReadableStream<Uint8Array>;
+    status: Promise<Deno.CommandStatus>;
+  };
+  now(): number;
+  setTimer(
+    callback: () => void,
+    milliseconds: number,
+  ): ReturnType<typeof setTimeout>;
+  clearTimer(timer: ReturnType<typeof setTimeout>): void;
+}
 /** Never signals a process. On a deadline/output failure close only our pipe
  * readers and retain unknown evidence until the owned command has settled.
  * The enclosing managed unit remains responsible for tree cancellation. */
-export const realBackupV2KernelCommand: BackupV2KernelCommand = async (
-  command,
-  args,
-) => {
-  if (unsettledFailure || commandsInFlight >= 16) fail("BOUNDED");
-  const child = new Deno.Command(command, {
-    args,
-    clearEnv: true,
-    env: backupV2ChildEnvironment({
-      PATH: "/usr/bin:/bin",
-      LC_ALL: "C",
-      LANG: "C",
-    }),
-    stdin: "null",
-    stdout: "piped",
-    stderr: "piped",
-  }).spawn();
-  commandsInFlight++;
-  const output = child.stdout.getReader(), errors = child.stderr.getReader();
-  const collect = async (
-    reader: ReadableStreamDefaultReader<Uint8Array>,
-    maximum: number,
-  ) => {
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    while (true) {
-      const item = await reader.read();
-      if (item.done) break;
-      total += item.value.length;
-      if (total > maximum) fail("BOUNDED");
-      chunks.push(item.value);
-    }
-    const bytes = new Uint8Array(total);
-    let at = 0;
-    for (const item of chunks) {
-      bytes.set(item, at);
-      at += item.length;
-    }
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+export function createBackupV2KernelCommand(
+  overrides: Partial<BackupV2KernelBackend> = {},
+): BackupV2KernelCommand {
+  const backend: BackupV2KernelBackend = {
+    spawn: (command, args) =>
+      new Deno.Command(command, {
+        args,
+        clearEnv: true,
+        env: backupV2ChildEnvironment({
+          PATH: "/usr/bin:/bin",
+          LC_ALL: "C",
+          LANG: "C",
+        }),
+        stdin: "null",
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn(),
+    now: () => performance.now(),
+    setTimer: setTimeout,
+    clearTimer: clearTimeout,
+    ...overrides,
   };
-  const terminal = child.status.finally(() => {
-    commandsInFlight--;
-    if (commandsInFlight === 0) unsettledFailure = false;
-  });
-  const operation = Promise.all([
-    collect(output, outputLimit(command, args)),
-    collect(errors, 8192),
-    terminal,
-  ]);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const [stdout, stderr, status] = await Promise.race([
-      operation,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new BackupV2KernelEvidenceError("BOUNDED")),
-          2000,
-        );
-      }),
+  let commandsInFlight = 0, unsettledFailure = false;
+  return async (
+    command,
+    args,
+  ) => {
+    const began = backend.now();
+    const detail: BackupV2KernelDiagnostic = {
+      helper: "UNKNOWN",
+      leasePhase: "UNKNOWN",
+      bound: "DEADLINE",
+      elapsedMs: 0,
+      stdoutBytes: 0,
+      stderrBytes: 0,
+      commandsInFlight,
+      childSettled: false,
+      readersSettled: false,
+    };
+    let settlement: Promise<boolean> = Promise.resolve(false);
+    const faults: BackupV2KernelDiagnostic[] = [];
+    const boundedError = (bound: BackupV2KernelDiagnostic["bound"]) => {
+      const error = new BackupV2KernelEvidenceError("BOUNDED");
+      const snapshot = {
+        ...detail,
+        bound,
+        elapsedMs: backend.now() - began,
+        commandsInFlight,
+      };
+      faults.push(snapshot);
+      kernelFaults.set(error, { detail: snapshot, settlement });
+      return error;
+    };
+    if (unsettledFailure) throw boundedError("UNSETTLED");
+    if (commandsInFlight >= 16) throw boundedError("CONCURRENCY");
+    const child = backend.spawn(command, args);
+    commandsInFlight++;
+    const output = child.stdout.getReader(), errors = child.stderr.getReader();
+    const collect = async (
+      reader: ReadableStreamDefaultReader<Uint8Array>,
+      maximum: number,
+      stream: "stdoutBytes" | "stderrBytes",
+    ) => {
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      while (true) {
+        const item = await reader.read();
+        if (item.done) break;
+        total += item.value.length;
+        detail[stream] = total;
+        if (total > maximum) {
+          throw boundedError(
+            stream === "stdoutBytes" ? "STDOUT_LIMIT" : "STDERR_LIMIT",
+          );
+        }
+        chunks.push(item.value);
+      }
+      const bytes = new Uint8Array(total);
+      let at = 0;
+      for (const item of chunks) {
+        bytes.set(item, at);
+        at += item.length;
+      }
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    };
+    const terminal = child.status.then((status) => {
+      detail.childSettled = true;
+      for (const fault of faults) fault.childSettled = true;
+      return status;
+    }).finally(() => {
+      commandsInFlight--;
+      if (commandsInFlight === 0) unsettledFailure = false;
+    });
+    const operation = Promise.all([
+      collect(output, outputLimit(command, args), "stdoutBytes"),
+      collect(errors, 8192, "stderrBytes"),
+      terminal,
     ]);
-    return { code: status.code, stdout, stderr, observerPid: child.pid };
-  } catch (error) {
-    unsettledFailure = commandsInFlight > 0;
-    void output.cancel().catch(() => {});
-    void errors.cancel().catch(() => {});
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
-};
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const [stdout, stderr, status] = await Promise.race([
+        operation,
+        new Promise<never>((_, reject) => {
+          timer = backend.setTimer(
+            () => reject(boundedError("DEADLINE")),
+            2000,
+          );
+        }),
+      ]);
+      return { code: status.code, stdout, stderr, observerPid: child.pid };
+    } catch (error) {
+      unsettledFailure = commandsInFlight > 0;
+      const readers = Promise.allSettled([output.cancel(), errors.cancel()]);
+      settlement = Promise.all([
+        readers,
+        terminal,
+        operation.then(() => true, () => false),
+      ]).then(([closed, status, complete]) => {
+        detail.readersSettled = closed.every((value) =>
+          value.status === "fulfilled"
+        );
+        for (const fault of faults) {
+          fault.childSettled = detail.childSettled;
+          fault.readersSettled = detail.readersSettled;
+        }
+        return complete && detail.readersSettled && status.success &&
+          faults.every((fault) => fault.bound === "DEADLINE") &&
+          detail.stdoutBytes <= outputLimit(command, args) &&
+          detail.stderrBytes <= 8192;
+      }).catch(() => false);
+      const fault = error && typeof error === "object"
+        ? kernelFaults.get(error)
+        : null;
+      if (fault) fault.settlement = settlement;
+      throw error;
+    } finally {
+      if (timer !== undefined) backend.clearTimer(timer);
+    }
+  };
+}
+export const realBackupV2KernelCommand = createBackupV2KernelCommand();
 function bounded(
   run: BackupV2KernelCommand,
   duration = 4000,
