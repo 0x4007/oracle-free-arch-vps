@@ -579,10 +579,11 @@ export function assertBackupV2StatusTransition(
     "compressionInputBytes",
     "verifiedChunks",
     "decryptedBytes",
+    "decodedBytes",
     "inventoryMembers",
   ] as const;
   const advanced = workCounters.some((key) =>
-    b.progress[key] > a.progress[key]
+    (b.progress[key] ?? 0) > (a.progress[key] ?? 0)
   );
   for (
     const key of [
@@ -591,9 +592,10 @@ export function assertBackupV2StatusTransition(
       "compressionInputBytes",
       "verifiedChunks",
       "decryptedBytes",
+      "decodedBytes",
       "inventoryMembers",
     ] as const
-  ) if (b.progress[key] < a.progress[key]) fail();
+  ) if ((b.progress[key] ?? 0) < (a.progress[key] ?? 0)) fail();
   if (
     !advanced && (b.lease.usefulProgressAtMs > a.lease.usefulProgressAtMs ||
       b.lease.usefulProgressExpiresAtMs > a.lease.usefulProgressExpiresAtMs)

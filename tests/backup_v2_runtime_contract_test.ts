@@ -539,6 +539,51 @@ Deno.test("terminal and cancellation status preserve final counters instead of t
     equal(final.progress.sourceBytes, 101);
   }
 });
+function verificationStatus(): BackupV2Status {
+  const value = status();
+  value.kind = "verify";
+  value.phase = "VERIFYING";
+  value.progress.phase = "VERIFYING";
+  value.activeRoleAttempt = null;
+  value.custody.unitName = value.custody.unitName.replace(
+    "-worker-",
+    "-verify-",
+  );
+  value.custody.cgroup = `${GATE_BACKUP_CGROUP_ROOT}/${value.custody.unitName}`;
+  return value;
+}
+Deno.test("runtime verification accepts decoded-only useful progress with an optional legacy zero", () => {
+  for (const previous of [undefined, 100]) {
+    const before = verificationStatus(), after = structuredClone(before);
+    if (previous !== undefined) before.progress.decodedBytes = previous;
+    after.progress.decodedBytes = (previous ?? 0) + 1;
+    after.progress.observedMonotonicMs++;
+    after.lease.observedMonotonicMs++;
+    after.lease.usefulProgressAtMs++;
+    after.lease.usefulProgressExpiresAtMs++;
+    assertBackupV2StatusTransition(before, after);
+  }
+});
+Deno.test("runtime verification rejects decoded regression including disappearance", () => {
+  for (const next of [99, undefined]) {
+    const before = verificationStatus(), after = structuredClone(before);
+    before.progress.decodedBytes = 100;
+    if (next !== undefined) after.progress.decodedBytes = next;
+    after.progress.observedMonotonicMs++;
+    after.lease.observedMonotonicMs++;
+    rejects(() => assertBackupV2StatusTransition(before, after));
+  }
+});
+Deno.test("runtime verification still rejects an unchanged heartbeat renewing its lease", () => {
+  const before = verificationStatus();
+  before.progress.decodedBytes = 100;
+  const after = structuredClone(before);
+  after.progress.observedMonotonicMs++;
+  after.lease.observedMonotonicMs++;
+  after.lease.usefulProgressAtMs++;
+  after.lease.usefulProgressExpiresAtMs++;
+  rejects(() => assertBackupV2StatusTransition(before, after));
+});
 Deno.test("runtime result binds selected root identity and preserves reused role capture intervals", () => {
   const r = result();
   equal(
