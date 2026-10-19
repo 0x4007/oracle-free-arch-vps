@@ -609,6 +609,6 @@ export function assertBackupV2StatusTransition(
   ) fail();
   if (
     !a.lease.retryEpisode && b.lease.retryEpisode &&
-    b.lease.retryEpisode.startedAtMs < a.progress.observedMonotonicMs
+    b.lease.retryEpisode.startedAtMs < a.lease.usefulProgressAtMs
   ) fail();
 }

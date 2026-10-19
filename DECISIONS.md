@@ -137,3 +137,7 @@ A complete ciphertext EOF and uploaded chunk journal do not replace the original
 ## 2026-10-19 cold mount cleanup working directory
 
 The shared cold-role namespace cleanup must leave its mounted working directory before ordinary unmount. A failed `cd /` or unmount remains fatal with cleanup status 79; successful cleanup preserves the original producer status. No forced or lazy unmount, suppressed failure, coverage change or reuse-contract change is introduced.
+
+## 2026-10-19 retry publication after asynchronous persistence
+
+A fixed retry may wait for durable journal persistence while supervision publishes a later status. New retry publication is ordered against actual useful progress, rather than the status observation time, so a heartbeat does not invalidate a legitimate retry. After existing timing, expiry, custody and freshness checks, a notification strictly older than already observed useful work is superseded and cannot reacquire a retry lease. Original uploader retry endpoints, sealed transfer deadlines, immutable windows and rejection of expired, future or backdated-across-work episodes remain. The task-local callback matrix reproduced the original rejection and proved both useful-work and heartbeat-only delay cases; it does not establish the original exception site or live backup acceptance.

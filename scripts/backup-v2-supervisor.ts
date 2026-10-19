@@ -606,6 +606,10 @@ export class BackupV2Supervisor {
       throw new Error("Retry cannot revive an expired lease");
     }
     this.#fresh(this.#previous.observedMonotonicMs, now);
+    if (
+      evidence.startedAtMs !== undefined &&
+      startedAtMs < this.#window.usefulProgressAtMs
+    ) return this.window();
     if (!this.#window.retryEpisode) {
       if (this.#serial <= this.#episodeSerial) {
         throw new Error("Retry episode needs new useful work");

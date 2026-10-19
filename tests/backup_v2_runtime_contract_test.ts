@@ -18,7 +18,10 @@ import {
   type BackupV2ObjectKind,
   backupV2ObjectName,
 } from "../scripts/backup-v2-contract.ts";
-import { BACKUP_V2_PROFILE_ID } from "../scripts/backup-v2-profile.ts";
+import {
+  BACKUP_V2_LIMITS,
+  BACKUP_V2_PROFILE_ID,
+} from "../scripts/backup-v2-profile.ts";
 import { createBackupV2InventorySummary } from "../scripts/backup-v2-inventory.ts";
 import { validateCatalogEntry } from "../scripts/backblaze-file-backup.ts";
 import {
@@ -511,6 +514,109 @@ Deno.test("runtime status keeps progress paired with its lease when work advance
   equal(cancelled.progress.sourceBytes, 102);
   equal(cancelled.lease.usefulProgressExpiresAtMs, expiry);
 });
+Deno.test("retry publication tolerates awaited persistence across heartbeats and newer useful work", async () => {
+  for (const usefulWork of [false, true]) {
+    const template = status(), work = new BackupV2WorkerProgress();
+    const active = template.activeRoleAttempt;
+    work.capture(
+      { role: "root", kind: "source", bytes: 99, members: 0 },
+      active,
+    );
+    let now = 0;
+    const supervisor = new BackupV2Supervisor(template.custody, {
+      progressGraceMs: 1000,
+      notificationGraceMs: 100,
+      observationTimeoutMs: 20,
+      maximumObservationAgeMs: 100,
+      productionWriterMarginBytes: 4096,
+      minimumFreeInodes: 100,
+      maximumSourceHeldDeletedBytes: 1024,
+    }, {
+      now: () => now,
+      notifier: { ready() {}, extend() {}, stopping() {}, close() {} },
+      observe: () =>
+        Promise.resolve({
+          identity: template.custody,
+          progress: work.observe(now),
+          capacity: {
+            observedMonotonicMs: now,
+            availableBytes: 10 * 1024 ** 3,
+            freeInodes: 10_000,
+            allocatedWorkspaceBytes: 0,
+            workspaceHeldDeletedBytes: 0,
+            sourceHeldDeletedBytes: 0,
+          },
+        }),
+    });
+    const publish = () =>
+      validateBackupV2Status({
+        ...template,
+        ...work.status(now),
+        lease: { ...supervisor.window(), observedMonotonicMs: now },
+      });
+    await supervisor.poll();
+    now = 10;
+    work.capture(
+      { role: "root", kind: "source", bytes: 100, members: 0 },
+      active,
+    );
+    await supervisor.poll();
+    const episode = {
+      sealedObjectIdentity: "sealed-slot",
+      retainedBytes: 64,
+      retryableTransport: true as const,
+      startedAtMs: 15,
+      expiresAtMs: 15 + BACKUP_V2_LIMITS.blockedTransportMs,
+    };
+    const notify = async () => {
+      equal((await supervisor.poll()).action, "renew");
+      supervisor.beginRetryEpisode(episode);
+      return publish();
+    };
+    const durable = Promise.withResolvers<void>();
+    const delayed = (async () => {
+      await durable.promise;
+      return await notify();
+    })();
+    now = 20;
+    if (usefulWork) {
+      work.capture(
+        { role: "root", kind: "source", bytes: 101, members: 0 },
+        active,
+      );
+    }
+    await supervisor.poll();
+    const before = publish();
+    equal(before.lease.retryEpisode, null);
+    now = 30;
+    durable.resolve();
+    const after = await delayed;
+    assertBackupV2StatusTransition(before, after);
+    equal(
+      after.lease.retryEpisode,
+      usefulWork ? null : {
+        startedAtMs: episode.startedAtMs,
+        expiresAtMs: episode.expiresAtMs,
+      },
+    );
+    now = 40;
+    const repeated = await notify();
+    assertBackupV2StatusTransition(after, repeated);
+    equal(repeated.lease.retryEpisode, after.lease.retryEpisode);
+    equal(
+      repeated.lease.usefulProgressExpiresAtMs,
+      before.lease.usefulProgressExpiresAtMs,
+    );
+    const backdated = structuredClone(before);
+    const old = before.lease.usefulProgressAtMs - 1;
+    backdated.lease.retryEpisode = {
+      startedAtMs: old,
+      expiresAtMs: old + 1000,
+    };
+    rejects(() => assertBackupV2StatusTransition(before, backdated));
+  }
+});
+
 Deno.test("terminal and cancellation status preserve final counters instead of the prior observation", () => {
   for (
     const phase of [
