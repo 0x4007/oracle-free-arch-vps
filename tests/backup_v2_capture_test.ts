@@ -315,6 +315,59 @@ Deno.test("v2 native argv retains metadata and all exclusions without archive st
     }
   }
 });
+Deno.test({
+  name: "v2 generated cold cleanup leaves its cwd and preserves failures",
+  ignore:
+    (await Deno.permissions.query({ name: "run", command: "/usr/bin/bash" }))
+      .state !== "granted",
+  async fn() {
+    const source = settings.sources.find((item) =>
+      item.name === "staging-boot"
+    )!;
+    const cleanup = backupV2NamespaceScript({
+      source,
+      role: "staging-boot",
+      stage: "/fixture",
+      index: "/fixture/index",
+      status: "/fixture/status",
+      exclusions: [],
+    }).split("\n").find((line) => line.startsWith("cleanup() {"));
+    assert(cleanup);
+    // These command fakes exercise the generated shell's status/ordering. The
+    // separate operator fixture proves the real kernel mount/CWD behavior.
+    for (const mode of ["success", "producer", "cd", "umount"] as const) {
+      const result = await new Deno.Command("/usr/bin/bash", {
+        args: [
+          "-c",
+          [
+            "d=$PWD",
+            `umount() { test "$PWD" != "$d" || return 32; printf 'umount\\n'; ${
+              mode === "umount" ? "return 32;" : "return 0;"
+            } }`,
+            "rmdir() { printf 'rmdir\\n'; }",
+            cleanup,
+            "trap cleanup EXIT",
+            ...(mode === "cd" ? ["cd() { return 1; }"] : []),
+            `exit ${mode === "producer" ? 23 : 0}`,
+          ].join("\n"),
+        ],
+        clearEnv: true,
+        env: { PATH: "/usr/bin:/bin" },
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      equals(
+        result.code,
+        mode === "success" ? 0 : mode === "producer" ? 23 : 79,
+      );
+      equals(
+        new TextDecoder().decode(result.stdout),
+        mode === "cd" ? "" : "umount\nrmdir\n",
+      );
+      equals(result.stderr.length, 0);
+    }
+  },
+});
 
 Deno.test("v2 drift classification rejects shrink, unreadable, unknown and cold-role drift", () => {
   const changed = "tar: ./volatile: file changed as we read it\n";

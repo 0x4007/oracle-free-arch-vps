@@ -181,7 +181,7 @@ export function backupV2NamespaceScript(params: {
     `exec 3>${quote(index)} || exit 70`,
     "mount --make-rprivate / || exit 70",
     'd=""',
-    'cleanup() { s=$?; if test -n "$d"; then umount "$d" || s=79; rmdir "$d" || s=79; fi; exit "$s"; }',
+    'cleanup() { s=$?; if test -n "$d"; then cd / || exit 79; umount "$d" || s=79; rmdir "$d" || s=79; fi; exit "$s"; }',
     "trap cleanup EXIT",
   ];
   if (source.livePath) lines.push(`cd ${quote(source.livePath)} || exit 71`);
