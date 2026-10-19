@@ -335,6 +335,42 @@ Deno.test("supervisor adopts the original durable retry window without sliding i
   );
 });
 
+Deno.test("late fixed retry notifications cannot reacquire a lease after useful work supersedes them", async () => {
+  const { state, supervisor } = fixture();
+  await supervisor.poll();
+  state.advance(10);
+  state.sample.progress.sourceBytes = 10;
+  await supervisor.poll();
+  const original = {
+    sealedObjectIdentity: "sealed-slot",
+    retainedBytes: 64,
+    retryableTransport: true as const,
+    startedAtMs: 15,
+    expiresAtMs: 15 + BACKUP_V2_LIMITS.blockedTransportMs,
+  };
+  state.advance(20);
+  state.sample.progress.sourceBytes++;
+  await supervisor.poll();
+  const useful = supervisor.window();
+  equal(supervisor.beginRetryEpisode(original), useful);
+  state.advance(30);
+  await supervisor.poll();
+  const heartbeat = supervisor.window();
+  equal(supervisor.beginRetryEpisode(original), heartbeat);
+  equal(heartbeat.usefulProgressAtMs, useful.usefulProgressAtMs);
+  equal(heartbeat.usefulProgressExpiresAtMs, useful.usefulProgressExpiresAtMs);
+  equal(heartbeat.retryEpisode, null);
+  throws(() => supervisor.beginRetryEpisode({ ...original, expiresAtMs: 29 }));
+  throws(() =>
+    supervisor.beginRetryEpisode({
+      ...original,
+      startedAtMs: 31,
+      expiresAtMs: 32,
+    })
+  );
+  equal(supervisor.window(), heartbeat);
+});
+
 Deno.test("sealed transfer grants bounded pending wait without fake work or retry-based deadline refresh", async () => {
   const f = fixture();
   await f.supervisor.poll();
