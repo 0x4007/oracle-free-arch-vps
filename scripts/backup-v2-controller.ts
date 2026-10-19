@@ -68,6 +68,7 @@ import {
   pollBackupV2Settlement,
   settleBackupV2Cancellation,
 } from "./backup-v2-supervisor.ts";
+import { backupV2RuntimeLeaseDirectory } from "./backup-v2-runtime-lease.ts";
 import {
   BACKUP_V2_LIMITS,
   BACKUP_V2_NAMESPACE,
@@ -1052,8 +1053,12 @@ export function backupV2LaunchArguments(
     "--no-lock",
     "--cached-only",
     "--no-code-cache",
-    `--allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${publicHome},${BACKUP_RUNTIME_BASE}`,
-    `--allow-write=${BACKUP_BASE},${PUBLIC_HOME_BASE},${BACKUP_V2_PROTECTION_SOURCE_BASE}`,
+    `--allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${publicHome},${BACKUP_RUNTIME_BASE},${
+      backupV2RuntimeLeaseDirectory(gate.unitName)
+    }`,
+    `--allow-write=${BACKUP_BASE},${PUBLIC_HOME_BASE},${BACKUP_V2_PROTECTION_SOURCE_BASE},${
+      backupV2RuntimeLeaseDirectory(gate.unitName)
+    }`,
     "--allow-env=INVOCATION_ID,NOTIFY_SOCKET",
     "--allow-sys=statfs",
     "--allow-ffi=/usr/lib/libsystemd.so.0",
@@ -1069,6 +1074,21 @@ export function backupV2RemoteProgram(jobId: string, program: string): string {
   return `printf '%s' ${shellQuote(program)} | DENO_DIR=${
     shellQuote(backupV2ControlCacheDirectory(jobId))
   } /usr/local/bin/deno run --no-prompt --no-config --no-lock --no-code-cache --cached-only --allow-read=${BACKUP_BASE},${JOBS_RUNTIME_ROOT},${RELEASES_ROOT},${BACKUP_V2_PROTECTION_SOURCE_BASE} --allow-run=/bin/sh,/usr/bin/systemctl,/usr/bin/flock,/usr/bin/cat,/usr/bin/find,/usr/bin/stat,/usr/bin/readlink,/usr/bin/sha256sum -`;
+}
+/** Only the exact settled invocation's two lease files may be removed. */
+export function backupV2RuntimeLeaseCleanupProgram(
+  gateInput: BackupV2Gate,
+): string {
+  const gate = validateBackupV2Gate(gateInput);
+  if (!gate.custody) fail();
+  const directory = backupV2RuntimeLeaseDirectory(gate.unitName),
+    release = `${RELEASES_ROOT}/${gate.envelope.request.sourceRevision}`,
+    program = `import { removeBackupV2RuntimeLease } from ${
+      JSON.stringify(release + "/scripts/backup-v2-runtime-lease.ts")
+    }; await removeBackupV2RuntimeLease(${JSON.stringify(gate.custody)});`;
+  return `printf '%s' ${shellQuote(program)} | DENO_DIR=${
+    shellQuote(backupV2ControlCacheDirectory(gate.envelope.request.jobId))
+  } /usr/local/bin/deno run --no-prompt --no-config --no-lock --no-code-cache --cached-only --allow-read=${release},${directory} --allow-write=${directory} -`;
 }
 export function backupV2ObservationProgram(
   gateInput: BackupV2Gate,
@@ -1240,6 +1260,12 @@ export function realBackupV2ControllerCapabilities(
           return;
         }
         if (!expected || !await retainedProof(expected)) fail();
+        if (
+          (await deps.remote.root(backupV2RuntimeLeaseCleanupProgram(expected)))
+            .code !== 0
+        ) {
+          throw new Error("Exact settled runtime lease cleanup failed");
+        }
         // Only the controller lock holder may remove the exact compared gate.
         same(await deps.private.read(GATE_PATH), expected);
         await removeGate(GATE_PATH);
