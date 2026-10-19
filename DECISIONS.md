@@ -127,3 +127,9 @@ Before notifying systemd of an extension, the stable MainPID atomically persists
 The integrated `6860ae6` source gates passed 859 tests with zero failures and 186 permission-dependent skips. Bounded native case evidence proved unchanged PID/invocation and continued useful pipe progress across reload, finite timeout after progress ended, and zero extensions when persistence was denied. The normal case used 44 pipe bytes with no archive reads or network payload; retained execution evidence and fresh settlement qualified that case separately. Original fixture and wrapper failures remain preserved as failures, without a claim that every wrapper passed.
 
 The genuine due-period all-role backup and independent cloud verification remain in progress. Full acceptance still requires retention, scratch/gate/lock/tunnel settlement, installed-artifact consistency, current timers and production continuity. No new machine-boot restoration is claimed.
+
+## 2026-10-19 GNU tar filesystem boundary diagnostics
+
+Every filesystem role uses the existing `--one-file-system` policy. The exact GNU tar diagnostic `file is on a different filesystem; not dumped` therefore records an intentional boundary and is accepted for those roles without counting as live drift. The recovery role does not use tar and receives no such allowance. Exit 1 still requires recognized changed-file drift on the live root; cold-role exit 1, tar exit 2, shrink, unreadable and unknown diagnostics remain fatal. Source coverage, exclusions, mount construction and source guards are unchanged.
+
+A complete ciphertext EOF and uploaded chunk journal do not replace the original inventory, source compatibility, role timing and sealed-checkpoint proof. The completed upload and prior failure artifacts remain preserved; this classifier correction does not establish standard role reuse or a completed backup.

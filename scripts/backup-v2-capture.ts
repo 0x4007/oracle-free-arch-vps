@@ -144,6 +144,12 @@ export function classifyBackupV2TarDiagnostics(
       drift.push(line);
     } else if (role === "root" && /^tar: .+: socket ignored$/.test(line)) {
       // Sockets have no persistent payload; their warning is not drift proof.
+    } else if (
+      role !== "recovery" &&
+      /^tar: .+: file is on a different filesystem; not dumped$/.test(line)
+    ) {
+      // Every filesystem role uses --one-file-system. Its intentional mount
+      // boundary is neither data loss nor evidence of live file drift.
     } else fail("unclassified tar diagnostic");
   }
   if (code === 1 && (role !== "root" || drift.length === 0)) {
