@@ -133,3 +133,7 @@ The genuine due-period all-role backup and independent cloud verification remain
 Every filesystem role uses the existing `--one-file-system` policy. The exact GNU tar diagnostic `file is on a different filesystem; not dumped` therefore records an intentional boundary and is accepted for those roles without counting as live drift. The recovery role does not use tar and receives no such allowance. Exit 1 still requires recognized changed-file drift on the live root; cold-role exit 1, tar exit 2, shrink, unreadable and unknown diagnostics remain fatal. Source coverage, exclusions, mount construction and source guards are unchanged.
 
 A complete ciphertext EOF and uploaded chunk journal do not replace the original inventory, source compatibility, role timing and sealed-checkpoint proof. The completed upload and prior failure artifacts remain preserved; this classifier correction does not establish standard role reuse or a completed backup.
+
+## 2026-10-19 cold mount cleanup working directory
+
+The shared cold-role namespace cleanup must leave its mounted working directory before ordinary unmount. A failed `cd /` or unmount remains fatal with cleanup status 79; successful cleanup preserves the original producer status. No forced or lazy unmount, suppressed failure, coverage change or reuse-contract change is introduced.
