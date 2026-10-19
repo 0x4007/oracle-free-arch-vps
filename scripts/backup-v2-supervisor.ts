@@ -112,6 +112,7 @@ export function backupV2SupervisorUnitProperties(
     Type: "notify",
     NotifyAccess: "main",
     RuntimeMaxSec: `${notificationGraceMs}ms`,
+    RuntimeRandomizedExtraSec: "0",
     TimeoutStartSec: `${notificationGraceMs}ms`,
     TimeoutStopSec: "30s",
     KillMode: "control-group",
@@ -188,6 +189,9 @@ export interface BackupV2SupervisorOptions {
 export interface BackupV2SupervisorCapabilities {
   now(): number;
   notifier: BackupV2Notifier;
+  /** Persist this same short deadline before EXTEND, including a processed
+   * READY barrier. Failure must leave the previous finite lease in force. */
+  persistRuntimeLease?(deadlineMs: number, signal: AbortSignal): Promise<void>;
   /** Bounded collector: independently check work, cgroup and filesystem/FD
    * accounting; counters are cumulative within the exact invocation. */
   observe(signal: AbortSignal): Promise<BackupV2SupervisorObservation>;
@@ -698,8 +702,21 @@ export class BackupV2Supervisor {
         this.#caps.notifier.ready();
         this.#ready = true;
       }
-      this.#caps.notifier.extend(decision.extendUsec);
-      return decision;
+      const deadlineMs = Math.min(
+        now + this.#options.notificationGraceMs,
+        decision.absoluteDeadlineMs,
+      );
+      if (this.#caps.persistRuntimeLease) {
+        await bounded(
+          (signal) => this.#caps.persistRuntimeLease!(deadlineMs, signal),
+          this.#options.observationTimeoutMs,
+          this.signal,
+        );
+      }
+      const extendUsec = Math.floor((deadlineMs - this.#now()) * 1000);
+      if (extendUsec <= 0) return this.cancel("LEASE_EXPIRED");
+      this.#caps.notifier.extend(extendUsec);
+      return { ...decision, extendUsec };
     } catch (error) {
       try {
         this.#caps.onFailure?.({ stage, ...classifyBackupV2Failure(error) });

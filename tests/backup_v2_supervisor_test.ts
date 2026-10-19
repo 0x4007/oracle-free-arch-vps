@@ -111,6 +111,42 @@ function fixture() {
   };
 }
 
+Deno.test("READY precedes persisted reload lease and persistence time is subtracted before notify", async () => {
+  const { state, options, capabilities } = fixture();
+  const supervisor = new BackupV2Supervisor(identity, options, {
+    ...capabilities,
+    persistRuntimeLease: (deadline, signal) => {
+      equal(state.messages, ["ready"]);
+      signal.throwIfAborted();
+      equal(deadline, 100);
+      state.messages.push("persisted");
+      state.advance(30);
+      return Promise.resolve();
+    },
+  });
+  const decision = await supervisor.poll();
+  equal(state.messages, ["ready", "persisted", 70_000]);
+  assert(decision.action === "renew" && decision.extendUsec === 70_000);
+});
+
+Deno.test("failed or expired persistence cannot send an extension or acquire a fresh grace", async () => {
+  for (const fails of [false, true]) {
+    const { state, options, capabilities } = fixture();
+    const supervisor = new BackupV2Supervisor(identity, options, {
+      ...capabilities,
+      persistRuntimeLease: () => {
+        state.advance(101);
+        if (fails) throw new Error("rename failed");
+        return Promise.resolve();
+      },
+    });
+    equal((await supervisor.poll()).action, "cancel");
+    equal(state.messages, ["ready"]);
+    equal((await supervisor.poll()).action, "cancel");
+    equal(state.messages, ["ready"]);
+  }
+});
+
 Deno.test("supervisor preserves sanitized capacity guard causes without changing cancellation decisions", async () => {
   for (
     const guard of [

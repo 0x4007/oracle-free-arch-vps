@@ -55,6 +55,7 @@ import {
   backupV2PiReleaseRoot,
   backupV2RemoteProgram,
   type BackupV2RetentionControl,
+  backupV2RuntimeLeaseCleanupProgram,
   collectBackupV2Release,
   copyBackupV2Protection,
   realBackupV2ControllerCapabilities,
@@ -640,6 +641,7 @@ Deno.test("actual generated source launch is finite notify custody with pinned s
       "--property=NotifyAccess=main",
       "--property=RemainAfterExit=yes",
       "--property=RuntimeMaxSec=30000ms",
+      "--property=RuntimeRandomizedExtraSec=0",
       "--property=LimitCORE=0",
       `--property=Environment=DENO_DIR=/var/tmp/arch-vps-file-backup-runtime/jobs/${s.envelope.request.jobId}/deno-cache`,
       "--no-code-cache",
@@ -681,6 +683,25 @@ Deno.test("actual generated source launch is finite notify custody with pinned s
   );
   assert(
     !argv.find((arg) => arg.startsWith("--allow-read="))!.includes("/proc"),
+  );
+  for (const permission of ["read", "write"]) {
+    const grant = argv.find((arg) => arg.startsWith(`--allow-${permission}=`))!;
+    equal(grant.split(/[=,]/).filter((path) => path.startsWith("/run")), [
+      `/run/systemd/system/${s.workerGate.unitName}.d`,
+    ]);
+  }
+});
+Deno.test("settled lease cleanup grants only its exact unit directory and bound invocation", async () => {
+  const gate = bound(settings().workerGate),
+    script = backupV2RuntimeLeaseCleanupProgram(gate);
+  assert(
+    script.includes(`--allow-write=/run/systemd/system/${gate.unitName}.d -`),
+  );
+  assert(script.includes("removeBackupV2RuntimeLease"));
+  assert(script.includes(gate.custody!.invocationId));
+  assert(!script.includes("--allow-run") && !script.includes("daemon-reload"));
+  await rejects(() =>
+    backupV2RuntimeLeaseCleanupProgram(settings().workerGate)
   );
 });
 Deno.test("root control helpers use each exact job cache with unchanged read-only script grants", async () => {

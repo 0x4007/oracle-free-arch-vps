@@ -85,6 +85,10 @@ import {
   createBackupV2Notifier,
 } from "./backup-v2-supervisor.ts";
 import {
+  BACKUP_V2_RUNTIME_LEASE_BYTES,
+  openBackupV2RuntimeLease,
+} from "./backup-v2-runtime-lease.ts";
+import {
   assertBackupV2StatusTransition,
   validateBackupV2Status,
 } from "./backup-v2-runtime-contract.ts";
@@ -1227,7 +1231,11 @@ export async function observeBackupV2Capacity(
   const availableBytes = Number(fs.bavail * fs.bsize),
     freeInodes = Number(fs.ffree);
   if (
-    ![allocated + workspaceHeldDeletedBytes, availableBytes, freeInodes].every((
+    ![
+      allocated + workspaceHeldDeletedBytes + BACKUP_V2_RUNTIME_LEASE_BYTES,
+      availableBytes,
+      freeInodes,
+    ].every((
       value,
     ) => Number.isSafeInteger(value) && value >= 0)
   ) fail();
@@ -1235,7 +1243,8 @@ export async function observeBackupV2Capacity(
     observedMonotonicMs: performance.now(),
     availableBytes,
     freeInodes,
-    allocatedWorkspaceBytes: allocated + workspaceHeldDeletedBytes,
+    allocatedWorkspaceBytes: allocated + workspaceHeldDeletedBytes +
+      BACKUP_V2_RUNTIME_LEASE_BYTES,
     workspaceHeldDeletedBytes,
     sourceHeldDeletedBytes: sourceDeleted,
   };
@@ -1354,7 +1363,8 @@ export async function runBackupV2RemoteWorker(
       );
     const pace = createBackupV2UploadPacer(),
       work = new BackupV2WorkerProgress(),
-      notifier = createBackupV2Notifier();
+      notifier = createBackupV2Notifier(),
+      runtimeLease = openBackupV2RuntimeLease(gate.custody!);
     const startedAtUtc = new Date().toISOString();
     const activeRoots = new Set<string>([
       `${runtime}/deno-cache`,
@@ -1446,6 +1456,7 @@ export async function runBackupV2RemoteWorker(
     }, {
       now: () => performance.now(),
       notifier,
+      persistRuntimeLease: runtimeLease.persist,
       onFailure: (failure) => {
         supervisorFailure ??= failure;
       },
@@ -2004,6 +2015,7 @@ export async function runBackupV2RemoteWorker(
       );
       journal.close();
       await nativeCustody.close();
+      runtimeLease.close();
       notifier.close(); // No STOPPING: retain active/exited custody.
       return status;
     } catch (error) {

@@ -3,6 +3,7 @@ import {
   backupV2CapacityRoots,
   observeBackupV2Capacity,
 } from "../scripts/backup-v2-worker.ts";
+import { BACKUP_V2_RUNTIME_LEASE_BYTES } from "../scripts/backup-v2-runtime-lease.ts";
 
 function equal(actual: unknown, expected: unknown) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -89,7 +90,10 @@ Deno.test("capacity counts only exact active roots, unique inodes and both delet
     "/var/tmp/future",
   ]);
   const sample = await observeBackupV2Capacity(f.gate, "cgroup", roots, f.io);
-  equal(sample.allocatedWorkspaceBytes, 224 * 512 + 4096 + 8192);
+  equal(
+    sample.allocatedWorkspaceBytes,
+    224 * 512 + 4096 + 8192 + BACKUP_V2_RUNTIME_LEASE_BYTES,
+  );
   equal(sample.workspaceHeldDeletedBytes, 4096 + 8192);
   equal(sample.sourceHeldDeletedBytes, 8192);
   equal(sample.availableBytes, 1000 * 4096);
@@ -164,7 +168,10 @@ Deno.test("capacity restarts every active root after transient descendant remova
     [f.graph],
     f.io,
   );
-  equal(sample.allocatedWorkspaceBytes, 288 * 512 + 4096 + 8192);
+  equal(
+    sample.allocatedWorkspaceBytes,
+    288 * 512 + 4096 + 8192 + BACKUP_V2_RUNTIME_LEASE_BYTES,
+  );
   equal(f.reads.filter((path) => path === f.gate + "/slot").length, 2);
 });
 
