@@ -619,6 +619,16 @@ Deno.test("actual generated source launch is finite notify custody with pinned s
   for (const kind of ["worker", "verify"] as const) {
     equal(
       backupV2LaunchArguments(s, kind).filter((arg) =>
+        arg.startsWith("--property=Memory")
+      ),
+      [
+        "--property=MemoryHigh=infinity",
+        "--property=MemoryMax=6255601664",
+        "--property=MemorySwapMax=0",
+      ],
+    );
+    equal(
+      backupV2LaunchArguments(s, kind).filter((arg) =>
         arg.startsWith("--allow-sys")
       ),
       ["--allow-sys=statfs"],
@@ -1158,6 +1168,14 @@ Deno.test("managed retention persists launch intent once and binds cold source c
   assert(calls.indexOf("bind") < calls.indexOf("ack"));
   equal(calls.filter((call) => call === "launch").length, 1);
   const argv = backupV2LaunchArguments(s, "prune", pending);
+  equal(
+    argv.filter((arg) => arg.startsWith("--property=Memory")),
+    [
+      "--property=MemoryHigh=infinity",
+      "--property=MemoryMax=6255601664",
+      "--property=MemorySwapMax=0",
+    ],
+  );
   equal(
     argv.filter((arg) => arg.startsWith("--allow-sys")),
     ["--allow-sys=statfs"],

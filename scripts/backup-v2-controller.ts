@@ -1018,7 +1018,7 @@ export function backupV2LaunchArguments(
       RemainAfterExit: "yes",
       Slice: GATE_BACKUP_SLICE,
       MemoryHigh: "infinity",
-      MemoryMax: "6G",
+      MemoryMax: "6255601664",
       MemorySwapMax: "0",
       CPUQuota: "100%",
       CPUWeight: "1",
