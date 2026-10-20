@@ -2528,7 +2528,7 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
       "entry-worker.ts",
     ],
   });
-  const script = calls.at(-1)!.args.join(" ");
+  const script = new TextDecoder().decode(calls.at(-1)!.input);
   assert(script.includes("systemd-run"));
   assert(
     script.includes(`arch-vps-b2-worker-${uuidFor(14)}.service`),
@@ -2594,7 +2594,7 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
       "entry-verify.ts",
     ],
   });
-  const verifyScript = calls.at(-1)!.args.join(" ");
+  const verifyScript = new TextDecoder().decode(calls.at(-1)!.input);
   assert(
     verifyScript.includes(`arch-vps-b2-verify-${uuidFor(14)}.service`),
     verifyScript,
@@ -2716,10 +2716,10 @@ Deno.test("wiring: agent socket setup prepares only the exact codex home before 
   const publicHome = `${PUBLIC_HOME_BASE}/${fixture.generation}`;
   const customSocket = "/run/user/1002/gnupg/verifier/S.gpg-agent";
   const defaultSocket = "/run/user/1002/gnupg/S.gpg-agent";
-  const calls: { args: string[] }[] = [];
-  const seam = realRemoteSeam((command, args) => {
+  const calls: { args: string[]; input?: Uint8Array }[] = [];
+  const seam = realRemoteSeam((command, args, input) => {
     if (command !== "ssh") throw new Error("unexpected command");
-    calls.push({ args });
+    calls.push({ args, input });
     return Promise.resolve({
       code: 0,
       stdout: `socket=${customSocket}\ndefault=${defaultSocket}\n`,
@@ -2730,7 +2730,7 @@ Deno.test("wiring: agent socket setup prepares only the exact codex home before 
   assert(resolved.socket === customSocket);
   assert(resolved.defaultSocket === defaultSocket);
   const rootCall = calls.at(-1)!;
-  const script = rootCall.args.join(" ");
+  const script = new TextDecoder().decode(rootCall.input);
   const mkdirAt = script.indexOf("mkdir -p");
   const createAt = script.indexOf("--create-socketdir");
   const listAt = script.indexOf("--list-dirs");
@@ -6343,4 +6343,28 @@ Deno.test("orchestration: transient inventory failures before planning and after
   }
   assert(surviving.has("foreign000000000000"), "foreign data must survive");
   assert(surviving.has("start0000000000000"), "start markers must survive");
+});
+
+Deno.test({
+  name:
+    "wiring: large root control scripts stream without argv limits or stdin/output deadlock",
+  ignore: (await Deno.permissions.query({ name: "run" })).state !== "granted",
+  async fn() {
+    const script = "head -c 262144 /dev/zero\n#" + "padding".repeat(40000) +
+      "\nif read -r unexpected; then exit 91; fi\nprintf 'done\\n'\n";
+    const seam = realRemoteSeam((command, args, input) => {
+      assert(command === "ssh");
+      const remoteLine = args.slice(args.indexOf(SOURCE_HOST) + 1).join(" ");
+      return realRemoteRunner("/usr/bin/timeout", [
+        "10s",
+        "/bin/bash",
+        "-c",
+        'sudo() { shift; "$@"; }; ' + remoteLine,
+      ], input);
+    });
+    const result = await seam.root(script);
+    assert(result.code === 0, result.stderr);
+    assert(result.stdout.length === 262149);
+    assert(result.stdout.endsWith("done\n"));
+  },
 });

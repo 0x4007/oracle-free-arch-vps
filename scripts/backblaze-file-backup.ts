@@ -1192,6 +1192,8 @@ export const realRemoteRunner: RemoteRunner = async (command, args, input) => {
     stdout: "piped",
     stderr: "piped",
   }).spawn();
+  // Drain output while sending a large control program: either pipe may fill.
+  const pendingOutput = child.output();
   if (input !== undefined) {
     const writer = child.stdin.getWriter();
     try {
@@ -1205,7 +1207,7 @@ export const realRemoteRunner: RemoteRunner = async (command, args, input) => {
       // Already closed.
     }
   }
-  const output = await child.output();
+  const output = await pendingOutput;
   return {
     code: (await child.status).code,
     stdout: new TextDecoder().decode(output.stdout),
@@ -1360,9 +1362,17 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
       );
     },
     async root(script: string) {
+      if (script.includes("\0")) throw new Error("Invalid control program");
       return await runner(
         "ssh",
-        ssh(["sudo", "-n", "bash", "-c", shellQuote(`set -eu\n${script}`)]),
+        ssh([
+          "sudo",
+          "-n",
+          "bash",
+          "-c",
+          shellQuote("exec 3<&0; exec 0</dev/null; exec bash /dev/fd/3"),
+        ]),
+        new TextEncoder().encode(`set -eu\n${script}\n`),
       );
     },
     async installer(payload: unknown) {
