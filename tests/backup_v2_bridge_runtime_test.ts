@@ -217,7 +217,7 @@ Deno.test("real bridge launch retains safepi wrapper, finite native lease and eq
   ) assert(args.includes(`--property=${property}`));
   assert(args.includes("--allow-ffi=/lib/aarch64-linux-gnu/libsystemd.so.0"));
   assert(!args.includes("-A"));
-  assert(args.includes("--v8-flags=--max-old-space-size=128"));
+  assert(args.includes("--v8-flags=--max-old-space-size=128,--expose-gc"));
   throws(() => backupV2BridgeRuntimeCommand(input, "/tmp/foreign"));
 });
 

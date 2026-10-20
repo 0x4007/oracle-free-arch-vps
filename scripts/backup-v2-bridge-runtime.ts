@@ -499,7 +499,7 @@ export function backupV2BridgeRuntimeCommand(
     "run",
     // The Pi has 464 MiB usable RAM. Collect transient polling allocations
     // before the default 256 MiB old-space heap pressures the whole host.
-    "--v8-flags=--max-old-space-size=128",
+    "--v8-flags=--max-old-space-size=128,--expose-gc",
     "--no-config",
     "--no-lock",
     "--cached-only",
@@ -769,6 +769,8 @@ export async function runBackupV2BridgeRuntime(
   path: string,
   deps: BackupV2BridgeRunnerDependencies,
 ): Promise<void> {
+  const collectGarbage = (globalThis as unknown as { gc?: () => void }).gc;
+  if (typeof collectGarbage !== "function") fail();
   const inputBytes = await strictRead(path),
     input = verifyInput(JSON.parse(new TextDecoder().decode(inputBytes))),
     paths = backupV2BridgeRuntimePaths(input.gate);
@@ -901,10 +903,14 @@ export async function runBackupV2BridgeRuntime(
   const hashValue = await hash(inputBytes);
   let status = await bridge.start();
   await save(status);
+  let polls = 0;
   while (status.state === "ACTIVE") {
     await new Promise((resolve) => setTimeout(resolve, 1000));
     status = await bridge.poll();
     await save(status);
+    // Deno 2.6 subprocess native allocations outgrow its small JS heap before
+    // automatic major collection runs. Release completed polling resources.
+    if (++polls % 4 === 0) collectGarbage();
   }
   if (status.state === "CANCELLATION_BLOCKED") {
     // Keep MainPID present: a clean exit would disable RuntimeMaxSec while an
