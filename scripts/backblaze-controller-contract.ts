@@ -33,6 +33,22 @@ export const GATE_SOURCE_LOCK_PATH =
 /** Future-request runtime budget: 12 hours from the request instant. */
 export const GATE_DEADLINE_HOURS = 12;
 export const GATE_DEADLINE_MS = GATE_DEADLINE_HOURS * 3_600_000;
+export const GATE_BACKUP_SLICE = "weekly-backup.slice";
+/** systemd nests the hyphenated backup slice beneath weekly.slice. */
+export const GATE_BACKUP_CGROUP_ROOT = "/weekly.slice/weekly-backup.slice";
+
+/** New backup units share a bounded slice; legacy generations keep their
+ * original system.slice path. Only the exact unit can prove emptiness. */
+export function backupUnitCgroupPaths(unitName: string): string[] {
+  if (typeof unitName !== "string" || !UNIT_NAME_PATTERN.test(unitName)) {
+    throw new Error("Backup cgroup unit name is invalid");
+  }
+  const name = unitName;
+  return [
+    `${GATE_BACKUP_CGROUP_ROOT}/${name}`,
+    `/system.slice/${name}`,
+  ];
+}
 export const UNIT_INVOCATION_PATTERN = /^[0-9a-f]{32}$/;
 
 export type GateState = "active" | "orphaned";
@@ -506,9 +522,9 @@ export function validateGateClearProof(
   ) {
     throw new Error("Clear proof control group or task count is malformed");
   }
-  const canonicalGroup = `/system.slice/${bound.unitName}`;
+  const canonicalGroups = backupUnitCgroupPaths(bound.unitName);
   const noProcessesBelow = (controlGroup === "" && tasksCurrent === null) ||
-    (controlGroup === canonicalGroup && tasksCurrent === 0);
+    (canonicalGroups.includes(controlGroup) && tasksCurrent === 0);
   if (!noProcessesBelow) {
     throw new Error(
       "No-process proof requires an empty control group with unset tasks or the canonical unit cgroup with zero tasks",

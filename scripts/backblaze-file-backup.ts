@@ -29,6 +29,7 @@ import { createHash } from "node:crypto";
 import {
   assertBackblazeLaunchAllowed,
   type BackupControllerGate,
+  GATE_BACKUP_SLICE,
   GATE_DEADLINE_HOURS,
   GATE_DEADLINE_MS,
   GATE_OWNER,
@@ -98,6 +99,7 @@ import {
   verifyDecryptedGeneration,
 } from "./backblaze-verifier.ts";
 import { withBackupLock } from "./backup-lock.ts";
+import { backupV2ChildEnvironment } from "./backup-v2-supervisor.ts";
 import { shellQuote } from "./backup-guest.ts";
 import type { CommandResult } from "./oci.ts";
 import { readPrivateJson, writePrivateJson } from "./oci.ts";
@@ -229,6 +231,11 @@ export function validateJobId(jobId: unknown): string {
     throw new Error("jobId must be job- plus a lower-case UUID");
   }
   return jobId;
+}
+
+/** Sibling cache avoids creating a new job directory before installer checks. */
+export function backupV2ControlCacheDirectory(jobId: unknown): string {
+  return `${JOBS_RUNTIME_ROOT}/control-cache-${validateJobId(jobId)}`;
 }
 
 export function validateGeneration(generation: unknown): string {
@@ -1161,13 +1168,32 @@ export type RemoteRunner = (
   input?: Uint8Array,
 ) => Promise<CommandResult>;
 
+/** Child processes receive no supervisor/agent/proxy environment implicitly.
+ * SSH keeps its existing argv/config/key-file lookup and GPG uses --homedir. */
+export function backupChildProcessOptions(): Pick<
+  Deno.CommandOptions,
+  "clearEnv" | "env"
+> {
+  return {
+    clearEnv: true,
+    env: backupV2ChildEnvironment({
+      PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      LC_ALL: "C",
+      LANG: "C",
+    }),
+  };
+}
+
 export const realRemoteRunner: RemoteRunner = async (command, args, input) => {
   const child = new Deno.Command(command, {
+    ...backupChildProcessOptions(),
     args,
     stdin: input === undefined ? "null" : "piped",
     stdout: "piped",
     stderr: "piped",
   }).spawn();
+  // Drain output while sending a large control program: either pipe may fill.
+  const pendingOutput = child.output();
   if (input !== undefined) {
     const writer = child.stdin.getWriter();
     try {
@@ -1181,7 +1207,7 @@ export const realRemoteRunner: RemoteRunner = async (command, args, input) => {
       // Already closed.
     }
   }
-  const output = await child.output();
+  const output = await pendingOutput;
   return {
     code: (await child.status).code,
     stdout: new TextDecoder().decode(output.stdout),
@@ -1336,17 +1362,30 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
       );
     },
     async root(script: string) {
-      return await runner(
-        "ssh",
-        ssh(["sudo", "-n", "bash", "-c", shellQuote(`set -eu\n${script}`)]),
-      );
-    },
-    async installer(payload: unknown) {
+      if (script.includes("\0")) throw new Error("Invalid control program");
       return await runner(
         "ssh",
         ssh([
           "sudo",
           "-n",
+          "bash",
+          "-c",
+          shellQuote("exec 3<&0; exec 0</dev/null; exec bash /dev/fd/3"),
+        ]),
+        new TextEncoder().encode(`set -eu\n${script}\n`),
+      );
+    },
+    async installer(payload: unknown) {
+      const cache = backupV2ControlCacheDirectory(
+        (payload as { jobId?: unknown } | null)?.jobId,
+      );
+      return await runner(
+        "ssh",
+        ssh([
+          "sudo",
+          "-n",
+          "/usr/bin/env",
+          `DENO_DIR=${cache}`,
           "/usr/local/bin/deno",
           "eval",
           shellQuote(REMOTE_INSTALLER),
@@ -1369,7 +1408,7 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
       ) {
         throw new Error("Remaining deadline seconds must be positive");
       }
-      // The owner authorized half of the measured two-core / 12 GB host.
+      // Owner-approved weekly budget: 6 GiB and one core on the two-core host.
       // Balanced root: 72 MB/s and 9,000 IOPS; each direction gets
       // half of that maximum, without splitting the allowance again.
       // The 50 GB staging boot volume has 24 MB/s and 3,000 IOPS.
@@ -1379,11 +1418,13 @@ export function realRemoteSeam(runner: RemoteRunner): RemoteSeam {
         "Type=exec",
         "RemainAfterExit=yes",
         `RuntimeMaxSec=${spec.remainingSec}`,
-        // One core is half of this two-core host; low scheduling priority
-        // still yields to production under contention. The hard RAM cap is
-        // half of observed MemTotal (12,511,203,328 bytes), not a reservation.
-        // No soft memory ceiling and no backup swap traffic.
-        "MemoryMax=6255601664",
+        // Worker and verifier share a backup-only slice so retained cache
+        // and overlapping processes cannot multiply the approved budget.
+        // The October 11 accepted run peaked near 5.83 GiB including cache;
+        // 6 GiB preserves that successful envelope without a soft ceiling.
+        `Slice=${GATE_BACKUP_SLICE}`,
+        "MemoryHigh=infinity",
+        "MemoryMax=6G",
         "MemorySwapMax=0",
         "CPUQuota=100%",
         "CPUWeight=1",
@@ -1562,8 +1603,9 @@ export interface TunnelChild {
 
 export type TunnelChildFactory = (args: string[]) => TunnelChild;
 
-function defaultTunnelChildFactory(args: string[]): TunnelChild {
+export function defaultTunnelChildFactory(args: string[]): TunnelChild {
   const child = new Deno.Command("ssh", {
+    ...backupChildProcessOptions(),
     args,
     stdin: "piped",
     stdout: "piped",
@@ -3140,35 +3182,54 @@ export function makeDecryptArchive(publicHome: string): DecryptArchive {
 /** Stream ciphertext on the remote target using the existing Pi agent tunnel.
  * Only bounded GPG protocol traffic reaches the Pi, never archive contents.
  */
-export function makeStreamDecryptArchive(publicHome: string) {
+export interface StreamDecryptProcesses {
+  command(args: string[]): Promise<{ success: boolean; stdout: Uint8Array }>;
+  spawn(args: string[]): Promise<{
+    stdin: WritableStream<Uint8Array>;
+    stdout: ReadableStream<Uint8Array>;
+    stderr: ReadableStream<Uint8Array>;
+    status: Promise<Deno.CommandStatus>;
+  }>;
+}
+export function makeStreamDecryptArchive(
+  publicHome: string,
+  processes?: StreamDecryptProcesses,
+) {
   return async (
     ciphertext: ReadableStream<Uint8Array>,
     destination: Pick<Deno.FsFile, "write">,
   ): Promise<{ integrityChecked: true }> => {
-    const socketResult = await new Deno.Command("sudo", {
-      args: [
-        "-n",
-        "-u",
-        "codex",
-        "gpgconf",
-        "--homedir",
-        publicHome,
-        "--list-dirs",
-        "agent-socket",
-      ],
-      stdout: "piped",
-      stderr: "piped",
-    }).output();
+    const command = processes?.command ??
+      ((args: string[]) =>
+        new Deno.Command("sudo", {
+          ...backupChildProcessOptions(),
+          args,
+          stdout: "piped",
+          stderr: "piped",
+        }).output());
+    const socketResult = await command([
+      "-n",
+      "-u",
+      "codex",
+      "gpgconf",
+      "--homedir",
+      publicHome,
+      "--list-dirs",
+      "agent-socket",
+    ]);
     if (!socketResult.success) {
       throw new Error("Custom agent socket resolution failed");
     }
     const agentSocket = new TextDecoder().decode(socketResult.stdout).trim()
       .split("\n").at(-1) ?? "";
-    const defaultResult = await new Deno.Command("sudo", {
-      args: ["-n", "-u", "codex", "gpgconf", "--list-dirs", "agent-socket"],
-      stdout: "piped",
-      stderr: "piped",
-    }).output();
+    const defaultResult = await command([
+      "-n",
+      "-u",
+      "codex",
+      "gpgconf",
+      "--list-dirs",
+      "agent-socket",
+    ]);
     if (!defaultResult.success) {
       throw new Error("Default agent socket resolution failed");
     }
@@ -3189,25 +3250,25 @@ export function makeStreamDecryptArchive(publicHome: string) {
     } catch (error) {
       if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
-    const child = new Deno.Command("sudo", {
-      args: [
-        "-n",
-        "-u",
-        "codex",
-        "gpg",
-        "--no-options",
-        "--no-autostart",
-        "--batch",
-        "--no-tty",
-        "--homedir",
-        publicHome,
-        "--status-fd=2",
-        "--decrypt",
-      ],
-      stdin: "piped",
-      stdout: "piped",
-      stderr: "piped",
-    }).spawn();
+    const decryptArgs = [
+      "--no-options",
+      "--no-autostart",
+      "--batch",
+      "--no-tty",
+      "--homedir",
+      publicHome,
+      "--status-fd=2",
+      "--decrypt",
+    ];
+    const child = processes
+      ? await processes.spawn(decryptArgs)
+      : new Deno.Command("sudo", {
+        ...backupChildProcessOptions(),
+        args: ["-n", "-u", "codex", "gpg", ...decryptArgs],
+        stdin: "piped",
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn();
     let statusText = "";
     let overflow = false;
     const diagnostics = (async () => {
@@ -3254,6 +3315,7 @@ export async function importRecipient(
 ): Promise<void> {
   // Idempotent public-only import as codex; the keyring never holds secrets.
   const child = new Deno.Command("sudo", {
+    ...backupChildProcessOptions(),
     args: [
       "-n",
       "-u",
@@ -3286,7 +3348,10 @@ export async function importRecipient(
   if (!output.success) throw new Error("Public recipient import failed");
 }
 
-export async function ensurePublicHome(publicHome: string): Promise<void> {
+export async function ensurePublicHome(
+  publicHome: string,
+  command?: (name: string, args: string[]) => Promise<{ code: number }>,
+): Promise<void> {
   try {
     const info = await Deno.lstat(publicHome);
     if (info.isSymlink || !info.isDirectory) {
@@ -3299,10 +3364,15 @@ export async function ensurePublicHome(publicHome: string): Promise<void> {
     if (!(error instanceof Deno.errors.NotFound)) throw error;
     await Deno.mkdir(publicHome, { mode: 0o700, recursive: true });
     const parent = publicHome.slice(0, publicHome.lastIndexOf("/"));
-    const chown = await new Deno.Command("chown", {
-      args: ["codex:codex", publicHome],
-    }).output();
-    void chown;
+    const chown = command
+      ? await command("chown", ["codex:codex", publicHome])
+      : await new Deno.Command("chown", {
+        ...backupChildProcessOptions(),
+        args: ["codex:codex", publicHome],
+      }).output();
+    if (chown.code !== 0) {
+      throw new Error("Source public key home ownership failed");
+    }
     const real = await Deno.realPath(parent);
     void real;
     await Deno.chmod(publicHome, 0o700);
@@ -3775,7 +3845,7 @@ export interface PiSourceConfig {
   exclusionsText: string;
 }
 
-async function loadDeployment(deps: PiDeps): Promise<PiDeployment> {
+export async function loadDeployment(deps: PiDeps): Promise<PiDeployment> {
   const value = await deps.private.read<unknown>(DEPLOYMENT_PATH);
   if (!isRecord(value) || Object.keys(value).length !== 3) {
     throw new Error("Backblaze deployment identity is missing");
@@ -3799,7 +3869,7 @@ async function loadDeployment(deps: PiDeps): Promise<PiDeployment> {
   };
 }
 
-async function loadSourceConfig(deps: PiDeps): Promise<PiSourceConfig> {
+export async function loadSourceConfig(deps: PiDeps): Promise<PiSourceConfig> {
   const config = await deps.private.read<Record<string, unknown>>(
     B2_CONFIG_PATH,
   );
@@ -5942,17 +6012,34 @@ async function piMain(): Promise<void> {
   }
   const deps = realPiDeps();
   await deps.lock(CONTROLLER_LOCK_PATH, async () => {
-    const reportValue = await runBackblazeCycle(deps);
+    const saved = await deps.private.read<
+      ControllerState | { schemaVersion: 2 }
+    >(CONTROLLER_STATE_PATH);
+    const legacyActive = saved?.schemaVersion === 1 &&
+      saved.job !== undefined &&
+      !["COMPLETE", "FAILED"].includes(saved.job.phase);
+    let reportValue: BackblazeRunReport;
+    if (legacyActive) reportValue = await runBackblazeCycle(deps);
+    else {
+      const runtime = await import("./backup-v2-controller.ts"),
+        bridge = await import("./backup-v2-bridge-runtime.ts");
+      const deployment = await loadDeployment(deps);
+      await runtime.installBackupV2PiRelease(deps, deployment.sourceRevision);
+      reportValue = await runtime.runBackupV2ControllerCycle(
+        deps,
+        bridge.realBackupV2BridgeRuntime(deps),
+      );
+    }
     console.log(JSON.stringify(reportValue));
     if (!reportValue.healthy) Deno.exitCode = 1;
   });
 }
 
 if (import.meta.main) {
-  try {
-    await piMain();
-  } catch (error) {
+  // Finish evaluating this shared module before the v2 controller imports it
+  // back for the existing Pi capabilities. A top-level await creates a cycle.
+  void piMain().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     Deno.exitCode = 1;
-  }
+  });
 }

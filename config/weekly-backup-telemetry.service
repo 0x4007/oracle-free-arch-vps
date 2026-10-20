@@ -1,0 +1,22 @@
+[Unit]
+Description=Sample resource telemetry for weekly backup workers and verification
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/libexec/weekly-backup-telemetry.py
+StateDirectory=weekly-backup-telemetry
+StateDirectoryMode=0700
+UMask=0077
+Nice=19
+CPUWeight=1
+IOWeight=1
+IOSchedulingClass=idle
+TimeoutStartSec=60
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/var/lib/weekly-backup-telemetry
+

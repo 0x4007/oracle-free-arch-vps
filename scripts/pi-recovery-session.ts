@@ -68,6 +68,7 @@ import {
   buildRecoveryTargetBundle,
   continueReplacementRestoration,
   RECOVERY_TARGET_CHECKPOINT,
+  recoveryCatalogSelection,
   type RecoveryRestorationState,
   type RecoveryTargetControlInput,
   type RecoveryTargetInstallApproval,
@@ -79,7 +80,7 @@ import {
 } from "./pi-recovery-acceptance.ts";
 import type { PreparationApproval } from "./pi-recovery-disk-preparation.ts";
 import type { B2Settings } from "./backblaze-storage.ts";
-import { validateCatalogEntry } from "./backblaze-file-backup.ts";
+import { backupRuntimeCatalog } from "./backup-v2-controller.ts";
 import {
   type ConsoleConnectionApproval,
   consoleConnectionPlan,
@@ -92,7 +93,6 @@ import {
   deriveRecoveryStageApproval,
   type UnattendedRecoveryConfig,
 } from "./pi-recovery-authority.ts";
-import { machineRestoreIndexSha256 } from "./backblaze-machine-restore.ts";
 import { RECOVERY_TARGET_PUBLIC_HOME } from "./pi-recovery-restore.ts";
 import { ISOLATION_EXECUTION_OPERATION } from "./pi-recovery-isolation-executor.ts";
 
@@ -350,22 +350,24 @@ export async function validateSessionBootstrap(config: ReplacementConfig) {
 
 async function unattendedContext(config: SessionConfig) {
   if (!config.unattended) return undefined;
-  const catalogState = await readPrivateJson<{ catalog: unknown[] }>(
+  const catalogState = await readPrivateJson<unknown>(
     ".private/file-backup/controller.json",
   );
-  const selected = catalogState.catalog.map(validateCatalogEntry).filter(
-    (entry) => entry.index.generation === config.generation,
+  const selected = backupRuntimeCatalog(catalogState).map(
+    recoveryCatalogSelection,
+  ).filter(
+    (entry) => entry.generation === config.generation,
   );
   if (selected.length !== 1) {
     throw Error("Unattended generation is absent or ambiguous");
   }
-  const catalog = selected[0];
+  const catalog = selected[0].catalog;
   const release = await readPrivateJson<
     { sourceRevision: string; hashes: Record<string, string> }
   >(".private/reports/pi-session-deployment.json");
   const authority = assertUnattendedRecoveryAuthority(
     config,
-    machineRestoreIndexSha256(catalog.index),
+    selected[0].indexSha256,
     release.sourceRevision,
   );
   for (const [path, digest] of Object.entries(release.hashes)) {
@@ -532,7 +534,7 @@ export async function runRecoverySession(
         );
         assertUnattendedRecoveryAuthority(
           current,
-          machineRestoreIndexSha256(unattended.catalog.index),
+          recoveryCatalogSelection(unattended.catalog).indexSha256,
           release.sourceRevision,
         );
         if (hash(current.unattended) !== hash(initial.unattended)) {
@@ -1025,7 +1027,7 @@ export async function runRecoverySession(
         });
       } else {
         if (
-          validateCatalogEntry(input.catalog).index.generation !==
+          recoveryCatalogSelection(input.catalog).generation !==
             config.generation
         ) {
           throw Error(
@@ -1034,9 +1036,8 @@ export async function runRecoverySession(
         }
         if (
           unattended &&
-          machineRestoreIndexSha256(
-              validateCatalogEntry(input.catalog).index,
-            ) !== unattended.authority.indexSha256
+          recoveryCatalogSelection(input.catalog).indexSha256 !==
+            unattended.authority.indexSha256
         ) throw Error("Restore input index differs from unattended authority");
         const inputDigest = hash(input);
         const preparation = preparationBindingFromLoader(

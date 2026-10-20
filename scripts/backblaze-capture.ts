@@ -148,7 +148,7 @@ const MAX_VG_BYTES = 1024 * 1024;
 const MAX_EFIVAR_BYTES = 64 * 1024;
 const MAX_EFIVARS = 512;
 
-const TAR_OPTIONS = [
+export const TAR_OPTIONS = [
   "--format=pax",
   "--create",
   "--file=-",
@@ -345,13 +345,18 @@ export function validateCaptureSettings(settings: CaptureSettings): void {
   exclusionPaths(settings.exclusionsText);
 }
 
-interface RunOutput {
+export interface RunOutput {
   code: number;
   stdout: string;
   stderr: string;
 }
+export type CaptureCommandRunner = (
+  command: string,
+  args: string[],
+  stderrLog?: string,
+) => Promise<RunOutput>;
 
-async function runCommand(
+export async function runCommand(
   command: string,
   args: string[],
   stderrLog?: string,
@@ -367,7 +372,7 @@ async function runCommand(
     stdout: new TextDecoder().decode(output.stdout),
     stderr: new TextDecoder().decode(output.stderr),
   };
-  if (output.code !== 0 && stderrLog) {
+  if (result.code !== 0 && stderrLog) {
     try {
       await writePrivateText(stderrLog, result.stderr);
     } catch {
@@ -513,7 +518,7 @@ function logPath(stage: string, label: string): string {
   return `${stage}/${label.replaceAll(":", "-")}.stderr.log`;
 }
 
-function gpgArgs(
+export function gpgArgs(
   homedir: string,
   recipient: string,
   output: string,
@@ -575,9 +580,10 @@ export function isPublicKeyArmorForm(content: string): boolean {
 /** Copy the pinned public recipient into the owned stage and prove exactly
  * one public key with the expected fingerprint and no secret material. The
  * source must be one ASCII PGP PUBLIC KEY BLOCK. */
-async function prepareRecipient(
+export async function prepareRecipient(
   settings: CaptureSettings,
   stage: string,
+  run: CaptureCommandRunner = runCommand,
 ): Promise<void> {
   const info = await Deno.stat(settings.recipientFile);
   if (!info.isFile || info.size > RECIPIENT_MAX_BYTES) fail("recipient:read");
@@ -596,7 +602,7 @@ async function prepareRecipient(
   const publicHome = `${stage}/gpg-public-home`;
   await Deno.mkdir(publicHome, { mode: 0o700 });
   await Deno.chmod(publicHome, 0o700);
-  const result = await runCommand("gpg", [
+  const result = await run("gpg", [
     "--no-options",
     "--no-autostart",
     "--no-keyring",
@@ -624,20 +630,25 @@ async function prepareRecipient(
 }
 
 /** The copied public file hash is pinned again before every encryption. */
-async function assertRecipientPinned(
+export async function assertRecipientPinned(
   settings: CaptureSettings,
   stage: string,
 ): Promise<void> {
+  const info = await Deno.lstat(`${stage}/recipient.asc`);
+  if (!info.isFile || info.isSymlink || info.size > RECIPIENT_MAX_BYTES) {
+    fail("recipient:pin");
+  }
   const bytes = await Deno.readFile(`${stage}/recipient.asc`);
   if ((await sha256Hex(bytes)) !== settings.recipientSha256) {
     fail("recipient:pin");
   }
 }
 
-async function assertMountGuards(
+export async function assertMountGuards(
   settings: CaptureSettings,
   stage: string,
   label: string,
+  run: CaptureCommandRunner = runCommand,
 ): Promise<void> {
   const root = settings.sources.find((source) => source.name === "root")!;
   const efi = settings.sources.find((source) => source.name === "efi")!;
@@ -658,20 +669,27 @@ async function assertMountGuards(
     } || { echo 'efi FSTYPE mismatch' >&2; exit 81; }`,
     "mountpoint -q /efi || { echo 'efi is not a mountpoint' >&2; exit 81; }",
   ].join("\n");
-  const result = await runBash(script, logPath(stage, label));
+  const result = await run("bash", ["-c", script], logPath(stage, label));
   requireOk(result, label);
 }
 
-async function requireNoPacmanLock(label: string): Promise<void> {
-  const result = await runCommand("bash", [
+async function requireNoPacmanLock(
+  label: string,
+  run: CaptureCommandRunner,
+): Promise<void> {
+  const result = await run("bash", [
     "-c",
     "test ! -e /var/lib/pacman/db.lck",
   ]);
   requireOk(result, label);
 }
 
-async function lsblkLayout(label: string, stage: string): Promise<LsblkNode[]> {
-  const result = await runCommand("lsblk", [
+async function lsblkLayout(
+  label: string,
+  stage: string,
+  run: CaptureCommandRunner,
+): Promise<LsblkNode[]> {
+  const result = await run("lsblk", [
     "-J",
     "-b",
     "-o",
@@ -688,31 +706,32 @@ async function lsblkLayout(label: string, stage: string): Promise<LsblkNode[]> {
   }
 }
 
-interface InitialState {
+export interface InitialState {
   layout: LsblkNode[];
   pacman: string;
   bootHashes: string;
 }
 
-async function initialInspection(
+export async function initialInspection(
   settings: CaptureSettings,
   stage: string,
+  run: CaptureCommandRunner = runCommand,
 ): Promise<InitialState> {
-  await requireNoPacmanLock("pacman-lock:initial");
-  const layout = await lsblkLayout("layout:initial", stage);
+  await requireNoPacmanLock("pacman-lock:initial", run);
+  const layout = await lsblkLayout("layout:initial", stage, run);
   validateSources(settings.sources, layout);
-  const pacman = await runCommand(
+  const pacman = await run(
     "pacman",
     ["-Q"],
     logPath(stage, "packages-before"),
   );
   requireOk(pacman, "packages:before");
-  const bootHashes = await runCommand("sha256sum", [
+  const bootHashes = await run("sha256sum", [
     "/boot/Image",
     "/boot/initramfs-linux.img",
   ], logPath(stage, "boot-before"));
   requireOk(bootHashes, "boot:before");
-  await assertMountGuards(settings, stage, "guard:initial");
+  await assertMountGuards(settings, stage, "guard:initial", run);
   return {
     layout,
     pacman: pacman.stdout,
@@ -720,12 +739,13 @@ async function initialInspection(
   };
 }
 
-async function recordToolVersions(
+export async function recordToolVersions(
   stage: string,
+  run: CaptureCommandRunner = runCommand,
 ): Promise<Record<string, string>> {
   const tools: Record<string, string> = {};
   for (const name of ["tar", "zstd", "gpg", "sfdisk", "vgcfgbackup"]) {
-    const result = await runCommand(
+    const result = await run(
       name,
       ["--version"],
       logPath(stage, `tools-${name}`),
@@ -988,7 +1008,7 @@ async function stagingAvail(stage: string, label: string): Promise<number> {
   return avail;
 }
 
-async function assertStagingBootParity(
+export async function assertStagingBootParity(
   stage: string,
   before: InitialState,
 ): Promise<void> {
@@ -1078,28 +1098,29 @@ async function captureRole(
   return { role, path: ciphertext, bytes, sha256, format: "tar.zst.gpg" };
 }
 
-async function finalInspection(
+export async function finalInspection(
   settings: CaptureSettings,
   stage: string,
   before: InitialState,
+  run: CaptureCommandRunner = runCommand,
 ): Promise<LsblkNode[]> {
-  await requireNoPacmanLock("pacman-lock:final");
-  const layout = await lsblkLayout("layout:final", stage);
+  await requireNoPacmanLock("pacman-lock:final", run);
+  const layout = await lsblkLayout("layout:final", stage, run);
   validateSources(settings.sources, layout);
-  const pacman = await runCommand(
+  const pacman = await run(
     "pacman",
     ["-Q"],
     logPath(stage, "packages-after"),
   );
   requireOk(pacman, "packages:after");
   if (pacman.stdout !== before.pacman) fail("packages:after");
-  const bootHashes = await runCommand("sha256sum", [
+  const bootHashes = await run("sha256sum", [
     "/boot/Image",
     "/boot/initramfs-linux.img",
   ], logPath(stage, "boot-after"));
   requireOk(bootHashes, "boot:after");
   if (bootHashes.stdout !== before.bootHashes) fail("boot:after");
-  await assertMountGuards(settings, stage, "guard:final");
+  await assertMountGuards(settings, stage, "guard:final", run);
   return layout;
 }
 
@@ -1139,7 +1160,10 @@ function findmntJson(text: string): unknown {
   }
 }
 
-async function collectEfivars(stage: string): Promise<unknown> {
+async function collectEfivars(
+  stage: string,
+  run: CaptureCommandRunner,
+): Promise<unknown> {
   const script = `set -u
 if test ! -d /sys/firmware/efi/efivars; then
   echo UNAVAILABLE
@@ -1160,7 +1184,11 @@ for f in /sys/firmware/efi/efivars/*; do
     ;;
   esac
 done`;
-  const result = await runBash(script, logPath(stage, "recovery-efivars"));
+  const result = await run(
+    "bash",
+    ["-c", script],
+    logPath(stage, "recovery-efivars"),
+  );
   requireOk(result, "recovery:efivars");
   if (result.stdout.trim() === "UNAVAILABLE") return { available: false };
   const variables = result.stdout.trim().split("\n").filter(Boolean).map(
@@ -1242,17 +1270,23 @@ export function swapfileRecreation(record: string): SwapfileRecreation {
   };
 }
 
-async function buildRecoveryBundle(params: {
+export interface RecoveryMetadataParams<Archive = CapturedArchive> {
   settings: CaptureSettings;
   stage: string;
   before: InitialState;
   layoutFinal: LsblkNode[];
   tools: Record<string, string>;
-  archives: CapturedArchive[];
+  archives: Archive[];
   swapRecreation: SwapfileRecreation;
   startedAtUtc: string;
   finishedAtUtc: string;
-}): Promise<CapturedArchive> {
+  run?: CaptureCommandRunner;
+}
+
+/** Collect bounded recovery facts without producing or encrypting an archive. */
+export async function collectRecoveryMetadata<Archive>(
+  params: RecoveryMetadataParams<Archive>,
+) {
   const {
     settings,
     stage,
@@ -1263,15 +1297,16 @@ async function buildRecoveryBundle(params: {
     swapRecreation,
     startedAtUtc,
     finishedAtUtc,
+    run = runCommand,
   } = params;
-  const findmnt = await runCommand("findmnt", [
+  const findmnt = await run("findmnt", [
     "-J",
     "-o",
     "TARGET,SOURCE,FSTYPE,OPTIONS,UUID",
   ], logPath(stage, "recovery-findmnt"));
   requireOk(findmnt, "recovery:findmnt");
   const mountOptions = async (path: string): Promise<string> => {
-    const result = await runCommand(
+    const result = await run(
       "findmnt",
       ["-nro", "OPTIONS", path],
       logPath(stage, "recovery-mount-options"),
@@ -1292,7 +1327,7 @@ async function buildRecoveryBundle(params: {
     if (!disk) fail("recovery:partition-table");
     if (seenDisks.has(disk)) continue;
     seenDisks.add(disk);
-    const dump = await runCommand(
+    const dump = await run(
       "sfdisk",
       ["--dump", disk],
       logPath(stage, "recovery-sfdisk"),
@@ -1302,7 +1337,7 @@ async function buildRecoveryBundle(params: {
     partitionTables.push({ disk, dump: dump.stdout });
   }
   const vgFile = `${stage}/lvm-ocivolume.vg`;
-  const lvmResult = await runCommand("vgcfgbackup", [
+  const lvmResult = await run("vgcfgbackup", [
     "--file",
     vgFile,
     "ocivolume",
@@ -1319,19 +1354,19 @@ async function buildRecoveryBundle(params: {
     sha256: await sha256Hex(lvmBytes),
     text: new TextDecoder().decode(lvmBytes),
   };
-  const cmdline = await runCommand(
+  const cmdline = await run(
     "cat",
     ["/proc/cmdline"],
     logPath(stage, "recovery-cmdline"),
   );
   requireOk(cmdline, "recovery:cmdline");
-  const fstab = await runCommand(
+  const fstab = await run(
     "cat",
     ["/etc/fstab"],
     logPath(stage, "recovery-fstab"),
   );
   requireOk(fstab, "recovery:fstab");
-  const efivars = await collectEfivars(stage);
+  const efivars = await collectEfivars(stage, run);
   const exclusions = exclusionPaths(settings.exclusionsText);
   const relativeExclusions = fsRelativeExclusions(exclusions);
   const stagingBootHashes = await Deno.readTextFile(
@@ -1380,6 +1415,14 @@ async function buildRecoveryBundle(params: {
     },
     efivars,
   };
+  return manifest;
+}
+
+async function buildRecoveryBundle(
+  params: RecoveryMetadataParams,
+): Promise<CapturedArchive> {
+  const { stage, settings } = params;
+  const manifest = await collectRecoveryMetadata(params);
   await writePrivateJson(`${stage}/manifest.json`, manifest);
   const compressedPartial = `${stage}/recovery.json.zst.partial`;
   const compress = await runBash(

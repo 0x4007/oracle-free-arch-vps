@@ -19,12 +19,20 @@ import { createHash } from "node:crypto";
 
 import { type CommandRunner, defaultRunner } from "./oci.ts";
 import {
-  type IndexArchiveRecord,
   type RecoveryIndex,
   validateRecoveryIndex,
 } from "./backblaze-index.ts";
 import type { UploadRole } from "./backblaze-upload.ts";
 import { validateRecoveryMetadata } from "./backblaze-verifier.ts";
+import {
+  type BackupV2ManifestRef,
+  type BackupV2Receipt,
+  type BackupV2Root,
+  parseBackupV2ObjectName,
+  validateBackupV2ManifestRef,
+  validateBackupV2Receipt,
+  validateBackupV2Root,
+} from "./backup-v2-contract.ts";
 
 const CONFIG_PATH = ".private/backblaze-machine-restore.json";
 const JOURNAL_NAME = "backblaze-machine-restore.journal.json";
@@ -134,9 +142,11 @@ export interface MachineLvmMetadata {
 
 export interface MachineMetadataArchive {
   role: RestoreArchiveRole;
-  path: string;
-  bytes: number;
-  sha256: string;
+  path?: string;
+  bytes?: number;
+  sha256?: string;
+  ciphertextBytes?: number;
+  ciphertextSha256?: string;
   format: "tar.zst.gpg";
 }
 
@@ -146,7 +156,7 @@ export interface MachineMetadataArchive {
  * archive stays forward-compatible without weakening the fields we bind.
  */
 export interface MachineRecoveryMetadata {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   generation: string;
   consistency: "live-file-copy";
   sourceShutdown: false;
@@ -181,12 +191,113 @@ export interface MachineRecoveryMetadata {
 
 /** Concrete m02 input.  `archives` are the six decrypted `.tar.zst` paths. */
 export interface MachineRestoreInput {
-  index: RecoveryIndex;
+  index: MachineRestoreSource;
   /** SHA-256 of JSON.stringify(validateRecoveryIndex(index)). */
   indexSha256: string;
   metadata: MachineRecoveryMetadata;
   archives: readonly DecryptedRestoreArchive[];
   target: MachineRestoreTarget;
+}
+
+/** A real v2 trust anchor and measured receipt, never a fabricated v1 index. */
+export interface MachineRestoreV2Source {
+  schemaVersion: 2;
+  format: "backup-v2";
+  generation: string;
+  root: BackupV2Root;
+  reference: BackupV2ManifestRef;
+  receipt: BackupV2Receipt;
+  receiptReference: BackupV2ManifestRef;
+}
+export type MachineRestoreSource = RecoveryIndex | MachineRestoreV2Source;
+
+export function validateMachineRestoreSource(
+  value: MachineRestoreSource,
+): MachineRestoreSource {
+  if (value?.schemaVersion !== 2) return validateRecoveryIndex(value);
+  const root = validateBackupV2Root(value.root),
+    reference = validateBackupV2ManifestRef(value.reference),
+    receipt = validateBackupV2Receipt(value.receipt),
+    receiptReference = validateBackupV2ManifestRef(value.receiptReference);
+  if (
+    value.format !== "backup-v2" || value.generation !== root.captureId ||
+    receipt.captureId !== root.captureId ||
+    receipt.recipientSha256 !== root.recipientSha256 ||
+    receipt.recipientFingerprint !== root.recipientFingerprint ||
+    receipt.configurationSha256 !== root.sourceConfigSha256 ||
+    JSON.stringify(receipt.root) !== JSON.stringify(reference) ||
+    sha256Hex(new TextEncoder().encode(JSON.stringify(root))) !==
+      reference.plaintextSha256 ||
+    sha256Hex(new TextEncoder().encode(JSON.stringify(receipt))) !==
+      receiptReference.plaintextSha256 ||
+    parseBackupV2ObjectName(receiptReference.object.fileName).kind !==
+      "receipt" ||
+    parseBackupV2ObjectName(receiptReference.object.fileName).captureId !==
+      root.captureId ||
+    parseBackupV2ObjectName(reference.object.fileName).kind !== "manifest" ||
+    parseBackupV2ObjectName(reference.object.fileName).captureId !==
+      root.captureId ||
+    root.roles.some((role) => role.captureFinishedAtUtc > receipt.verifiedAtUtc)
+  ) fail("source:v2-binding");
+  return {
+    schemaVersion: 2,
+    format: "backup-v2",
+    generation: root.captureId,
+    root,
+    reference,
+    receipt,
+    receiptReference,
+  };
+}
+
+/** Shared boot expectations for layout and copied-root isolation. */
+export function machineRestoreBootHashes(
+  sourceInput: MachineRestoreSource,
+  metadata: MachineRecoveryMetadata,
+) {
+  const source = validateMachineRestoreSource(sourceInput);
+  if (source.schemaVersion === 1) {
+    return validateRecoveryMetadata(metadata, source);
+  }
+  if (
+    metadata.schemaVersion !== 2 || metadata.format !== "backup-v2-recovery" ||
+    metadata.generation !== source.generation ||
+    metadata.sourceConfigSha256 !== source.root.sourceConfigSha256 ||
+    metadata.recipient?.fingerprint !== source.root.recipientFingerprint ||
+    metadata.recipient?.publicSha256 !== source.root.recipientSha256 ||
+    sha256Hex(new TextEncoder().encode(JSON.stringify(metadata))) !==
+      source.receipt.metadataSha256
+  ) fail("metadata:v2-binding");
+  const sample = (role: string, member: string) =>
+    source.receipt.bootSamples.find((item) =>
+      item.role === role && item.member === member
+    )!.sha256;
+  const kernelSha256 = sample("root", "./boot/Image"),
+    initramfsSha256 = sample("root", "./boot/initramfs-linux.img");
+  const pair = (text: string, names: string[]) => {
+    const rows = text.trim().split("\n");
+    if (rows.length !== 2) fail("metadata:v2-boot");
+    return rows.map((row, index) => {
+      const match = /^([0-9a-f]{64}) {2}(.+)$/.exec(row);
+      if (!match || match[2] !== names[index]) fail("metadata:v2-boot");
+      return match[1];
+    });
+  };
+  const root = pair(metadata.bootHashes.root, [
+      "/boot/Image",
+      "/boot/initramfs-linux.img",
+    ]),
+    staging = pair(metadata.bootHashes.stagingBoot, [
+      "./arch-vmlinuz",
+      "./arch-initrd.img",
+    ]);
+  if (
+    root[0] !== kernelSha256 || root[1] !== initramfsSha256 ||
+    staging[0] !== kernelSha256 || staging[1] !== initramfsSha256 ||
+    sample("staging-boot", "./arch-vmlinuz") !== kernelSha256 ||
+    sample("staging-boot", "./arch-initrd.img") !== initramfsSha256
+  ) fail("metadata:v2-boot");
+  return { kernelSha256, initramfsSha256 };
 }
 
 export interface MachineRestoreResult {
@@ -308,9 +419,12 @@ function sha256Hex(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-/** Exported so the primary can bind the same canonical index identity. */
-export function machineRestoreIndexSha256(indexInput: RecoveryIndex): string {
-  const index = validateRecoveryIndex(indexInput);
+/** Bind a canonical v1 index or the trusted v2 root plaintext identity. */
+export function machineRestoreIndexSha256(
+  indexInput: MachineRestoreSource,
+): string {
+  const index = validateMachineRestoreSource(indexInput);
+  if (index.schemaVersion === 2) return index.reference.plaintextSha256;
   return sha256Hex(new TextEncoder().encode(JSON.stringify(index)));
 }
 
@@ -543,20 +657,20 @@ function validateLvmText(
  * and `/dev/sdb` are selected by recorded capacity, not by enumeration order.
  */
 export function buildRestoreLayout(
-  indexInput: RecoveryIndex,
+  indexInput: MachineRestoreSource,
   metadata: MachineRecoveryMetadata,
   target: MachineRestoreTarget,
 ): RestoreLayout {
   assertTargetShape(target);
-  const index = validateRecoveryIndex(indexInput);
+  const index = validateMachineRestoreSource(indexInput);
   try {
-    validateRecoveryMetadata(metadata, index);
+    machineRestoreBootHashes(index, metadata);
   } catch {
     fail("metadata:binding");
   }
   if (
     metadata.generation !== index.generation ||
-    metadata.schemaVersion !== 1 ||
+    metadata.schemaVersion !== index.schemaVersion ||
     metadata.consistency !== "live-file-copy" ||
     metadata.sourceShutdown !== false ||
     metadata.machineBootRestoreProved !== false
@@ -704,7 +818,7 @@ export function buildRestoreLayout(
 }
 
 function archiveMap(
-  index: RecoveryIndex,
+  index: MachineRestoreSource,
   metadata: MachineRecoveryMetadata,
   archives: readonly DecryptedRestoreArchive[],
 ): Map<RestoreArchiveRole, DecryptedRestoreArchive> {
@@ -723,9 +837,30 @@ function archiveMap(
     );
   }
   if (metadataByRole.size !== 6) fail("metadata:archives");
-  const indexByRole = new Map<RestoreArchiveRole, IndexArchiveRecord>();
-  for (const item of index.archives) {
-    if (item.role !== "recovery") indexByRole.set(item.role, item);
+  const indexByRole = new Map<
+    RestoreArchiveRole,
+    {
+      bytes: number;
+      sha256: string;
+      plaintextBytes?: number;
+      plaintextSha256?: string;
+    }
+  >();
+  if (index.schemaVersion === 1) {
+    for (const item of index.archives) {
+      if (item.role !== "recovery") indexByRole.set(item.role, item);
+    }
+  } else {
+    for (const item of index.receipt.archives) {
+      if (item.role !== "recovery") {
+        indexByRole.set(item.role, {
+          bytes: item.ciphertextBytes,
+          sha256: item.ciphertextSha256,
+          plaintextBytes: item.compressedBytes,
+          plaintextSha256: item.compressedSha256,
+        });
+      }
+    }
   }
   const out = new Map<RestoreArchiveRole, DecryptedRestoreArchive>();
   for (const archive of archives) {
@@ -752,15 +887,24 @@ function archiveMap(
       typeof ciphertextBytes !== "number" ||
       !Number.isSafeInteger(ciphertextBytes) ||
       ciphertextBytes !== expected.bytes ||
-      ciphertextBytes !== metadataArchive.bytes ||
+      ciphertextBytes !==
+        (index.schemaVersion === 1
+          ? metadataArchive.bytes
+          : metadataArchive.ciphertextBytes) ||
       ciphertextSha256 !== expected.sha256 ||
-      ciphertextSha256 !== metadataArchive.sha256 ||
+      ciphertextSha256 !==
+        (index.schemaVersion === 1
+          ? metadataArchive.sha256
+          : metadataArchive.ciphertextSha256) ||
       typeof ciphertextSha256 !== "string" ||
       !SHA256_ANY_PATTERN.test(ciphertextSha256) ||
       typeof plaintextBytes !== "number" ||
       !Number.isSafeInteger(plaintextBytes) || plaintextBytes <= 0 ||
       typeof plaintextSha256 !== "string" ||
-      !SHA256_ANY_PATTERN.test(plaintextSha256)
+      !SHA256_ANY_PATTERN.test(plaintextSha256) ||
+      (index.schemaVersion === 2 &&
+        (plaintextBytes !== expected.plaintextBytes ||
+          plaintextSha256 !== expected.plaintextSha256))
     ) fail("archives:binding");
     out.set(role, {
       role,
@@ -1735,7 +1879,10 @@ async function verifyJournalStage(
 
 function assertMachineMetadataInput(metadata: MachineRecoveryMetadata): void {
   if (!isRecord(metadata)) fail("metadata:shape");
-  if (metadata.schemaVersion !== 1 || typeof metadata.generation !== "string") {
+  if (
+    ![1, 2].includes(metadata.schemaVersion) ||
+    typeof metadata.generation !== "string"
+  ) {
     fail("metadata:shape");
   }
   if (
@@ -1783,7 +1930,7 @@ export async function restoreMachine(
 ): Promise<MachineRestoreResult> {
   assertTargetShape(input.target);
   assertMachineMetadataInput(input.metadata);
-  const index = validateRecoveryIndex(input.index);
+  const index = validateMachineRestoreSource(input.index);
   const indexSha256 = machineRestoreIndexSha256(index);
   if (
     !SHA256_PATTERN.test(input.indexSha256) || input.indexSha256 !== indexSha256

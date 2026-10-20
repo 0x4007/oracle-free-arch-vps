@@ -5,7 +5,7 @@
  * under the exact DIRECT_PREFIX namespace. The caller owns encryption,
  * manifests, acceptance, retention and four-point selection: this client
  * never labels an object as a recovered backup, never enumerates or deletes
- * anything outside DIRECT_PREFIX (in particular the previous `restic/`
+ * payload outside DIRECT_PREFIX (in particular the previous `restic/`
  * repository), and never retries an API request automatically, so a
  * caller-driven retry decides exactly how duplicates are reconciled.
  *
@@ -21,6 +21,7 @@
  * raw provider errors.
  */
 
+import { BACKUP_V2_LIMITS, BACKUP_V2_NAMESPACE } from "./backup-v2-profile.ts";
 export const DIRECT_PREFIX = "restic/direct-v1/";
 
 export const MAX_CHUNK_BYTES = 64 * 1024 * 1024;
@@ -64,6 +65,15 @@ export interface B2Object {
 }
 
 export type B2Fetcher = typeof fetch;
+
+// Pure policy checks shared with the separately versioned, bounded v2 wire adapter.
+export {
+  assertBackblazeUrl as validateB2ApiUrl,
+  assertUploadUrl as validateB2UploadUrl,
+  basicAuthorization as b2BasicAuthorization,
+  validateSettings as validateB2Settings,
+  verifyAllowedScope as validateB2AllowedScope,
+};
 
 interface AuthorizedScope {
   token: string;
@@ -211,17 +221,17 @@ function assertUploadUrl(
   }
 }
 
-function assertObjectName(fileName: string): void {
+function assertObjectName(fileName: string, prefix = DIRECT_PREFIX): void {
   if (typeof fileName !== "string") {
     throw new Error("object name rejected: not a string");
   }
   if (fileName.length === 0) {
     throw new Error("object name rejected: empty");
   }
-  if (!fileName.startsWith(DIRECT_PREFIX)) {
-    throw new Error(`object name rejected: outside ${DIRECT_PREFIX}`);
+  if (!fileName.startsWith(prefix)) {
+    throw new Error(`object name rejected: outside ${prefix}`);
   }
-  const suffix = fileName.slice(DIRECT_PREFIX.length);
+  const suffix = fileName.slice(prefix.length);
   if (suffix.length === 0) {
     throw new Error("object name rejected: empty suffix");
   }
@@ -427,11 +437,12 @@ function listedObject(
   operation: string,
   bucketId: string,
   value: unknown,
+  prefix = DIRECT_PREFIX,
 ): B2Object {
   const item = expectRecord(operation, value);
   const fileName = requiredString(operation, item, "fileName");
   // Any item outside the exact namespace fails the whole listing.
-  assertObjectName(fileName);
+  assertObjectName(fileName, prefix);
   const fileId = requiredString(operation, item, "fileId");
   const action = requiredString(operation, item, "action");
   if (action !== "upload" && action !== "hide" && action !== "start") {
@@ -736,8 +747,11 @@ export class B2Store {
     return bytes;
   }
 
-  /** List every version under DIRECT_PREFIX, including hide and start markers. */
-  async versions(): Promise<B2Object[]> {
+  /** Read-only inventory of one exact backup namespace. Writes stay v1-only. */
+  async versions(prefix = DIRECT_PREFIX): Promise<B2Object[]> {
+    if (prefix !== DIRECT_PREFIX && prefix !== BACKUP_V2_NAMESPACE) {
+      throw new Error("versions failed: namespace rejected");
+    }
     const scope = await this.#authorizeOnce();
     const operation = "b2_list_file_versions";
     const found: B2Object[] = [];
@@ -749,7 +763,7 @@ export class B2Store {
       pages += 1;
       const payload: JsonRecord = {
         bucketId: this.#settings.bucketId,
-        prefix: DIRECT_PREFIX,
+        prefix,
         maxFileCount: LIST_PAGE_SIZE,
       };
       if (startFileName !== undefined) {
@@ -768,7 +782,13 @@ export class B2Store {
         throw invalidResponse(operation, "files");
       }
       for (const item of filesValue) {
-        found.push(listedObject(operation, this.#settings.bucketId, item));
+        found.push(
+          listedObject(operation, this.#settings.bucketId, item, prefix),
+        );
+        if (
+          prefix === BACKUP_V2_NAMESPACE &&
+          found.length > BACKUP_V2_LIMITS.pruneCandidates
+        ) throw operationError(operation, "version inventory bound");
       }
       const nextFileName = body["nextFileName"];
       const nextFileId = body["nextFileId"];
@@ -779,6 +799,7 @@ export class B2Store {
       if (!hasNext || !hasNextId) {
         throw operationError(operation, "incomplete continuation");
       }
+      assertObjectName(nextFileName as string, prefix);
       if (pages >= MAX_LIST_PAGES) {
         throw operationError(operation, "more than 10000 pages");
       }

@@ -62,12 +62,14 @@ import {
   type ControllerPhase,
   type ControllerState,
   decideGpgStatus,
+  defaultTunnelChildFactory,
   deriveVerifierGate,
   entryVerifyText,
   entryWorkerText,
   type GateSeam,
   generationPrefixes,
   JOBS_RUNTIME_ROOT,
+  makeStreamDecryptArchive,
   type MetadataStore,
   newJobState,
   type ObservedUnit,
@@ -78,6 +80,7 @@ import {
   pumpGpgStdout,
   readVerifierAvailBytes,
   realPrivateSeam,
+  realRemoteRunner,
   realRemoteSeam,
   realTunnelSeam,
   type RemoteRunner,
@@ -199,6 +202,98 @@ const SOURCE_CONFIG_SHA256 = sourceConfigSha256({
   recipientSha256: RECIPIENT_SHA256,
   recipientFingerprint: RECIPIENT_FINGERPRINT,
   exclusionsText: EXCLUSIONS_TEXT,
+});
+
+Deno.test("child environment: actual SSH gpgconf and decrypt factories isolate notification credentials", async () => {
+  const originalCommand = Object.getOwnPropertyDescriptor(Deno, "Command")!;
+  const originalReadDir = Object.getOwnPropertyDescriptor(Deno, "readDir")!;
+  const observed: { command: string; options: Deno.CommandOptions }[] = [];
+  const bytes = (text: string) =>
+    new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode(text));
+        c.close();
+      },
+    });
+  class CommandFixture {
+    constructor(
+      readonly command: string,
+      readonly options: Deno.CommandOptions,
+    ) {
+      observed.push({ command, options });
+    }
+    output() {
+      const socket = this.options.args?.includes("--homedir")
+        ? "/run/user/1002/custom/S.gpg-agent"
+        : "/run/user/1002/default/S.gpg-agent";
+      return Promise.resolve({
+        success: true,
+        code: 0,
+        signal: null,
+        stdout: new TextEncoder().encode(socket + "\n"),
+        stderr: new Uint8Array(),
+      });
+    }
+    spawn() {
+      return {
+        stdin: new WritableStream<Uint8Array>({ write() {} }),
+        stdout: bytes("plaintext"),
+        stderr: bytes("[GNUPG:] DECRYPTION_OKAY\n[GNUPG:] GOODMDC\n"),
+        status: Promise.resolve({ success: true, code: 0, signal: null }),
+        output: () => this.output(),
+      };
+    }
+  }
+  try {
+    Object.defineProperty(Deno, "Command", {
+      configurable: originalCommand.configurable,
+      enumerable: originalCommand.enumerable,
+      writable: true,
+      value: CommandFixture,
+    });
+    Object.defineProperty(Deno, "readDir", {
+      configurable: originalReadDir.configurable,
+      enumerable: originalReadDir.enumerable,
+      writable: true,
+      value: () => ({
+        async *[Symbol.asyncIterator]() {
+          yield* [];
+        },
+      }),
+    });
+    await realRemoteRunner("gpgconf", ["--list-dirs", "agent-extra-socket"]);
+    defaultTunnelChildFactory(["-o", "BatchMode=yes", "fixture"]);
+    let received = 0;
+    await makeStreamDecryptArchive("/fixture/public-only")(
+      bytes("ciphertext"),
+      {
+        write(part) {
+          received += part.length;
+          return Promise.resolve(part.length);
+        },
+      },
+    );
+    assert(received === 9, "the real decrypt seam still drains plaintext");
+    assert(
+      observed.length === 5,
+      "runner, SSH, two socket resolvers and decrypt all ran through the command boundary",
+    );
+    for (const { options } of observed) {
+      assert(
+        options.clearEnv === true,
+        "child must not inherit parent environment",
+      );
+      assert(
+        Object.keys(options.env ?? {}).sort().join(",") === "LANG,LC_ALL,PATH",
+        "only fixed approved variables reach children",
+      );
+      assert(!Object.hasOwn(options.env ?? {}, "NOTIFY_SOCKET"));
+      assert(!Object.hasOwn(options.env ?? {}, "SSH_AUTH_SOCK"));
+    }
+  } finally {
+    Object.defineProperty(Deno, "Command", originalCommand);
+    Object.defineProperty(Deno, "readDir", originalReadDir);
+  }
 });
 
 /** 2026-09-06 is a Sunday; local 00:05 is 04:05 UTC (EDT). */
@@ -2433,7 +2528,7 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
       "entry-worker.ts",
     ],
   });
-  const script = calls.at(-1)!.args.join(" ");
+  const script = new TextDecoder().decode(calls.at(-1)!.input);
   assert(script.includes("systemd-run"));
   assert(
     script.includes(`arch-vps-b2-worker-${uuidFor(14)}.service`),
@@ -2442,7 +2537,7 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
   assert(script.includes("Type=exec"));
   assert(script.includes("RemainAfterExit=yes"));
   assert(script.includes("RuntimeMaxSec=12345"), script);
-  assert(script.includes("MemoryMax=6255601664"));
+  assert(script.includes("MemoryMax=6G"));
   assert(script.includes("CPUQuota=100%"));
   assert(!script.includes("CPUQuota=25%"), script);
   // Half of the two-core host is one full core. IO budgets apply the
@@ -2469,8 +2564,10 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
   // MemoryHigh=768M was removed after it stalled a real upload: the worker's
   // natural peak is ~1,078 MB, so a soft limit below that throttled it
   // continuously (194,527 events) and it stopped making progress.
-  assert(!script.includes("MemoryHigh"), script);
-  assert(script.includes("MemoryMax=6255601664"), script);
+  assert(script.includes("MemoryHigh=infinity"), script);
+  assert(!script.includes("MemoryHigh=768M"), script);
+  assert(script.includes("Slice=weekly-backup.slice"), script);
+  assert(script.includes("MemoryMax=6G"), script);
   assert(script.includes("MemorySwapMax=0"), script);
   assert(script.includes("Nice=19"), script);
   assert(script.includes("IOSchedulingClass=idle"), script);
@@ -2481,7 +2578,7 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
       script.includes(`${JOBS_RUNTIME_ROOT}/${fixture.jobId}`),
   );
   assert(script.includes("entry-worker.ts"));
-  // Worker and verifier use the same owner-approved half-resource budget.
+  // Worker and verifier share the same dedicated backup resource budget.
   await seam.launchUnit({
     unitName: verifyUnitName(fixture.generation),
     runtimeDir: `${JOBS_RUNTIME_ROOT}/${fixture.jobId}`,
@@ -2497,7 +2594,7 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
       "entry-verify.ts",
     ],
   });
-  const verifyScript = calls.at(-1)!.args.join(" ");
+  const verifyScript = new TextDecoder().decode(calls.at(-1)!.input);
   assert(
     verifyScript.includes(`arch-vps-b2-verify-${uuidFor(14)}.service`),
     verifyScript,
@@ -2519,6 +2616,25 @@ Deno.test("wiring: fixed launch unit properties and transport installer", async 
   const payload = JSON.parse(new TextDecoder().decode(installCall.input));
   assert(payload.jobId === fixture.jobId);
   assert(installCall.args.join(" ").includes("deno eval"));
+  assert(installCall.args.includes(`/usr/bin/env`));
+  assert(
+    installCall.args.includes(
+      `DENO_DIR=${JOBS_RUNTIME_ROOT}/control-cache-${fixture.jobId}`,
+    ),
+  );
+  assert(
+    !installCall.args.includes(
+      `DENO_DIR=${JOBS_RUNTIME_ROOT}/${fixture.jobId}/control-cache`,
+    ),
+  );
+  const previousCalls = calls.length;
+  let rejected = false;
+  try {
+    await seam.installer({ jobId: "../foreign", files: [] });
+  } catch {
+    rejected = true;
+  }
+  assert(rejected && calls.length === previousCalls);
 });
 
 Deno.test("wiring: installer source is quoted so the real ssh command survives remote-shell parsing", async () => {
@@ -2572,17 +2688,22 @@ Deno.test("wiring: installer source is quoted so the real ssh command survives r
       .split("\0");
     const argv = parts.at(-1) === "" ? parts.slice(0, -1) : parts;
     assert(
-      argv.length === 4,
+      argv.length === 6,
       `the remote shell must produce the sudo argv, got ${
         JSON.stringify(argv)
       }`,
     );
     assert(argv[0] === "-n");
-    assert(argv[1] === "/usr/local/bin/deno");
-    assert(argv[2] === "eval");
+    assert(argv[1] === "/usr/bin/env");
     assert(
-      argv[3].startsWith("const payload") && argv[3].includes("\n") &&
-        argv[3].includes("installed: true") && argv[3].endsWith("}));"),
+      argv[2] ===
+        `DENO_DIR=${JOBS_RUNTIME_ROOT}/control-cache-${fixture.jobId}`,
+    );
+    assert(argv[3] === "/usr/local/bin/deno");
+    assert(argv[4] === "eval");
+    assert(
+      argv[5].startsWith("const payload") && argv[5].includes("\n") &&
+        argv[5].includes("installed: true") && argv[5].endsWith("}));"),
       "the installer source must survive as one exact eval argument",
     );
   } finally {
@@ -2595,10 +2716,10 @@ Deno.test("wiring: agent socket setup prepares only the exact codex home before 
   const publicHome = `${PUBLIC_HOME_BASE}/${fixture.generation}`;
   const customSocket = "/run/user/1002/gnupg/verifier/S.gpg-agent";
   const defaultSocket = "/run/user/1002/gnupg/S.gpg-agent";
-  const calls: { args: string[] }[] = [];
-  const seam = realRemoteSeam((command, args) => {
+  const calls: { args: string[]; input?: Uint8Array }[] = [];
+  const seam = realRemoteSeam((command, args, input) => {
     if (command !== "ssh") throw new Error("unexpected command");
-    calls.push({ args });
+    calls.push({ args, input });
     return Promise.resolve({
       code: 0,
       stdout: `socket=${customSocket}\ndefault=${defaultSocket}\n`,
@@ -2609,7 +2730,7 @@ Deno.test("wiring: agent socket setup prepares only the exact codex home before 
   assert(resolved.socket === customSocket);
   assert(resolved.defaultSocket === defaultSocket);
   const rootCall = calls.at(-1)!;
-  const script = rootCall.args.join(" ");
+  const script = new TextDecoder().decode(rootCall.input);
   const mkdirAt = script.indexOf("mkdir -p");
   const createAt = script.indexOf("--create-socketdir");
   const listAt = script.indexOf("--list-dirs");
@@ -6222,4 +6343,28 @@ Deno.test("orchestration: transient inventory failures before planning and after
   }
   assert(surviving.has("foreign000000000000"), "foreign data must survive");
   assert(surviving.has("start0000000000000"), "start markers must survive");
+});
+
+Deno.test({
+  name:
+    "wiring: large root control scripts stream without argv limits or stdin/output deadlock",
+  ignore: (await Deno.permissions.query({ name: "run" })).state !== "granted",
+  async fn() {
+    const script = "head -c 262144 /dev/zero\n#" + "padding".repeat(40000) +
+      "\nif read -r unexpected; then exit 91; fi\nprintf 'done\\n'\n";
+    const seam = realRemoteSeam((command, args, input) => {
+      assert(command === "ssh");
+      const remoteLine = args.slice(args.indexOf(SOURCE_HOST) + 1).join(" ");
+      return realRemoteRunner("/usr/bin/timeout", [
+        "10s",
+        "/bin/bash",
+        "-c",
+        'sudo() { shift; "$@"; }; ' + remoteLine,
+      ], input);
+    });
+    const result = await seam.root(script);
+    assert(result.code === 0, result.stderr);
+    assert(result.stdout.length === 262149);
+    assert(result.stdout.endsWith("done\n"));
+  },
 });

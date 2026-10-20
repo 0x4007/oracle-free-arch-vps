@@ -1,3 +1,17 @@
+import { backupUnitCgroupPaths } from "./backblaze-controller-contract.ts";
+import { STALE_AFTER_MS } from "./backblaze-file-backup.ts";
+import { backupV2GateDirectory } from "./backup-v2-worker.ts";
+import {
+  type BackupV2Status,
+  validateBackupV2Gate,
+  validateBackupV2Status,
+} from "./backup-v2-runtime-contract.ts";
+import {
+  parseBackupV2ObjectName,
+  validateBackupV2ObjectRef,
+  validateBackupV2PutIntent,
+} from "./backup-v2-contract.ts";
+import { BACKUP_V2_LIMITS } from "./backup-v2-profile.ts";
 /** Observation only: never controls a backup or copies archive contents. */
 const BACKUP = "/var/tmp/arch-vps-file-backup";
 const REPORT = "/var/lib/arch-vps-backup-progress/report.json";
@@ -19,6 +33,9 @@ const STATES = new Set([
 ]);
 
 export interface ProgressSample {
+  format?: "backup-v2";
+  v2Status?: BackupV2Status;
+  processBound?: boolean;
   observedAtUtc: string;
   jobId: string;
   generation: string;
@@ -171,6 +188,9 @@ export function assessProgress(
     cycleFinishAtUtc: null,
   };
   if (!sample) return report;
+  if (sample.format === "backup-v2") {
+    return assessBackupV2Progress(sample, prior, now, report);
+  }
   if (
     sample.phase === "FAILED" || sample.phase === "ACCEPTED" ||
     sample.phase === "COMPLETE"
@@ -294,11 +314,265 @@ export function assessProgress(
   return report;
 }
 
-async function json(path: string): Promise<Record<string, unknown> | null> {
+/** CPU/IO remain attribution data. Only cumulative source/compressor/readback/
+ * decrypt/inventory work proves v2 progress; phase/UTC/heartbeat changes do not. */
+export function assessBackupV2Progress(
+  sample: ProgressSample,
+  prior: ProgressReport | null,
+  now: Date,
+  empty?: ProgressReport,
+): ProgressReport {
+  const report: ProgressReport = empty ?? {
+    schemaVersion: 1,
+    jobId: sample.jobId,
+    observedAtUtc: now.toISOString(),
+    state: "UNKNOWN",
+    detail: "V2 progress is unproved",
+    sample,
+    lastProgressAtUtc: null,
+    uploadBytesPerSecond: null,
+    uploadFinishAtUtc: null,
+    cycleFinishAtUtc: null,
+  };
+  let status: BackupV2Status;
+  try {
+    status = validateBackupV2Status(sample.v2Status);
+  } catch {
+    return report;
+  }
+  if (
+    status.envelope.request.jobId !== sample.jobId ||
+    status.envelope.request.captureId !== sample.generation ||
+    status.custody.invocationId !== sample.invocationId ||
+    status.phase !== sample.phase ||
+    Date.parse(status.updatedAtUtc) > now.getTime()
+  ) return report;
+  if (status.phase === "FAILED" || status.phase === "CANCELLATION_BLOCKED") {
+    report.state = "FAILED";
+    report.detail =
+      `V2 source ${status.phase}; custody and cleanup remain separate`;
+    return report;
+  }
+  if (["CLOUD_COMPLETE", "ACCEPTED", "CLEANED"].includes(status.phase)) {
+    report.state = "BASELINE";
+    report.detail = status.kind === "prune"
+      ? "Source retention stage finished; controller cleanup completion remains separate"
+      : "Source terminal artifact exists; accepted catalog and settlement proof remain controller-owned";
+    return report;
+  }
+  if (
+    sample.processBound !== true || sample.cpuUsec === null ||
+    sample.readBytes === null || sample.writeBytes === null ||
+    now.getTime() - Date.parse(status.updatedAtUtc) > STALE_AFTER_MS
+  ) {
+    report.detail =
+      "Exact v2 source process, current status or cgroup counters are unavailable";
+    return report;
+  }
+  report.state = "BASELINE";
+  report.detail = status.kind === "prune"
+    ? "First bound source retention work observation"
+    : "First bound v2 work observation; capture and upload may overlap";
+  report.lastProgressAtUtc = sample.observedAtUtc;
+  const old = prior?.sample;
+  let previous: BackupV2Status;
+  try {
+    previous = validateBackupV2Status(old?.v2Status);
+  } catch {
+    return report;
+  }
+  if (
+    !old || !previous || old.format !== "backup-v2" ||
+    old.processBound !== true || previous.gateId !== status.gateId ||
+    previous.sourceBootId !== status.sourceBootId ||
+    previous.envelope.requestSha256 !== status.envelope.requestSha256 ||
+    JSON.stringify(previous.custody) !== JSON.stringify(status.custody)
+  ) return report;
+  const elapsed = Date.parse(sample.observedAtUtc) -
+    Date.parse(old.observedAtUtc);
+  if (
+    !(elapsed > 0) ||
+    status.progress.observedMonotonicMs <= previous.progress.observedMonotonicMs
+  ) {
+    report.state = "UNKNOWN";
+    report.detail = "V2 source observation clock did not advance";
+    return report;
+  }
+  const fields = [
+    "sourceBytes",
+    "compressionInputBytes",
+    "verifiedChunks",
+    "decryptedBytes",
+    "decodedBytes",
+    "inventoryMembers",
+  ] as const;
+  if (
+    fields.some((key) =>
+      (status.progress[key] ?? 0) < (previous.progress[key] ?? 0)
+    ) ||
+    sample.uploadedBytes !== null && old.uploadedBytes !== null &&
+      sample.uploadedBytes < old.uploadedBytes
+  ) {
+    report.detail = "V2 work counters reset; a fresh baseline is required";
+    return report;
+  }
+  const changed =
+    fields.some((key) =>
+      (status.progress[key] ?? 0) > (previous.progress[key] ?? 0)
+    ) ||
+    sample.uploadedBytes !== null && old.uploadedBytes !== null &&
+      sample.uploadedBytes > old.uploadedBytes;
+  report.lastProgressAtUtc = changed
+    ? sample.observedAtUtc
+    : prior?.lastProgressAtUtc ?? old.observedAtUtc;
+  const episode = status.lease.retryEpisode,
+    waiting = episode !== null &&
+      episode.expiresAtMs > status.lease.observedMonotonicMs;
+  report.state = changed
+    ? "PROGRESSING"
+    : waiting
+    ? "BASELINE"
+    : now.getTime() - Date.parse(report.lastProgressAtUtc) >= HOUR
+    ? "STALLED"
+    : "BASELINE";
+  report.detail = changed
+    ? status.kind === "prune"
+      ? "Bound source retention inventory work advanced; controller cleanup completion remains separate"
+      : "Bound v2 source/compressor/verified-byte/decrypt/inventory work advanced; capture/upload overlap has no finalized total ETA"
+    : waiting
+    ? "Fixed source retry episode is active; no new useful work is claimed"
+    : report.state === "STALLED"
+    ? "No useful v2 work advanced for at least one hour; CPU/IO or heartbeats alone do not renew progress"
+    : "Waiting for comparable useful v2 work";
+  if (
+    sample.uploadedBytes !== null && old.uploadedBytes !== null &&
+    sample.uploadedBytes > old.uploadedBytes &&
+    JSON.stringify(sample.resourceLimits) === JSON.stringify(old.resourceLimits)
+  ) {
+    report.uploadBytesPerSecond = (sample.uploadedBytes - old.uploadedBytes) /
+      (elapsed / 1000);
+  }
+  return report;
+}
+
+/** Readback-selected payload bytes, never attempted PUT bytes or link ceilings.
+ * This bounded journal observation is not cloud verification or acceptance. */
+export async function verifiedBackupV2JournalBytes(
+  chunks: AsyncIterable<Uint8Array>,
+  captureId: string,
+): Promise<number> {
+  let pending = "", bytes = 0, total = 0;
+  const decoder = new TextDecoder("utf-8", { fatal: true }),
+    intents = new Map<
+      string,
+      { bytes: number; sha1: string; sha256: string; verified: boolean }
+    >(),
+    selected = new Map<string, string>(),
+    logical = new Set<string>(),
+    transfers = new Set<string>();
+  for await (const chunk of chunks) {
+    if (chunk.length > 64 * 1024) {
+      throw Error("V2 journal read chunk exceeded bound");
+    }
+    bytes += chunk.length;
+    if (bytes > BACKUP_V2_LIMITS.journalBytes) {
+      throw Error("V2 journal bound exceeded");
+    }
+    pending += decoder.decode(chunk, { stream: true });
+    let end: number;
+    while ((end = pending.indexOf("\n")) >= 0) {
+      const line = pending.slice(0, end);
+      pending = pending.slice(end + 1);
+      if (new TextEncoder().encode(line).length > 8192) {
+        throw Error("V2 journal record bound exceeded");
+      }
+      const r = JSON.parse(line);
+      if (r.type === "intent") {
+        const i = validateBackupV2PutIntent(r.intent);
+        if (
+          i.captureId !== captureId ||
+          intents.size >= BACKUP_V2_LIMITS.physicalPuts
+        ) throw Error("V2 journal identity differs");
+        logical.add(
+          `${i.captureId}/${i.attemptId}/${i.role}/${i.kind}/${i.ordinal}`,
+        );
+        intents.set(i.name, {
+          bytes: i.slot.bytes,
+          sha1: i.slot.sha1,
+          sha256: i.slot.sha256,
+          verified: false,
+        });
+      } else if (r.type === "verify") {
+        const i = intents.get(r.name);
+        if (!i) throw Error("V2 readback intent is missing");
+        i.verified = true;
+      } else if (r.type === "selected") {
+        const object = validateBackupV2ObjectRef(r.object),
+          i = intents.get(r.name),
+          name = parseBackupV2ObjectName(object.fileName);
+        if (
+          !i || !i.verified || object.fileName !== r.name ||
+          name.captureId !== captureId ||
+          object.contentLength !== i.bytes ||
+          object.sha256 !== i.sha256 || object.contentSha1 !== i.sha1
+        ) throw Error("V2 selected readback differs");
+        if (name.kind !== "data") continue;
+        const key = `${name.attemptId}/${name.kind}/${name.ordinal}`,
+          value = JSON.stringify(object),
+          old = selected.get(key);
+        if (old !== undefined && old !== value) {
+          throw Error("V2 selection conflicts");
+        }
+        if (old === undefined) {
+          selected.set(key, value);
+          total += object.contentLength;
+        }
+        if (
+          selected.size > BACKUP_V2_LIMITS.logicalObjects || !finite(total) ||
+          total > BACKUP_V2_LIMITS.ciphertextBytes
+        ) throw Error("V2 selected bytes exceed bound");
+      } else if (r.type === "transfer") {
+        if (
+          typeof r.key !== "string" || !logical.has(r.key) ||
+          transfers.has(`${r.key}/${r.phase}`) ||
+          !["PUT", "READBACK"].includes(r.phase) ||
+          typeof r.startedAtUtc !== "string" ||
+          !Number.isFinite(Date.parse(r.startedAtUtc)) ||
+          Object.keys(r).sort().join(",") !== "key,phase,startedAtUtc,type"
+        ) {
+          throw Error("Invalid V2 transfer record");
+        }
+        transfers.add(`${r.key}/${r.phase}`);
+      } else if (
+        !["begin", "candidate", "reclaimed", "episode", "scan", "eof"].includes(
+          r.type,
+        )
+      ) throw Error("Unknown V2 journal record");
+    }
+    if (new TextEncoder().encode(pending).length > 8192) {
+      throw Error("V2 journal record bound exceeded");
+    }
+  }
+  decoder.decode(); // A concurrent partial final record is not selected evidence.
+  return total;
+}
+
+async function json(
+  path: string,
+  budget?: { remaining: number },
+): Promise<Record<string, unknown> | null> {
   try {
     const info = await Deno.lstat(path);
     if (!info.isFile || info.isSymlink || info.size > 2 * 1024 * 1024) {
       return null;
+    }
+    if (budget) {
+      if (
+        info.uid !== 0 || info.nlink !== 1 || info.mode === null ||
+        (info.mode & 0o777) !== 0o600
+      ) return null;
+      budget.remaining -= info.size;
+      if (budget.remaining < 0) return null;
     }
     const value = JSON.parse(await Deno.readTextFile(path));
     return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -309,13 +583,20 @@ async function json(path: string): Promise<Record<string, unknown> | null> {
   }
 }
 
+/** Permit only named backup units and a fixed set of cgroup controls. */
+export function isBackupCgroupControlPath(path: string): boolean {
+  return /^\/sys\/fs\/cgroup\/(?:system\.slice|weekly\.slice\/weekly-backup\.slice)\/arch-vps-b2-(?:v2-)?(?:worker|verify|prune)-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?:-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})?\.service\/(cgroup\.events|cgroup\.procs|cpu\.stat|io\.stat|cpu\.max|cpu\.weight|memory\.max|memory\.high|memory\.swap\.max|io\.max)$/
+    .test(path);
+}
+
 async function text(path: string): Promise<string | null> {
   try {
     // Deno treats /sys as all-access. Grant only this fixed control reader
     // rather than granting the observer unrestricted Deno permissions.
     if (
-      /^\/sys\/fs\/cgroup\/system\.slice\/arch-vps-b2-(worker|verify)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.service\/(cpu\.stat|io\.stat|cpu\.max|cpu\.weight|memory\.max|memory\.high|memory\.swap\.max|io\.max)$/
-        .test(path)
+      isBackupCgroupControlPath(path) ||
+      /^\/proc\/[1-9][0-9]{0,9}\/(stat|cgroup)$/.test(path) ||
+      path === "/proc/sys/kernel/random/boot_id"
     ) {
       const result = await new Deno.Command("/usr/bin/cat", {
         args: ["--", path],
@@ -343,7 +624,7 @@ function total(records: unknown, field: string): number | null {
 }
 
 /** Reads only status, metadata, file sizes, and the exact job's cgroup. */
-export async function sampleLatest(now: Date): Promise<ProgressSample | null> {
+async function sampleLegacy(now: Date): Promise<ProgressSample | null> {
   let selected: Record<string, unknown> | null = null;
   let count = 0;
   try {
@@ -380,7 +661,16 @@ export async function sampleLatest(now: Date): Promise<ProgressSample | null> {
   const unitName = `arch-vps-b2-${
     phase === "VERIFYING" || phase === "ACCEPTED" ? "verify" : "worker"
   }-${jobId.slice(4)}.service`;
-  const group = `/sys/fs/cgroup/system.slice/${unitName}`;
+  const groups = backupUnitCgroupPaths(unitName).map((path) =>
+    `/sys/fs/cgroup${path}`
+  );
+  let group = groups[0];
+  for (const candidate of groups) {
+    if (await text(`${candidate}/cgroup.events`) !== null) {
+      group = candidate;
+      break;
+    }
+  }
   const controlNames = [
     "cpu.max",
     "cpu.weight",
@@ -481,6 +771,223 @@ export async function sampleLatest(now: Date): Promise<ProgressSample | null> {
   };
 }
 
+export function backupV2ProcessBound(
+  status: BackupV2Status,
+  boot: string | null,
+  processGroup: string | null,
+  stat: string | null,
+  members: string | null,
+): boolean {
+  if (
+    boot?.trim() !== status.sourceBootId ||
+    processGroup?.trim() !== `0::${status.custody.cgroup}` ||
+    !members?.trim().split(/\s+/).includes(String(status.custody.mainPid)) ||
+    !stat?.startsWith(`${status.custody.mainPid} (`)
+  ) return false;
+  const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+  return fields[19] === status.custody.mainStartTicks &&
+    !["Z", "X"].includes(fields[0]);
+}
+export function validateBackupV2ProgressGate(
+  value: unknown,
+  directory: string,
+) {
+  const gate = validateBackupV2Gate(value);
+  if (backupV2GateDirectory(gate) !== directory) {
+    throw Error("V2 observation gate directory differs");
+  }
+  return gate;
+}
+async function journalBytes(
+  directory: string,
+  captureId: string,
+): Promise<number | null> {
+  try {
+    const path = `${directory}/journal/upload-journal.ndjson`,
+      before = await Deno.lstat(path);
+    if (
+      !before.isFile || before.isSymlink || before.uid !== 0 ||
+      before.nlink !== 1 || before.mode === null ||
+      (before.mode & 0o777) !== 0o600 ||
+      before.size > BACKUP_V2_LIMITS.journalBytes
+    ) return null;
+    using file = await Deno.open(path, { read: true });
+    const opened = await file.stat();
+    if (opened.dev !== before.dev || opened.ino !== before.ino) return null;
+    const chunks = async function* () {
+      let remaining = before.size;
+      while (remaining > 0) {
+        const bytes = new Uint8Array(Math.min(8192, remaining)),
+          count = await file.read(bytes);
+        if (!count) throw Error("V2 journal read stopped");
+        remaining -= count;
+        yield bytes.subarray(0, count);
+      }
+    };
+    const result = await verifiedBackupV2JournalBytes(chunks(), captureId),
+      after = await Deno.lstat(path);
+    return after.dev === before.dev && after.ino === before.ino &&
+        after.size >= before.size
+      ? result
+      : null;
+  } catch {
+    return null;
+  }
+}
+/** Only public bound gate/status metadata is discovered under the existing
+ * backup root. Missing publication is unknown; secret runtime settings are never read. */
+async function sampleV2(
+  now: Date,
+): Promise<{ found: boolean; sample: ProgressSample | null }> {
+  let found = false, scanned = 0;
+  let latest:
+    | { status: BackupV2Status; directory: string; bound: boolean }
+    | null = null;
+  const budget = { remaining: 16 * 1024 * 1024 };
+  try {
+    for await (const generation of Deno.readDir(BACKUP)) {
+      if (++scanned > 4096) return { found: true, sample: null };
+      if (
+        !generation.isDirectory || !generation.name.startsWith("generation-") ||
+        !UUID.test(generation.name.slice(11))
+      ) continue;
+      for await (
+        const gateEntry of Deno.readDir(`${BACKUP}/${generation.name}`)
+      ) {
+        if (++scanned > 4096) return { found: true, sample: null };
+        if (
+          !gateEntry.isDirectory || !gateEntry.name.startsWith("v2-") ||
+          !UUID.test(gateEntry.name.slice(3))
+        ) continue;
+        found = true;
+        for await (
+          const invocation of Deno.readDir(
+            `${BACKUP}/${generation.name}/${gateEntry.name}`,
+          )
+        ) {
+          if (++scanned > 4096) return { found, sample: null };
+          if (
+            !invocation.isDirectory || !/^[a-f0-9]{32}$/.test(invocation.name)
+          ) continue;
+          const directory =
+            `${BACKUP}/${generation.name}/${gateEntry.name}/${invocation.name}`;
+          const gate = validateBackupV2ProgressGate(
+            await json(`${directory}/gate.json`, budget),
+            directory,
+          );
+          if (
+            Date.parse(gate.envelope.request.requestedAtUtc) > now.getTime()
+          ) return { found, sample: null };
+          const status = validateBackupV2Status(
+            await json(`${directory}/status.json`, budget),
+            gate,
+          );
+          const ack = await json(`${directory}/gate-bound.json`, budget);
+          let sameCustody = false;
+          try {
+            validateBackupV2Status({ ...status, custody: ack?.custody }, gate);
+            sameCustody = true;
+          } catch { /* unknown acknowledgement */ }
+          const bound = ack !== null && Object.keys(ack).length === 4 &&
+            ack.gateId === gate.gateId &&
+            ack.requestSha256 === gate.envelope.requestSha256 &&
+            ack.sourceBootId === gate.sourceBootId && sameCustody;
+          if (
+            !latest ||
+            status.envelope.request.requestedAtUtc >
+              latest.status.envelope.request.requestedAtUtc ||
+            status.envelope.request.requestedAtUtc ===
+                  latest.status.envelope.request.requestedAtUtc &&
+              status.updatedAtUtc > latest.status.updatedAtUtc
+          ) latest = { status, directory, bound };
+        }
+      }
+    }
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) {
+      return { found: true, sample: null };
+    }
+  }
+  if (!latest || budget.remaining < 0) return { found, sample: null };
+  const { status, directory, bound } = latest,
+    group = `/sys/fs/cgroup${status.custody.cgroup}`,
+    pid = status.custody.mainPid;
+  const [boot, procGroup, stat, members, cpu, io] = await Promise.all([
+    text("/proc/sys/kernel/random/boot_id"),
+    text(`/proc/${pid}/cgroup`),
+    text(`/proc/${pid}/stat`),
+    text(`${group}/cgroup.procs`),
+    text(`${group}/cpu.stat`),
+    text(`${group}/io.stat`),
+  ]);
+  const names = [
+      "cpu.max",
+      "cpu.weight",
+      "memory.max",
+      "memory.high",
+      "memory.swap.max",
+      "io.max",
+    ],
+    values = await Promise.all(names.map((name) => text(`${group}/${name}`)));
+  const ioSum = (field: string): number | null => {
+    if (io === null) return null;
+    const sum = [...io.matchAll(new RegExp(`\\b${field}=(\\d+)`, "g"))].reduce(
+      (total, value) => total + Number(value[1]),
+      0,
+    );
+    return finite(sum) ? sum : null;
+  };
+  const usage = cpu?.match(/^usage_usec (\d+)$/m)?.[1];
+  const uploadedBytes = await journalBytes(
+    directory,
+    status.envelope.request.captureId,
+  );
+  const [afterGroup, afterStat, afterMembers] = await Promise.all([
+    text(`/proc/${pid}/cgroup`),
+    text(`/proc/${pid}/stat`),
+    text(`${group}/cgroup.procs`),
+  ]);
+  return {
+    found,
+    sample: {
+      format: "backup-v2",
+      v2Status: status,
+      processBound: bound &&
+        backupV2ProcessBound(status, boot, procGroup, stat, members) &&
+        backupV2ProcessBound(status, boot, afterGroup, afterStat, afterMembers),
+      observedAtUtc: now.toISOString(),
+      jobId: status.envelope.request.jobId,
+      generation: status.envelope.request.captureId,
+      requestedAtUtc: status.envelope.request.requestedAtUtc,
+      invocationId: status.custody.invocationId,
+      phase: status.phase,
+      unitName: status.custody.unitName,
+      cpuUsec: usage !== undefined && finite(Number(usage))
+        ? Number(usage)
+        : null,
+      readBytes: ioSum("rbytes"),
+      writeBytes: ioSum("wbytes"),
+      archiveBytes: null,
+      uploadedBytes,
+      verifiedChunks: status.progress.verifiedChunks,
+      captureBytes: null,
+      sourceRevision: status.envelope.request.sourceRevision,
+      resourceLimits: parseResourceLimits(
+        group,
+        Object.fromEntries(names.map((name, index) => [name, values[index]])),
+      ),
+    },
+  };
+}
+export async function sampleLatest(now: Date): Promise<ProgressSample | null> {
+  const [legacy, v2] = await Promise.all([sampleLegacy(now), sampleV2(now)]);
+  if (!v2.found) return legacy;
+  if (!v2.sample) return null;
+  return legacy && legacy.requestedAtUtc > v2.sample.requestedAtUtc
+    ? legacy
+    : v2.sample;
+}
+
 async function writeReport(report: ProgressReport): Promise<void> {
   const directory = REPORT.slice(0, REPORT.lastIndexOf("/"));
   await Deno.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -545,10 +1052,13 @@ async function writeReport(report: ProgressReport): Promise<void> {
 }
 
 if (import.meta.main) {
-  const now = new Date();
+  const began = new Date();
   const prior = await json(REPORT);
+  const sample = await sampleLatest(began),
+    now = sample?.format === "backup-v2" ? new Date() : began;
+  if (sample?.format === "backup-v2") sample.observedAtUtc = now.toISOString();
   const report = assessProgress(
-    await sampleLatest(now),
+    sample,
     prior?.schemaVersion === 1 ? prior as unknown as ProgressReport : null,
     now,
   );

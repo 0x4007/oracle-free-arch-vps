@@ -19,12 +19,358 @@ import {
   type ObservedSource,
   realRemoteRunner,
   realRemoteSeam,
+  STALE_AFTER_MS,
   validateControllerState,
+  type WatchdogAssessment,
+  weekWindow,
 } from "./backblaze-file-backup.ts";
+import {
+  backupRuntimeCatalog,
+  type BackupV2ControllerObservation,
+  type BackupV2ControllerState,
+  observeBackupV2Source,
+  readBackupRuntimeGate,
+  validateBackupV2ControllerState,
+} from "./backup-v2-controller.ts";
+import {
+  type BackupV2Gate,
+  type BackupV2RequestEnvelope,
+  validateBackupV2Gate,
+  validateBackupV2RequestEnvelope,
+  validateBackupV2Status,
+} from "./backup-v2-runtime-contract.ts";
 
 export const B2_REPORT_PATH = ".private/reports/backblaze-file-backup.json";
 export const ORACLE_REPORT_PATH = ".private/reports/backup-watchdog.json";
 export const B2_STATE_PATH = ".private/file-backup/controller.json";
+
+/** Actual capture intervals and independently accepted receipts determine
+ * freshness. A request, heartbeat or new verification date cannot refresh it. */
+export function acceptedBackupRuntimeCapture(value: unknown, now: Date) {
+  const window = weekWindow(now),
+    start = Date.parse(window.startAtUtc),
+    end = Date.parse(window.endAtUtc);
+  let unknown = false;
+  const entries = backupRuntimeCatalog(value).flatMap((entry) => {
+    const verifiedAtUtc = entry.schemaVersion === 1
+      ? entry.entry.receipt.verifiedAtUtc
+      : entry.receipt.verifiedAtUtc;
+    const acceptedAtUtc = entry.schemaVersion === 1
+      ? entry.entry.acceptedAtUtc
+      : entry.acceptedAtUtc;
+    const starts = entry.schemaVersion === 1
+      ? [entry.entry.index.captureStartedAtUtc]
+      : entry.selectedRoot.root.roles.map((role) => role.captureStartedAtUtc);
+    const finishes = entry.schemaVersion === 1
+      ? [entry.entry.index.captureFinishedAtUtc]
+      : entry.selectedRoot.root.roles.map((role) => role.captureFinishedAtUtc);
+    const captured = Math.max(...finishes.map(Date.parse)),
+      verified = Date.parse(verifiedAtUtc),
+      accepted = Date.parse(acceptedAtUtc);
+    if (
+      ![captured, verified, accepted, ...starts.map(Date.parse)].every(
+        Number.isFinite,
+      ) || captured > verified || verified > now.getTime() ||
+      accepted > now.getTime()
+    ) {
+      unknown = true;
+      return [];
+    }
+    return [{
+      entry,
+      captureStartedAtUtc: new Date(Math.min(...starts.map(Date.parse)))
+        .toISOString(),
+      captureFinishedAtUtc: new Date(captured).toISOString(),
+      verifiedAtUtc,
+      current: captured >= start && captured < end,
+    }];
+  }).sort((a, b) =>
+    Date.parse(b.captureFinishedAtUtc) - Date.parse(a.captureFinishedAtUtc)
+  );
+  return {
+    latest: entries[0] ?? null,
+    current: entries.find((entry) => entry.current) ?? null,
+    periodKey: window.periodKey,
+    unknown,
+  };
+}
+
+export function assessBackupV2Watchdog(
+  stateInput: unknown,
+  gateInput: unknown | null,
+  now: Date,
+  source?: BackupV2ControllerObservation,
+  progress?: unknown,
+  retention?: unknown,
+): WatchdogAssessment {
+  const state = validateBackupV2ControllerState(stateInput), job = state.job;
+  let gate: BackupV2Gate | null = null;
+  try {
+    gate = gateInput === null ? null : validateBackupV2Gate(gateInput);
+  } catch {
+    return { status: "B2_BACKUP_GATE_UNKNOWN", healthy: false };
+  }
+  const jobId = job?.settings.envelope.request.jobId;
+  if (
+    job?.phase === "COMPLETE" &&
+    (gate?.kind === "prune" || retention !== undefined)
+  ) {
+    const report = assessBackupV2Retention(
+      job.settings.envelope,
+      gate,
+      now,
+      retention,
+      source,
+    );
+    const accepted = acceptedBackupRuntimeCapture(state, now);
+    return {
+      ...report,
+      healthy: report.healthy && !accepted.unknown && accepted.current !== null,
+    };
+  }
+  if (
+    gate?.state === "CANCELLATION_BLOCKED" ||
+    job?.phase === "CANCELLATION_BLOCKED"
+  ) {
+    return {
+      status: `B2_CANCELLATION_BLOCKED:${
+        jobId ?? gate?.envelope.request.jobId
+      }`,
+      healthy: false,
+    };
+  }
+  const accepted = acceptedBackupRuntimeCapture(state, now);
+  if (accepted.unknown) {
+    return {
+      status: "B2_BACKUP_ACCEPTANCE_UNKNOWN",
+      healthy: false,
+      detail: "Accepted capture timestamps are future or contradictory",
+    };
+  }
+  if (!job || job.phase === "COMPLETE") {
+    if (gate !== null) {
+      return {
+        status: `B2_BACKUP_GATE_HELD:${gate.envelope.request.jobId}`,
+        healthy: false,
+      };
+    }
+    const entry = accepted.current?.entry;
+    const acceptedJob = entry?.schemaVersion === 2
+      ? entry.envelope.request.jobId
+      : entry?.entry.index.generation.replace(/^generation-/, "job-");
+    return accepted.current
+      ? { status: `B2_BACKUP_CURRENT:${acceptedJob}`, healthy: true }
+      : { status: `B2_PERIOD_MISSED:${accepted.periodKey}`, healthy: false };
+  }
+  if (job.phase === "FAILED") {
+    return { status: `B2_BACKUP_FAILED:${jobId}`, healthy: false };
+  }
+  if (!["WORKER", "VERIFY"].includes(job.phase)) {
+    return {
+      status: `B2_BACKUP_PENDING:${jobId}`,
+      healthy: false,
+      detail: "Bounded v2 controller transition; acceptance remains separate",
+    };
+  }
+  const expected = job.activeKind === "worker"
+    ? job.workerGate
+    : job.verifierGate;
+  if (
+    gate === null || gate.state !== "ACTIVE" || !gate.custody ||
+    gate.gateId !== expected.gateId ||
+    gate.sourceBootId !== expected.sourceBootId ||
+    gate.envelope.requestSha256 !== expected.envelope.requestSha256 ||
+    JSON.stringify(gate.custody) !== JSON.stringify(expected.custody)
+  ) return { status: `B2_BACKUP_ACTIVE_UNBOUND:${jobId}`, healthy: false };
+  const liveIdentity = source?.identity;
+  if (
+    !source || source.sourceBootId !== gate.sourceBootId || !liveIdentity ||
+    Object.keys(liveIdentity).length !== 5 ||
+    !([
+      "unitName",
+      "invocationId",
+      "mainPid",
+      "mainStartTicks",
+      "cgroup",
+    ] as const).every((key) => liveIdentity[key] === gate.custody![key])
+  ) return { status: `B2_BACKUP_SOURCE_UNKNOWN:${jobId}`, healthy: false };
+  let status;
+  try {
+    status = validateBackupV2Status(source.status, gate);
+  } catch {
+    return { status: `B2_BACKUP_SOURCE_MISMATCH:${jobId}`, healthy: false };
+  }
+  if (status.phase === "CANCELLATION_BLOCKED" || status.phase === "FAILED") {
+    return { status: `B2_BACKUP_${status.phase}:${jobId}`, healthy: false };
+  }
+  if (["CLOUD_COMPLETE", "ACCEPTED", "CLEANED"].includes(status.phase)) {
+    return {
+      status: `B2_BACKUP_PENDING:${jobId}`,
+      healthy: false,
+      detail:
+        "Source terminal artifact awaits independent controller acceptance and settlement",
+    };
+  }
+  if (source.unit !== "RUNNING") {
+    return { status: `B2_BACKUP_SOURCE_UNKNOWN:${jobId}`, healthy: false };
+  }
+  if (
+    Date.parse(status.updatedAtUtc) > now.getTime() ||
+    now.getTime() - Date.parse(status.updatedAtUtc) > STALE_AFTER_MS
+  ) return { status: `B2_BACKUP_SOURCE_STALE:${jobId}`, healthy: false };
+  const report = progress as {
+    schemaVersion?: unknown;
+    jobId?: unknown;
+    observedAtUtc?: unknown;
+    state?: unknown;
+    sample?: { format?: unknown; processBound?: unknown; v2Status?: unknown };
+  } | null;
+  const observed = Date.parse(String(report?.observedAtUtc));
+  if (
+    report?.schemaVersion !== 1 || report.jobId !== jobId ||
+    report.sample?.format !== "backup-v2" ||
+    report.sample.processBound !== true || !Number.isFinite(observed) ||
+    observed > now.getTime() || now.getTime() - observed > 75 * 60_000
+  ) return { status: `B2_BACKUP_PROGRESS_UNKNOWN:${jobId}`, healthy: false };
+  try {
+    const reported = validateBackupV2Status(report.sample.v2Status, gate);
+    if (
+      [
+        "CLOUD_COMPLETE",
+        "ACCEPTED",
+        "CLEANED",
+        "FAILED",
+        "CANCELLATION_BLOCKED",
+      ].includes(reported.phase)
+    ) throw Error("Report is terminal");
+  } catch {
+    return { status: `B2_BACKUP_PROGRESS_UNKNOWN:${jobId}`, healthy: false };
+  }
+  if (["STALLED", "BEHIND_SCHEDULE", "FAILED"].includes(String(report.state))) {
+    return {
+      status: `B2_PROGRESS_${String(report.state)}:${jobId}`,
+      healthy: false,
+    };
+  }
+  if (report.state !== "PROGRESSING") {
+    return {
+      status: `B2_BACKUP_PROGRESS_UNKNOWN:${jobId}`,
+      healthy: false,
+      detail:
+        "Current process is bound; useful work has no comparable advancing observation",
+    };
+  }
+  return {
+    status: `B2_BACKUP_ACTIVE:${jobId}`,
+    healthy: true,
+    detail:
+      "Bound source useful work advanced; the due period still needs independent catalog acceptance",
+  };
+}
+
+/** Project the existing core retention control; backup acceptance alone is
+ * never retention/cleanup completion. This observer never advances its phase. */
+export function assessBackupV2Retention(
+  envelopeInput: BackupV2RequestEnvelope,
+  liveGate: BackupV2Gate | null,
+  now: Date,
+  value: unknown,
+  source?: BackupV2ControllerObservation,
+): WatchdogAssessment {
+  let stage: "PLAN" | "EXECUTE", phase: string, gate: BackupV2Gate;
+  const envelope = validateBackupV2RequestEnvelope(envelopeInput);
+  let control: Record<string, unknown>;
+  try {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw Error("Missing retention control");
+    }
+    control = value as Record<string, unknown>;
+    const input = control.input as Record<string, unknown>;
+    if (
+      control.schemaVersion !== 2 ||
+      control.format !== "backup-v2-retention-controller" || !input ||
+      input.schemaVersion !== 2 || input.format !== "backup-v2-prune" ||
+      !["PLAN", "EXECUTE"].includes(String(input.stage)) ||
+      ![
+        "REQUESTED",
+        "RUNNING",
+        "SETTLED",
+        "COMPLETE",
+        "PARTIAL",
+        "CANCELLATION_BLOCKED",
+      ].includes(String(control.phase))
+    ) throw Error("Invalid retention control");
+    gate = validateBackupV2Gate(control.gate);
+    const original = validateBackupV2Gate(input.gate);
+    if (
+      gate.kind !== "prune" || original.kind !== "prune" ||
+      gate.envelope.requestSha256 !== envelope.requestSha256 ||
+      original.envelope.requestSha256 !== envelope.requestSha256 ||
+      original.gateId !== gate.gateId ||
+      original.sourceBootId !== gate.sourceBootId
+    ) throw Error("Retention identity differs");
+    if (
+      liveGate &&
+      (liveGate.kind !== "prune" || liveGate.gateId !== gate.gateId ||
+        liveGate.sourceBootId !== gate.sourceBootId ||
+        liveGate.envelope.requestSha256 !== envelope.requestSha256)
+    ) throw Error("Live prune gate differs");
+    stage = input.stage as "PLAN" | "EXECUTE";
+    phase = liveGate?.state === "CANCELLATION_BLOCKED" ||
+        gate.state === "CANCELLATION_BLOCKED"
+      ? "CANCELLATION_BLOCKED"
+      : String(control.phase);
+  } catch {
+    return {
+      status: "B2_RETENTION_UNKNOWN",
+      healthy: false,
+      detail: "Retention control or prune custody is unavailable",
+    };
+  }
+  let healthy = false;
+  if (phase === "COMPLETE") {
+    const result = control.result as Record<string, unknown> | null;
+    try {
+      const completed = validateBackupV2Gate(result?.gate),
+        input = control.input as Record<string, unknown>;
+      healthy = stage === "EXECUTE" && liveGate === null &&
+        result?.schemaVersion === 2 &&
+        result.format === "backup-v2-prune-result" &&
+        result.stage === "EXECUTE" && result.state === "COMPLETE" &&
+        result.transactionId === input.transactionId &&
+        /^[a-f0-9]{64}$/.test(String(result.nativeCustodySha256)) &&
+        completed.kind === "prune" && completed.gateId === gate.gateId &&
+        completed.sourceBootId === gate.sourceBootId &&
+        completed.envelope.requestSha256 === envelope.requestSha256;
+    } catch { /* Incomplete cleanup evidence remains unhealthy. */ }
+  } else if (
+    phase === "RUNNING" && liveGate?.state === "ACTIVE" &&
+    source?.unit === "RUNNING" && source.sourceBootId === gate.sourceBootId
+  ) {
+    try {
+      const status = validateBackupV2Status(source.status, liveGate);
+      validateBackupV2Status({ ...status, custody: source.identity }, liveGate);
+      if (status.phase === "CANCELLATION_BLOCKED") {
+        phase = "CANCELLATION_BLOCKED";
+      } else if (status.phase === "FAILED") phase = "PARTIAL";
+      else {healthy = status.phase === "PRUNING" &&
+          Date.parse(status.updatedAtUtc) <= now.getTime() &&
+          now.getTime() - Date.parse(status.updatedAtUtc) <= 60_000 &&
+          Math.max(
+              status.lease.usefulProgressExpiresAtMs,
+              status.lease.retryEpisode?.expiresAtMs ?? 0,
+              status.lease.transferEpisode?.expiresAtMs ?? 0,
+            ) > status.lease.observedMonotonicMs;}
+    } catch { /* Unknown source evidence never proves retention progress. */ }
+  }
+  return {
+    status: `B2_RETENTION_${stage}_${phase}`,
+    healthy,
+    detail: phase === "COMPLETE" && healthy
+      ? "Controller retention and cleanup completed; backup freshness is checked separately"
+      : "Backup accepted; source retention and cleanup remain separate",
+  };
+}
 
 /** Only fresh alarms for the currently observed source invocation affect alerts. */
 export function assessHourlyProgress(
@@ -239,49 +585,112 @@ export async function main(): Promise<void> {
     };
   }
   let b2Report: Record<string, unknown>;
+  let v2Dispatch = false;
   try {
-    let controllerState: ControllerState | undefined;
+    let rawState: unknown;
     try {
-      controllerState = validateControllerState(
-        await readPrivateJson(B2_STATE_PATH),
-      );
+      rawState = await readPrivateJson(B2_STATE_PATH);
     } catch (error) {
       if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
-    const gate = await readGate();
-    let source: ObservedSource | undefined;
-    if (gate !== null && controllerState?.job !== undefined) {
-      try {
-        source = await observeLiveSource(
-          gate.jobId,
-          gate.unitName,
-          now,
-        );
-      } catch {
-        source = {
-          observedAtUtc: now.toISOString(),
-          reachable: false,
-          invocationId: null,
-          status: null,
-        };
+    v2Dispatch =
+      (rawState as { schemaVersion?: unknown } | undefined)?.schemaVersion ===
+        2;
+    if (v2Dispatch) {
+      const state: BackupV2ControllerState = validateBackupV2ControllerState(
+          rawState,
+        ),
+        gate = await readBackupRuntimeGate();
+      let source: BackupV2ControllerObservation | undefined,
+        progress: unknown,
+        retention: unknown;
+      if (state.job?.phase === "COMPLETE") {
+        try {
+          retention = await readPrivateJson(
+            `.private/file-backup/retention/${state.job.settings.envelope.request.jobId}.json`,
+          );
+        } catch (error) {
+          if (!(error instanceof Deno.errors.NotFound)) retention = null;
+        }
       }
+      if (gate?.schemaVersion === 2 && state.job) {
+        try {
+          source = await observeBackupV2Source(gate);
+        } catch { /* unavailable source is unknown, not a fresh heartbeat */ }
+        if (source?.unit === "RUNNING") {
+          try {
+            const read = await realRemoteSeam(realRemoteRunner).root(
+              "cat /var/lib/arch-vps-backup-progress/report.json",
+            );
+            if (read.code === 0 && read.stdout.length <= 64 * 1024) {
+              progress = JSON.parse(read.stdout);
+            }
+          } catch { /* no usable work observation */ }
+        }
+      }
+      const observedNow = new Date(),
+        accepted = acceptedBackupRuntimeCapture(state, observedNow);
+      b2Report = {
+        lastSuccessfulCaptureAtUtc: accepted.latest?.captureFinishedAtUtc ??
+          null,
+        lastArchiveVerificationAtUtc: accepted.latest?.verifiedAtUtc ?? null,
+        captureStartedAtUtc: accepted.latest?.captureStartedAtUtc ?? null,
+        lastBootDrill: await readBootDrillEvidence(
+          ".private/reports/backblaze-machine-boot.json",
+          observedNow,
+        ),
+        ...assessBackupV2Watchdog(
+          state,
+          gate,
+          observedNow,
+          source,
+          progress,
+          retention,
+        ),
+        observedAtUtc: observedNow.toISOString(),
+        notificationSent: false,
+      };
+    } else {
+      let controllerState: ControllerState | undefined;
+      if (rawState !== undefined) {
+        controllerState = validateControllerState(rawState);
+      }
+      const gate = await readGate();
+      let source: ObservedSource | undefined;
+      if (gate !== null && controllerState?.job !== undefined) {
+        try {
+          source = await observeLiveSource(
+            gate.jobId,
+            gate.unitName,
+            now,
+          );
+        } catch {
+          source = {
+            observedAtUtc: now.toISOString(),
+            reachable: false,
+            invocationId: null,
+            status: null,
+          };
+        }
+      }
+      const latestAccepted = controllerState?.catalog.slice().sort((a, b) =>
+        Date.parse(b.acceptedAtUtc) - Date.parse(a.acceptedAtUtc)
+      )[0];
+      b2Report = {
+        lastSuccessfulCaptureAtUtc:
+          latestAccepted?.index.captureFinishedAtUtc ??
+            null,
+        lastArchiveVerificationAtUtc: latestAccepted?.receipt.verifiedAtUtc ??
+          null,
+        lastBootDrill: await readBootDrillEvidence(
+          ".private/reports/backblaze-machine-boot.json",
+          now,
+        ),
+        ...assessBackblazeWatchdog(controllerState, gate, now, source),
+        observedAtUtc: now.toISOString(),
+        notificationSent: false,
+      };
     }
-    const latestAccepted = controllerState?.catalog.slice().sort((a, b) =>
-      Date.parse(b.acceptedAtUtc) - Date.parse(a.acceptedAtUtc)
-    )[0];
-    b2Report = {
-      lastSuccessfulCaptureAtUtc: latestAccepted?.index.captureFinishedAtUtc ??
-        null,
-      lastArchiveVerificationAtUtc: latestAccepted?.receipt.verifiedAtUtc ??
-        null,
-      lastBootDrill: await readBootDrillEvidence(
-        ".private/reports/backblaze-machine-boot.json",
-        now,
-      ),
-      ...assessBackblazeWatchdog(controllerState, gate, now, source),
-      observedAtUtc: now.toISOString(),
-      notificationSent: false,
-    };
   } catch (error) {
     b2Report = {
       status: "B2_WATCHDOG_CHECK_FAILED",
@@ -292,7 +701,7 @@ export async function main(): Promise<void> {
     };
   }
   // Read only the small hourly report; this never restarts or recaptures a job.
-  if (b2Report.healthy === true) {
+  if (b2Report.healthy === true && !v2Dispatch) {
     try {
       const state = await readPrivateJson<ControllerState>(B2_STATE_PATH);
       if (state.job) {
