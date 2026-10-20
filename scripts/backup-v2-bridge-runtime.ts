@@ -497,6 +497,9 @@ export function backupV2BridgeRuntimeCommand(
     }).map(([key, value]) => `--property=${key}=${value}`),
     "/usr/local/bin/deno",
     "run",
+    // The Pi has 464 MiB usable RAM. Collect transient polling allocations
+    // before the default 256 MiB old-space heap pressures the whole host.
+    "--v8-flags=--max-old-space-size=128",
     "--no-config",
     "--no-lock",
     "--cached-only",

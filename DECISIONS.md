@@ -157,3 +157,7 @@ Project source transfer and retry windows onto the keeper clock with inward inte
 ## 2026-10-20 cancelled verifier with complete child exits
 
 A cancelled verifier may have a host-only UNIT mount and complete native CHILD/EXIT records but lack the final NO_PRIVATE_MOUNT marker. After exact-stop proof, matching boot/invocation, fresh proof that main and all children are gone, empty cgroup, no unshare children, no unresolved namespace leaders and unchanged journal bytes, its namespace references are zero. Incomplete child history remains blocked; ordinary success still requires its terminal evidence. This resolves the fbc84239 verifier recovery without rewriting its journal or accepting its unverified upload.
+
+## 2026-10-20 Pi bridge heap budget
+
+The Pi reports 464 MiB usable RAM. The key-connection helper's default V8 heap limit is 270008320 bytes; its growing polling allocations compete with the entire host before its existing service memory limits apply. A native timeout left the source verifier running and its already-open archive progressing. A guarded operator reconnect preserved that exact verifier invocation and its upload. Set the helper's existing Deno V8 flag to max-old-space-size=128 (measured heap limit 135790592 bytes) so garbage collection runs earlier. Keep safepi, MemoryHigh, MemoryMax, CPU and finite native-lease limits unchanged. This setting requires sustained live observation; short startup success alone does not prove stability.
