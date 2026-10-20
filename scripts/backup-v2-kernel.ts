@@ -1071,7 +1071,9 @@ async function custodyFacts(
       if (
         journal.noPrivateMountProved ||
         cancelled && facts.mainGone && live.size === 0 && descendants === 0 &&
-          journal.children.length === 0 && journal.mounts.length === 1 &&
+          journal.children.every((child) =>
+            child.exit !== null && child.identity.kind !== "unshare"
+          ) && journal.mounts.length === 1 &&
           journal.mounts[0].scope === "UNIT"
       ) {
         facts.namespaces = 0;

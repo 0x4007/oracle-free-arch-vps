@@ -1309,3 +1309,15 @@ Deno.test("kernel cancellation rejects mismatched stop/boot and never hides a li
     null,
   );
 });
+
+Deno.test("kernel cancellation settles host-only exited child history without a final marker", async () => {
+  const f = await cancelledFixture({ omitNoPrivateMount: true });
+  const after = await observeBackupV2Kernel(gate, f.after, {
+    cancellationStopProof: f.proof,
+  });
+  equal(after.nativeCustodySha256, f.digest);
+  equal([after.tree?.namespaceReferences, after.managerNamespaceReferences], [
+    0,
+    0,
+  ]);
+});

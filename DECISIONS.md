@@ -149,3 +149,11 @@ Kernel-bound errors retain only fixed helper, lease-phase and bound codes with v
 ## 2026-10-19 post-EOF socket diagnostics and primary failure preservation
 
 The exact GNU tar `socket ignored` diagnostic is an intentional omission for every filesystem role and contributes no changed-file drift. Recovery has no tar allowance; cold exit one, exit two, shrink, unreadable and unknown diagnostics remain fatal. Producer release preserves the first failure when cancellation, index or FIFO cleanup also fails, emitting only a fixed secondary-cleanup notice. Cleanup failure without a prior failure remains fatal. A tiny actual producer pipeline reproduced natural Oracle Root socket rejection and separately reproduced FIFO cleanup masking a primary error as a DOMException; this does not prove the original 1af DOMException site. EOF, native exit and complete inventory remain separate proofs, and no existing request or immutable release is rewritten.
+
+## 2026-10-20 conservative bridge clock projection
+
+Project source transfer and retry windows onto the keeper clock with inward integer rounding: round the start up and expiry down. Fractional floating-point subtraction can otherwise exceed an exact maximum window by a few billionths of a millisecond and reject a healthy transfer. Repeated observations retain the earliest expiry; all original identity, freshness and duration checks remain. This repair preserves the completed cloud capture for a verifier-only retry.
+
+## 2026-10-20 cancelled verifier with complete child exits
+
+A cancelled verifier may have a host-only UNIT mount and complete native CHILD/EXIT records but lack the final NO_PRIVATE_MOUNT marker. After exact-stop proof, matching boot/invocation, fresh proof that main and all children are gone, empty cgroup, no unshare children, no unresolved namespace leaders and unchanged journal bytes, its namespace references are zero. Incomplete child history remains blocked; ordinary success still requires its terminal evidence. This resolves the fbc84239 verifier recovery without rewriting its journal or accepting its unverified upload.

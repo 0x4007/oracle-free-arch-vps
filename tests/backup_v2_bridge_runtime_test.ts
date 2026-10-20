@@ -1,3 +1,4 @@
+import { validateBackupV2LeaseWindow } from "../scripts/backup-v2-contract.ts";
 import {
   backupV2BridgeEntrypoint,
   backupV2BridgeRuntimeCommand,
@@ -455,4 +456,33 @@ Deno.test("real bridge close refuses absent or mismatched custody without stoppi
     "CANCELLATION_BLOCKED",
   );
   equal(stops, 0);
+});
+
+Deno.test("fractional source clocks never widen a projected transfer window", () => {
+  for (const localNow of [16344.279672, 16343.417434, 20000, 40971.939949]) {
+    const value = status();
+    value.lease.observedMonotonicMs = 40971.939949;
+    value.lease.transferEpisode = {
+      kind: "SEALED_TRANSFER",
+      operationId: "read/fractional",
+      phase: "READBACK",
+      sealedObjectIdentity: "sealed-fractional",
+      retainedBytes: 67108864,
+      startedAtMs: 36417.360805,
+      expiresAtMs: 21786417.360805,
+    };
+    const projected = createBackupV2BridgeWaitProjection()(
+      value,
+      now,
+      localNow,
+    );
+    validateBackupV2LeaseWindow({
+      observedMonotonicMs: localNow,
+      usefulProgressAtMs: 0,
+      usefulProgressExpiresAtMs: localNow + 120000,
+      ...projected,
+    });
+    const episode = projected.transferEpisode!;
+    assert(episode.expiresAtMs - episode.startedAtMs <= 21750000);
+  }
 });

@@ -78,7 +78,8 @@ export function createBackupV2BridgeWaitProjection() {
         Math.max(0, age) + 5000;
       const remaining = value.expiresAtMs - lease.observedMonotonicMs -
         Math.max(0, age) - 5000;
-      const expiresAtMs = Math.max(0, localNow + remaining);
+      // Round inward: fractional clock subtraction must never widen a window.
+      const expiresAtMs = Math.max(0, Math.floor(localNow + remaining));
       if (!previous && seen.size >= BACKUP_V2_LIMITS.physicalPuts * 3) fail();
       const result = previous
         ? {
@@ -87,7 +88,7 @@ export function createBackupV2BridgeWaitProjection() {
         }
         : {
           signature,
-          startedAtMs: Math.max(0, localNow - elapsed),
+          startedAtMs: Math.max(0, Math.ceil(localNow - elapsed)),
           expiresAtMs,
         };
       result.startedAtMs = Math.min(result.startedAtMs, result.expiresAtMs);
