@@ -6,6 +6,6 @@ After=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/home/pi/ops/weekly-backup-controller
-ExecStart=/usr/local/bin/safepi deno task weekly:audit
+ExecStart=/bin/bash -c 'set -o pipefail; /usr/local/bin/safepi deno task weekly:audit 2>&1 | cat'
 TimeoutStartSec=5min
 UMask=0077

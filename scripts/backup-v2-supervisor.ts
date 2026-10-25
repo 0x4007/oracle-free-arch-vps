@@ -18,7 +18,7 @@ import {
 
 /** Internal service plumbing only; m08 must grant this exact FFI path, never -A. */
 export const BACKUP_V2_NOTIFY_LIBRARY = "/usr/lib/libsystemd.so.0";
-export const BACKUP_V2_MAX_NOTIFICATION_MS = 60_000;
+export const BACKUP_V2_MAX_NOTIFICATION_MS = 300_000;
 export type BackupV2Notification =
   | { kind: "ready" }
   | { kind: "stopping" }

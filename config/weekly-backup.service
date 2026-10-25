@@ -2,10 +2,11 @@
 Description=Pi-controlled online Arch VPS group backup
 Wants=network-online.target
 After=network-online.target
+ConditionPathExists=!%h/ops/weekly-backup-controller/.private/backup-controller-gate.json
 
 [Service]
 Type=oneshot
 WorkingDirectory=/home/pi/ops/weekly-backup-controller
-ExecStart=/usr/local/bin/safepi deno task backup:scheduled
+ExecStart=/bin/bash -c 'set -o pipefail; /usr/local/bin/safepi deno task backup:scheduled 2>&1 | cat'
 TimeoutStartSec=infinity
 UMask=0077

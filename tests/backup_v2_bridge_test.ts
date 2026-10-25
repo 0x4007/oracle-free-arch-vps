@@ -148,6 +148,10 @@ Deno.test("bridge properties retain finite main-only notify custody and Pi caps"
   equal(properties.Type, "notify");
   equal(properties.NotifyAccess, "main");
   equal(properties.RuntimeMaxSec, "1000ms");
+  equal(
+    backupV2BridgeUnitProperties(300_000).RuntimeMaxSec,
+    "300000ms",
+  );
   equal(properties.RemainAfterExit, "yes");
   equal(properties.MemoryHigh, "320M");
   equal(properties.MemoryMax, "380M");
