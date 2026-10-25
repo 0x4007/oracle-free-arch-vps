@@ -205,7 +205,7 @@ Deno.test("real bridge launch retains safepi wrapper, finite native lease and eq
       "Type=notify",
       "NotifyAccess=main",
       "RemainAfterExit=yes",
-      "RuntimeMaxSec=60000ms",
+      "RuntimeMaxSec=300000ms",
       "MemoryHigh=320M",
       "MemoryMax=380M",
       "MemorySwapMax=0",

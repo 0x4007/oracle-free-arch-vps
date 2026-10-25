@@ -487,7 +487,7 @@ export function backupV2BridgeRuntimeCommand(
     "--user",
     `--unit=${paths.unitName}`,
     ...Object.entries({
-      ...backupV2BridgeUnitProperties(60_000),
+      ...backupV2BridgeUnitProperties(300_000),
       MemorySwapMax: "0",
       WorkingDirectory: cwd,
       UMask: "0077",

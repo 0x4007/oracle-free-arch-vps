@@ -53,16 +53,47 @@ async function loadState(): Promise<RuntimeState | undefined> {
  * The run lock covers config/state reads, all mutations, and final acceptance.
  * This entry point never installs a timer or provisions a restore clone.
  */
+export interface BackupRuntimeOptions {
+  /** The scheduler rechecks due work while a B2 job owns the gate. Any
+   * present gate, including the newer backup-v2 schema, is a clean skip. */
+  skipWhenOracleMutationBlocked?: boolean;
+}
+
+/** Presence is enough to block mutation. The legacy parser above intentionally
+ * accepts only the legacy gate schema; the scheduler must not interpret a
+ * newer gate format as permission to mutate. */
+export async function backupGatePresent(
+  path = ".private/backup-controller-gate.json",
+): Promise<boolean> {
+  try {
+    await Deno.lstat(path);
+    return true;
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) return false;
+    throw error;
+  }
+}
+
 export async function main(
   beforeCycle?: (
     state: RuntimeState | undefined,
   ) => Promise<BackupRunControl | void>,
+  options: BackupRuntimeOptions = {},
 ): Promise<void> {
   await withBackupLock(".private/backup-controller.lock", async () => {
     // Immediately inside the shared lock, before any config/state read,
     // callback, evidence, guest or OCI path: a Backblaze gate blocks all
     // Oracle mutation. Absence alone
     // permits; malformed gate state fails closed.
+    if (
+      options.skipWhenOracleMutationBlocked === true &&
+      await backupGatePresent()
+    ) {
+      console.log(
+        "Backup gate present; scheduled Oracle mutation will retry later",
+      );
+      return;
+    }
     const gate = await readGate();
     assertOracleMutationAllowed(gate);
     const config = await readPrivateJson<RuntimeConfig>(CONFIG);

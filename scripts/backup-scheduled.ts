@@ -543,7 +543,7 @@ export async function runScheduledBackup(): Promise<void> {
           assertCaptureStillAuthorized(latest, claim!, new Date());
         },
       };
-    });
+    }, { skipWhenOracleMutationBlocked: true });
   } catch (error) {
     if (error instanceof Skipped) {
       console.log(error.message);
