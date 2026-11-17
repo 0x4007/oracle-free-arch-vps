@@ -1,0 +1,364 @@
+import {
+  ALERT_REMINDER_MS,
+  ALERT_RETRY_MS,
+  backupAlertDestination,
+  type BackupAlertObservation,
+  DEFAULT_ALERT_DESTINATION,
+  notifyBackupAlerts,
+  runWithBackupAlert,
+} from "../scripts/backup-mac-alert.ts";
+import { runAlertingScheduledBackup } from "../scripts/alerting-backup-scheduled.ts";
+import { watchdogAlertOutcome } from "../scripts/backup-watchdog.ts";
+import { readPrivateJson, writePrivateJson } from "../scripts/oci.ts";
+import { runScheduledBackblaze } from "../scripts/scheduled-backblaze-file-backup.ts";
+
+function assert(value: unknown, message = "Assertion failed"): asserts value {
+  if (!value) throw new Error(message);
+}
+
+const ledgerPath = ".private/backup-alerts.json";
+const configPath = ".private/backup-notification.json";
+const started = Date.parse("2026-11-17T20:51:03Z");
+const at = (offset = 0) => new Date(started + offset);
+const oracleFailure = {
+  stream: "oracle-scheduled",
+  outcome: "SCHEDULED_BACKUP_FAILED",
+} as const;
+const b2Failure = {
+  stream: "backblaze-scheduled",
+  outcome: "SCHEDULED_CLAIM_CUSTODY_UNDECIDABLE",
+} as const;
+
+function receipt(input: string | URL | Request, init?: RequestInit) {
+  const url = new URL(String(input));
+  assert(init?.method === "POST" && init.redirect === "error" && init.signal);
+  assert(url.protocol === "https:");
+  return Response.json({
+    id: "received-fixture",
+    event: "message",
+    topic: url.pathname.slice(1),
+    message: init.body,
+  });
+}
+
+const missingFixturePermissions =
+  (await Deno.permissions.query({ name: "read" })).state !== "granted" ||
+  (await Deno.permissions.query({ name: "write" })).state !== "granted";
+
+async function withLedgerFixture(work: () => Promise<void>) {
+  const previous = Deno.cwd(), directory = await Deno.makeTempDir();
+  try {
+    Deno.chdir(directory);
+    await Deno.mkdir(".private", { mode: 0o700 });
+    await work();
+  } finally {
+    Deno.chdir(previous);
+    await Deno.remove(directory, { recursive: true });
+  }
+}
+
+Deno.test("backup notifications migrate the old Mac approval and accept an HTTPS topic override", () => {
+  assert(backupAlertDestination().href === DEFAULT_ALERT_DESTINATION);
+  assert(
+    backupAlertDestination({
+      destination: "nv@m1.local",
+      approvedAtUtc: at().toISOString(),
+    }).href === DEFAULT_ALERT_DESTINATION,
+  );
+  assert(
+    backupAlertDestination({ destination: "https://ntfy.example/ops" }).href ===
+      "https://ntfy.example/ops",
+  );
+  for (
+    const destination of [
+      "nv@m1.local",
+      "http://ntfy.example/ops",
+      "https://example:password@ntfy.example/ops",
+      "https://ntfy.example/ops?anything=yes",
+      "https://ntfy.example/ops#otherwise",
+      "https://ntfy.example/ops/topic",
+      "https://ntfy.example/",
+    ]
+  ) {
+    let failed = false;
+    try {
+      backupAlertDestination({ destination });
+    } catch {
+      failed = true;
+    }
+    assert(failed);
+  }
+});
+
+Deno.test({
+  name:
+    "first refusal, reminders and recovery are independent for every alert stream",
+  ignore: missingFixturePermissions,
+  fn: () =>
+    withLedgerFixture(async () => {
+      const messages: string[] = [];
+      const request: typeof fetch = (input, init) => {
+        messages.push(String(init?.body));
+        return Promise.resolve(receipt(input, init));
+      };
+      const first = await notifyBackupAlerts([oracleFailure, b2Failure], {
+        now: at(),
+        request,
+      });
+      assert(first.notificationSent && first.pendingAlerts === 0);
+      assert(messages.splice(0).length === 2);
+      await notifyBackupAlerts(
+        [
+          b2Failure,
+          { ...oracleFailure, outcome: "BACKUP_RETRY_BLOCKED" },
+        ],
+        { now: at(ALERT_REMINDER_MS - 1), request },
+      );
+      assert(messages.splice(0).length === 0);
+      await notifyBackupAlerts([
+        oracleFailure,
+        { ...b2Failure, outcome: "DEFERRED" },
+        { stream: "oracle-watchdog", outcome: "SCHEDULED_WINDOW_MISSED" },
+      ], { now: at(ALERT_REMINDER_MS), request });
+      const reminders = messages.splice(0);
+      assert(reminders.length === 2);
+      assert(
+        reminders[0].startsWith("oracle-scheduled SCHEDULED_BACKUP_FAILED"),
+      );
+      assert(
+        reminders[1].startsWith("oracle-watchdog SCHEDULED_WINDOW_MISSED"),
+      );
+      await notifyBackupAlerts([
+        { ...oracleFailure, outcome: "HEALTHY" },
+        b2Failure,
+      ], {
+        now: at(ALERT_REMINDER_MS + ALERT_RETRY_MS),
+        request,
+      });
+      const recovery = messages.splice(0);
+      assert(recovery.length === 2);
+      assert(recovery[0].startsWith("oracle-scheduled BACKUP_RECOVERED"));
+      assert(recovery[1].startsWith("backblaze-scheduled SCHEDULED_CLAIM"));
+      await notifyBackupAlerts([oracleFailure], {
+        now: at(ALERT_REMINDER_MS + 2 * ALERT_RETRY_MS),
+        request,
+      });
+      assert(Number(messages.length) === 1);
+      assert(
+        messages[0].startsWith("oracle-scheduled SCHEDULED_BACKUP_FAILED"),
+      );
+    }),
+});
+
+Deno.test({
+  name:
+    "legacy alerts and new refusals stay pending until ntfy confirms delivery",
+  ignore: missingFixturePermissions,
+  fn: () =>
+    withLedgerFixture(async () => {
+      await writePrivateJson(ledgerPath, {
+        records: [{
+          id: "legacy-row",
+          healthy: false,
+          status: "B2:job-redact-this;ORACLE:retained-source-reference",
+          observedAtUtc: at(-1000).toISOString(),
+          attempts: 1,
+        }],
+      });
+      await writePrivateJson(configPath, {
+        destination: "nv@m1.local",
+        approvedAtUtc: at(-1000).toISOString(),
+      });
+      const messages: string[] = [];
+      const request: typeof fetch = (input, init) => {
+        messages.push(String(init?.body));
+        assert(String(input) === DEFAULT_ALERT_DESTINATION);
+        return Promise.resolve(new Response("unavailable", { status: 503 }));
+      };
+      const failed = await notifyBackupAlerts([], { now: at(), request });
+      assert(failed.notificationError === "NTFY_DELIVERY_FAILED");
+      assert(failed.pendingAlerts === 1 && messages.length === 1);
+      assert(!messages[0].includes("redact-this"));
+      messages.splice(0);
+      const first = await notifyBackupAlerts([oracleFailure], {
+        now: at(1),
+        request: (input, init) => {
+          messages.push(String(init?.body));
+          return Promise.resolve(receipt(input, init));
+        },
+      });
+      assert(first.notificationSent && first.pendingAlerts === 1);
+      assert(Number(messages.length) === 1);
+      assert(
+        messages[0].startsWith("oracle-scheduled SCHEDULED_BACKUP_FAILED"),
+      );
+      messages.splice(0);
+
+      const malformed = await notifyBackupAlerts([], {
+        now: at(ALERT_RETRY_MS),
+        request: () => Promise.resolve(Response.json({ event: "message" })),
+      });
+      assert(malformed.notificationError === "NTFY_DELIVERY_FAILED");
+      assert(malformed.pendingAlerts === 1);
+
+      await writePrivateJson(configPath, {
+        destination: "http://ntfy.example/ops",
+      });
+      const invalid = await notifyBackupAlerts([], {
+        now: at(2 * ALERT_RETRY_MS),
+        request,
+      });
+      assert(invalid.notificationError === "NTFY_DESTINATION_INVALID");
+      assert(!invalid.notificationConfigured && invalid.pendingAlerts === 1);
+
+      await writePrivateJson(configPath, {
+        destination: "https://ntfy.example/ops",
+      });
+      const recovered = await notifyBackupAlerts([], {
+        now: at(2 * ALERT_RETRY_MS),
+        request: (input, init) => {
+          assert(String(input) === "https://ntfy.example/ops");
+          messages.push(String(init?.body));
+          return Promise.resolve(receipt(input, init));
+        },
+      });
+      assert(recovered.notificationSent && recovered.pendingAlerts === 0);
+      assert(
+        messages.splice(0).every((message) => !message.includes("redact")),
+      );
+      const ledger = await readPrivateJson<{
+        records: Record<string, unknown>[];
+      }>(ledgerPath);
+      assert(ledger.records.length === 2);
+      assert(ledger.records.every((record) => !!record.deliveredAtUtc));
+      assert(ledger.records[0].attempts === 4);
+    }),
+});
+
+Deno.test({
+  name:
+    "overdue claim escalation is immediate and remains deduplicated across fallback failures",
+  ignore: missingFixturePermissions,
+  fn: () =>
+    withLedgerFixture(async () => {
+      const messages: string[] = [];
+      const request: typeof fetch = (input, init) => {
+        messages.push(String(init?.body));
+        return Promise.resolve(receipt(input, init));
+      };
+      const overdue = {
+        ...b2Failure,
+        outcome: "SCHEDULED_CLAIM_CUSTODY_OVERDUE",
+      } as const;
+      await notifyBackupAlerts([b2Failure], { now: at(), request });
+      await notifyBackupAlerts([overdue], { now: at(1), request });
+      assert(messages.length === 2);
+      assert(messages[1].includes("SCHEDULED_CLAIM_CUSTODY_OVERDUE"));
+      await notifyBackupAlerts([overdue], { now: at(2), request });
+      assert(messages.splice(0).length === 2);
+      await notifyBackupAlerts(
+        [{ ...b2Failure, outcome: "SCHEDULED_BACKUP_FAILED" }],
+        { now: at(1 + ALERT_REMINDER_MS), request },
+      );
+      assert(Number(messages.length) === 1);
+      assert(messages[0].includes("SCHEDULED_CLAIM_CUSTODY_OVERDUE"));
+      await notifyBackupAlerts([overdue], {
+        now: at(2 + ALERT_REMINDER_MS),
+        request,
+      });
+      assert(Number(messages.length) === 1);
+    }),
+});
+
+Deno.test("scheduled entry points alert on thrown refusal and returned blocked reports", async () => {
+  const observations: BackupAlertObservation[] = [];
+  const notify = (events: readonly BackupAlertObservation[]) => {
+    observations.push(...events);
+    return Promise.resolve({
+      notificationConfigured: true,
+      notificationSent: true,
+      pendingAlerts: 0,
+    });
+  };
+  const earlyFailure = new Error("fixture information must stay private");
+  let failure: unknown;
+  try {
+    await runAlertingScheduledBackup(
+      () => Promise.reject(earlyFailure),
+      notify,
+    );
+  } catch (error) {
+    failure = error;
+  }
+  assert(failure === earlyFailure);
+  assert(observations[0].stream === "oracle-scheduled");
+  assert(observations[0].outcome === "SCHEDULED_BACKUP_FAILED");
+  await runAlertingScheduledBackup(() => Promise.resolve("DEFERRED"), notify);
+  assert(observations[1].outcome === "DEFERRED");
+  const blocked = {
+    healthy: false,
+    status: "B2_SKIPPED:SCHEDULED_CLAIM_CUSTODY_UNDECIDABLE",
+    observedAtUtc: at().toISOString(),
+  };
+  assert(
+    await runScheduledBackblaze(() => Promise.resolve(blocked), notify) ===
+      blocked,
+  );
+  assert(observations[2].stream === "backblaze-scheduled");
+  assert(observations[2].outcome === "SCHEDULED_CLAIM_CUSTODY_UNDECIDABLE");
+
+  for (
+    const [status, healthy, expected] of [
+      ["WORKER", true, "HEALTHY"],
+      ["COMPLETE", true, "HEALTHY"],
+      ["VERIFY_REQUESTED", false, "DEFERRED"],
+      ["CANCELLATION_BLOCKED", false, "B2_CANCELLATION_BLOCKED"],
+      ["B2_RETENTION_EXECUTE_PARTIAL", false, "B2_RETENTION_BLOCKED"],
+    ] as const
+  ) {
+    await runScheduledBackblaze(
+      () => Promise.resolve({ ...blocked, status, healthy }),
+      notify,
+    );
+    assert(observations.at(-1)?.outcome === expected);
+  }
+});
+
+Deno.test("watchdog distinguishes normal progress from current acceptance", () => {
+  for (
+    const [status, healthy, expected] of [
+      ["ACCEPTED_BACKUP_CURRENT", true, "HEALTHY"],
+      ["BACKUP_IN_PROGRESS", true, "DEFERRED"],
+      ["B2_BACKUP_ACTIVE:job-fixture", true, "DEFERRED"],
+      ["B2_BACKUP_PENDING:job-fixture", false, "DEFERRED"],
+      ["B2_BACKUP_CURRENT:job-fixture", true, "HEALTHY"],
+      ["SCHEDULED_WINDOW_MISSED", false, "SCHEDULED_WINDOW_MISSED"],
+      ["B2_PROGRESS_STALLED:job-fixture", false, "B2_PROGRESS_STALLED"],
+    ] as const
+  ) {
+    assert(
+      watchdogAlertOutcome({ status, healthy }, "WATCHDOG_CHECK_FAILED") ===
+        expected,
+    );
+  }
+});
+
+Deno.test("an alert recording failure leaves the original backup failure intact", async () => {
+  const original = new Error("original");
+  const logged: string[] = [];
+  let caught: unknown;
+  try {
+    await runWithBackupAlert(
+      "oracle-scheduled",
+      () => Promise.reject(original),
+      () => "HEALTHY",
+      () =>
+        Promise.reject(new Error("transport error may contain private data")),
+      (message) => logged.push(message),
+    );
+  } catch (error) {
+    caught = error;
+  }
+  assert(caught === original);
+  assert(logged.length === 1 && logged[0] === "BACKUP_ALERT_RECORD_FAILED");
+});

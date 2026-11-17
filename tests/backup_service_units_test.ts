@@ -43,6 +43,43 @@ Deno.test("weekly scheduler skips at the unit boundary while a backup gate exist
   );
 });
 
+Deno.test("scheduled services route startup failures through the same scoped alert stream", async () => {
+  const { tasks } = JSON.parse(await text("deno.json"));
+  assertEquals(
+    tasks["backup:scheduled"].endsWith(
+      "--allow-net=docs.oracle.com,ntfy.pavlovcik.com scripts/alerting-backup-scheduled.ts",
+    ),
+    true,
+  );
+  assertEquals(
+    tasks["backup:watchdog"].endsWith(
+      "--allow-run=ssh --allow-net=ntfy.pavlovcik.com scripts/backup-watchdog.ts",
+    ),
+    true,
+  );
+  const backblaze = await text("config/backblaze-file-backup.service");
+  const oracle = await text("config/weekly-backup.service");
+  assertEquals(
+    backblaze.includes("scripts/scheduled-backblaze-file-backup.ts"),
+    true,
+  );
+  for (
+    const [unit, stream] of [[oracle, "oracle-scheduled"], [
+      backblaze,
+      "backblaze-scheduled",
+    ]]
+  ) {
+    assertEquals(unit.includes("ExecStopPost=-/bin/bash"), true);
+    assertEquals(unit.includes('"$$SERVICE_RESULT" == success'), true);
+    assertEquals(
+      unit.includes(
+        `--allow-net=ntfy.pavlovcik.com scripts/backup-mac-alert.ts ${stream}`,
+      ),
+      true,
+    );
+  }
+});
+
 Deno.test("backup gate presence blocks both current and future schemas", async () => {
   const dir = await Deno.makeTempDir({ prefix: "backup-gate-presence-" });
   try {

@@ -864,7 +864,8 @@ export async function readScheduledClaimForBackblaze(
   );
 }
 
-export async function runScheduledBackup(): Promise<void> {
+export async function runScheduledBackup(): Promise<"HEALTHY" | "DEFERRED"> {
+  let completed = false;
   try {
     await main(async (state, config) => {
       // The shared lock serializes capture; normal source activity stays online.
@@ -936,6 +937,7 @@ export async function runScheduledBackup(): Promise<void> {
             status: cycle.phase === "complete" ? "complete" : "failed",
             updatedAtUtc: new Date().toISOString(),
           });
+          completed = cycle.phase === "complete";
         },
         beforeCapture: async () => {
           const latest = await readPrivateJson<BackupSchedule>(
@@ -954,10 +956,13 @@ export async function runScheduledBackup(): Promise<void> {
   } catch (error) {
     if (error instanceof Skipped) {
       console.log(error.message);
-      return;
+      return error.message === "PERIOD_ALREADY_SATISFIED"
+        ? "HEALTHY"
+        : "DEFERRED";
     }
     throw error;
   }
+  return completed ? "HEALTHY" : "DEFERRED";
 }
 
 if (import.meta.main) {

@@ -6091,40 +6091,38 @@ export async function runBackblazeCycle(
   return reportValue;
 }
 
-async function piMain(): Promise<void> {
+export async function runBackblazePiController(): Promise<BackblazeRunReport> {
   const cwd = await Deno.realPath(".");
   if (cwd !== PI_CONTROLLER_CWD) {
     throw new Error(`File backup runs only from ${PI_CONTROLLER_CWD}`);
   }
   const deps = realPiDeps();
-  await deps.lock(CONTROLLER_LOCK_PATH, async () => {
+  return await deps.lock(CONTROLLER_LOCK_PATH, async () => {
     const saved = await deps.private.read<
       ControllerState | { schemaVersion: 2 }
     >(CONTROLLER_STATE_PATH);
     const legacyActive = saved?.schemaVersion === 1 &&
       saved.job !== undefined &&
       !["COMPLETE", "FAILED"].includes(saved.job.phase);
-    let reportValue: BackblazeRunReport;
-    if (legacyActive) reportValue = await runBackblazeCycle(deps);
-    else {
-      const runtime = await import("./backup-v2-controller.ts"),
-        bridge = await import("./backup-v2-bridge-runtime.ts");
-      const deployment = await loadDeployment(deps);
-      await runtime.installBackupV2PiRelease(deps, deployment.sourceRevision);
-      reportValue = await runtime.runBackupV2ControllerCycle(
-        deps,
-        bridge.realBackupV2BridgeRuntime(deps),
-      );
-    }
-    console.log(JSON.stringify(reportValue));
-    if (!reportValue.healthy) Deno.exitCode = 1;
+    if (legacyActive) return await runBackblazeCycle(deps);
+    const runtime = await import("./backup-v2-controller.ts"),
+      bridge = await import("./backup-v2-bridge-runtime.ts");
+    const deployment = await loadDeployment(deps);
+    await runtime.installBackupV2PiRelease(deps, deployment.sourceRevision);
+    return await runtime.runBackupV2ControllerCycle(
+      deps,
+      bridge.realBackupV2BridgeRuntime(deps),
+    );
   });
 }
 
 if (import.meta.main) {
   // Finish evaluating this shared module before the v2 controller imports it
   // back for the existing Pi capabilities. A top-level await creates a cycle.
-  void piMain().catch((error) => {
+  void runBackblazePiController().then((report) => {
+    console.log(JSON.stringify(report));
+    if (!report.healthy) Deno.exitCode = 1;
+  }).catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     Deno.exitCode = 1;
   });
