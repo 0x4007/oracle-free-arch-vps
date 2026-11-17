@@ -1,3 +1,6 @@
+import { backupGatePresent } from "../scripts/backup-runtime.ts";
+import { withBackupTestFixture } from "./backup-test-fixtures.ts";
+
 function assertEquals(
   actual: unknown,
   expected: unknown,
@@ -9,8 +12,6 @@ function assertEquals(
     );
   }
 }
-
-import { backupGatePresent } from "../scripts/backup-runtime.ts";
 
 const root = new URL("../", import.meta.url);
 
@@ -81,10 +82,8 @@ Deno.test("scheduled services route startup failures through the same scoped ale
 });
 
 Deno.test("backup gate presence blocks both current and future schemas", async () => {
-  const dir = await Deno.makeTempDir({ prefix: "backup-gate-presence-" });
-  try {
-    await Deno.mkdir(`${dir}/.private`, { mode: 0o700 });
-    const path = `${dir}/.private/backup-controller-gate.json`;
+  await withBackupTestFixture("gate-presence", async (directory) => {
+    const path = `${directory}/backup-controller-gate.json`;
     assertEquals(await backupGatePresent(path), false);
     await Deno.writeTextFile(path, JSON.stringify({ format: "backup-v2" }), {
       mode: 0o600,
@@ -92,7 +91,5 @@ Deno.test("backup gate presence blocks both current and future schemas", async (
     assertEquals(await backupGatePresent(path), true);
     await Deno.remove(path);
     assertEquals(await backupGatePresent(path), false);
-  } finally {
-    await Deno.remove(dir, { recursive: true });
-  }
+  });
 });

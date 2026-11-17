@@ -1,9 +1,6 @@
 import { withBackupLock } from "./backup-lock.ts";
 import { readPrivateJson, writePrivateJson } from "./oci.ts";
 
-const CONFIG_PATH = ".private/backup-notification.json";
-const LEDGER_PATH = ".private/backup-alerts.json";
-const LOCK_PATH = ".private/backup-alerts.lock";
 export const DEFAULT_ALERT_DESTINATION = "https://ntfy.pavlovcik.com/alerts";
 export const ALERT_REMINDER_MS = 6 * 60 * 60_000;
 export const ALERT_RETRY_MS = 15 * 60_000;
@@ -127,10 +124,10 @@ export function backupAlertDestination(value?: unknown): URL {
   return endpoint;
 }
 
-async function readLedger(): Promise<AlertLedger> {
+async function readLedger(path: string): Promise<AlertLedger> {
   let ledger: AlertLedger;
   try {
-    ledger = await readPrivateJson(LEDGER_PATH);
+    ledger = await readPrivateJson(path);
   } catch (error) {
     if (!(error instanceof Deno.errors.NotFound)) throw error;
     return { records: [] };
@@ -153,10 +150,10 @@ async function readLedger(): Promise<AlertLedger> {
   return ledger;
 }
 
-async function readDestination(): Promise<URL> {
+async function readDestination(path: string): Promise<URL> {
   let value: unknown;
   try {
-    value = await readPrivateJson(CONFIG_PATH);
+    value = await readPrivateJson(path);
   } catch (error) {
     if (!(error instanceof Deno.errors.NotFound)) throw error;
   }
@@ -245,20 +242,24 @@ async function publishAlert(
  * All existing scheduled invocations can retry undelivered records. */
 export async function notifyBackupAlerts(
   observations: readonly BackupAlertObservation[],
-  { now = new Date(), request = fetch }: {
+  { now = new Date(), request = fetch, stateDirectory = ".private" }: {
     now?: Date;
     request?: typeof fetch;
+    stateDirectory?: string;
   } = {},
 ): Promise<BackupAlertDelivery> {
-  return await withBackupLock(LOCK_PATH, async () => {
-    const ledger = await readLedger();
+  const ledgerPath = `${stateDirectory}/backup-alerts.json`;
+  const lockPath = `${stateDirectory}/backup-alerts.lock`;
+  const configPath = `${stateDirectory}/backup-notification.json`;
+  return await withBackupLock(lockPath, async () => {
+    const ledger = await readLedger(ledgerPath);
     if (updateLedger(ledger, observations, now)) {
-      await writePrivateJson(LEDGER_PATH, ledger);
+      await writePrivateJson(ledgerPath, ledger);
     }
     const pending = ledger.records.filter((record) => !record.deliveredAtUtc);
     let destination: URL;
     try {
-      destination = await readDestination();
+      destination = await readDestination(configPath);
     } catch {
       return {
         notificationConfigured: false,
@@ -287,7 +288,7 @@ export async function notifyBackupAlerts(
       attempts++;
       record.attempts++;
       record.lastAttemptAtUtc = now.toISOString();
-      await writePrivateJson(LEDGER_PATH, ledger);
+      await writePrivateJson(ledgerPath, ledger);
       const delivered = await publishAlert(destination, record, request).catch(
         () => false,
       );
@@ -297,7 +298,7 @@ export async function notifyBackupAlerts(
         continue;
       }
       record.deliveredAtUtc = now.toISOString();
-      await writePrivateJson(LEDGER_PATH, ledger);
+      await writePrivateJson(ledgerPath, ledger);
       result.notificationSent = true;
       result.pendingAlerts--;
     }

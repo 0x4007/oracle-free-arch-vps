@@ -29,6 +29,10 @@ import {
   scheduledClaimOwnerState,
 } from "../scripts/scheduled-claim-custody.ts";
 import { type BackupPolicy } from "../scripts/weekly-backup.ts";
+import {
+  canUseBackupTestFixtures,
+  withBackupTestFixture,
+} from "./backup-test-fixtures.ts";
 
 const schedule: BackupSchedule = {
   approvedAtUtc: "2026-09-05T01:51:00.000Z",
@@ -398,69 +402,68 @@ const nativeFiles =
 Deno.test({
   name:
     "two controllers acquire the real kernel lock and fence an orphan after a failed claim write",
-  ignore: !nativeFiles,
-  async fn() {
-    const dir = await Deno.makeTempDir({ prefix: "backup-claim-lock-" });
-    const claimPath = `${dir}/claim.json`;
-    const lockPath = `${dir}/controller.lock`;
-    const sourceIntent = `${dir}/source-intent.json`;
-    await writePrivateJson(claimPath, started);
-    const entered = Promise.withResolvers<void>();
-    const secondArrived = Promise.withResolvers<void>();
-    let launches = 0;
-    let repairs = 0;
-    let recoveryAttempts = 0;
-    const deps: RecoveryDeps = {
-      ownerState: () => Promise.resolve("dead"),
-      proveIdle: () => {
-        recoveryAttempts++;
-        return Promise.resolve();
-      },
-      read: async (path) => {
-        try {
-          return await readPrivateJson(
+  ignore: !canUseBackupTestFixtures,
+  fn: () =>
+    withBackupTestFixture("claim-lock", async (dir) => {
+      const claimPath = `${dir}/claim.json`;
+      const lockPath = `${dir}/controller.lock`;
+      const sourceIntent = `${dir}/source-intent.json`;
+      await writePrivateJson(claimPath, started);
+      const entered = Promise.withResolvers<void>();
+      const secondArrived = Promise.withResolvers<void>();
+      let launches = 0;
+      let repairs = 0;
+      let recoveryAttempts = 0;
+      const deps: RecoveryDeps = {
+        ownerState: () => Promise.resolve("dead"),
+        proveIdle: () => {
+          recoveryAttempts++;
+          return Promise.resolve();
+        },
+        read: async (path) => {
+          try {
+            return await readPrivateJson(
+              path === CLAIM_PATH ? claimPath : `${dir}/archive.json`,
+            );
+          } catch (error) {
+            if (error instanceof Deno.errors.NotFound) return undefined;
+            throw error;
+          }
+        },
+        write: async (path, value) => {
+          if (path === CLAIM_PATH && recoveryAttempts === 1) {
+            throw new Error("first controller exited before settling");
+          }
+          if (path !== CLAIM_PATH) repairs++;
+          await writePrivateJson(
             path === CLAIM_PATH ? claimPath : `${dir}/archive.json`,
+            value,
           );
-        } catch (error) {
-          if (error instanceof Deno.errors.NotFound) return undefined;
-          throw error;
-        }
-      },
-      write: async (path, value) => {
-        if (path === CLAIM_PATH && recoveryAttempts === 1) {
-          throw new Error("first controller exited before settling");
-        }
-        if (path !== CLAIM_PATH) repairs++;
-        await writePrivateJson(
-          path === CLAIM_PATH ? claimPath : `${dir}/archive.json`,
-          value,
-        );
-      },
-    };
-    const run = () =>
-      withBackupLock(lockPath, async () => {
-        if (recoveryAttempts === 0) {
-          entered.resolve();
-          await secondArrived.promise;
-        }
-        const result = await recoverScheduledClaim(
-          await readPrivateJson(claimPath),
-          predecessor,
-          schedule,
-          now,
-          deps,
-        );
-        assert(result?.status === "failed");
-        try {
-          await Deno.stat(sourceIntent);
-          return;
-        } catch (error) {
-          if (!(error instanceof Deno.errors.NotFound)) throw error;
-        }
-        await writePrivateJson(sourceIntent, { stage: "intent" });
-        launches++;
-      });
-    try {
+        },
+      };
+      const run = () =>
+        withBackupLock(lockPath, async () => {
+          if (recoveryAttempts === 0) {
+            entered.resolve();
+            await secondArrived.promise;
+          }
+          const result = await recoverScheduledClaim(
+            await readPrivateJson(claimPath),
+            predecessor,
+            schedule,
+            now,
+            deps,
+          );
+          assert(result?.status === "failed");
+          try {
+            await Deno.stat(sourceIntent);
+            return;
+          } catch (error) {
+            if (!(error instanceof Deno.errors.NotFound)) throw error;
+          }
+          await writePrivateJson(sourceIntent, { stage: "intent" });
+          launches++;
+        });
       const first = rejects(run, "SCHEDULED_CLAIM_CUSTODY_UNDECIDABLE");
       await entered.promise;
       const second = run();
@@ -468,10 +471,7 @@ Deno.test({
       await Promise.all([first, second]);
       await run();
       assert(recoveryAttempts === 2 && repairs === 1 && launches === 1);
-    } finally {
-      await Deno.remove(dir, { recursive: true });
-    }
-  },
+    }),
 });
 
 Deno.test({

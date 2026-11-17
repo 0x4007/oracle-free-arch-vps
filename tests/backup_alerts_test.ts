@@ -11,13 +11,15 @@ import { runAlertingScheduledBackup } from "../scripts/alerting-backup-scheduled
 import { watchdogAlertOutcome } from "../scripts/backup-watchdog.ts";
 import { readPrivateJson, writePrivateJson } from "../scripts/oci.ts";
 import { runScheduledBackblaze } from "../scripts/scheduled-backblaze-file-backup.ts";
+import {
+  canUseBackupTestFixtures,
+  withBackupTestFixture,
+} from "./backup-test-fixtures.ts";
 
 function assert(value: unknown, message = "Assertion failed"): asserts value {
   if (!value) throw new Error(message);
 }
 
-const ledgerPath = ".private/backup-alerts.json";
-const configPath = ".private/backup-notification.json";
 const started = Date.parse("2026-11-17T20:51:03Z");
 const at = (offset = 0) => new Date(started + offset);
 const oracleFailure = {
@@ -41,20 +43,20 @@ function receipt(input: string | URL | Request, init?: RequestInit) {
   });
 }
 
-const missingFixturePermissions =
-  (await Deno.permissions.query({ name: "read" })).state !== "granted" ||
-  (await Deno.permissions.query({ name: "write" })).state !== "granted";
-
-async function withLedgerFixture(work: () => Promise<void>) {
-  const previous = Deno.cwd(), directory = await Deno.makeTempDir();
-  try {
-    Deno.chdir(directory);
-    await Deno.mkdir(".private", { mode: 0o700 });
-    await work();
-  } finally {
-    Deno.chdir(previous);
-    await Deno.remove(directory, { recursive: true });
-  }
+async function withLedgerFixture(
+  work: (
+    notify: typeof notifyBackupAlerts,
+    ledgerPath: string,
+    configPath: string,
+  ) => Promise<void>,
+) {
+  await withBackupTestFixture("alert-ledger", (stateDirectory) =>
+    work(
+      (observations, options) =>
+        notifyBackupAlerts(observations, { ...options, stateDirectory }),
+      `${stateDirectory}/backup-alerts.json`,
+      `${stateDirectory}/backup-notification.json`,
+    ));
 }
 
 Deno.test("backup notifications migrate the old Mac approval and accept an HTTPS topic override", () => {
@@ -93,21 +95,21 @@ Deno.test("backup notifications migrate the old Mac approval and accept an HTTPS
 Deno.test({
   name:
     "first refusal, reminders and recovery are independent for every alert stream",
-  ignore: missingFixturePermissions,
+  ignore: !canUseBackupTestFixtures,
   fn: () =>
-    withLedgerFixture(async () => {
+    withLedgerFixture(async (notify) => {
       const messages: string[] = [];
       const request: typeof fetch = (input, init) => {
         messages.push(String(init?.body));
         return Promise.resolve(receipt(input, init));
       };
-      const first = await notifyBackupAlerts([oracleFailure, b2Failure], {
+      const first = await notify([oracleFailure, b2Failure], {
         now: at(),
         request,
       });
       assert(first.notificationSent && first.pendingAlerts === 0);
       assert(messages.splice(0).length === 2);
-      await notifyBackupAlerts(
+      await notify(
         [
           b2Failure,
           { ...oracleFailure, outcome: "BACKUP_RETRY_BLOCKED" },
@@ -115,7 +117,7 @@ Deno.test({
         { now: at(ALERT_REMINDER_MS - 1), request },
       );
       assert(messages.splice(0).length === 0);
-      await notifyBackupAlerts([
+      await notify([
         oracleFailure,
         { ...b2Failure, outcome: "DEFERRED" },
         { stream: "oracle-watchdog", outcome: "SCHEDULED_WINDOW_MISSED" },
@@ -128,7 +130,7 @@ Deno.test({
       assert(
         reminders[1].startsWith("oracle-watchdog SCHEDULED_WINDOW_MISSED"),
       );
-      await notifyBackupAlerts([
+      await notify([
         { ...oracleFailure, outcome: "HEALTHY" },
         b2Failure,
       ], {
@@ -139,7 +141,7 @@ Deno.test({
       assert(recovery.length === 2);
       assert(recovery[0].startsWith("oracle-scheduled BACKUP_RECOVERED"));
       assert(recovery[1].startsWith("backblaze-scheduled SCHEDULED_CLAIM"));
-      await notifyBackupAlerts([oracleFailure], {
+      await notify([oracleFailure], {
         now: at(ALERT_REMINDER_MS + 2 * ALERT_RETRY_MS),
         request,
       });
@@ -153,9 +155,9 @@ Deno.test({
 Deno.test({
   name:
     "legacy alerts and new refusals stay pending until ntfy confirms delivery",
-  ignore: missingFixturePermissions,
+  ignore: !canUseBackupTestFixtures,
   fn: () =>
-    withLedgerFixture(async () => {
+    withLedgerFixture(async (notify, ledgerPath, configPath) => {
       await writePrivateJson(ledgerPath, {
         records: [{
           id: "legacy-row",
@@ -175,12 +177,12 @@ Deno.test({
         assert(String(input) === DEFAULT_ALERT_DESTINATION);
         return Promise.resolve(new Response("unavailable", { status: 503 }));
       };
-      const failed = await notifyBackupAlerts([], { now: at(), request });
+      const failed = await notify([], { now: at(), request });
       assert(failed.notificationError === "NTFY_DELIVERY_FAILED");
       assert(failed.pendingAlerts === 1 && messages.length === 1);
       assert(!messages[0].includes("redact-this"));
       messages.splice(0);
-      const first = await notifyBackupAlerts([oracleFailure], {
+      const first = await notify([oracleFailure], {
         now: at(1),
         request: (input, init) => {
           messages.push(String(init?.body));
@@ -194,7 +196,7 @@ Deno.test({
       );
       messages.splice(0);
 
-      const malformed = await notifyBackupAlerts([], {
+      const malformed = await notify([], {
         now: at(ALERT_RETRY_MS),
         request: () => Promise.resolve(Response.json({ event: "message" })),
       });
@@ -204,7 +206,7 @@ Deno.test({
       await writePrivateJson(configPath, {
         destination: "http://ntfy.example/ops",
       });
-      const invalid = await notifyBackupAlerts([], {
+      const invalid = await notify([], {
         now: at(2 * ALERT_RETRY_MS),
         request,
       });
@@ -214,7 +216,7 @@ Deno.test({
       await writePrivateJson(configPath, {
         destination: "https://ntfy.example/ops",
       });
-      const recovered = await notifyBackupAlerts([], {
+      const recovered = await notify([], {
         now: at(2 * ALERT_RETRY_MS),
         request: (input, init) => {
           assert(String(input) === "https://ntfy.example/ops");
@@ -238,9 +240,9 @@ Deno.test({
 Deno.test({
   name:
     "overdue claim escalation is immediate and remains deduplicated across fallback failures",
-  ignore: missingFixturePermissions,
+  ignore: !canUseBackupTestFixtures,
   fn: () =>
-    withLedgerFixture(async () => {
+    withLedgerFixture(async (notify) => {
       const messages: string[] = [];
       const request: typeof fetch = (input, init) => {
         messages.push(String(init?.body));
@@ -250,19 +252,19 @@ Deno.test({
         ...b2Failure,
         outcome: "SCHEDULED_CLAIM_CUSTODY_OVERDUE",
       } as const;
-      await notifyBackupAlerts([b2Failure], { now: at(), request });
-      await notifyBackupAlerts([overdue], { now: at(1), request });
+      await notify([b2Failure], { now: at(), request });
+      await notify([overdue], { now: at(1), request });
       assert(messages.length === 2);
       assert(messages[1].includes("SCHEDULED_CLAIM_CUSTODY_OVERDUE"));
-      await notifyBackupAlerts([overdue], { now: at(2), request });
+      await notify([overdue], { now: at(2), request });
       assert(messages.splice(0).length === 2);
-      await notifyBackupAlerts(
+      await notify(
         [{ ...b2Failure, outcome: "SCHEDULED_BACKUP_FAILED" }],
         { now: at(1 + ALERT_REMINDER_MS), request },
       );
       assert(Number(messages.length) === 1);
       assert(messages[0].includes("SCHEDULED_CLAIM_CUSTODY_OVERDUE"));
-      await notifyBackupAlerts([overdue], {
+      await notify([overdue], {
         now: at(2 + ALERT_REMINDER_MS),
         request,
       });
