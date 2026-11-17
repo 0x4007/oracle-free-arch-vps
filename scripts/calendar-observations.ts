@@ -1,6 +1,7 @@
 /** Dated read-only observations. A late trigger records current reality, never
  * backdated coverage, successful backup history or a finalized billing claim. */
 import { withBackupLock } from "./backup-lock.ts";
+import { readFreeSubscription } from "./backup-controller-evidence.ts";
 import {
   type BackupInventoryConfig,
   readBackupInventory,
@@ -211,33 +212,14 @@ export async function main(runner: CommandRunner = defaultRunner) {
     // Keep Pi and provider load bounded: all network reads are serial.
     await observe("inventory", () => readBackupInventory(config, runner));
     await observe("subscription", async () => {
-      const list = dataObject(
-        await query([
-          "organizations",
-          "subscription",
-          "list",
-          "--compartment-id",
-          config.tenancyId,
-          "--all",
-        ]),
-      );
-      if (
-        !Array.isArray(list.items) || list.items.length !== 1 ||
-        typeof list.items[0]?.id !== "string"
-      ) throw Error("Subscription identity ambiguous");
-      const value = dataObject(
-        await query([
-          "organizations",
-          "subscription",
-          "get",
-          "--subscription-id",
-          list.items[0].id,
-        ]),
+      const { subscription, tier } = await readFreeSubscription(
+        query,
+        config.tenancyId,
       );
       return {
         observedAtUtc: new Date().toISOString(),
-        value,
-        postTrialEligibilityProved: false,
+        value: subscription,
+        postTrialEligibilityProved: tier === "FREE",
       };
     });
     await observe("postedCost", async () => {

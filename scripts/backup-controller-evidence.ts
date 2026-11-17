@@ -8,6 +8,7 @@ import {
   dataObject,
   defaultRunner,
   type JsonRecord,
+  redactOcid,
   runJson,
   stringField,
 } from "./oci.ts";
@@ -91,23 +92,79 @@ export function verifyPublishedFreeLimits(html: string): number {
   return 5;
 }
 
+function observedSubscriptionValue(value: unknown): string {
+  if (typeof value === "string") {
+    return JSON.stringify(redactOcid(value).slice(0, 80));
+  }
+  if (value === null) return "null";
+  if (value === undefined) return "missing";
+  return typeof value;
+}
+
 export function verifyFreeSubscription(
   subscription: JsonRecord,
   tenancyId: string,
-): void {
+): "FREE_AND_TRIAL" | "FREE" {
+  const lifecycle = subscription["lifecycle-state"];
+  const tier = subscription["subscription-tier"];
+  const paymentModel = subscription["payment-model"];
+  const tenancyMatches = tenancyId.length > 0 &&
+    subscription["compartment-id"] === tenancyId;
   if (
-    subscription["compartment-id"] !== tenancyId ||
-    subscription["lifecycle-state"] !== "ACTIVE" ||
-    subscription["subscription-tier"] !== "FREE_AND_TRIAL" ||
-    subscription["payment-model"] !== "FREE_TRIAL"
+    !tenancyMatches || lifecycle !== "ACTIVE" ||
+    (tier !== "FREE_AND_TRIAL" && tier !== "FREE") ||
+    paymentModel !== "FREE_TRIAL"
   ) {
     throw new Error(
-      "Current subscription is not the verified Free Tier account; the post-trial representation is unverified",
+      `Free Tier subscription verification failed (lifecycle-state=${
+        observedSubscriptionValue(lifecycle)
+      }, subscription-tier=${observedSubscriptionValue(tier)}, payment-model=${
+        observedSubscriptionValue(paymentModel)
+      }, compartment-matches-tenancy=${tenancyMatches})`,
     );
   }
-  // Oracle's public Organizations API schema does not document a stable
-  // post-trial Always Free enum mapping. Keep unknown representations refused
-  // until a dated provider source and live account response establish one.
+  return tier;
+}
+
+export async function readFreeSubscription(
+  query: (args: string[]) => Promise<JsonRecord>,
+  tenancyId: string,
+) {
+  const collection = dataObject(
+    await query([
+      "organizations",
+      "subscription",
+      "list",
+      "--compartment-id",
+      tenancyId,
+      "--all",
+    ]),
+  );
+  const items = collection.items;
+  if (!Array.isArray(items) || items.length !== 1) {
+    const count = Array.isArray(items) ? items.length : "unavailable";
+    throw new Error(
+      `Expected one Organizations subscription, observed ${count}`,
+    );
+  }
+  const id = stringField(dataObject({ data: items[0] }), "id");
+  if (!id.trim()) throw new Error("Organizations subscription ID is empty");
+  const subscription = dataObject(
+    await query([
+      "organizations",
+      "subscription",
+      "get",
+      "--subscription-id",
+      id,
+    ]),
+  );
+  const tier = verifyFreeSubscription(subscription, tenancyId);
+  if (subscription.id !== id) {
+    throw new Error(
+      "Organizations subscription list and get identities differ",
+    );
+  }
+  return { subscription, tier };
 }
 
 export function backupControllerEvidence(
@@ -180,32 +237,7 @@ export function backupControllerEvidence(
           limit: verifyPublishedFreeLimits(document),
         };
       }
-      const collection = dataObject(
-        await call([
-          "organizations",
-          "subscription",
-          "list",
-          "--compartment-id",
-          config.tenancyId,
-          "--all",
-        ]),
-      );
-      if (!Array.isArray(collection.items) || collection.items.length !== 1) {
-        throw new Error(
-          "Subscription inventory changed; account reconciliation required",
-        );
-      }
-      const summary = collection.items[0] as JsonRecord;
-      const subscription = dataObject(
-        await call([
-          "organizations",
-          "subscription",
-          "get",
-          "--subscription-id",
-          stringField(summary, "id"),
-        ]),
-      );
-      verifyFreeSubscription(subscription, config.tenancyId);
+      await readFreeSubscription(call, config.tenancyId);
       const storage = await objectStorage({
         ociCliPath: config.ociCliPath,
         ociProfile: config.ociProfile,
@@ -217,10 +249,8 @@ export function backupControllerEvidence(
       const surfaces = await readFreeResourceSurfaceEvidence(config, runner);
       return {
         freeResourceSurface: surfaces,
-        accountAndLimitsProved:
-          subscription["subscription-tier"] === "FREE_AND_TRIAL" &&
-          subscription["payment-model"] === "FREE_TRIAL" &&
-          officialProof.limit === 5 && surfaces.freeResourceSurfaceProved,
+        accountAndLimitsProved: officialProof.limit === 5 &&
+          surfaces.freeResourceSurfaceProved,
         backupLimit: officialProof.limit,
         objectStorageComplete: storage.inventoryComplete,
         // Use the conservative decimal-GB bound, including every stored version.

@@ -9,6 +9,7 @@ CLI syntax, and supported-image requirements can change.
   - Use for the current A1 OCPU-hours, memory-hours, home-region storage,
     backup-object count, Object Storage, and idle-instance policy.
   - Last checked for this kit: 2026-09-03.
+- The OCI Organizations subscription commands report current account identity and state. The 2026-11-17 query with the Pi controller's profile returned one tenancy-matched subscription with lifecycle `ACTIVE`, tier `FREE`, and payment model `FREE_TRIAL`. `time-updated` was `2026-10-31T05:56:26.015Z`. The 30-day USD 300 promotion expired on 2026-09-29 at 23:59:59 UTC and was `EXPIRED`. This is an observation of the controller's account. Consult the current Always Free Resources page for allowance and policy. [List subscriptions](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/organizations/subscription/list.html) · [Get subscription](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/organizations/subscription/get.html)
 - [Creating a Boot Volume Backup](https://docs.oracle.com/en-us/iaas/Content/Block/Tasks/create-bv-boot-volume-backup.htm)
   - Use for current boot-volume backup behavior, lifecycle states, and Console
     or CLI workflow.
