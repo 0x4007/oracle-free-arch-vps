@@ -499,7 +499,8 @@ Deno.test({
     const lock = `${dir}/lock`;
     await Deno.mkdir(slice, { recursive: true });
     await Deno.writeTextFile(lock, "");
-    await Deno.writeTextFile(`${cgroup}/cgroup.events`, "populated 1\n");
+    // Like a real cgroup v2 root: controllers file present, no cgroup.events.
+    await Deno.writeTextFile(`${cgroup}/cgroup.controllers`, "cpu io memory\n");
     await Deno.writeTextFile(`${slice}/cgroup.events`, "populated 0\n");
     const processList = "1 systemd /usr/lib/systemd/systemd\n";
     const systemctl = `${dir}/systemctl`;

@@ -3871,7 +3871,9 @@ export async function proveBackblazeSourceIdle(
     'test -z "$units"',
     "jobs=$(systemctl list-jobs --no-legend --plain --no-pager)",
     'case "$jobs" in *arch-vps-b2-*) exit 1 ;; esac',
-    "test -r /sys/fs/cgroup/cgroup.events",
+    // The cgroup v2 root has no cgroup.events file; cgroup.controllers is what
+    // proves the unified hierarchy is mounted and readable there.
+    "test -r /sys/fs/cgroup/cgroup.controllers",
     `for events in /sys/fs/cgroup${GATE_BACKUP_CGROUP_ROOT}/cgroup.events /sys/fs/cgroup/system.slice/arch-vps-b2-*.service/cgroup.events; do`,
     '  if test -e "$events"; then grep -qx "populated 0" "$events"; fi',
     "done",
