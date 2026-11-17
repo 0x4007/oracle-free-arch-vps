@@ -34,12 +34,7 @@ not prove that four runs occurred naturally or unattended. Compare the retained
 controller journals, scheduled-run evidence and exact generations. Existing
 closely spaced development captures remain development evidence.
 
-Posted cost may lag or contain no data. Neither an empty result nor a posted zero
-proves a finalized zero bill. The subscription response is retained without
-guessing Oracle's undocumented post-trial representation. Account eligibility,
-actual resource retention and the first finalized post-trial statement still
-need evaluation against provider evidence. Guest SSH samples remain supporting
-evidence, separate from native Oracle idle-policy metrics.
+Posted cost can lag. A finalized statement is required to establish a zero bill. The observer retains the verified subscription response in its private report and sets `postTrialEligibilityProved` when the shared account check accepts `FREE` with `FREE_TRIAL`. Resource retention requires its own inventory evidence. Guest SSH samples supplement native Oracle idle-policy metrics. [Dated account evidence](DECISIONS.md#post-trial-free-tier-account-evidence--2026-11-17)
 
 A completed implementation or an enabled timer does not complete these future
 observations. Read PROJECT-VISION.md and the current revision-bound recovery kit

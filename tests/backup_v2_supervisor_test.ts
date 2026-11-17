@@ -1,4 +1,5 @@
 import {
+  BACKUP_V2_MAX_NOTIFICATION_MS,
   backupV2ChildEnvironment,
   backupV2FailureEvidence,
   type BackupV2Notifier,
@@ -446,7 +447,14 @@ Deno.test("supervisor notification encoding is bounded, whitelisted and singly N
     ),
     "EXTEND_TIMEOUT_USEC=4000000\0",
   );
-  for (const usec of [0, -1, NaN, Infinity, 0.5, 60_000_001]) {
+  const maximumUsec = BACKUP_V2_MAX_NOTIFICATION_MS * 1000;
+  equal(
+    decoder.decode(
+      encodeBackupV2Notification({ kind: "extend", usec: maximumUsec }),
+    ),
+    `EXTEND_TIMEOUT_USEC=${maximumUsec}\0`,
+  );
+  for (const usec of [0, -1, NaN, Infinity, 0.5, maximumUsec + 1]) {
     throws(() => encodeBackupV2Notification({ kind: "extend", usec }));
   }
   throws(() => encodeBackupV2Notification({ kind: "MAINPID=1" } as never));

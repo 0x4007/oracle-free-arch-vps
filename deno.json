@@ -6,12 +6,12 @@
     "lint": "deno lint",
     "restore": "deno run --allow-read=.private --allow-write=.private --allow-run scripts/oci-restore.ts",
     "group-restore": "deno run --allow-read=.private --allow-write=.private --allow-run scripts/oci-group-restore-run.ts",
-    "test": "deno test tests",
+    "test": "deno test --allow-read=config/weekly-backup.service,config/backblaze-file-backup.service,config/weekly-backup-watchdog.service,config/weekly-audit.service,deno.json,tests/.backup-test-fixtures --allow-write=tests/.backup-test-fixtures tests",
     "weekly:audit": "deno run --allow-read=.private --allow-write=.private --allow-run scripts/oci-weekly-audit.ts",
     "backup:inventory": "deno run --allow-read=.private --allow-write=.private --allow-run scripts/oci-backup-inventory.ts",
     "backup:run": "deno run --allow-read=.private --allow-write=.private --allow-run --allow-net=docs.oracle.com scripts/backup-runtime.ts",
-    "backup:scheduled": "deno run --allow-read=.private --allow-write=.private --allow-run --allow-net=docs.oracle.com scripts/backup-scheduled.ts",
-    "backup:watchdog": "deno run --allow-read=.private --allow-write=.private --allow-run=ssh scripts/backup-watchdog.ts",
+    "backup:scheduled": "deno run --allow-read=.private --allow-write=.private --allow-run --allow-net=docs.oracle.com,ntfy.pavlovcik.com scripts/alerting-backup-scheduled.ts",
+    "backup:watchdog": "deno run --allow-read=.private --allow-write=.private --allow-run=ssh --allow-net=ntfy.pavlovcik.com scripts/backup-watchdog.ts",
     "backup:replace": "deno run --allow-read=.,.private,config --allow-write=.private --allow-run --allow-net=docs.oracle.com scripts/pi-recovery-session.ts",
     "backup:recover": "deno run --allow-read=.private --allow-write=.private --allow-run --allow-net=docs.oracle.com scripts/backup-recovery.ts"
   }

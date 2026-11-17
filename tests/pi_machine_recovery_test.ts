@@ -400,9 +400,10 @@ Deno.test({
         } else if (line.includes("organizations subscription get")) {
           eligibilityReads++;
           data = {
+            id: "subscription",
             "compartment-id": config.compartmentId,
             "lifecycle-state": "ACTIVE",
-            "subscription-tier": "FREE_AND_TRIAL",
+            "subscription-tier": "FREE",
             "payment-model": "FREE_TRIAL",
           };
         } else if (line.includes("iam compartment list")) {

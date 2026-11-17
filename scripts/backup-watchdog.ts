@@ -5,7 +5,12 @@ import {
   validateSchedule,
 } from "./backup-schedule.ts";
 import { readPrivateJson, writePrivateJson } from "./oci.ts";
-import { notifyMac } from "./backup-mac-alert.ts";
+import {
+  type BackupAlertDelivery,
+  type BackupAlertOutcome,
+  backupAlertReason,
+  notifyBackupAlerts,
+} from "./backup-mac-alert.ts";
 import { readGate } from "./backblaze-controller-gate.ts";
 import type { OnlineBackupRetry } from "./online-backup-contract.ts";
 import type { GroupRestorePlan } from "./oci-group-restore-drill.ts";
@@ -535,6 +540,33 @@ async function observeLiveSource(
   };
 }
 
+export function watchdogAlertOutcome(
+  report: Record<string, unknown>,
+  fallback: "WATCHDOG_CHECK_FAILED" | "B2_WATCHDOG_CHECK_FAILED",
+): BackupAlertOutcome {
+  const status = typeof report.status === "string"
+    ? report.status.split(":", 1)[0]
+    : "";
+  if (status === "B2_BACKUP_PENDING") return "DEFERRED";
+  if (report.healthy === true) {
+    if (
+      [
+        "BACKUP_IN_PROGRESS",
+        "B2_BACKUP_ACTIVE",
+        "B2_BACKUP_IDLE",
+        "B2_BACKUP_RETIRING",
+      ].includes(status) ||
+      (status.startsWith("B2_RETENTION_") && !status.endsWith("_COMPLETE"))
+    ) return "DEFERRED";
+    return "HEALTHY";
+  }
+  if (status.startsWith("B2_RETENTION_")) return "B2_RETENTION_BLOCKED";
+  if (status === "B2_BACKUP_CANCELLATION_BLOCKED") {
+    return "B2_CANCELLATION_BLOCKED";
+  }
+  return backupAlertReason(status, fallback);
+}
+
 export async function main(): Promise<void> {
   const now = new Date();
   let oracleReport: Record<string, unknown>;
@@ -726,32 +758,21 @@ export async function main(): Promise<void> {
       // Existing live source/gate checks still own missing-source failures.
     }
   }
-  await writePrivateJson(ORACLE_REPORT_PATH, oracleReport);
-  await writePrivateJson(B2_REPORT_PATH, b2Report);
-  // notifyMac keeps ONE last-status ledger: two separate per-report calls
-  // alternate the last status every pass, so any existing alert makes two
-  // identical hourly passes emit four notifications. One combined bounded
-  // stable status carrying both assessment statuses yields one record per
-  // transition; the single delivery outcome is shared by both preserved
-  // individual reports and a delivery failure still stays visible on both.
-  let delivery:
-    | {
-      notificationConfigured: boolean;
-      notificationSent: boolean;
-      pendingAlerts: number;
-    }
-    | undefined;
+  let delivery: BackupAlertDelivery | undefined;
   try {
-    delivery = await notifyMac({
-      status: `B2:${String(b2Report.status)};ORACLE:${
-        String(oracleReport.status)
-      }`,
-      healthy: oracleReport.healthy === true && b2Report.healthy === true,
-      observedAtUtc: now.toISOString(),
-    });
+    delivery = await notifyBackupAlerts([
+      {
+        stream: "oracle-watchdog",
+        outcome: watchdogAlertOutcome(oracleReport, "WATCHDOG_CHECK_FAILED"),
+      },
+      {
+        stream: "backblaze-watchdog",
+        outcome: watchdogAlertOutcome(b2Report, "B2_WATCHDOG_CHECK_FAILED"),
+      },
+    ]);
   } catch {
     for (const report of [b2Report, oracleReport]) {
-      report.notificationError = "MAC_ALERT_RECORD_OR_DELIVERY_FAILED";
+      report.notificationError = "BACKUP_ALERT_RECORD_FAILED";
     }
   }
   if (delivery !== undefined) {

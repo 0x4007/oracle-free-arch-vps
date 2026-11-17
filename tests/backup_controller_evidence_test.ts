@@ -1,5 +1,6 @@
 import {
   backupControllerEvidence,
+  readFreeSubscription,
   verifyFreeSubscription,
   verifyPublishedFreeLimits,
 } from "../scripts/backup-controller-evidence.ts";
@@ -63,16 +64,23 @@ function assert(value: unknown): asserts value {
   if (!value) throw new Error("Assertion failed");
 }
 function refuses(run: () => unknown) {
-  let rejected = false;
   try {
     run();
-  } catch {
-    rejected = true;
+  } catch (error) {
+    assert(error instanceof Error);
+    return error.message;
   }
-  assert(rejected);
+  throw new Error("Expected refusal");
 }
 const terms =
   "first 1,500 OCPU hours and 9,000 GB hours per month for free; equivalent to 2 OCPUs and 12 GB of memory; total of 200 GB of Block Volume storage, and five volume backups; amounts apply to both boot volumes and block volumes combined; 20 GB of combined Standard tier, Infrequent Access tier, and Archive tier data";
+const trialSubscription = {
+  id: "subscription",
+  "compartment-id": "tenancy",
+  "lifecycle-state": "ACTIVE",
+  "subscription-tier": "FREE_AND_TRIAL",
+  "payment-model": "FREE_TRIAL",
+};
 Deno.test("published allowance changes fail closed", () => {
   assert(verifyPublishedFreeLimits(terms) === 5);
   refuses(() =>
@@ -80,39 +88,134 @@ Deno.test("published allowance changes fail closed", () => {
   );
   refuses(() => verifyPublishedFreeLimits("Access denied"));
 });
-Deno.test("account proof rejects paid, inactive and wrong-tenancy subscriptions", () => {
-  const account = {
-    "compartment-id": "tenancy",
-    "lifecycle-state": "ACTIVE",
-    "subscription-tier": "FREE_AND_TRIAL",
-    "payment-model": "FREE_TRIAL",
-  };
-  verifyFreeSubscription(account, "tenancy");
-  refuses(() =>
-    verifyFreeSubscription(
-      { ...account, "payment-model": "PAY_AS_YOU_GO" },
-      "tenancy",
-    )
+Deno.test("account proof rejects and describes unsupported Organizations values", () => {
+  assert(
+    refuses(() => verifyFreeSubscription(trialSubscription, "other-tenancy"))
+      .includes("compartment-matches-tenancy=false"),
   );
-  refuses(() =>
-    verifyFreeSubscription(
-      { ...account, "lifecycle-state": "INACTIVE" },
+  for (
+    const [field, values] of [
+      ["lifecycle-state", ["INACTIVE", "UNKNOWN"]],
+      ["subscription-tier", ["PAYG", "ALWAYS_FREE", "free", "UNKNOWN"]],
+      ["payment-model", [
+        "FREE",
+        "PAY_AS_YOU_GO",
+        "pay-as-you-go",
+        "MONTHLY_COMMITMENT",
+        "ANNUAL_COMMITMENT",
+        "UNKNOWN",
+      ]],
+    ] as const
+  ) {
+    for (const tier of ["FREE_AND_TRIAL", "FREE"]) {
+      for (const value of [...values, null, undefined, {}]) {
+        const message = refuses(() =>
+          verifyFreeSubscription({
+            ...trialSubscription,
+            "subscription-tier": tier,
+            [field]: value,
+          }, "tenancy")
+        );
+        const observed = value === undefined
+          ? "missing"
+          : value !== null && typeof value === "object"
+          ? "object"
+          : JSON.stringify(value);
+        assert(message.includes(`${field}=${observed}`));
+        assert(message.includes("subscription-tier="));
+        assert(message.includes("payment-model="));
+      }
+    }
+  }
+});
+
+Deno.test("Organizations proof refuses ambiguous inventory and mismatched details", async () => {
+  const listed = { id: trialSubscription.id };
+  for (
+    const items of [undefined, [], [listed, listed], [null], [{}], [{ id: "" }]]
+  ) {
+    let calls = 0;
+    const error: unknown = await readFreeSubscription(() => {
+      calls++;
+      return Promise.resolve({ data: { items } });
+    }, "tenancy").catch((error) => error);
+    assert(error instanceof Error && calls === 1);
+  }
+  for (const id of [undefined, "other-subscription"]) {
+    const error: unknown = await readFreeSubscription(
+      (args) =>
+        Promise.resolve({
+          data: args[2] === "list"
+            ? { items: [listed] }
+            : { ...trialSubscription, id },
+        }),
       "tenancy",
-    )
-  );
-  refuses(() => verifyFreeSubscription(account, "other-tenancy"));
-  refuses(() =>
-    verifyFreeSubscription(
-      { ...account, "subscription-tier": "FREE", "payment-model": "FREE" },
-      "tenancy",
-    )
-  );
-  refuses(() =>
-    verifyFreeSubscription(
-      { ...account, "subscription-tier": "ALWAYS_FREE" },
-      "tenancy",
-    )
-  );
+    ).catch((error) => error);
+    assert(
+      error instanceof Error && error.message.includes("identities differ"),
+    );
+  }
+});
+
+Deno.test("controller proves account and limits for active trial and post-trial Free Tier", async () => {
+  for (const tier of ["FREE_AND_TRIAL", "FREE"] as const) {
+    const evidence = backupControllerEvidence({
+      ociCliPath: "oci",
+      ociProfile: "DEFAULT",
+      tenancyId: "tenancy",
+      source: {
+        instanceId: "instance",
+        bootVolumeId: "boot",
+        rootVolumeId: "root",
+        compartmentId: "tenancy",
+        region: "region",
+      },
+    }, (command, args) => {
+      assert(command === "oci");
+      const start = args.findIndex((arg) =>
+        ["organizations", "os", "iam", "compute", "bv"].includes(arg)
+      );
+      assert(start >= 0);
+      const operation = args.slice(start);
+      let data: unknown = [];
+      switch (operation.slice(0, 3).join(" ")) {
+        case "organizations subscription list":
+          assert(operation.includes("--all") && operation.includes("tenancy"));
+          data = { items: [{ id: trialSubscription.id }] };
+          break;
+        case "organizations subscription get":
+          assert(operation.includes(trialSubscription.id));
+          data = {
+            ...trialSubscription,
+            "subscription-tier": tier,
+            promotion: [{ status: tier === "FREE" ? "EXPIRED" : "ACTIVE" }],
+          };
+          break;
+        case "os ns get":
+          data = "namespace";
+          break;
+        case "iam availability-domain list":
+          data = [{ name: "fixture-domain" }];
+          break;
+        case "iam compartment list":
+        case "os bucket list":
+        case "compute image list":
+        case "bv boot-volume list":
+        case "bv volume list":
+          break;
+        default:
+          throw new Error("Unexpected OCI operation in fixture");
+      }
+      return Promise.resolve({
+        code: 0,
+        stdout: JSON.stringify({ data }),
+        stderr: "",
+      });
+    }, () => Promise.resolve(terms));
+    const proof = await evidence.verify();
+    assert(proof.accountAndLimitsProved && proof.backupLimit === 5);
+    assert(proof.objectStorageComplete && proof.objectStorageWithinLimit);
+  }
 });
 Deno.test("suspended versioning still counts older Object Storage versions", async () => {
   let versionsRead = false;

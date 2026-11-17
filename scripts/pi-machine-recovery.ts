@@ -7,7 +7,10 @@ import {
   assertOracleMutationAllowed,
   readGate,
 } from "./backblaze-controller-gate.ts";
-import { backupControllerEvidence } from "./backup-controller-evidence.ts";
+import {
+  backupControllerEvidence,
+  readFreeSubscription,
+} from "./backup-controller-evidence.ts";
 import type { BackupInventoryConfig } from "./oci-backup-inventory.ts";
 import {
   type CommandRunner,
@@ -519,38 +522,13 @@ export async function proveTrialFunding(
       "60",
       ...args,
     ], runner);
-  const collection = dataObject(
-    await call([
-      "organizations",
-      "subscription",
-      "list",
-      "--compartment-id",
-      controller.tenancyId,
-      "--all",
-    ]),
+  const { subscription, tier } = await readFreeSubscription(
+    call,
+    controller.tenancyId,
   );
-  if (!Array.isArray(collection.items) || collection.items.length !== 1) {
-    throw Error("A single current Organizations subscription is required");
-  }
-  const summary = collection.items[0] as JsonRecord;
-  const subscription = dataObject(
-    await call([
-      "organizations",
-      "subscription",
-      "get",
-      "--subscription-id",
-      stringField(summary, "id"),
-    ]),
-  );
-  if (
-    subscription.id !== summary.id ||
-    subscription["compartment-id"] !== controller.tenancyId ||
-    subscription["lifecycle-state"] !== "ACTIVE" ||
-    subscription["subscription-tier"] !== "FREE_AND_TRIAL" ||
-    subscription["payment-model"] !== "FREE_TRIAL"
-  ) {
+  if (tier !== "FREE_AND_TRIAL") {
     throw Error(
-      "Current subscription is not the ACTIVE Free Trial account",
+      `Trial funding requires subscription-tier="FREE_AND_TRIAL", observed subscription-tier="${tier}"`,
     );
   }
   const trialExpiry = Date.parse(config.trial.expiresAtUtc);

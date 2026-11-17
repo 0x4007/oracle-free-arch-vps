@@ -26,12 +26,12 @@ import {
   validateStandingApproval,
 } from "./weekly-backup.ts";
 
-interface RuntimeConfig extends BackupInventoryConfig {
+export interface RuntimeConfig extends BackupInventoryConfig {
   action: "preflight" | "cycle";
   policy: BackupPolicy;
   guest: GuestPolicy;
 }
-interface RuntimeState {
+export interface RuntimeState {
   policy: BackupPolicy;
   cycle: BackupJournal;
   guest?: GuestJournal;
@@ -74,10 +74,34 @@ export async function backupGatePresent(
   }
 }
 
+export interface BackupRuntimeControl extends BackupRunControl {
+  /** The preparation phase only reads remote state and writes local journals. */
+  afterPreparationFailure?: () => Promise<void>;
+}
+
+export async function settleBackupPreparation<T>(
+  prepare: () => Promise<T>,
+  onFailure: (() => Promise<void>) | undefined,
+): Promise<T> {
+  try {
+    return await prepare();
+  } catch (error) {
+    try {
+      await onFailure?.();
+    } catch {
+      console.error(
+        "Scheduled claim preparation failure could not be recorded",
+      );
+    }
+    throw error;
+  }
+}
+
 export async function main(
   beforeCycle?: (
     state: RuntimeState | undefined,
-  ) => Promise<BackupRunControl | void>,
+    config: RuntimeConfig,
+  ) => Promise<BackupRuntimeControl | void>,
   options: BackupRuntimeOptions = {},
 ): Promise<void> {
   await withBackupLock(".private/backup-controller.lock", async () => {
@@ -122,15 +146,15 @@ export async function main(
         "Runtime state belongs to another source or standing approval",
       );
     }
-    let control: BackupRunControl | void = undefined;
+    const evidence = backupControllerEvidence(config);
+    const guest = backupGuestControl(config.guest);
+    let control: BackupRuntimeControl | void = undefined;
     if (beforeCycle) {
       if (config.action !== "cycle") {
         throw new Error("Scheduled execution requires cycle mode");
       }
-      control = await beforeCycle(state);
+      control = await beforeCycle(state, config);
     }
-    const evidence = backupControllerEvidence(config);
-    const guest = backupGuestControl(config.guest);
     if (config.action === "preflight") {
       await evidence.assertNoOtherController();
       const proof = await evidence.verify();
@@ -164,70 +188,6 @@ export async function main(
       console.log(JSON.stringify(report));
       return;
     }
-    if (state && state.cycle.mode !== "online") {
-      if (
-        state.cycle.phase !== "complete" || state.guest?.restored !== true ||
-        state.cycle.recoveryStatus === "needed" ||
-        state.cycle.recoveryStatus === "failed" ||
-        !state.cycle.bootId || !state.cycle.rootId
-      ) {
-        throw new Error(
-          "Legacy outage journal must be reconciled before online cutover",
-        );
-      }
-      await evidence.assertNoOtherController();
-      const inventory = await readBackupInventory(config);
-      const boot = inventory.bootBackups.find((item) =>
-        item.id === state!.cycle.bootId
-      );
-      const root = inventory.rootBackups.find((item) =>
-        item.id === state!.cycle.rootId
-      );
-      if (
-        !boot || !root || inventory.instance["lifecycle-state"] !== "RUNNING" ||
-        !inventory.sourceAttachmentsProved
-      ) throw new Error("Legacy accepted pair or running source is not proved");
-      validateBackupPair(
-        boot,
-        root,
-        state.cycle.suffix,
-        config.source.bootVolumeId,
-        config.source.rootVolumeId,
-        config.source.compartmentId,
-      );
-      await guest.acceptSource();
-      await guest.observeSource();
-      const archivePath =
-        `.private/cycles/${state.cycle.suffix}.before-online.json`;
-      try {
-        const prior = await readPrivateJson(archivePath);
-        if (JSON.stringify(prior) !== JSON.stringify(state)) {
-          throw new Error(
-            "Legacy archive already exists with different evidence",
-          );
-        }
-      } catch (error) {
-        if (!(error instanceof Deno.errors.NotFound)) throw error;
-        await writePrivateJson(archivePath, state);
-      }
-      const policy: BackupPolicy = {
-        ...config.policy,
-        acceptedPair: {
-          suffix: state.cycle.suffix,
-          bootId: state.cycle.bootId,
-          rootId: state.cycle.rootId,
-        },
-      };
-      state = { policy, cycle: newBackupJournal(policy, new Date()) };
-      await writePrivateJson(STATE, state);
-    }
-    if (!state) {
-      state = {
-        policy: structuredClone(config.policy),
-        cycle: newBackupJournal(config.policy, new Date()),
-      };
-      await writePrivateJson(STATE, state);
-    }
     let reportedPhase: string | undefined;
     const operations = () =>
       ociBackupOperations(
@@ -247,37 +207,110 @@ export async function main(
           }
         },
       );
-    if (state.cycle.phase === "complete") {
-      await runBackupCycle(state.policy, state.cycle, operations());
-      if (state.policy.retainPreviousPair) {
-        throw new Error(
-          "First restore drill and retained-pair reconciliation are required before another cycle",
+    state = await settleBackupPreparation(async () => {
+      if (state && state.cycle.mode !== "online") {
+        if (
+          state.cycle.phase !== "complete" || state.guest?.restored !== true ||
+          state.cycle.recoveryStatus === "needed" ||
+          state.cycle.recoveryStatus === "failed" ||
+          !state.cycle.bootId || !state.cycle.rootId
+        ) {
+          throw new Error(
+            "Legacy outage journal must be reconciled before online cutover",
+          );
+        }
+        await evidence.assertNoOtherController();
+        const inventory = await readBackupInventory(config);
+        const boot = inventory.bootBackups.find((item) =>
+          item.id === state!.cycle.bootId
         );
+        const root = inventory.rootBackups.find((item) =>
+          item.id === state!.cycle.rootId
+        );
+        if (
+          !boot || !root ||
+          inventory.instance["lifecycle-state"] !== "RUNNING" ||
+          !inventory.sourceAttachmentsProved
+        ) {
+          throw new Error(
+            "Legacy accepted pair or running source is not proved",
+          );
+        }
+        validateBackupPair(
+          boot,
+          root,
+          state.cycle.suffix,
+          config.source.bootVolumeId,
+          config.source.rootVolumeId,
+          config.source.compartmentId,
+        );
+        await guest.acceptSource();
+        await guest.observeSource();
+        const archivePath =
+          `.private/cycles/${state.cycle.suffix}.before-online.json`;
+        try {
+          const prior = await readPrivateJson(archivePath);
+          if (JSON.stringify(prior) !== JSON.stringify(state)) {
+            throw new Error(
+              "Legacy archive already exists with different evidence",
+            );
+          }
+        } catch (error) {
+          if (!(error instanceof Deno.errors.NotFound)) throw error;
+          await writePrivateJson(archivePath, state);
+        }
+        const policy: BackupPolicy = {
+          ...config.policy,
+          acceptedPair: {
+            suffix: state.cycle.suffix,
+            bootId: state.cycle.bootId,
+            rootId: state.cycle.rootId,
+          },
+        };
+        state = { policy, cycle: newBackupJournal(policy, new Date()) };
+        await writePrivateJson(STATE, state);
       }
-      await writePrivateJson(
-        `.private/cycles/${state.cycle.suffix}.json`,
-        state,
-      );
-      const policy: BackupPolicy = {
-        ...state.policy,
-        acceptedPair: {
-          suffix: state.cycle.suffix,
-          bootId: state.cycle.bootId!,
-          rootId: state.cycle.rootId!,
-          volumeGroupBackupId: state.cycle.captureIdentity?.volumeGroupBackupId,
-        },
-        allowFifthSlot: config.policy.allowFifthSlot,
-        volumeGroupId: config.policy.volumeGroupId,
-      };
-      state = {
-        policy,
-        cycle: newBackupJournal(policy, new Date()),
-        lastSuccessfulCaptureAtUtc:
-          state.cycle.captureIdentity?.captureTimeUtc ??
-            state.lastSuccessfulCaptureAtUtc,
-      };
-      await writePrivateJson(STATE, state);
-    }
+      if (!state) {
+        state = {
+          policy: structuredClone(config.policy),
+          cycle: newBackupJournal(config.policy, new Date()),
+        };
+        await writePrivateJson(STATE, state);
+      }
+      if (state.cycle.phase === "complete") {
+        await runBackupCycle(state.policy, state.cycle, operations());
+        if (state.policy.retainPreviousPair) {
+          throw new Error(
+            "First restore drill and retained-pair reconciliation are required before another cycle",
+          );
+        }
+        await writePrivateJson(
+          `.private/cycles/${state.cycle.suffix}.json`,
+          state,
+        );
+        const policy: BackupPolicy = {
+          ...state.policy,
+          acceptedPair: {
+            suffix: state.cycle.suffix,
+            bootId: state.cycle.bootId!,
+            rootId: state.cycle.rootId!,
+            volumeGroupBackupId: state.cycle.captureIdentity
+              ?.volumeGroupBackupId,
+          },
+          allowFifthSlot: config.policy.allowFifthSlot,
+          volumeGroupId: config.policy.volumeGroupId,
+        };
+        state = {
+          policy,
+          cycle: newBackupJournal(policy, new Date()),
+          lastSuccessfulCaptureAtUtc:
+            state.cycle.captureIdentity?.captureTimeUtc ??
+              state.lastSuccessfulCaptureAtUtc,
+        };
+        await writePrivateJson(STATE, state);
+      }
+      return state;
+    }, control?.afterPreparationFailure);
     const cycle = state.cycle;
     try {
       await runBackupCycle(state.policy, cycle, operations(), control ?? {});

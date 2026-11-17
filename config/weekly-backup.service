@@ -9,4 +9,6 @@ Type=oneshot
 WorkingDirectory=/home/pi/ops/weekly-backup-controller
 ExecStart=/bin/bash -c 'set -o pipefail; /usr/local/bin/safepi deno task backup:scheduled 2>&1 | cat'
 TimeoutStartSec=infinity
+# Record failures before the Deno entry point reached its own handler.
+ExecStopPost=-/bin/bash -c 'set -o pipefail; [[ "$$SERVICE_RESULT" == success ]] || /usr/local/bin/safepi deno run --allow-read=.private --allow-write=.private --allow-net=ntfy.pavlovcik.com scripts/backup-mac-alert.ts oracle-scheduled 2>&1 | cat'
 UMask=0077

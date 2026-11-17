@@ -2,6 +2,12 @@
 
 Recorded 2026-09-22 for the online Backblaze backup path in this repository. These are implementation decisions made under the owner-controlled [PROJECT-VISION.md](PROJECT-VISION.md) charter. They do not amend, replace, or claim the authority of that charter, which wins on any conflict, and they stay inside the resource-budget and request-transport scope described here.
 
+## Post-trial Free Tier account evidence — 2026-11-17
+
+The 2026-11-17 OCI Organizations query through the Pi controller's own profile returned one `ACTIVE` subscription, with compartment equal to the tenancy, `subscription-tier=FREE`, `payment-model=FREE_TRIAL` and `time-updated=2026-10-31T05:56:26.015Z`. The 30-day USD 300 trial promotion showed `EXPIRED` with a 2026-09-29 23:59:59 UTC expiry. [Provider reference and dated observation](SOURCES.md#oracle-cloud-infrastructure)
+
+The routine controller and calendar observer use one subscription check. It requires exactly one matching list/get identity, the tenancy compartment, `ACTIVE` lifecycle, `FREE_TRIAL` payment, and either the observed `FREE` tier or the earlier `FREE_AND_TRIAL` trial tier. The routine backup still verifies current published limits and live resource inventory. Trial-funded recovery additionally requires `FREE_AND_TRIAL` and current promotion and expiry evidence. The November 17 observation establishes the account's post-trial representation. A finalized post-trial statement is separate billing evidence.
+
 ## Backup gate rechecks skip cleanly and failures remain attributable — 2026-10-25
 
 The 2026-10-25 weekly cycle completed its OCI capture, then `weekly-backup.service` failed at its 15-minute recheck while the Backblaze controller gate was active. A second issue made that failure opaque: `safepi` runs its payload in a sibling systemd scope, so the controller's stderr was not in the service journal. The Backblaze worker that had completed at 07:03Z was unchanged; the 07:24Z retry advanced the controller to verification.
