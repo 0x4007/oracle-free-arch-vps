@@ -781,6 +781,7 @@ function harness(options: HarnessOptions): Harness {
     recipientSha256: RECIPIENT_SHA256,
     recipientFingerprint: RECIPIENT_FINGERPRINT,
   });
+  privateMap.set(".private/backup-runtime.json", ORACLE_STATE_FIXTURE);
   options.seedPrivate?.(privateMap);
   const events: string[] = [];
   const logs: string[] = [];
@@ -1834,9 +1835,28 @@ Deno.test(
 
 Deno.test("orchestration: Oracle runtime is required before new work", async () => {
   const h = harness({ now: new Date(WINDOW_START + 1000) });
+  h.privateMap.delete(".private/backup-runtime.json");
   const report = await runBackblazeCycle(h.deps, 4);
   assert(report.status.startsWith("B2_SKIPPED"));
   assert(!h.privateMap.has(CONTROLLER_STATE_PATH));
+});
+
+Deno.test("orchestration: a refused admission leaves a saved request ready to retry", async () => {
+  const fixture = generationFixture(8, WINDOW_START);
+  const state = stateWithJob(fixture, "REQUESTED");
+  const h = harness({ now: new Date(WINDOW_START + 1000) });
+  await h.deps.private.write(CONTROLLER_STATE_PATH, state);
+  h.privateMap.delete(".private/backup-runtime.json");
+  const report = await runBackblazeCycle(h.deps, 1);
+  assert(report.status.startsWith("B2_SKIPPED"));
+  const saved = await h.deps.private.read<ControllerState>(
+    CONTROLLER_STATE_PATH,
+  );
+  assert(saved?.job?.phase === "REQUESTED" && h.launches.length === 0);
+  h.privateMap.set(".private/backup-runtime.json", ORACLE_STATE_FIXTURE);
+  const resumed = await stepBackupController(saved, h.deps, h.deps.now());
+  assert(resumed.job?.envelope.request.jobId === fixture.jobId);
+  assert(Number(h.launches.length) === 1);
 });
 
 Deno.test("orchestration: duplicate invocation never creates a second job", async () => {
@@ -4778,7 +4798,10 @@ Deno.test("cycle: a blocked next-period launch preserves the closed predecessor 
     name: string;
     seedPrivate: NonNullable<HarnessOptions["seedPrivate"]>;
   }[] = [
-    { name: "absent Oracle state", seedPrivate: () => {} },
+    {
+      name: "absent Oracle state",
+      seedPrivate: (map) => map.delete(".private/backup-runtime.json"),
+    },
     {
       name: "started scheduled claim",
       seedPrivate: (map) => {

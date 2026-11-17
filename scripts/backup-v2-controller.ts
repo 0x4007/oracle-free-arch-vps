@@ -4,6 +4,7 @@ import { isDeepStrictEqual } from "node:util";
 import {
   B2_REPORT_PATH,
   type BackblazeRunReport,
+  backblazeScheduledClaim,
   BACKUP_BASE,
   BACKUP_RUNTIME_BASE,
   CONTROLLER_STATE_PATH,
@@ -530,7 +531,12 @@ export async function stepBackupV2Controller(
   const live = await deps.gate.read();
   if (job.phase === "REQUESTED" || job.phase === "VERIFY_REQUESTED") {
     if (live !== null) same(validateBackupV2Gate(live), gate);
-    else await deps.gate.replace(null, gate);
+    else {
+      // An Oracle invocation could have acquired the controller lock
+      // after a crash or between the worker and verifier gates.
+      await deps.admit(state.legacy);
+      await deps.gate.replace(null, gate);
+    }
     await deps.install(job.settings);
     if (kind === "verify") await deps.verifierInput(job);
     job.phase = kind === "worker" ? "WORKER" : "VERIFY";
@@ -1339,10 +1345,15 @@ export function realBackupV2ControllerCapabilities(
       });
     },
     async admit(legacy) {
-      assertBackblazeLaunchAllowed(
-        await deps.private.read(".private/backup-runtime.json"),
-        await deps.private.read(".private/backup-scheduled-window.json"),
+      const oracleState = await deps.private.read(
+        ".private/backup-runtime.json",
       );
+      const claim = await backblazeScheduledClaim(
+        deps,
+        oracleState,
+        deps.now(),
+      );
+      assertBackblazeLaunchAllowed(oracleState, claim);
       if (legacy.job && !["COMPLETE", "FAILED"].includes(legacy.job.phase)) {
         fail();
       }
@@ -1897,6 +1908,7 @@ export async function runBackupV2RetentionCycle(
   }
   if (control.phase === "REQUESTED") {
     if (await caps.gate.read() !== null) fail();
+    await caps.admit(state.legacy);
     const before = await caps.observe(control.gate);
     if (
       before.unit !== "ABSENT" ||

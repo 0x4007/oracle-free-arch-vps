@@ -29,6 +29,7 @@ import { createHash } from "node:crypto";
 import {
   assertBackblazeLaunchAllowed,
   type BackupControllerGate,
+  GATE_BACKUP_CGROUP_ROOT,
   GATE_BACKUP_SLICE,
   GATE_DEADLINE_HOURS,
   GATE_DEADLINE_MS,
@@ -3810,6 +3811,12 @@ export interface PiDeps {
   gate: GateSeam;
   logger: (message: string) => void;
   sleep: (ms: number) => Promise<void>;
+  reconcileScheduledClaim?: (
+    oracleState: unknown,
+    claim: unknown,
+    now: Date,
+    proveSourceIdle: () => Promise<void>,
+  ) => Promise<unknown>;
 }
 
 export function realPiDeps(): PiDeps {
@@ -3824,7 +3831,64 @@ export function realPiDeps(): PiDeps {
     gate: realGateSeam(),
     logger: (message) => console.log(message),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    reconcileScheduledClaim: async (...args) =>
+      await (await import("./backup-scheduled.ts"))
+        .readScheduledClaimForBackblaze(...args),
   };
+}
+
+/** Called inside the shared Pi lock after the runtime gate has been proved
+ * absent. Check the source lock and systemd independently before the Pi
+ * archives and releases an abandoned Oracle scheduler claim. */
+export async function backblazeScheduledClaim(
+  deps: PiDeps,
+  oracleState: unknown,
+  now: Date,
+): Promise<unknown> {
+  const claim = await deps.private.read<unknown>(MANIFEST_PATH);
+  if (
+    !deps.reconcileScheduledClaim ||
+    (claim as { status?: unknown } | undefined)?.status !== "started"
+  ) return claim;
+  return await deps.reconcileScheduledClaim(
+    oracleState,
+    claim,
+    now,
+    () => proveBackblazeSourceIdle(deps.remote),
+  );
+}
+
+export async function proveBackblazeSourceIdle(
+  remote: Pick<RemoteSeam, "root">,
+): Promise<void> {
+  const result = await remote.root([
+    "set -euo pipefail",
+    `test -f ${shellQuote(SOURCE_LOCK_PATH)}`,
+    `test ! -L ${shellQuote(SOURCE_LOCK_PATH)}`,
+    `exec 9<${shellQuote(SOURCE_LOCK_PATH)}`,
+    "flock -n 9",
+    "units=$(systemctl list-units --type=service --no-legend --plain --no-pager --state=running,activating,deactivating,reloading 'arch-vps-b2-*.service')",
+    'test -z "$units"',
+    "jobs=$(systemctl list-jobs --no-legend --plain --no-pager)",
+    'case "$jobs" in *arch-vps-b2-*) exit 1 ;; esac',
+    "test -r /sys/fs/cgroup/cgroup.events",
+    `for events in /sys/fs/cgroup${GATE_BACKUP_CGROUP_ROOT}/cgroup.events /sys/fs/cgroup/system.slice/arch-vps-b2-*.service/cgroup.events; do`,
+    '  if test -e "$events"; then grep -qx "populated 0" "$events"; fi',
+    "done",
+    "processes=$(ps -eo pid=,comm=,args=)",
+    "printf '%s\\n' \"$processes\" | awk '",
+    "  $1 == 1 { init = 1 }",
+    '  $2 == "zstd" && $0 ~ / -3 -T1 --check -c( |$)/ { escaped = 1 }',
+    '  $2 == "tar" && $0 ~ / (-C |--directory=)\\/( |$)/ { escaped = 1 }',
+    "  $2 ~ /^(deno|bash|sh|tar|zstd|gpg|unshare)$/ &&",
+    "    ($0 ~ /\\/var\\/tmp\\/arch-vps-file-(backup|recovery|verification)[-\\/ ]/ ||",
+    "     $0 ~ / (entry-(worker|verify)\\.ts|backup-v2-(worker|bridge-runtime)\\.ts)( |$)/) { escaped = 1 }",
+    "  END { exit !init || escaped }'",
+    "echo SOURCE_IDLE",
+  ].join("\n"));
+  if (result.code !== 0 || result.stdout.trim() !== "SOURCE_IDLE") {
+    throw new Error("Remote backup custody is unproved");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -4195,6 +4259,8 @@ async function orphanJob(
   return await failJob(deps, state, `ORPHANED_${reason}`);
 }
 
+class BackblazeLaunchDeferred extends Error {}
+
 /** One monotonic controller step; every mutation is a durable write and the
  * gate/lock identity is re-checked before any remote launch or clear. */
 export async function stepBackupController(
@@ -4205,15 +4271,27 @@ export async function stepBackupController(
   const state = validateControllerState(stateInput ?? emptyControllerState());
   const window = weekWindow(now);
   const inWindow = withinCatchUp(now);
+  const assertScheduledAdmission = async () => {
+    const oracleState = await deps.private.read<unknown>(
+      ".private/backup-runtime.json",
+    );
+    const claim = await backblazeScheduledClaim(deps, oracleState, now);
+    assertBackblazeLaunchAllowed(oracleState, claim);
+  };
+  const assertResumedAdmission = async () => {
+    try {
+      await assertScheduledAdmission();
+    } catch (error) {
+      throw new BackblazeLaunchDeferred(
+        error instanceof Error ? error.message : "Scheduled admission failed",
+      );
+    }
+  };
   const requestNewJob = async (
     base: ControllerState,
     currentWindow: WeekWindow,
   ): Promise<ControllerState> => {
-    const oracleState = await deps.private.read<unknown>(
-      ".private/backup-runtime.json",
-    );
-    const scheduledClaim = await deps.private.read<unknown>(MANIFEST_PATH);
-    assertBackblazeLaunchAllowed(oracleState, scheduledClaim);
+    await assertScheduledAdmission();
     const deployment = await loadDeployment(deps);
     const config = await loadSourceConfig(deps);
     const uuid = crypto.randomUUID();
@@ -4321,6 +4399,9 @@ export async function stepBackupController(
           "SOURCE_UNREACHABLE_AT_DEADLINE",
         );
       }
+      // A crash before writing the source gate releases the controller lock.
+      // Check the current Oracle journal again before entering the source.
+      if (await deps.gate.read() === null) await assertResumedAdmission();
       // Reclaim stale generation scratch BEFORE the worker computes its
       // staging-space requirement: a failed or interrupted cycle otherwise
       // leaks its working copies forever, and those bytes sit on the exact
@@ -4637,6 +4718,7 @@ export async function stepBackupController(
           throw new Error("Verifier gate identity does not match the job");
         }
       } else {
+        await assertResumedAdmission();
         await deps.gate.create(derived);
       }
       const publicHome = `${PUBLIC_HOME_BASE}/${generation}`;
@@ -5823,6 +5905,10 @@ export async function runBackblazeCycle(
         next = await stepBackupController(state, deps, deps.now());
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof BackblazeLaunchDeferred) {
+          completedReport = skip(`B2_SKIPPED:${message}`, message);
+          break;
+        }
         // Reread the durable state after any step failure: progress the
         // failing step already persisted (launch phase, gate binding,
         // catalog acceptance, prune plan evidence) must never be replaced

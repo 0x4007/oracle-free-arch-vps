@@ -483,6 +483,29 @@ Deno.test("bounded controller preserves FAILED v1 and snapshots predecessor befo
     validateBackupV2ControllerState({ ...state, unexpected: true })
   );
 });
+Deno.test("a queued v2 request rechecks Oracle admission before it can fence and launch", async () => {
+  const f = fixture();
+  const pending = await stepBackupV2Controller(legacy(), f.deps);
+  equal(pending.job!.phase, "REQUESTED");
+  const admit = f.deps.admit;
+  f.deps.admit = async () => {
+    throw new Error("An Oracle capture now owns the pending journal");
+  };
+  await rejects(() => stepBackupV2Controller(pending, f.deps));
+  assert(f.live === null);
+  equal(f.calls, ["admit", "archive"]);
+  f.deps.admit = admit;
+  const launched = await stepBackupV2Controller(pending, f.deps);
+  equal(launched.job!.phase, "WORKER");
+  equal(f.calls, [
+    "admit",
+    "archive",
+    "admit",
+    "gate",
+    "install",
+    "launch:worker",
+  ]);
+});
 Deno.test("controller binds external invocation and recovers crash after gate binding before state write", async () => {
   const f = fixture();
   let state = await stepBackupV2Controller(legacy(), f.deps);

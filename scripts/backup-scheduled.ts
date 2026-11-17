@@ -1,4 +1,10 @@
-import { main } from "./backup-runtime.ts";
+import {
+  main,
+  type RuntimeConfig,
+  type RuntimeState,
+} from "./backup-runtime.ts";
+import { assertBackblazeLaunchAllowed } from "./backblaze-controller-contract.ts";
+import { backupControllerEvidence } from "./backup-controller-evidence.ts";
 import {
   type BackupSchedule,
   currentWindow,
@@ -11,7 +17,22 @@ import {
   ONLINE_RETRY_POLICY,
   type OnlineBackupRetry,
 } from "./online-backup-contract.ts";
+import {
+  type BackupInventory,
+  readBackupInventory,
+} from "./oci-backup-inventory.ts";
 import { readPrivateJson, redactOcid, writePrivateJson } from "./oci.ts";
+import {
+  CLAIM_INCIDENT_AGE_MS,
+  CLAIM_PATH,
+  currentClaimOwner,
+  CYCLE_SUFFIX,
+  LEGACY_CLAIM_MIN_AGE_MS,
+  ScheduledClaimCustodyError,
+  type ScheduledClaimOwner,
+  scheduledClaimOwnerState,
+  validateClaimOwner,
+} from "./scheduled-claim-custody.ts";
 
 export type ScheduledClaimStatus =
   | "started"
@@ -60,6 +81,15 @@ export interface WindowClaim {
   approvedSchedule?: ApprovedSchedule;
   /** Set only on a terminal reconciliation-required claim. */
   reconciliation?: ScheduledClaimReconciliation;
+  /** Bound to one controller attempt. Older live claims omit this record. */
+  owner?: ScheduledClaimOwner;
+  failure?: {
+    reason:
+      | "CONTROLLER_EXITED"
+      | "LEGACY_CONTROLLER_EXITED"
+      | "PREPARATION_FAILED";
+    observedAtUtc: string;
+  };
 }
 
 export interface ScheduledCycleState {
@@ -89,8 +119,6 @@ export type ScheduledDecision =
     reconciliationClaim?: WindowClaim;
   }
   | { action: "run"; claim: WindowClaim };
-
-const CLAIM = ".private/backup-scheduled-window.json";
 
 class Skipped extends Error {}
 
@@ -263,6 +291,7 @@ function validateClaim(claim: WindowClaim): void {
   if (claim.approvedSchedule !== undefined) {
     validateApprovedSchedule(claim.approvedSchedule);
   }
+  if (claim.owner !== undefined) validateClaimOwner(claim.owner);
   if (claim.status === "reconciliation-required") {
     const reconciliation = claim.reconciliation;
     if (
@@ -354,8 +383,9 @@ function claimFor(
   existing: WindowClaim | undefined,
   schedule: BackupSchedule,
 ): WindowClaim {
+  const { owner: _owner, failure: _failure, ...prior } = existing ?? {};
   return {
-    ...(existing ?? {}),
+    ...prior,
     windowId: existing?.windowId ?? triggerId,
     periodId: existing?.periodId ?? due,
     previousCycleSuffix: state?.cycle?.phase === "complete"
@@ -475,40 +505,399 @@ export function planScheduledClaim(
   };
 }
 
-async function readClaim(): Promise<WindowClaim | undefined> {
+async function readOptional<T>(path: string): Promise<T | undefined> {
   try {
-    const claim = await readPrivateJson<WindowClaim>(CLAIM);
-    validateClaim(claim);
-    return claim;
+    return await readPrivateJson<T>(path);
   } catch (error) {
     if (error instanceof Deno.errors.NotFound) return undefined;
     throw error;
   }
 }
 
-export async function runScheduledBackup(): Promise<void> {
-  let claim: WindowClaim | undefined;
+interface ClaimRecovery {
+  /** The exact known remote operation, if one was already committed. */
+  knownGroupId?: string;
+  knownGroupSuffix?: string;
+  expectedGroupSuffix?: string;
+  inventorySince: number;
+  status: "failed" | "complete";
+}
+
+function recoveryFor(
+  claim: WindowClaim,
+  state: RuntimeState | undefined,
+  updated: number,
+  now: number,
+): ClaimRecovery | undefined {
+  const cycle = state?.cycle;
+  if (!cycle) {
+    return claim.owner?.journalSuffix === null &&
+        claim.previousCycleSuffix === undefined
+      ? { status: "failed", inventorySince: updated }
+      : undefined;
+  }
+  const createdAt = parseTimestamp(cycle.createdAtUtc);
+  const updatedAt = parseTimestamp(cycle.updatedAtUtc);
+  if (
+    cycle.mode !== "online" || !CYCLE_SUFFIX.test(cycle.suffix) ||
+    createdAt === undefined || updatedAt === undefined ||
+    createdAt > updatedAt ||
+    updatedAt > now ||
+    (cycle.volumeGroupBackupIntent !== undefined &&
+      typeof cycle.volumeGroupBackupIntent !== "boolean") ||
+    (cycle.volumeGroupBackupId !== undefined &&
+      (typeof cycle.volumeGroupBackupId !== "string" ||
+        cycle.volumeGroupBackupId === ""))
+  ) return undefined;
+  if (
+    cycle.phase === "complete" && cycle.suffix === claim.previousCycleSuffix
+  ) {
+    if (
+      updatedAt > updated ||
+      (claim.owner !== undefined && claim.owner.journalSuffix !== cycle.suffix)
+    ) return undefined;
+    return {
+      status: "failed",
+      inventorySince: updatedAt,
+      knownGroupId: cycle.captureIdentity?.volumeGroupBackupId ??
+        cycle.volumeGroupBackupId,
+      knownGroupSuffix: cycle.suffix,
+    };
+  }
+  // Only a new-format claim can bind a crash within a new or resumed
+  // journal. Legacy migration is confined to the unchanged predecessor.
+  const owner = claim.owner;
+  const ownsJournal = owner
+    ? owner.journalSuffix === cycle.suffix ||
+      (createdAt >= Date.parse(owner.startedAtUtc) &&
+        (owner.journalSuffix === null || owner.journalSuffix ===
+                claim.previousCycleSuffix &&
+            cycle.previousPair.suffix === claim.previousCycleSuffix))
+    : cycle.phase === "complete" && createdAt >= updated &&
+      cycle.previousPair.suffix === claim.previousCycleSuffix;
+  if (!ownsJournal) return undefined;
+  if (cycle.phase === "complete") {
+    return {
+      status: "complete",
+      inventorySince: createdAt,
+      knownGroupId: cycle.captureIdentity?.volumeGroupBackupId ??
+        cycle.volumeGroupBackupId,
+      knownGroupSuffix: cycle.suffix,
+    };
+  }
+  if (
+    !owner ||
+    ![
+      "planned",
+      "backing-up",
+      "pair-available",
+      "source-accepted",
+      "retiring",
+      "failed",
+    ].includes(cycle.phase)
+  ) return undefined;
+  return {
+    status: "failed",
+    inventorySince: Math.min(createdAt, Date.parse(owner.startedAtUtc)),
+    knownGroupId: cycle.volumeGroupBackupId,
+    knownGroupSuffix: cycle.suffix,
+    ...(captureStarted(state) ? { expectedGroupSuffix: cycle.suffix } : {}),
+  };
+}
+
+type ClaimStore = {
+  read(path: string): Promise<unknown>;
+  write(path: string, value: WindowClaim): Promise<void>;
+};
+
+interface ClaimRecoveryDeps extends ClaimStore {
+  ownerState: typeof scheduledClaimOwnerState;
+  proveIdle(recovery: ClaimRecovery): Promise<void>;
+}
+
+const claimStore: ClaimStore = {
+  read: readOptional,
+  write: writePrivateJson,
+};
+
+async function archiveClaim(
+  claim: WindowClaim,
+  store: ClaimStore,
+): Promise<void> {
+  const original = JSON.stringify(claim);
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(original),
+  );
+  const path = `.private/cycles/scheduled-claim-${
+    Array.from(new Uint8Array(digest), (byte) =>
+      byte.toString(16).padStart(2, "0")).join("")
+  }.abandoned.json`;
+  const prior = await store.read(path);
+  if (prior === undefined) await store.write(path, claim);
+  else if (JSON.stringify(prior) !== original) {
+    throw new ScheduledClaimCustodyError("SCHEDULED_CLAIM_CUSTODY_UNDECIDABLE");
+  }
+}
+
+/** Called only while the shared controller flock is held. Claim recovery is
+ * a durable transition after proof. The runtime journal and remote artifacts
+ * stay available to their existing exact-operation reconciliation. */
+export async function recoverScheduledClaim(
+  claim: WindowClaim | undefined,
+  state: RuntimeState | undefined,
+  schedule: BackupSchedule,
+  now: Date,
+  deps: ClaimRecoveryDeps,
+): Promise<WindowClaim | undefined> {
+  if (claim === undefined) return undefined;
+  validateClaim(claim);
+  if (claim.status !== "started") return claim;
+  const updated = Date.parse(claim.updatedAtUtc);
+  const nowMs = now.getTime();
+  const oldPeriod = (ageMs: number) =>
+    claim.periodId !== undefined && claim.windowId === claim.periodId &&
+    claim.periodId === periodAt(schedule, new Date(updated)) &&
+    claim.periodId <= periodAt(schedule, new Date(nowMs - ageMs));
+  validateSchedule(schedule, now);
+  if (
+    updated > nowMs ||
+    (claim.owner !== undefined &&
+      claim.owner.startedAtUtc !== claim.updatedAtUtc)
+  ) throw new ScheduledClaimCustodyError("SCHEDULED_CLAIM_CUSTODY_UNDECIDABLE");
+  const overdue = claim.owner === undefined
+    ? oldPeriod(CLAIM_INCIDENT_AGE_MS) ||
+      nowMs - updated >= CLAIM_INCIDENT_AGE_MS
+    : nowMs - updated >= CLAIM_INCIDENT_AGE_MS;
+  const undecidable = () =>
+    new ScheduledClaimCustodyError(
+      overdue
+        ? "SCHEDULED_CLAIM_CUSTODY_OVERDUE"
+        : "SCHEDULED_CLAIM_CUSTODY_UNDECIDABLE",
+    );
+  if (
+    !claim.approvedSchedule ||
+    !sameApprovedSchedule(claim.approvedSchedule, approvedScheduleOf(schedule))
+  ) throw undecidable();
+  if (claim.owner !== undefined) {
+    let ownerState;
+    try {
+      ownerState = await deps.ownerState(claim.owner);
+    } catch {
+      throw undecidable();
+    }
+    if (ownerState === "live") {
+      throw new ScheduledClaimCustodyError("SCHEDULED_CLAIM_OWNER_LIVE");
+    }
+    if (ownerState !== "dead") throw undecidable();
+  } else if (!oldPeriod(LEGACY_CLAIM_MIN_AGE_MS)) {
+    throw undecidable();
+  }
   try {
-    await main(async (state) => {
+    const recovery = recoveryFor(claim, state, updated, nowMs);
+    if (!recovery) throw undecidable();
+    await deps.proveIdle(recovery);
+    await archiveClaim(claim, deps);
+    const recovered: WindowClaim = {
+      ...claim,
+      status: recovery.status,
+      updatedAtUtc: now.toISOString(),
+      ...(recovery.status === "failed"
+        ? {
+          failure: {
+            reason: claim.owner
+              ? "CONTROLLER_EXITED"
+              : "LEGACY_CONTROLLER_EXITED",
+            observedAtUtc: now.toISOString(),
+          },
+        }
+        : {}),
+    };
+    await deps.write(CLAIM_PATH, recovered);
+    return recovered;
+  } catch {
+    throw undecidable();
+  }
+}
+
+export function assertClaimInventorySettled(
+  inventory: Pick<
+    BackupInventory,
+    | "observedAtUtc"
+    | "instance"
+    | "sourceAttachmentsProved"
+    | "sourceVolumeGroupProved"
+    | "sourceVolumeGroup"
+    | "volumeGroupBackups"
+  >,
+  config: Pick<RuntimeConfig, "policy" | "source">,
+  recovery: ClaimRecovery,
+): void {
+  const groupId = config.policy.volumeGroupId;
+  const observedAt = Date.parse(inventory.observedAtUtc);
+  if (
+    !groupId || inventory.instance["lifecycle-state"] !== "RUNNING" ||
+    !inventory.sourceAttachmentsProved || !inventory.sourceVolumeGroupProved ||
+    inventory.sourceVolumeGroup?.id !== groupId || !Number.isFinite(observedAt)
+  ) throw new Error("Claim source custody is unproved");
+  let expected = 0;
+  let known = 0;
+  for (const group of inventory.volumeGroupBackups) {
+    const id = group.id;
+    const groupSource = group["volume-group-id"];
+    const displayName = group["display-name"];
+    const isExpected = recovery.expectedGroupSuffix !== undefined &&
+      displayName === `arch-online-golden-${recovery.expectedGroupSuffix}`;
+    if (
+      groupSource !== groupId && !isExpected && id !== recovery.knownGroupId
+    ) {
+      if (typeof groupSource === "string" && groupSource !== "") continue;
+      throw new Error("Group custody is unproved");
+    }
+    const created = Date.parse(String(group["time-created"] ?? ""));
+    if (
+      typeof id !== "string" || id === "" || groupSource !== groupId ||
+      group["compartment-id"] !== config.source.compartmentId ||
+      group["lifecycle-state"] !== "AVAILABLE" ||
+      !Number.isFinite(created) || created > observedAt
+    ) throw new Error("Group operation has not settled");
+    if (id === recovery.knownGroupId) {
+      if (
+        group.type !== "FULL" ||
+        displayName !== `arch-online-golden-${recovery.knownGroupSuffix}`
+      ) throw new Error("Previously known group differs");
+      known++;
+    }
+    if (isExpected) {
+      if (
+        group.type !== "FULL" || created < recovery.inventorySince ||
+        (recovery.knownGroupId !== undefined && id !== recovery.knownGroupId)
+      ) throw new Error("Recorded group operation differs");
+      expected++;
+    } else if (
+      created >= recovery.inventorySince && id !== recovery.knownGroupId
+    ) {
+      throw new Error("Unexpected group operation after the prior checkpoint");
+    }
+  }
+  if (recovery.knownGroupId !== undefined && known !== 1) {
+    throw new Error("Previously known group is missing or ambiguous");
+  }
+  if (recovery.expectedGroupSuffix !== undefined && expected !== 1) {
+    throw new Error("Recorded group creation is ambiguous");
+  }
+}
+
+function realClaimRecovery(
+  config: RuntimeConfig,
+  state: RuntimeState | undefined,
+  proveSourceIdle = async () => {
+    const source = await import("./backblaze-file-backup.ts");
+    await source.proveBackblazeSourceIdle(
+      source.realRemoteSeam(source.realRemoteRunner),
+    );
+  },
+): ClaimRecoveryDeps {
+  return {
+    ...claimStore,
+    ownerState: scheduledClaimOwnerState,
+    async proveIdle(recovery) {
+      if (
+        config.action !== "cycle" ||
+        JSON.stringify(config.source) !==
+          JSON.stringify(config.policy.source) ||
+        config.volumeGroupId !== config.policy.volumeGroupId ||
+        (state && (JSON.stringify(state.policy.source) !==
+            JSON.stringify(config.source) ||
+          state.policy.volumeGroupId !== config.policy.volumeGroupId ||
+          JSON.stringify(state.policy.standingApproval) !==
+            JSON.stringify(config.policy.standingApproval)))
+      ) throw new Error("Claim source or standing approval differs");
+      if (state?.cycle.phase === "complete") {
+        assertBackblazeLaunchAllowed(state, undefined);
+      }
+      const evidence = backupControllerEvidence(config);
+      await evidence.assertNoOtherController();
+      assertClaimInventorySettled(
+        await readBackupInventory(config),
+        config,
+        recovery,
+      );
+      await proveSourceIdle();
+      await evidence.assertNoOtherController();
+    },
+  };
+}
+
+/** Fresh Backblaze admission only. The existing gate and Oracle validators
+ * still run. A recovery must not bypass the completed-Oracle-source rule. */
+export async function readScheduledClaimForBackblaze(
+  state: unknown,
+  claim: unknown,
+  now: Date,
+  proveSourceIdle: () => Promise<void>,
+): Promise<unknown> {
+  if (
+    !claim || typeof claim !== "object" ||
+    (claim as { status?: unknown }).status !== "started"
+  ) return claim;
+  const runtime = state as RuntimeState;
+  const config = await readPrivateJson<RuntimeConfig>(
+    ".private/backup-controller.json",
+  );
+  const schedule = await readPrivateJson<BackupSchedule>(
+    ".private/backup-schedule.json",
+  );
+  const deps = realClaimRecovery(config, runtime, proveSourceIdle);
+  return await recoverScheduledClaim(
+    claim as WindowClaim,
+    runtime,
+    schedule,
+    now,
+    {
+      ...deps,
+      proveIdle: (recovery) => {
+        assertBackblazeLaunchAllowed(state, undefined);
+        return deps.proveIdle(recovery);
+      },
+    },
+  );
+}
+
+export async function runScheduledBackup(): Promise<void> {
+  try {
+    await main(async (state, config) => {
       // The shared lock serializes capture; normal source activity stays online.
       const now = new Date();
       const schedule = await readPrivateJson<BackupSchedule>(
         ".private/backup-schedule.json",
       );
-      const existing = await readClaim();
-      const runtime = state as unknown as ScheduledRuntimeState | undefined;
-      const decision = planScheduledClaim(schedule, now, runtime, existing);
+      const existing = await readOptional<WindowClaim>(CLAIM_PATH);
+      // Preserve the existing operator path for expired one-time approvals.
+      // That path retains the claim and never releases it for Backblaze.
+      const expiredLegacy = existing?.owner === undefined &&
+        existing?.status === "started" &&
+        expiredReconciliationClaim(schedule, now, state, existing) !==
+          undefined;
+      const reconciled = expiredLegacy ? existing : await recoverScheduledClaim(
+        existing,
+        state,
+        schedule,
+        now,
+        realClaimRecovery(config, state),
+      );
+      const decision = planScheduledClaim(schedule, now, state, reconciled);
       if (decision.action === "skip") {
         // Repair a crash between durable runtime completion and afterCycle
         // before releasing the shared lock or allowing the B2 launch gate.
         if (decision.completedClaim) {
-          await writePrivateJson(CLAIM, decision.completedClaim);
+          await writePrivateJson(CLAIM_PATH, decision.completedClaim);
         }
         // Persist the terminal claim before failing: a later invocation must
         // keep skipping with its distinct reason until the operator reconciles
         // both this stale claim and the matching failed runtime journal.
         if (decision.reconciliationClaim) {
-          await writePrivateJson(CLAIM, decision.reconciliationClaim);
+          await writePrivateJson(CLAIM_PATH, decision.reconciliationClaim);
         }
         if (
           [
@@ -520,11 +909,29 @@ export async function runScheduledBackup(): Promise<void> {
         ) throw new Error(decision.reason);
         throw new Skipped(decision.reason);
       }
-      claim = decision.claim;
-      await writePrivateJson(CLAIM, claim);
+      const claim: WindowClaim = {
+        ...decision.claim,
+        owner: await currentClaimOwner(
+          decision.claim.updatedAtUtc,
+          state?.cycle.suffix ?? null,
+        ),
+      };
+      await writePrivateJson(CLAIM_PATH, claim);
       return {
+        afterPreparationFailure: async () => {
+          const observedAtUtc = new Date().toISOString();
+          await writePrivateJson(
+            CLAIM_PATH,
+            {
+              ...claim,
+              status: "failed",
+              updatedAtUtc: observedAtUtc,
+              failure: { reason: "PREPARATION_FAILED", observedAtUtc },
+            } satisfies WindowClaim,
+          );
+        },
         afterCycle: async (cycle) => {
-          await writePrivateJson(CLAIM, {
+          await writePrivateJson(CLAIM_PATH, {
             ...claim,
             status: cycle.phase === "complete" ? "complete" : "failed",
             updatedAtUtc: new Date().toISOString(),
@@ -540,7 +947,7 @@ export async function runScheduledBackup(): Promise<void> {
           // acceptance window cannot authorize a stale capture. Weekly claims
           // stay due after the grace period; only the bounded acceptance
           // trigger must also still be active when OCI creation starts.
-          assertCaptureStillAuthorized(latest, claim!, new Date());
+          assertCaptureStillAuthorized(latest, claim, new Date());
         },
       };
     }, { skipWhenOracleMutationBlocked: true });
@@ -549,8 +956,6 @@ export async function runScheduledBackup(): Promise<void> {
       console.log(error.message);
       return;
     }
-    // Before the runtime starts a journal, leave the durable claim started.
-    // Once it starts, afterCycle owns finalization under the shared lock.
     throw error;
   }
 }
