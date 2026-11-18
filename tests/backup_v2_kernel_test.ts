@@ -111,12 +111,13 @@ function stat(pid: number, start = "456") {
   fields[19] = start;
   return `${pid} (native metadata) ${fields.join(" ")}\n`;
 }
-function fixture() {
+function fixture(expectedGate = gate) {
+  const expectedCgroup = expectedGate.custody!.cgroup;
   const state = {
     boot: ID,
     main: 123,
     control: 0,
-    invocation: gate.custody!.invocationId,
+    invocation: expectedGate.custody!.invocationId,
     start: "456",
     active: "active",
     sub: "running",
@@ -133,7 +134,7 @@ function fixture() {
     if (command === "/usr/bin/systemctl") {
       return Promise.resolve(
         ok(
-          `LoadState=${state.load}\nActiveState=${state.active}\nSubState=${state.sub}\nResult=${state.result}\nMainPID=${state.main}\nControlPID=${state.control}\nInvocationID=${state.invocation}\nControlGroup=${cgroup}\n`,
+          `LoadState=${state.load}\nActiveState=${state.active}\nSubState=${state.sub}\nResult=${state.result}\nMainPID=${state.main}\nControlPID=${state.control}\nInvocationID=${state.invocation}\nControlGroup=${expectedCgroup}\n`,
         ),
       );
     }
@@ -146,7 +147,7 @@ function fixture() {
         return Promise.resolve(ok(stat(123, state.start)));
       }
       if (path === "/proc/123/cgroup") {
-        return Promise.resolve(ok(`0::${cgroup}\n`));
+        return Promise.resolve(ok(`0::${expectedCgroup}\n`));
       }
       if (path.endsWith("/cgroup.procs")) {
         return Promise.resolve(
@@ -298,17 +299,33 @@ Deno.test("kernel absent unit alone has no identity or empty-tree proof", async 
 });
 
 Deno.test("kernel absent original cgroup proves empty only with exact retained successful exit", async () => {
-  const f = fixture();
-  f.state.main = 0;
-  f.state.sub = "exited";
-  f.state.absent = true;
-  const observed = await observeBackupV2Kernel(gate, f.run);
-  equal(observed.identity, gate.custody);
-  equal(observed.tree?.descendants, 0);
-  equal(observed.tree?.cgroupPopulated, false);
-  equal(observed.tree?.namespaceReferences, null);
-  f.state.result = "timeout";
-  equal((await observeBackupV2Kernel(gate, f.run)).tree?.descendants, null);
+  const pruneUnit = unitName.replace("-worker-", "-prune-");
+  const prune = {
+    ...gate,
+    kind: "prune" as const,
+    unitName: pruneUnit,
+    custody: {
+      ...gate.custody!,
+      unitName: pruneUnit,
+      cgroup: `${GATE_BACKUP_CGROUP_ROOT}/${pruneUnit}`,
+    },
+  };
+  for (const expected of [gate, prune]) {
+    const f = fixture(expected);
+    f.state.main = 0;
+    f.state.sub = "exited";
+    f.state.absent = true;
+    const observed = await observeBackupV2Kernel(expected, f.run);
+    equal(observed.identity, expected.custody);
+    equal(observed.tree?.descendants, 0);
+    equal(observed.tree?.cgroupPopulated, false);
+    equal(observed.tree?.namespaceReferences, null);
+    f.state.result = "timeout";
+    equal(
+      (await observeBackupV2Kernel(expected, f.run)).tree?.descendants,
+      null,
+    );
+  }
 });
 
 Deno.test("kernel unreadable cgroup and sparse populated counter retain unknown facts", async () => {

@@ -2056,18 +2056,15 @@ export async function runBackupV2RemoteWorker(
         completedResult,
         true,
       );
-      const partial = "state" in result && result.state === "PARTIAL";
+      // A durable prune result can describe a blocked or partial transaction
+      // after the source process has finished and settled its native custody.
+      // Report the terminal transport receipt and let the Pi classify effects.
       work.phase = kind === "worker"
         ? "CLOUD_COMPLETE"
         : kind === "verify"
         ? "ACCEPTED"
-        : partial
-        ? "FAILED"
         : "CLEANED";
-      const status = await writeStatus(
-        new Date().toISOString(),
-        partial ? null : resultSha256,
-      );
+      const status = await writeStatus(new Date().toISOString(), resultSha256);
       journal.close();
       await nativeCustody.close();
       runtimeLease.close();
