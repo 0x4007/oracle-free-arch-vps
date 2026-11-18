@@ -514,6 +514,47 @@ async function readOptional<T>(path: string): Promise<T | undefined> {
   }
 }
 
+type ClaimRecoveryCheck =
+  | "CLAIM_RECORD"
+  | "APPROVED_SCHEDULE"
+  | "CLAIM_TIME_BINDING"
+  | "OWNER_OBSERVATION"
+  | "OWNER_STILL_LIVE"
+  | "OWNER_CUSTODY_UNPROVED"
+  | "LEGACY_PERIOD_AGE"
+  | "RUNTIME_JOURNAL_MISSING"
+  | "RUNTIME_JOURNAL_INVALID"
+  | "RUNTIME_PREDECESSOR_MISMATCH"
+  | "RUNTIME_JOURNAL_IDENTITY"
+  | "RUNTIME_PHASE_CUSTODY"
+  | "REMOTE_IDLE_PROOF"
+  | "SOURCE_POLICY_IDENTITY"
+  | "OCI_PREDECESSOR_ACCEPTANCE"
+  | "OCI_CONTROLLER_IDLE_BEFORE"
+  | "OCI_INVENTORY_READ"
+  | "OCI_SOURCE_CUSTODY"
+  | "OCI_GROUP_CUSTODY"
+  | "OCI_GROUP_NOT_SETTLED"
+  | "OCI_PREDECESSOR_GROUP_MISMATCH"
+  | "OCI_EXPECTED_GROUP_MISMATCH"
+  | "OCI_UNEXPECTED_GROUP"
+  | "OCI_PREDECESSOR_GROUP_UNPROVED"
+  | "OCI_EXPECTED_GROUP_UNPROVED"
+  | "B2_SOURCE_IDLE"
+  | "OCI_CONTROLLER_IDLE_AFTER"
+  | "CLAIM_ARCHIVE"
+  | "CLAIM_SETTLEMENT_WRITE";
+
+class ClaimRecoveryCheckError extends Error {
+  constructor(readonly check: ClaimRecoveryCheck) {
+    super(check);
+  }
+}
+
+function logClaimCheckFailure(check: ClaimRecoveryCheck): void {
+  console.error("SCHEDULED_CLAIM_CHECK_FAILED", check);
+}
+
 interface ClaimRecovery {
   /** The exact known remote operation, if one was already committed. */
   knownGroupId?: string;
@@ -528,13 +569,13 @@ function recoveryFor(
   state: RuntimeState | undefined,
   updated: number,
   now: number,
-): ClaimRecovery | undefined {
+): ClaimRecovery | ClaimRecoveryCheck {
   const cycle = state?.cycle;
   if (!cycle) {
     return claim.owner?.journalSuffix === null &&
         claim.previousCycleSuffix === undefined
       ? { status: "failed", inventorySince: updated }
-      : undefined;
+      : "RUNTIME_JOURNAL_MISSING";
   }
   const createdAt = parseTimestamp(cycle.createdAtUtc);
   const updatedAt = parseTimestamp(cycle.updatedAtUtc);
@@ -548,14 +589,14 @@ function recoveryFor(
     (cycle.volumeGroupBackupId !== undefined &&
       (typeof cycle.volumeGroupBackupId !== "string" ||
         cycle.volumeGroupBackupId === ""))
-  ) return undefined;
+  ) return "RUNTIME_JOURNAL_INVALID";
   if (
     cycle.phase === "complete" && cycle.suffix === claim.previousCycleSuffix
   ) {
     if (
       updatedAt > updated ||
       (claim.owner !== undefined && claim.owner.journalSuffix !== cycle.suffix)
-    ) return undefined;
+    ) return "RUNTIME_PREDECESSOR_MISMATCH";
     return {
       status: "failed",
       inventorySince: updatedAt,
@@ -575,7 +616,7 @@ function recoveryFor(
             cycle.previousPair.suffix === claim.previousCycleSuffix))
     : cycle.phase === "complete" && createdAt >= updated &&
       cycle.previousPair.suffix === claim.previousCycleSuffix;
-  if (!ownsJournal) return undefined;
+  if (!ownsJournal) return "RUNTIME_JOURNAL_IDENTITY";
   if (cycle.phase === "complete") {
     return {
       status: "complete",
@@ -595,7 +636,7 @@ function recoveryFor(
       "retiring",
       "failed",
     ].includes(cycle.phase)
-  ) return undefined;
+  ) return "RUNTIME_PHASE_CUSTODY";
   return {
     status: "failed",
     inventorySince: Math.min(createdAt, Date.parse(owner.startedAtUtc)),
@@ -651,7 +692,12 @@ export async function recoverScheduledClaim(
   deps: ClaimRecoveryDeps,
 ): Promise<WindowClaim | undefined> {
   if (claim === undefined) return undefined;
-  validateClaim(claim);
+  try {
+    validateClaim(claim);
+  } catch (error) {
+    logClaimCheckFailure("CLAIM_RECORD");
+    throw error;
+  }
   if (claim.status !== "started") return claim;
   const updated = Date.parse(claim.updatedAtUtc);
   const nowMs = now.getTime();
@@ -659,44 +705,60 @@ export async function recoverScheduledClaim(
     claim.periodId !== undefined && claim.windowId === claim.periodId &&
     claim.periodId === periodAt(schedule, new Date(updated)) &&
     claim.periodId <= periodAt(schedule, new Date(nowMs - ageMs));
-  validateSchedule(schedule, now);
+  try {
+    validateSchedule(schedule, now);
+  } catch (error) {
+    logClaimCheckFailure("APPROVED_SCHEDULE");
+    throw error;
+  }
   if (
     updated > nowMs ||
     (claim.owner !== undefined &&
       claim.owner.startedAtUtc !== claim.updatedAtUtc)
-  ) throw new ScheduledClaimCustodyError("SCHEDULED_CLAIM_CUSTODY_UNDECIDABLE");
+  ) {
+    logClaimCheckFailure("CLAIM_TIME_BINDING");
+    throw new ScheduledClaimCustodyError("SCHEDULED_CLAIM_CUSTODY_UNDECIDABLE");
+  }
   const overdue = claim.owner === undefined
     ? oldPeriod(CLAIM_INCIDENT_AGE_MS) ||
       nowMs - updated >= CLAIM_INCIDENT_AGE_MS
     : nowMs - updated >= CLAIM_INCIDENT_AGE_MS;
-  const undecidable = () =>
-    new ScheduledClaimCustodyError(
+  const undecidable = (check: ClaimRecoveryCheck) => {
+    logClaimCheckFailure(check);
+    return new ScheduledClaimCustodyError(
       overdue
         ? "SCHEDULED_CLAIM_CUSTODY_OVERDUE"
         : "SCHEDULED_CLAIM_CUSTODY_UNDECIDABLE",
     );
+  };
   if (
     !claim.approvedSchedule ||
     !sameApprovedSchedule(claim.approvedSchedule, approvedScheduleOf(schedule))
-  ) throw undecidable();
+  ) throw undecidable("APPROVED_SCHEDULE");
   if (claim.owner !== undefined) {
     let ownerState;
     try {
       ownerState = await deps.ownerState(claim.owner);
     } catch {
-      throw undecidable();
+      throw undecidable("OWNER_OBSERVATION");
     }
     if (ownerState === "live") {
+      logClaimCheckFailure("OWNER_STILL_LIVE");
       throw new ScheduledClaimCustodyError("SCHEDULED_CLAIM_OWNER_LIVE");
     }
-    if (ownerState !== "dead") throw undecidable();
+    if (ownerState !== "dead") throw undecidable("OWNER_CUSTODY_UNPROVED");
   } else if (!oldPeriod(LEGACY_CLAIM_MIN_AGE_MS)) {
-    throw undecidable();
+    throw undecidable("LEGACY_PERIOD_AGE");
   }
+  let check: ClaimRecoveryCheck = "RUNTIME_JOURNAL_INVALID";
   try {
     const recovery = recoveryFor(claim, state, updated, nowMs);
-    if (!recovery) throw undecidable();
+    if (typeof recovery === "string") {
+      throw new ClaimRecoveryCheckError(recovery);
+    }
+    check = "REMOTE_IDLE_PROOF";
     await deps.proveIdle(recovery);
+    check = "CLAIM_ARCHIVE";
     await archiveClaim(claim, deps);
     const recovered: WindowClaim = {
       ...claim,
@@ -713,10 +775,13 @@ export async function recoverScheduledClaim(
         }
         : {}),
     };
+    check = "CLAIM_SETTLEMENT_WRITE";
     await deps.write(CLAIM_PATH, recovered);
     return recovered;
-  } catch {
-    throw undecidable();
+  } catch (error) {
+    throw undecidable(
+      error instanceof ClaimRecoveryCheckError ? error.check : check,
+    );
   }
 }
 
@@ -739,7 +804,7 @@ export function assertClaimInventorySettled(
     !groupId || inventory.instance["lifecycle-state"] !== "RUNNING" ||
     !inventory.sourceAttachmentsProved || !inventory.sourceVolumeGroupProved ||
     inventory.sourceVolumeGroup?.id !== groupId || !Number.isFinite(observedAt)
-  ) throw new Error("Claim source custody is unproved");
+  ) throw new ClaimRecoveryCheckError("OCI_SOURCE_CUSTODY");
   let expected = 0;
   let known = 0;
   for (const group of inventory.volumeGroupBackups) {
@@ -752,7 +817,7 @@ export function assertClaimInventorySettled(
       groupSource !== groupId && !isExpected && id !== recovery.knownGroupId
     ) {
       if (typeof groupSource === "string" && groupSource !== "") continue;
-      throw new Error("Group custody is unproved");
+      throw new ClaimRecoveryCheckError("OCI_GROUP_CUSTODY");
     }
     const created = Date.parse(String(group["time-created"] ?? ""));
     if (
@@ -760,31 +825,31 @@ export function assertClaimInventorySettled(
       group["compartment-id"] !== config.source.compartmentId ||
       group["lifecycle-state"] !== "AVAILABLE" ||
       !Number.isFinite(created) || created > observedAt
-    ) throw new Error("Group operation has not settled");
+    ) throw new ClaimRecoveryCheckError("OCI_GROUP_NOT_SETTLED");
     if (id === recovery.knownGroupId) {
       if (
         group.type !== "FULL" ||
         displayName !== `arch-online-golden-${recovery.knownGroupSuffix}`
-      ) throw new Error("Previously known group differs");
+      ) throw new ClaimRecoveryCheckError("OCI_PREDECESSOR_GROUP_MISMATCH");
       known++;
     }
     if (isExpected) {
       if (
         group.type !== "FULL" || created < recovery.inventorySince ||
         (recovery.knownGroupId !== undefined && id !== recovery.knownGroupId)
-      ) throw new Error("Recorded group operation differs");
+      ) throw new ClaimRecoveryCheckError("OCI_EXPECTED_GROUP_MISMATCH");
       expected++;
     } else if (
       created >= recovery.inventorySince && id !== recovery.knownGroupId
     ) {
-      throw new Error("Unexpected group operation after the prior checkpoint");
+      throw new ClaimRecoveryCheckError("OCI_UNEXPECTED_GROUP");
     }
   }
   if (recovery.knownGroupId !== undefined && known !== 1) {
-    throw new Error("Previously known group is missing or ambiguous");
+    throw new ClaimRecoveryCheckError("OCI_PREDECESSOR_GROUP_UNPROVED");
   }
   if (recovery.expectedGroupSuffix !== undefined && expected !== 1) {
-    throw new Error("Recorded group creation is ambiguous");
+    throw new ClaimRecoveryCheckError("OCI_EXPECTED_GROUP_UNPROVED");
   }
 }
 
@@ -802,29 +867,38 @@ function realClaimRecovery(
     ...claimStore,
     ownerState: scheduledClaimOwnerState,
     async proveIdle(recovery) {
-      if (
-        config.action !== "cycle" ||
-        JSON.stringify(config.source) !==
-          JSON.stringify(config.policy.source) ||
-        config.volumeGroupId !== config.policy.volumeGroupId ||
-        (state && (JSON.stringify(state.policy.source) !==
-            JSON.stringify(config.source) ||
-          state.policy.volumeGroupId !== config.policy.volumeGroupId ||
-          JSON.stringify(state.policy.standingApproval) !==
-            JSON.stringify(config.policy.standingApproval)))
-      ) throw new Error("Claim source or standing approval differs");
-      if (state?.cycle.phase === "complete") {
-        assertBackblazeLaunchAllowed(state, undefined);
+      let check: ClaimRecoveryCheck = "SOURCE_POLICY_IDENTITY";
+      try {
+        if (
+          config.action !== "cycle" ||
+          JSON.stringify(config.source) !==
+            JSON.stringify(config.policy.source) ||
+          config.volumeGroupId !== config.policy.volumeGroupId ||
+          (state && (JSON.stringify(state.policy.source) !==
+              JSON.stringify(config.source) ||
+            state.policy.volumeGroupId !== config.policy.volumeGroupId ||
+            JSON.stringify(state.policy.standingApproval) !==
+              JSON.stringify(config.policy.standingApproval)))
+        ) throw new Error("Claim source or standing approval differs");
+        check = "OCI_PREDECESSOR_ACCEPTANCE";
+        if (state?.cycle.phase === "complete") {
+          assertBackblazeLaunchAllowed(state, undefined);
+        }
+        check = "OCI_CONTROLLER_IDLE_BEFORE";
+        const evidence = backupControllerEvidence(config);
+        await evidence.assertNoOtherController();
+        check = "OCI_INVENTORY_READ";
+        const inventory = await readBackupInventory(config);
+        check = "OCI_SOURCE_CUSTODY";
+        assertClaimInventorySettled(inventory, config, recovery);
+        check = "B2_SOURCE_IDLE";
+        await proveSourceIdle();
+        check = "OCI_CONTROLLER_IDLE_AFTER";
+        await evidence.assertNoOtherController();
+      } catch (error) {
+        if (error instanceof ClaimRecoveryCheckError) throw error;
+        throw new ClaimRecoveryCheckError(check);
       }
-      const evidence = backupControllerEvidence(config);
-      await evidence.assertNoOtherController();
-      assertClaimInventorySettled(
-        await readBackupInventory(config),
-        config,
-        recovery,
-      );
-      await proveSourceIdle();
-      await evidence.assertNoOtherController();
     },
   };
 }
