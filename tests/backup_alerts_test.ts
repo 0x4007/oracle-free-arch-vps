@@ -331,6 +331,32 @@ Deno.test("scheduled entry points alert on thrown refusal and returned blocked r
     );
     assert(observations.at(-1)?.outcome === expected);
   }
+
+  await runScheduledBackblaze(
+    () =>
+      Promise.resolve({
+        status: "B2_BACKUP_CURRENT:job-fixture",
+        healthy: true,
+        observedAtUtc: at().toISOString(),
+        maintenance: {
+          retention: {
+            status: "B2_RETENTION_PLAN_BLOCKED",
+            healthy: false,
+            observedAtUtc: at().toISOString(),
+            reason: "SOURCE_STATUS_CANCELLATION_BLOCKED",
+            retentionTransactionId: "61d5c174-45ff-4d7d-baec-57d06da81e89",
+          },
+        },
+      }),
+    notify,
+  );
+  assert(observations.at(-2)?.stream === "backblaze-scheduled");
+  assert(observations.at(-2)?.outcome === "HEALTHY");
+  assert(observations.at(-1)?.stream === "backblaze-retention");
+  assert(observations.at(-1)?.outcome === "B2_RETENTION_BLOCKED");
+  assert(
+    observations.at(-1)?.reportReason === "SOURCE_STATUS_CANCELLATION_BLOCKED",
+  );
 });
 
 Deno.test("watchdog distinguishes normal progress from current acceptance", () => {

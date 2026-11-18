@@ -227,3 +227,10 @@ object is the only object.
 Do not upload plaintext as a fallback. Stop when the remote destination,
 recipient key, or isolated decrypt-test location is missing. Record the control
 as `missing` until the owner provides those inputs.
+
+
+## Backblaze maintenance blocks or reports damage
+
+From the deployed Pi controller directory, inspect `status`, `reason` and `message` in `.private/reports/backblaze-retention.json` or `.private/reports/backblaze-catalog-verification.json`. Check `.private/reports/backblaze-file-backup.json` for the accepted backup assessment and the watchdog's separate `maintenance` results. Use the current deployed controller and a current accepted capture to regenerate a health report previously overwritten by maintenance. Never print the credential-bearing controller state or provider response. [Backblaze retention rollout](BACKUP-REPAIR-RUNBOOK.md#backblaze-retention-rollout)
+
+A credential refusal calls for checking the installed credential, bucket identity and capability proof. A custody refusal calls for reconciling the exact bound gate or transaction before attempting again. An exact catalog damage report names the affected accepted generation. Preserve intact fallbacks and leave execution disabled while the damage is investigated. Follow the live catalog verification step before enabling deletion. [Catalog verification and retention policy](BACKUP-REPAIR-RUNBOOK.md#backblaze-retention-rollout)

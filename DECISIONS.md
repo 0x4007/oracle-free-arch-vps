@@ -2,6 +2,14 @@
 
 Recorded 2026-09-22 for the online Backblaze backup path in this repository. These are implementation decisions made under the owner-controlled [PROJECT-VISION.md](PROJECT-VISION.md) charter. They do not amend, replace, or claim the authority of that charter, which wins on any conflict, and they stay inside the resource-budget and request-transport scope described here.
 
+## Backblaze master credential and independent health reporting — 2026-11-18
+
+The owner directed use of the existing Backblaze account master key for both backup and retention. The controller proves the fixed bucket name and exact configured ID against Backblaze before using the unrestricted key. It constrains its writer to the backup namespace and limits provider operations to the proved bucket. Retention falls back to the writer credential when the explicit retention file is absent. An installed explicit file takes precedence and its validation must pass.
+
+The Pi installer reads the two existing master-key environment variables, validates the selected credential while custody is settled, updates the private writer config atomically and retains a guarded private rollback snapshot. New immutable VPS jobs receive the selected credential from the Pi. Historical jobs retain their existing settings.
+
+The scheduled controller and watchdog derive backup freshness from the accepted capture and report maintenance separately. A catalog check or plan writes its own report. Refusals carry fixed machine-readable reasons and one-line guidance. A newer maintenance error preserves earlier proof of catalog damage until a subsequent exact check establishes the affected generation's integrity. A proven damaged point does not count toward backup health or the retention target. [Credential and rollout procedure](BACKUP-REPAIR-RUNBOOK.md#backblaze-retention-rollout)
+
 ## Two accepted Backblaze generations and orphan cleanup — 2026-11-18
 
 The owner approved this on 2026-11-18. “can you update the backup controller to only keep the latest two weeks of backups? also ideally if it can clear orphaned uploads...self cleaning....because we have a lot of failed uploads costing me storage $$$”
@@ -10,7 +18,7 @@ Keep the newest two independently verified catalog generations by acceptance tim
 
 Grace defaults to 72 hours. One transaction may delete at most half of the bucket's measured version and unfinished-part bytes by default. Execution and cleanup of eligible legacy orphan layouts require separate opt-ins. The same fenced source transaction handles exact accepted retirement and orphan cleanup, while foreign, unsettled, unknown, and shared references stay protected. Before deletion the controller verifies the source plan byte-for-byte on the Pi, writes a private report and journals any proposed catalog retirement. It compares the original catalog during handoff. Only after source completion and retained integrity proof does the Pi publish the trimmed catalog. Reports distinguish this run’s deletions, already-absent orphan attempts and damaged generations. Plans, outcomes and source journals are private; alerts project only fixed reasons, aggregate counts/bytes and affected generation IDs.
 
-The provider key remains scoped separately for backup and whole-bucket retention metadata. Historical retention records cannot enable execution. Maintenance uses the current verified release, leaving pinned capture settings and existing backup schedules intact. The policy, safe rollout and key requirements are in the [retention runbook](BACKUP-REPAIR-RUNBOOK.md#backblaze-retention-rollout). The upload-size proposal changes no exclusions.
+Historical retention records cannot enable execution. Maintenance uses the current verified release, leaving pinned capture settings and existing backup schedules intact. The policy, safe rollout and key requirements are in the [retention runbook](BACKUP-REPAIR-RUNBOOK.md#backblaze-retention-rollout). The upload-size proposal changes no exclusions.
 
 ## Backblaze verifier terminal reconciliation — 2026-11-18
 

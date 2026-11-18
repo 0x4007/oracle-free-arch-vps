@@ -86,7 +86,10 @@ import {
   validateBackupV2ObjectRef,
   validateBackupV2PutIntent,
 } from "./backup-v2-contract.ts";
-import { type B2Settings, validateB2Settings } from "./backblaze-storage.ts";
+import {
+  type B2Settings,
+  selectB2RetentionCredential,
+} from "./backblaze-storage.ts";
 import {
   type BackupV2RetentionJob,
   type BackupV2RetentionPolicy,
@@ -98,20 +101,32 @@ import {
 import {
   B2_CATALOG_CONTROL_PATH,
   B2_CATALOG_DAMAGED_ALERT,
-  B2_CATALOG_REPORT_PATH,
   B2_RETENTION_CONTROL_PATH,
   B2_RETENTION_KEY_PATH,
   B2_RETENTION_ORPHAN_ALERT,
   B2_RETENTION_PAGE_BYTES,
   B2_RETENTION_POLICY_PATH,
-  B2_RETENTION_REPORT_PATH,
+  type BackblazeMaintenanceMode,
+  type BackblazeMaintenanceReports,
+  type BackblazeMaintenanceResult,
   type BackupV2PiRetentionReport,
+  maintenanceFailure,
   persistPrivateRetentionPlan,
+  publishMaintenanceReport,
+  readBackblazeMaintenance,
   retentionOrphansFound,
   retentionTransactionPath,
   validateRetentionPlanReference,
   validateRetentionSummary,
 } from "./backup-v2-retention-report.ts";
+import {
+  addBackblazeFailureReason,
+  BackblazeReportError,
+  backblazeReportExplanation,
+  type BackblazeReportReason,
+  reasonForBackblazeError,
+  withBackblazeReportReason,
+} from "./backup-v2-report-reasons.ts";
 import type {
   BackupV2KernelObservation,
   BackupV2KernelObservationOptions,
@@ -556,7 +571,7 @@ function logCancellationBlocked(
   );
 }
 
-function normalizeBackupV2ControllerState(
+export function normalizeBackupV2ControllerState(
   input: ControllerState | BackupV2ControllerState,
 ): BackupV2ControllerState {
   return (input as { schemaVersion: number }).schemaVersion === 1
@@ -611,8 +626,13 @@ export async function stepBackupV2Controller(
     if (!withinCatchUp(now) || backupV2PeriodSatisfied(state, now)) {
       return state;
     }
-    if (await deps.gate.read() !== null) fail();
-    await deps.admit(state.legacy);
+    if (await deps.gate.read() !== null) {
+      throw new BackblazeReportError("B2_BACKUP_GATE_HELD");
+    }
+    await withBackblazeReportReason(
+      "B2_BACKUP_ADMISSION_BLOCKED",
+      () => deps.admit(state.legacy),
+    );
     await deps.archive(input);
     const settings = validateBackupV2WorkerSettings(
       await deps.create(weekWindow(now).periodKey),
@@ -664,7 +684,10 @@ export async function stepBackupV2Controller(
     else {
       // An Oracle invocation could have acquired the controller lock
       // after a crash or between the worker and verifier gates.
-      await deps.admit(state.legacy);
+      await withBackblazeReportReason(
+        "B2_BACKUP_ADMISSION_BLOCKED",
+        () => deps.admit(state.legacy),
+      );
       await deps.gate.replace(null, gate);
     }
     await deps.install(job.settings);
@@ -950,11 +973,110 @@ export async function stepBackupV2Controller(
   return await save();
 }
 
+/** Actual capture intervals and independently accepted receipts determine
+ * freshness. A request, heartbeat or new verification date cannot refresh it. */
+export function acceptedBackupRuntimeCapture(
+  value: unknown,
+  now: Date,
+  damaged: readonly string[] = [],
+) {
+  const window = weekWindow(now),
+    start = Date.parse(window.startAtUtc),
+    end = Date.parse(window.endAtUtc);
+  let unknown = false;
+  const entries = backupRuntimeCatalog(value).flatMap((entry) => {
+    const capture = entry.schemaVersion === 2
+      ? entry.envelope.request.captureId
+      : entry.entry.index.generation;
+    if (damaged.includes(capture)) return [];
+    const verifiedAtUtc = entry.schemaVersion === 1
+      ? entry.entry.receipt.verifiedAtUtc
+      : entry.receipt.verifiedAtUtc;
+    const acceptedAtUtc = entry.schemaVersion === 1
+      ? entry.entry.acceptedAtUtc
+      : entry.acceptedAtUtc;
+    const starts = entry.schemaVersion === 1
+      ? [entry.entry.index.captureStartedAtUtc]
+      : entry.selectedRoot.root.roles.map((role) => role.captureStartedAtUtc);
+    const finishes = entry.schemaVersion === 1
+      ? [entry.entry.index.captureFinishedAtUtc]
+      : entry.selectedRoot.root.roles.map((role) => role.captureFinishedAtUtc);
+    const captured = Math.max(...finishes.map(Date.parse)),
+      verified = Date.parse(verifiedAtUtc),
+      accepted = Date.parse(acceptedAtUtc);
+    if (
+      ![captured, verified, accepted, ...starts.map(Date.parse)].every(
+        Number.isFinite,
+      ) || captured > verified || verified > now.getTime() ||
+      accepted > now.getTime()
+    ) {
+      unknown = true;
+      return [];
+    }
+    return [{
+      entry,
+      captureStartedAtUtc: new Date(Math.min(...starts.map(Date.parse)))
+        .toISOString(),
+      captureFinishedAtUtc: new Date(captured).toISOString(),
+      verifiedAtUtc,
+      current: captured >= start && captured < end,
+    }];
+  }).sort((a, b) =>
+    Date.parse(b.captureFinishedAtUtc) - Date.parse(a.captureFinishedAtUtc)
+  );
+  return {
+    latest: entries[0] ?? null,
+    current: entries.find((entry) => entry.current) ?? null,
+    periodKey: window.periodKey,
+    unknown,
+  };
+}
+
 export function backupV2ControllerReport(
   state: BackupV2ControllerState,
   now: Date,
+  damaged: readonly string[] = [],
 ): BackblazeRunReport {
   const job = state.job, phase = job?.phase ?? "IDLE";
+  const observedAtUtc = now.toISOString();
+  if (phase === "COMPLETE" || phase === "IDLE") {
+    const accepted = acceptedBackupRuntimeCapture(state, now, damaged);
+    const entry = accepted.current?.entry;
+    if (accepted.unknown) {
+      return addBackblazeFailureReason({
+        status: "B2_BACKUP_ACCEPTANCE_UNKNOWN",
+        observedAtUtc,
+        healthy: false,
+      }, "B2_BACKUP_ACCEPTANCE_UNKNOWN");
+    }
+    if (entry) {
+      const generation = acceptedId(entry);
+      const jobId = entry.schemaVersion === 2
+        ? entry.envelope.request.jobId
+        : generation.replace(/^generation-/, "job-");
+      return {
+        status: `B2_BACKUP_CURRENT:${jobId}`,
+        observedAtUtc,
+        healthy: true,
+        jobId,
+        generation,
+      };
+    }
+    const currentWasDamaged = damaged.length > 0 &&
+      acceptedBackupRuntimeCapture(state, now).current !== null;
+    return {
+      status: currentWasDamaged
+        ? B2_CATALOG_DAMAGED_ALERT
+        : phase === "IDLE"
+        ? "B2_BACKUP_IDLE"
+        : `B2_PERIOD_MISSED:${accepted.periodKey}`,
+      observedAtUtc,
+      healthy: false,
+      ...backblazeReportExplanation(
+        currentWasDamaged ? "DAMAGED_ACCEPTED_GENERATION" : "B2_PERIOD_MISSED",
+      ),
+    };
+  }
   const status = job?.activeKind === "worker"
     ? job.workerStatus
     : job?.verifierStatus;
@@ -969,23 +1091,28 @@ export function backupV2ControllerReport(
         status.lease.retryEpisode?.expiresAtMs ?? 0,
         status.lease.transferEpisode?.expiresAtMs ?? 0,
       ) > status.lease.observedMonotonicMs;
+  const healthy = ["WORKER", "VERIFY"].includes(phase) &&
+    Boolean(fresh && (initializing || leased));
   return {
     status: phase,
-    observedAtUtc: now.toISOString(),
-    healthy: phase === "COMPLETE" ||
-      phase === "IDLE" && backupV2PeriodSatisfied(state, now) ||
-      ["WORKER", "VERIFY"].includes(phase) &&
-        Boolean(fresh && (initializing || leased)),
+    observedAtUtc,
+    healthy,
     ...(job
       ? {
         jobId: job.settings.envelope.request.jobId,
         generation: job.settings.envelope.request.captureId,
       }
       : {}),
-    detail: phase === "COMPLETE"
-      ? "Cloud recovery point accepted; retention requires its separate reference-safe proof"
-      : job?.cancellationBlockedReason ??
-        "Bounded v2 reconciliation; source lease and custody remain independent",
+    ...(healthy ? {} : backblazeReportExplanation(
+      job?.cancellationBlockedReason ??
+        (phase === "FAILED"
+          ? status?.phase === "FAILED"
+            ? "SOURCE_STATUS_FAILED"
+            : "B2_BACKUP_FAILED"
+          : ["WORKER", "VERIFY"].includes(phase)
+          ? "B2_BACKUP_PROGRESS_UNKNOWN"
+          : "B2_BACKUP_PENDING"),
+    )),
   };
 }
 
@@ -1013,9 +1140,13 @@ export async function recoverBlockedBackupV2Verifier(
     if (next.job?.phase === "VERIFY_SETTLED") {
       next = await stepBackupV2Controller(next, caps, expected);
     }
-    const report = backupV2ControllerReport(next, deps.now());
+    const now = deps.now();
+    const { damaged } = await readBackblazeMaintenance(deps.private, now);
+    const report = backupV2ControllerReport(next, now, damaged);
     await deps.private.write(B2_REPORT_PATH, report);
-    return report;
+    return next.job?.phase === "COMPLETE"
+      ? { ...report, status: "COMPLETE" }
+      : report;
   });
 }
 
@@ -2054,7 +2185,7 @@ export function backupV2RetentionNeedsReconcile(
 }
 
 export async function readBackupV2RetentionControl(
-  privateIO: PrivateSeam,
+  privateIO: Pick<PrivateSeam, "read">,
   verifyCatalogOnly = false,
 ): Promise<BackupV2RetentionControl | undefined> {
   const control = await privateIO.read<BackupV2RetentionControl>(
@@ -2170,10 +2301,18 @@ async function prepareAcceptedBackupV2ScratchCleanup(
 }
 
 async function proveRetentionIdle(deps: PiDeps): Promise<void> {
-  const oracle = await deps.private.read(".private/backup-runtime.json");
-  const claim = await deps.private.read(MANIFEST_PATH);
-  assertBackblazeLaunchAllowed(oracle, claim);
-  await proveBackblazeSourceIdle(deps.remote);
+  await withBackblazeReportReason(
+    "B2_RETENTION_ORACLE_CUSTODY_UNPROVED",
+    async () => {
+      const oracle = await deps.private.read(".private/backup-runtime.json");
+      const claim = await deps.private.read(MANIFEST_PATH);
+      assertBackblazeLaunchAllowed(oracle, claim);
+    },
+  );
+  await withBackblazeReportReason(
+    "B2_RETENTION_CUSTODY_UNPROVED",
+    () => proveBackblazeSourceIdle(deps.remote),
+  );
 }
 
 async function discoverRetentionCustody(
@@ -2277,19 +2416,10 @@ async function discoverRetentionCustody(
 
 async function configuredRetentionKey(deps: PiDeps): Promise<B2Settings> {
   const config = await loadSourceConfig(deps);
-  const secret = record(await deps.private.read(B2_RETENTION_KEY_PATH), [
-    "accessKeyId",
-    "secretAccessKey",
-    "bucketId",
-    "bucketName",
-  ]) as unknown as B2Settings;
-  validateB2Settings(secret);
-  if (
-    secret.bucketId !== config.b2.bucketId ||
-    secret.bucketName !== config.b2.bucketName ||
-    secret.accessKeyId === config.b2.accessKeyId
-  ) fail();
-  return secret;
+  return await selectB2RetentionCredential(
+    config.b2,
+    () => deps.private.read(B2_RETENTION_KEY_PATH),
+  );
 }
 
 async function startRetentionControl(
@@ -2301,24 +2431,32 @@ async function startRetentionControl(
   verifyCatalogOnly: boolean,
 ): Promise<BackupV2RetentionControl> {
   await proveRetentionIdle(deps);
-  await configuredRetentionKey(deps);
   const settings = withoutKey(
-    await caps.create(weekWindow(deps.now()).periodKey),
+    await withBackblazeReportReason(
+      "B2_RETENTION_SOURCE_PREFLIGHT_FAILED",
+      () => caps.create(weekWindow(deps.now()).periodKey),
+    ),
   );
-  const graphs: BackupV2ProtectionDescriptor[] = [];
-  for (const entry of state.catalog) {
-    if (entry.format !== "backup-v2") continue;
-    const bytes = await deps.private.readBytes(
-      `${BACKUP_V2_PROTECTION_CONTROL_BASE}/roots/${entry.selectedRoot.reference.plaintextSha256}.json`,
-      BACKUP_V2_LIMITS.controlResponseBytes,
-    );
-    if (!bytes) fail();
-    const descriptor = validateBackupV2ProtectionDescriptor(
-      JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
-    );
-    same(descriptor.root, entry.selectedRoot.reference);
-    graphs.push(descriptor);
-  }
+  const graphs = await withBackblazeReportReason(
+    "B2_RETENTION_CATALOG_BINDING_INVALID",
+    async () => {
+      const graphs: BackupV2ProtectionDescriptor[] = [];
+      for (const entry of state.catalog) {
+        if (entry.format !== "backup-v2") continue;
+        const bytes = await deps.private.readBytes(
+          `${BACKUP_V2_PROTECTION_CONTROL_BASE}/roots/${entry.selectedRoot.reference.plaintextSha256}.json`,
+          BACKUP_V2_LIMITS.controlResponseBytes,
+        );
+        if (!bytes) fail();
+        const descriptor = validateBackupV2ProtectionDescriptor(
+          JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
+        );
+        same(descriptor.root, entry.selectedRoot.reference);
+        graphs.push(descriptor);
+      }
+      return graphs;
+    },
+  );
   const custody = verifyCatalogOnly
     ? {
       jobs: [],
@@ -2329,7 +2467,10 @@ async function startRetentionControl(
         unresolvedPuts: [],
       },
     }
-    : await discoverRetentionCustody(deps, settings, state, options);
+    : await withBackblazeReportReason(
+      "B2_RETENTION_CUSTODY_UNPROVED",
+      () => discoverRetentionCustody(deps, settings, state, options),
+    );
   const gate = newPruneGate(settings, deps.now());
   const job = state.job;
   const scratchProof = job?.phase === "COMPLETE"
@@ -2508,19 +2649,44 @@ async function retentionReport(
   deps: PiDeps,
   healthy: boolean,
   publish = false,
-): Promise<BackblazeRunReport> {
+): Promise<BackblazeMaintenanceResult> {
   const result = control.result ?? control.plannedResult;
   const status = result
     ? planStatus(control, result)
+    : control.phase === "PLAN_BLOCKED"
+    ? "B2_RETENTION_PLAN_BLOCKED"
     : `B2_RETENTION_${control.input.stage}_${control.phase}`;
-  if (result) {
+  const mode = control.input.snapshot.verifyCatalogOnly
+    ? "verify-catalog"
+    : "scheduled";
+  const now = deps.now();
+  const terminal = result && (publish ||
+    ["PLAN_ONLY", "PLAN_BLOCKED", "COMPLETE", "PARTIAL"].includes(
+      control.phase,
+    ));
+  const summary = result ? validateRetentionSummary(result.summary) : undefined;
+  const reason = healthy
+    ? terminal ? undefined : "B2_RETENTION_RECONCILIATION_PENDING"
+    : summary?.blockReason ?? control.cancellationBlockedReason ??
+      "B2_RETENTION_STATUS_UNPROVED";
+  const checkedCaptureIds = control.input.snapshot.verifyCatalogOnly && result
+    ? control.input.snapshot.catalog.map(acceptedId)
+    : undefined;
+  const observation: BackblazeMaintenanceResult = {
+    status,
+    observedAtUtc: terminal ? result.finishedAtUtc : now.toISOString(),
+    healthy,
+    retentionTransactionId: control.input.transactionId,
+    ...(reason ? backblazeReportExplanation(reason) : {}),
+    ...(summary ? { retention: summary } : {}),
+    ...(checkedCaptureIds ? { checkedCaptureIds } : {}),
+  };
+  if (terminal) {
     const report: BackupV2PiRetentionReport = {
       schemaVersion: 1,
       format: "backblaze-retention-report",
       transactionId: control.input.transactionId,
-      // Reconstructing a missing report must retain the time of its proof.
-      // Otherwise cached success can outrank a newer catalog damage check.
-      observedAtUtc: result.finishedAtUtc,
+      observedAtUtc: observation.observedAtUtc,
       status,
       healthy,
       policy: control.input.snapshot.policy,
@@ -2528,56 +2694,34 @@ async function retentionReport(
         ...result.plan,
         path: retentionTransactionPath(control.input.transactionId, "plan"),
       },
-      summary: validateRetentionSummary(result.summary),
+      summary: summary!,
       retainedCaptureIds: result.retainedCaptureIds,
-      ...(control.input.snapshot.verifyCatalogOnly
-        ? { checkedCaptureIds: control.input.snapshot.catalog.map(acceptedId) }
-        : {}),
+      ...(checkedCaptureIds ? { checkedCaptureIds } : {}),
+      ...(reason ? backblazeReportExplanation(reason) : {}),
     };
-    if (
-      publish ||
-      ["PLAN_ONLY", "PLAN_BLOCKED", "COMPLETE", "PARTIAL"].includes(
-        control.phase,
-      )
-    ) {
+    await withBackblazeReportReason("B2_REPORT_WRITE_FAILED", async () => {
       const path = retentionTransactionPath(
         control.input.transactionId,
         "report",
       );
-      const saved = await deps.private.read<BackupV2PiRetentionReport>(path);
-      if (!isDeepStrictEqual(report, saved)) {
+      if (!isDeepStrictEqual(report, await deps.private.read(path))) {
         await deps.private.write(path, report);
       }
-      const latestPath = control.input.snapshot.verifyCatalogOnly
-        ? B2_CATALOG_REPORT_PATH
-        : B2_RETENTION_REPORT_PATH;
-      const latest = await deps.private.read<BackupV2PiRetentionReport>(
-        latestPath,
+      await publishMaintenanceReport(
+        deps.private,
+        mode,
+        observation,
+        now,
+        report,
       );
-      if (
-        !latest || !isDeepStrictEqual(latest, report) &&
-          Date.parse(latest.observedAtUtc) <= Date.parse(report.observedAtUtc)
-      ) {
-        await deps.private.write(latestPath, report);
-      }
-    }
-    return {
-      status,
-      observedAtUtc: report.observedAtUtc,
-      healthy,
-      retention: report.summary,
-      retentionTransactionId: report.transactionId,
-      ...(report.checkedCaptureIds
-        ? { checkedCaptureIds: report.checkedCaptureIds }
-        : {}),
-    };
+    });
+  } else {
+    await withBackblazeReportReason(
+      "B2_REPORT_WRITE_FAILED",
+      () => publishMaintenanceReport(deps.private, mode, observation, now),
+    );
   }
-  return {
-    status,
-    observedAtUtc: deps.now().toISOString(),
-    healthy,
-    detail: control.cancellationBlockedReason,
-  };
+  return observation;
 }
 
 async function readPrivatePlan(
@@ -2626,6 +2770,7 @@ interface BackupV2RetentionCycleSeam {
     control: BackupV2RetentionControl,
     deps: PiDeps,
     caps: BackupV2ControllerCapabilities,
+    preflightCredential?: B2Settings,
   ): Promise<void>;
   readPlan(
     control: BackupV2RetentionControl,
@@ -2636,10 +2781,12 @@ interface BackupV2RetentionCycleSeam {
 const retentionIO: BackupV2RetentionCycleSeam = {
   proveIdle: proveRetentionIdle,
   readPlan: readPrivatePlan,
-  async installRuntime(control, deps, caps) {
+  async installRuntime(control, deps, caps, preflightCredential) {
+    const key = preflightCredential ?? await configuredRetentionKey(deps);
+    if (!preflightCredential) await deps.verifyRetentionCredential?.(key);
     await caps.install({
       ...control.settings,
-      B2Settings: await configuredRetentionKey(deps),
+      B2Settings: key,
     });
   },
 };
@@ -2720,7 +2867,7 @@ export async function runBackupV2RetentionCycle(
   caps: BackupV2ControllerCapabilities,
   mode: "scheduled" | "plan" | "verify-catalog" = "scheduled",
   io: BackupV2RetentionCycleSeam = retentionIO,
-): Promise<BackblazeRunReport | null> {
+): Promise<BackblazeMaintenanceResult | null> {
   const verifyCatalogOnly = mode === "verify-catalog";
   const planOnly = mode !== "scheduled";
   const path = verifyCatalogOnly
@@ -2735,15 +2882,23 @@ export async function runBackupV2RetentionCycle(
     planOnly && !verifyCatalogOnly && control &&
     backupV2RetentionNeedsReconcile(control) &&
     control.input.snapshot.policy.execute
-  ) return null;
+  ) throw new BackblazeReportError("B2_RETENTION_EXECUTION_IN_PROGRESS");
   if (state.job && !["COMPLETE", "FAILED"].includes(state.job.phase)) {
     return null;
   }
   if (
     state.legacy.job && !["COMPLETE", "FAILED"].includes(state.legacy.job.phase)
   ) return null;
-  const rawPolicy = await deps.private.read(B2_RETENTION_POLICY_PATH);
-  const options = backupV2RetentionPolicy(rawPolicy, planOnly);
+  const { rawPolicy, options } = await withBackblazeReportReason(
+    "B2_RETENTION_POLICY_INVALID",
+    async () => {
+      const rawPolicy = await deps.private.read(B2_RETENTION_POLICY_PATH);
+      return {
+        rawPolicy,
+        options: backupV2RetentionPolicy(rawPolicy, planOnly),
+      };
+    },
+  );
   const head =
     [...state.catalog].sort((a, b) =>
       acceptedAt(b).localeCompare(acceptedAt(a))
@@ -2755,12 +2910,15 @@ export async function runBackupV2RetentionCycle(
       : null,
     ...options,
   });
+  let preflightCredential: B2Settings | undefined;
   if (!control || !backupV2RetentionNeedsReconcile(control)) {
     if (live !== null) return null;
     if (!planOnly && control?.anchor === anchor) {
       return retentionReport(control, deps, control.phase !== "PLAN_BLOCKED");
     }
     if (!planOnly && !state.catalog.length) return null;
+    preflightCredential = await configuredRetentionKey(deps);
+    await deps.verifyRetentionCredential?.(preflightCredential);
     control = await startRetentionControl(
       state,
       deps,
@@ -2769,18 +2927,31 @@ export async function runBackupV2RetentionCycle(
       options,
       verifyCatalogOnly,
     );
-    await deps.private.write(path, control);
+    await withBackblazeReportReason(
+      "B2_RETENTION_CONTROL_WRITE_FAILED",
+      () => deps.private.write(path, control),
+    );
   }
   const current = control;
   const input = current.input;
-  const save = () => deps.private.write(path, current);
+  const save = () =>
+    withBackblazeReportReason(
+      "B2_RETENTION_CONTROL_WRITE_FAILED",
+      () => deps.private.write(path, current),
+    );
   const report = (healthy = false) => retentionReport(current, deps, healthy);
   if (input.stage === "EXECUTE" && planOnly) return report(false);
   if (input.stage === "EXECUTE") {
-    if (current.anchor !== anchor) fail();
+    if (current.anchor !== anchor) {
+      throw new BackblazeReportError("B2_RETENTION_APPROVAL_CHANGED");
+    }
     const livePolicy = backupV2RetentionPolicy(rawPolicy);
-    same(livePolicy.policy, input.snapshot.policy);
-    same(livePolicy.retiredRestic, input.snapshot.retiredRestic);
+    if (
+      !isDeepStrictEqual(livePolicy.policy, input.snapshot.policy) ||
+      !isDeepStrictEqual(livePolicy.retiredRestic, input.snapshot.retiredRestic)
+    ) {
+      throw new BackblazeReportError("B2_RETENTION_APPROVAL_CHANGED");
+    }
   }
   const block = async (reason: BackupV2CancellationBlockedReason) => {
     current.phase = "CANCELLATION_BLOCKED";
@@ -2796,7 +2967,7 @@ export async function runBackupV2RetentionCycle(
         backupV2PruneLaunchArguments(current.gate).map(shellQuote).join(" "),
       )).code !== 0
     ) {
-      throw new Error("Prune launch outcome unproved");
+      throw new BackblazeReportError("B2_RETENTION_LAUNCH_UNPROVED");
     }
   };
   const freshStage = () => {
@@ -2847,7 +3018,6 @@ export async function runBackupV2RetentionCycle(
         "SOURCE_TERMINAL_RESULT_MISSING",
       ].includes(current.cancellationBlockedReason ?? "");
     }
-    delete current.cancellationBlockedReason;
     await save();
     return report();
   }
@@ -2860,38 +3030,48 @@ export async function runBackupV2RetentionCycle(
       before.sourceBootId !== current.gate.sourceBootId
     ) fail();
     if (input.stage === "EXECUTE") {
-      await io.readPlan(current, deps, false);
-      const saved = await deps.private.read<BackupV2PiRetentionReport>(
-        retentionTransactionPath(input.transactionId, "report"),
-      );
-      if (
-        saved?.schemaVersion !== 1 ||
-        saved.format !== "backblaze-retention-report" ||
-        saved.transactionId !== input.transactionId ||
-        saved.plan.path !==
-          retentionTransactionPath(input.transactionId, "plan")
-      ) fail();
-      same(validateRetentionPlanReference(saved.plan), input.plan);
-      await authorizeCatalogRetirement(deps, caps, current);
-    }
-    await io.installRuntime(current, deps, caps);
-    if (input.scratchCleanupRequestSha256 !== null) {
-      if (
-        state.job?.settings.envelope.requestSha256 !==
-          input.scratchCleanupRequestSha256
-      ) fail();
-      await prepareAcceptedBackupV2ScratchCleanup(
-        state.job,
-        req.jobId,
-        deps,
-        caps,
+      await withBackblazeReportReason(
+        "B2_RETENTION_PLAN_UNPROVED",
+        async () => {
+          await io.readPlan(current, deps, false);
+          const saved = await deps.private.read<BackupV2PiRetentionReport>(
+            retentionTransactionPath(input.transactionId, "report"),
+          );
+          if (
+            saved?.schemaVersion !== 1 ||
+            saved.format !== "backblaze-retention-report" ||
+            saved.transactionId !== input.transactionId ||
+            saved.plan.path !==
+              retentionTransactionPath(input.transactionId, "plan")
+          ) fail();
+          same(validateRetentionPlanReference(saved.plan), input.plan);
+          await authorizeCatalogRetirement(deps, caps, current);
+        },
       );
     }
-    await installBackupV2Artifact(
-      deps,
-      req.jobId,
-      `${JOBS_RUNTIME_ROOT}/${req.jobId}/prune-${current.gate.gateId}-request.json`,
-      input,
+    await withBackblazeReportReason(
+      "B2_RETENTION_SOURCE_SETTINGS_FAILED",
+      async () => {
+        await io.installRuntime(current, deps, caps, preflightCredential);
+        if (input.scratchCleanupRequestSha256 !== null) {
+          if (
+            state.job?.settings.envelope.requestSha256 !==
+              input.scratchCleanupRequestSha256
+          ) fail();
+          await prepareAcceptedBackupV2ScratchCleanup(
+            state.job,
+            req.jobId,
+            deps,
+            caps,
+          );
+        }
+        await installBackupV2Artifact(
+          deps,
+          req.jobId,
+          `${JOBS_RUNTIME_ROOT}/${req.jobId}/prune-${current.gate.gateId}-request.json`,
+          input,
+        );
+      },
     );
     if (live === null) await caps.gate.replace(null, current.gate);
     current.phase = "RUNNING";
@@ -3018,7 +3198,10 @@ export async function runBackupV2RetentionCycle(
   } else if (!await caps.gate.cleared(current.gate, artifacts)) fail();
 
   if (input.stage === "PLAN") {
-    await io.readPlan(current, deps, true);
+    await withBackblazeReportReason(
+      "B2_RETENTION_PLAN_UNPROVED",
+      () => io.readPlan(current, deps, true),
+    );
     if (result.scratchCleanup && state.job) {
       await deps.private.write(
         `${PIP_JOB_EVIDENCE_PATH}/${state.job.settings.envelope.request.jobId}/v2-scratch-cleanup.json`,
@@ -3060,105 +3243,237 @@ export async function runBackupV2RetentionCycle(
 export async function runBackupV2ControllerCycle(
   deps: PiDeps,
   bridge: BackupV2ControllerCapabilities["bridge"],
-  mode: "scheduled" | "plan" | "verify-catalog" = "scheduled",
+  mode: BackblazeMaintenanceMode = "scheduled",
 ): Promise<BackblazeRunReport> {
-  let value =
-    await deps.private.read<ControllerState | BackupV2ControllerState>(
-      CONTROLLER_STATE_PATH,
-    ) ?? { schemaVersion: 1 as const, catalog: [] };
+  let { value, state } = await withBackblazeReportReason(
+    "B2_CONTROLLER_STATE_UNREADABLE",
+    async () => {
+      const value =
+        await deps.private.read<ControllerState | BackupV2ControllerState>(
+          CONTROLLER_STATE_PATH,
+        ) ?? { schemaVersion: 1 as const, catalog: [] };
+      return { value, state: normalizeBackupV2ControllerState(value) };
+    },
+  );
   const caps = realBackupV2ControllerCapabilities(deps, bridge);
   const deadline = performance.now() + 240_000;
-  let state = normalizeBackupV2ControllerState(value);
-  const publish = async (report: BackblazeRunReport) => {
-    await deps.private.write(B2_REPORT_PATH, report);
-    return report;
+  const observations: BackblazeMaintenanceReports = {};
+  const record = (
+    requested: BackblazeMaintenanceMode,
+    result: BackblazeMaintenanceResult,
+  ) => {
+    observations[requested === "verify-catalog" ? "catalog" : "retention"] =
+      result;
+    return result;
   };
-  const refused = (status: string, healthy: boolean): BackblazeRunReport => ({
-    status,
-    healthy,
-    observedAtUtc: deps.now().toISOString(),
-  });
-  const retention = async (requested: typeof mode, continueOnly = false) => {
-    let report: BackblazeRunReport | null = null;
-    const verify = requested === "verify-catalog";
-    const initial = await readBackupV2RetentionControl(deps.private, verify);
+  const refused = async (
+    requested: BackblazeMaintenanceMode,
+    reason: BackblazeReportReason,
+    status?: string,
+    transactionId?: string,
+  ) => {
+    const now = deps.now();
+    const result = {
+      ...maintenanceFailure(requested, now, reason, status),
+      ...(transactionId ? { retentionTransactionId: transactionId } : {}),
+    };
+    try {
+      await publishMaintenanceReport(deps.private, requested, result, now);
+      return record(requested, result);
+    } catch {
+      return record(requested, {
+        ...result,
+        reportWriteError: "B2_REPORT_WRITE_FAILED",
+      });
+    }
+  };
+  const publishBackup = async (failed?: BackblazeReportReason) => {
+    const now = deps.now();
+    const { damaged, reports } = await readBackblazeMaintenance(
+      deps.private,
+      now,
+    );
+    const backup = backupV2ControllerReport(state, now, damaged);
+    const maintenance = { ...reports, ...observations };
     if (
-      continueOnly && (!initial || !backupV2RetentionNeedsReconcile(initial))
-    ) return null;
-    do {
+      !failed && backup.healthy &&
+      (!state.job || state.job.phase === "COMPLETE")
+    ) {
       try {
-        report = await runBackupV2RetentionCycle(state, deps, caps, requested);
+        const gate = await readBackupRuntimeGate(deps.private);
+        if (gate && (gate.schemaVersion !== 2 || gate.kind !== "prune")) {
+          failed = "B2_BACKUP_GATE_HELD";
+        }
       } catch {
-        return refused("B2_RETENTION_BLOCKED", false);
+        failed = "B2_BACKUP_GATE_UNKNOWN";
       }
-      if (!report || !report.healthy) break;
-      const current = await readBackupV2RetentionControl(deps.private, verify);
-      if (
-        !current || !backupV2RetentionNeedsReconcile(current) ||
-        (current.phase === "RUNNING" && current.gate.custody && !current.result)
-      ) break;
-      await deps.sleep(1000);
-    } while (performance.now() < deadline);
-    return report;
+    }
+    const report: BackblazeRunReport = {
+      ...backup,
+      ...(failed
+        ? {
+          status: "B2_BACKUP_FAILED",
+          healthy: false,
+          ...backblazeReportExplanation(failed),
+        }
+        : {}),
+      ...(Object.keys(maintenance).length ? { maintenance } : {}),
+    };
+    try {
+      await deps.private.write(B2_REPORT_PATH, report);
+      return report;
+    } catch {
+      return {
+        ...report,
+        reportWriteError: "B2_REPORT_WRITE_FAILED",
+        ...(!report.reason
+          ? backblazeReportExplanation("B2_REPORT_WRITE_FAILED")
+          : {}),
+      } satisfies BackblazeRunReport;
+    }
+  };
+  const readControl = (requested: BackblazeMaintenanceMode) =>
+    withBackblazeReportReason(
+      "B2_RETENTION_CONTROL_INVALID",
+      () =>
+        readBackupV2RetentionControl(
+          deps.private,
+          requested === "verify-catalog",
+        ),
+    );
+  const retention = async (
+    requested: BackblazeMaintenanceMode,
+    control?: BackupV2RetentionControl,
+  ) => {
+    let report: BackblazeMaintenanceResult | null = null;
+    try {
+      do {
+        report = await runBackupV2RetentionCycle(state, deps, caps, requested);
+        if (!report || !report.healthy) break;
+        control = await readControl(requested);
+        if (
+          !control || !backupV2RetentionNeedsReconcile(control) ||
+          (control.phase === "RUNNING" && control.gate.custody &&
+            !control.result)
+        ) break;
+        await deps.sleep(1000);
+      } while (performance.now() < deadline);
+    } catch (error) {
+      const reason = reasonForBackblazeError(error, "B2_RETENTION_STEP_FAILED");
+      return await refused(
+        requested,
+        reason,
+        undefined,
+        control?.input.transactionId,
+      );
+    }
+    return report ? record(requested, report) : null;
   };
 
-  const legacyGate = await readBackupRuntimeGate(deps.private);
-  const verify = await readBackupV2RetentionControl(deps.private, true);
-  const prune = await readBackupV2RetentionControl(deps.private);
-  const pruning = prune && backupV2RetentionNeedsReconcile(prune);
-  const verifying = verify && backupV2RetentionNeedsReconcile(verify);
   if (mode !== "scheduled") {
-    if (
-      mode === "verify-catalog" && legacyGate !== null &&
-        (legacyGate.schemaVersion !== 2 || legacyGate.kind !== "prune" ||
-          legacyGate.gateId !== verify?.gate.gateId) ||
-      mode === "plan" && verifying
-    ) return publish(refused("B2_RETENTION_BUSY", false));
-    return publish(
-      await retention(mode) ?? refused("B2_RETENTION_BUSY", false),
-    );
+    try {
+      const gate = await withBackblazeReportReason(
+        "B2_RETENTION_CONTROL_INVALID",
+        () => readBackupRuntimeGate(deps.private),
+      );
+      const control = await readControl(mode);
+      const other = await readControl(
+        mode === "plan" ? "verify-catalog" : "plan",
+      );
+      if (
+        (gate && (gate.schemaVersion !== 2 || gate.kind !== "prune" ||
+          gate.gateId !== control?.gate.gateId)) ||
+        other && backupV2RetentionNeedsReconcile(other)
+      ) {
+        return await refused(
+          mode,
+          "B2_RETENTION_BACKUP_IN_PROGRESS",
+          "B2_RETENTION_BUSY",
+        );
+      }
+      return await retention(mode, control) ??
+        await refused(
+          mode,
+          "B2_RETENTION_BACKUP_IN_PROGRESS",
+          "B2_RETENTION_BUSY",
+        );
+    } catch (error) {
+      return await refused(
+        mode,
+        reasonForBackblazeError(error, "B2_RETENTION_STEP_FAILED"),
+      );
+    }
   }
+
+  let liveGate: Awaited<ReturnType<typeof readBackupRuntimeGate>>;
+  try {
+    liveGate = await readBackupRuntimeGate(deps.private);
+  } catch {
+    return await publishBackup("B2_BACKUP_GATE_UNKNOWN");
+  }
+  const observeControl = async (requested: BackblazeMaintenanceMode) => {
+    try {
+      return await readControl(requested);
+    } catch {
+      await refused(requested, "B2_RETENTION_CONTROL_INVALID");
+      return undefined;
+    }
+  };
+  const verify = await observeControl("verify-catalog");
+  const prune = await observeControl("scheduled");
   if (
-    verifying && (!legacyGate || legacyGate.schemaVersion === 2 &&
-        legacyGate.kind === "prune" && legacyGate.gateId === verify.gate.gateId)
+    verify && backupV2RetentionNeedsReconcile(verify) &&
+    (!liveGate || liveGate.schemaVersion === 2 && liveGate.kind === "prune" &&
+        liveGate.gateId === verify.gate.gateId)
   ) {
-    return publish(
-      await retention("verify-catalog", true) ??
-        refused("B2_RETENTION_BLOCKED", false),
-    );
+    if (!await retention("verify-catalog", verify)) {
+      await refused("verify-catalog", "B2_RETENTION_CUSTODY_UNPROVED");
+    }
+    return await publishBackup();
   }
-  if (pruning) {
-    return publish(
-      await retention("scheduled", true) ??
-        refused("B2_RETENTION_BLOCKED", false),
-    );
+  if (prune && backupV2RetentionNeedsReconcile(prune)) {
+    if (!await retention("scheduled", prune)) {
+      await refused("scheduled", "B2_RETENTION_CUSTODY_UNPROVED");
+    }
+    return await publishBackup();
   }
-  if (legacyGate?.schemaVersion === 2 && legacyGate.kind === "prune") {
-    return publish(refused("B2_RETENTION_LEGACY_CUSTODY_UNSETTLED", false));
+  if (liveGate?.schemaVersion === 2 && liveGate.kind === "prune") {
+    await refused(
+      "scheduled",
+      "B2_RETENTION_CUSTODY_UNPROVED",
+      "B2_RETENTION_LEGACY_CUSTODY_UNSETTLED",
+    );
+    return await publishBackup();
   }
 
   // A terminal plan-only or refused transaction cannot keep a due capture
   // behind maintenance. Schedule the backup before creating a new plan.
-  do {
-    const previousPhase = value.schemaVersion === 2
-      ? value.job?.phase
-      : undefined;
-    state = await stepBackupV2Controller(value, caps);
-    value = state;
-    const job = state.job;
-    if (
-      !job || ["COMPLETE", "FAILED", "CANCELLATION_BLOCKED"].includes(job.phase)
-    ) break;
-    if (previousPhase === "VERIFY_SETTLED" && job.phase === previousPhase) {
-      break;
-    }
-    const status = job.activeKind === "worker"
-      ? job.workerStatus
-      : job.verifierStatus;
-    if (["WORKER", "VERIFY"].includes(job.phase) && status !== null) break;
-    if (["WORKER", "VERIFY"].includes(job.phase)) await deps.sleep(1000);
-  } while (performance.now() < deadline);
-  return publish(
-    await retention("scheduled") ?? backupV2ControllerReport(state, deps.now()),
-  );
+  try {
+    do {
+      const previousPhase = value.schemaVersion === 2
+        ? value.job?.phase
+        : undefined;
+      state = await stepBackupV2Controller(value, caps);
+      value = state;
+      const job = state.job;
+      if (
+        !job ||
+        ["COMPLETE", "FAILED", "CANCELLATION_BLOCKED"].includes(job.phase)
+      ) break;
+      if (previousPhase === "VERIFY_SETTLED" && job.phase === previousPhase) {
+        break;
+      }
+      const status = job.activeKind === "worker"
+        ? job.workerStatus
+        : job.verifierStatus;
+      if (["WORKER", "VERIFY"].includes(job.phase) && status !== null) break;
+      if (["WORKER", "VERIFY"].includes(job.phase)) await deps.sleep(1000);
+    } while (performance.now() < deadline);
+  } catch (error) {
+    return await publishBackup(
+      reasonForBackblazeError(error, "B2_BACKUP_STEP_FAILED"),
+    );
+  }
+  if (!observations.retention) await retention("scheduled", prune);
+  return await publishBackup();
 }

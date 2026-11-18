@@ -81,8 +81,10 @@ import {
   workerUnitName,
 } from "./backblaze-source-worker.ts";
 import {
+  B2CredentialError,
   type B2Object,
   type B2Settings,
+  b2SettingsFromConfig,
   B2Store,
 } from "./backblaze-storage.ts";
 import type { UploadResult } from "./backblaze-upload.ts";
@@ -99,7 +101,24 @@ import {
   validateVerifierReceipt,
   verifyDecryptedGeneration,
 } from "./backblaze-verifier.ts";
-import type { BackupV2RetentionSummary } from "./backup-v2-retention.ts";
+import {
+  B2_RETENTION_KEY_PATH,
+  type BackblazeMaintenanceMode,
+  type BackblazeMaintenanceReports,
+  type BackblazeMaintenanceResult,
+  maintenanceFailure,
+  publishMaintenanceReport,
+} from "./backup-v2-retention-report.ts";
+import {
+  addBackblazeFailureReason,
+  BackblazeReportError,
+  backblazeReportExplanation,
+  type BackblazeReportReason,
+  backblazeReportReason,
+  type BackblazeReportReasonFields,
+  reasonForBackblazeError,
+  withBackblazeReportReason,
+} from "./backup-v2-report-reasons.ts";
 import { withBackupLock } from "./backup-lock.ts";
 import { backupV2ChildEnvironment } from "./backup-v2-supervisor.ts";
 import { shellQuote } from "./backup-guest.ts";
@@ -1848,9 +1867,30 @@ export interface PrivateSeam {
   readText(path: string, maxBytes: number): Promise<string | undefined>;
 }
 
+async function readOptionalRetentionKey<T>(
+  path: string,
+): Promise<T | undefined> {
+  let info: Deno.FileInfo;
+  try {
+    info = await Deno.lstat(path);
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) return undefined;
+    throw error;
+  }
+  if (
+    !info.isFile || info.uid !== Deno.uid() || info.nlink !== 1 ||
+    info.mode === null || (info.mode & 0o7777) !== 0o600 ||
+    info.size > 32 * 1024
+  ) throw new Error("Unsafe retention credential file");
+  return await readPrivateJson<T>(path);
+}
+
 export function realPrivateSeam(): PrivateSeam {
   return {
     async read<T>(path: string): Promise<T | undefined> {
+      if (path === B2_RETENTION_KEY_PATH) {
+        return await readOptionalRetentionKey(path);
+      }
       try {
         return await readPrivateJson<T>(path);
       } catch (error) {
@@ -2580,7 +2620,7 @@ export function revalidatePruneDeletions(
 // Watchdog assessment (pure)
 // ---------------------------------------------------------------------------
 
-export interface WatchdogAssessment {
+export interface WatchdogAssessment extends BackblazeReportReasonFields {
   status: string;
   healthy: boolean;
   detail?: string;
@@ -3812,6 +3852,7 @@ export interface PiDeps {
   gate: GateSeam;
   logger: (message: string) => void;
   sleep: (ms: number) => Promise<void>;
+  verifyRetentionCredential?(settings: B2Settings): Promise<void>;
   reconcileScheduledClaim?: (
     oracleState: unknown,
     claim: unknown,
@@ -3832,6 +3873,11 @@ export function realPiDeps(): PiDeps {
     gate: realGateSeam(),
     logger: (message) => console.log(message),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    async verifyRetentionCredential(settings) {
+      const { BackupV2Store } = await import("./backup-v2-store.ts");
+      await new BackupV2Store(settings, undefined, undefined, "retention")
+        .verifyCredential(AbortSignal.timeout(20_000));
+    },
     reconcileScheduledClaim: async (...args) =>
       await (await import("./backup-scheduled.ts"))
         .readScheduledClaimForBackblaze(...args),
@@ -3937,10 +3983,22 @@ export async function loadDeployment(deps: PiDeps): Promise<PiDeployment> {
 }
 
 export async function loadSourceConfig(deps: PiDeps): Promise<PiSourceConfig> {
-  const config = await deps.private.read<Record<string, unknown>>(
-    B2_CONFIG_PATH,
-  );
-  if (!isRecord(config)) throw new Error("B2 scoped configuration is missing");
+  let config: unknown;
+  try {
+    config = await deps.private.read(B2_CONFIG_PATH);
+  } catch {
+    throw new B2CredentialError(
+      "B2_CREDENTIAL_SETTINGS_INVALID",
+      "The private Backblaze writer configuration is unreadable",
+    );
+  }
+  if (!isRecord(config)) {
+    throw new B2CredentialError(
+      "B2_CREDENTIAL_SETTINGS_INVALID",
+      "The private Backblaze writer configuration is missing or malformed",
+    );
+  }
+  const b2 = b2SettingsFromConfig(config);
   const deployment = await loadDeployment(deps);
   const recipientPath = RECIPIENT_PATH;
   const recipientBytes = await deps.private.readBytes(recipientPath, 64 * 1024);
@@ -3958,32 +4016,22 @@ export async function loadSourceConfig(deps: PiDeps): Promise<PiSourceConfig> {
     throw new Error("Approved exclusions file is missing");
   }
   if (!Array.isArray(config.sources)) {
-    throw new Error("B2 scoped configuration sources are missing");
+    throw new Error("B2 source configuration sources are missing");
   }
   return {
     sources: config.sources as FileSource[],
-    b2: {
-      accessKeyId: config.accessKeyId as string,
-      secretAccessKey: config.secretAccessKey as string,
-      bucketId: config.bucketId as string,
-      bucketName: config.bucketName as string,
-    },
+    b2,
     recipientPath,
     recipientBytes,
     exclusionsText,
   };
 }
 
-export interface BackblazeRunReport {
-  status: string;
-  observedAtUtc: string;
+export interface BackblazeRunReport extends BackblazeMaintenanceResult {
   jobId?: string;
   generation?: string;
-  healthy: boolean;
   detail?: string;
-  retention?: BackupV2RetentionSummary;
-  retentionTransactionId?: string;
-  checkedCaptureIds?: string[];
+  maintenance?: BackblazeMaintenanceReports;
 }
 
 // ---------------------------------------------------------------------------
@@ -5622,22 +5670,28 @@ export async function runBackblazeCycle(
     CONTROLLER_STATE_PATH,
   );
   let state = validateControllerState(initial ?? emptyControllerState());
-  const skip = (status: string, detail?: string): BackblazeRunReport => ({
-    status,
-    observedAtUtc: deps.now().toISOString(),
-    healthy: false,
-    ...(detail === undefined ? {} : { detail }),
-  });
+  const skip = (error: unknown, reported: string): BackblazeRunReport => {
+    const reason = backblazeReportReason(
+      reported,
+      reasonForBackblazeError(error, "B2_BACKUP_STEP_FAILED"),
+    );
+    return {
+      status: `B2_SKIPPED:${reason}`,
+      observedAtUtc: deps.now().toISOString(),
+      healthy: false,
+      ...backblazeReportExplanation(reason),
+    };
+  };
   const failReport = (
     failed: ControllerState,
-    message: string,
+    reason: BackblazeReportReason,
   ): BackblazeRunReport => ({
     status: `B2_BACKUP_FAILED:${failed.job!.envelope.request.jobId}`,
     observedAtUtc: deps.now().toISOString(),
     jobId: failed.job!.envelope.request.jobId,
     generation: failed.job!.envelope.request.generation,
     healthy: false,
-    detail: message,
+    ...backblazeReportExplanation(reason),
   });
   let deadlineExpired = false;
   let cycleFailed = false;
@@ -5653,7 +5707,7 @@ export async function runBackblazeCycle(
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (error instanceof BackblazeLaunchDeferred) {
-          completedReport = skip(`B2_SKIPPED:${message}`, message);
+          completedReport = skip(error, message);
           break;
         }
         // Reread the durable state after any step failure: progress the
@@ -5704,7 +5758,7 @@ export async function runBackblazeCycle(
         }
         const base = durable ?? state;
         if (base.job === undefined) {
-          completedReport = skip(`B2_SKIPPED:${message}`, message);
+          completedReport = skip(error, message);
           break;
         }
         // Job creation for the next due period can fail (Oracle authority
@@ -5717,7 +5771,7 @@ export async function runBackblazeCycle(
           base.job.envelope.request.periodKey !==
             weekWindow(deps.now()).periodKey
         ) {
-          completedReport = skip(`B2_SKIPPED:${message}`, message);
+          completedReport = skip(error, message);
           break;
         }
         const failed = await failJob(
@@ -5726,7 +5780,10 @@ export async function runBackblazeCycle(
           "CONTROLLER_STEP_FAILED",
           message,
         );
-        completedReport = failReport(failed, message);
+        completedReport = failReport(
+          failed,
+          reasonForBackblazeError(error, "B2_BACKUP_STEP_FAILED"),
+        );
         break;
       }
       const after = next.job?.phase ?? "none";
@@ -5762,12 +5819,15 @@ export async function runBackblazeCycle(
           jobId: next.job!.envelope.request.jobId,
           generation: next.job!.envelope.request.generation,
           healthy: assessment.healthy,
-          ...(assessment.healthy || next.job!.failure === undefined
+          ...(assessment.healthy
             ? {}
-            : { detail: next.job!.failure.code }),
+            : backblazeReportExplanation("B2_BACKUP_FAILED")),
         };
         await deps.private.write(B2_REPORT_PATH, {
-          ...assessment,
+          ...addBackblazeFailureReason(
+            { status: assessment.status, healthy: assessment.healthy },
+            "B2_BACKUP_FAILED",
+          ),
           observedAtUtc: deps.now().toISOString(),
         });
         completedReport = reportValue;
@@ -5809,13 +5869,13 @@ export async function runBackblazeCycle(
       status: "B2_TUNNEL_CLOSE_FAILED",
       observedAtUtc: deps.now().toISOString(),
       healthy: false,
-      detail: "Task tunnel closure could not be proved",
+      ...backblazeReportExplanation("B2_TUNNEL_CLOSE_FAILED"),
     }).catch(() =>
       deps.logger("Tunnel closure failure report could not be saved")
     );
   }
   if (cycleFailed) throw cycleError;
-  if (tunnelFailed) throw new Error("Task tunnel closure could not be proved");
+  if (tunnelFailed) throw new BackblazeReportError("B2_TUNNEL_CLOSE_FAILED");
   if (completedReport !== undefined) return completedReport;
   const reportValue = {
     status: `B2_BACKUP_INCOMPLETE:${
@@ -5830,47 +5890,142 @@ export async function runBackblazeCycle(
     detail: deadlineExpired
       ? "Request deadline reached"
       : "Step budget exhausted",
+    ...backblazeReportExplanation("B2_BACKUP_INCOMPLETE"),
   };
+  const { status, healthy } = assessBackblazeWatchdog(
+    state,
+    await deps.gate.read(),
+    deps.now(),
+  );
   await deps.private.write(B2_REPORT_PATH, {
-    ...assessBackblazeWatchdog(state, await deps.gate.read(), deps.now()),
+    ...addBackblazeFailureReason({ status, healthy }, "B2_BACKUP_INCOMPLETE"),
     observedAtUtc: deps.now().toISOString(),
   });
   return reportValue;
 }
 
 export async function runBackblazePiController(
-  mode: "scheduled" | "plan" | "verify-catalog" = "scheduled",
+  mode: BackblazeMaintenanceMode = "scheduled",
+  deps: PiDeps = realPiDeps(),
+  controllerDir = () => Deno.realPath("."),
 ): Promise<BackblazeRunReport> {
-  const cwd = await Deno.realPath(".");
-  if (cwd !== PI_CONTROLLER_CWD) {
-    throw new Error(`File backup runs only from ${PI_CONTROLLER_CWD}`);
-  }
-  const deps = realPiDeps();
-  return await deps.lock(CONTROLLER_LOCK_PATH, async () => {
-    const saved = await deps.private.read<
-      ControllerState | { schemaVersion: 2 }
-    >(CONTROLLER_STATE_PATH);
-    const legacyActive = saved?.schemaVersion === 1 &&
-      saved.job !== undefined &&
-      !["COMPLETE", "FAILED"].includes(saved.job.phase);
-    if (legacyActive) {
-      if (mode === "scheduled") return await runBackblazeCycle(deps);
-      return {
-        status: "B2_RETENTION_BUSY",
+  const reportError = async (
+    reason: BackblazeReportReason,
+    mayWrite: boolean,
+  ): Promise<BackblazeRunReport> => {
+    const now = deps.now();
+    const report = mode === "scheduled"
+      ? {
+        status: "B2_BACKUP_FAILED",
         healthy: false,
-        observedAtUtc: deps.now().toISOString(),
-      };
+        observedAtUtc: now.toISOString(),
+        ...backblazeReportExplanation(reason),
+      }
+      : maintenanceFailure(mode, now, reason);
+    if (mayWrite) {
+      try {
+        if (mode === "scheduled") {
+          await deps.private.write(B2_REPORT_PATH, report);
+        } else await publishMaintenanceReport(deps.private, mode, report, now);
+        return report;
+      } catch {
+        /* Preserve the primary reason when its report path is unavailable. */
+      }
     }
-    const runtime = await import("./backup-v2-controller.ts"),
-      bridge = await import("./backup-v2-bridge-runtime.ts");
-    const deployment = await loadDeployment(deps);
-    await runtime.installBackupV2PiRelease(deps, deployment.sourceRevision);
-    return await runtime.runBackupV2ControllerCycle(
-      deps,
-      bridge.realBackupV2BridgeRuntime(deps),
-      mode,
-    );
-  });
+    return { ...report, reportWriteError: "B2_REPORT_WRITE_FAILED" };
+  };
+  try {
+    if (await controllerDir() !== PI_CONTROLLER_CWD) {
+      return await reportError("B2_CONTROLLER_CWD_INVALID", false);
+    }
+  } catch {
+    return await reportError("B2_CONTROLLER_CWD_INVALID", false);
+  }
+
+  try {
+    return await deps.lock(CONTROLLER_LOCK_PATH, async () => {
+      try {
+        const saved = await withBackblazeReportReason(
+          "B2_CONTROLLER_STATE_UNREADABLE",
+          () =>
+            deps.private.read<ControllerState | { schemaVersion: 2 }>(
+              CONTROLLER_STATE_PATH,
+            ),
+        );
+        const legacyActive = saved?.schemaVersion === 1 &&
+          saved.job !== undefined &&
+          !["COMPLETE", "FAILED"].includes(saved.job.phase);
+        if (legacyActive) {
+          if (mode === "scheduled") {
+            const report = await runBackblazeCycle(deps);
+            if (
+              report.status.startsWith("B2_SKIPPED") ||
+              report.status.startsWith("B2_BACKUP_FAILED")
+            ) {
+              await deps.private.write(B2_REPORT_PATH, report);
+            }
+            return report;
+          }
+          const now = deps.now();
+          const report = maintenanceFailure(
+            mode,
+            now,
+            "B2_RETENTION_BACKUP_IN_PROGRESS",
+            "B2_RETENTION_BUSY",
+          );
+          await withBackblazeReportReason(
+            "B2_REPORT_WRITE_FAILED",
+            () => publishMaintenanceReport(deps.private, mode, report, now),
+          );
+          return report;
+        }
+        const [runtime, bridge] = await withBackblazeReportReason(
+          "B2_DEPLOYMENT_UNPROVED",
+          async () => {
+            const runtime = await import("./backup-v2-controller.ts");
+            const bridge = await import("./backup-v2-bridge-runtime.ts");
+            const deployment = await loadDeployment(deps);
+            await runtime.installBackupV2PiRelease(
+              deps,
+              deployment.sourceRevision,
+            );
+            return [runtime, bridge] as const;
+          },
+        );
+        return await runtime.runBackupV2ControllerCycle(
+          deps,
+          bridge.realBackupV2BridgeRuntime(deps),
+          mode,
+        );
+      } catch (error) {
+        return await reportError(
+          reasonForBackblazeError(error, "B2_BACKUP_STEP_FAILED"),
+          true,
+        );
+      }
+    });
+  } catch {
+    // The operation could not establish controller lock custody. Publishing
+    // outside that lock could overwrite a concurrent controller's report.
+    return await reportError("B2_CONTROLLER_LOCK_UNPROVED", false);
+  }
+}
+
+export function backblazeOperatorExitCode(
+  report: BackblazeRunReport,
+  mode: Exclude<BackblazeMaintenanceMode, "scheduled">,
+): number {
+  if (!report.healthy || report.reportWriteError) return 1;
+  if (mode === "verify-catalog") {
+    if (report.status === "B2_RETENTION_CATALOG_VERIFIED") return 0;
+  } else if (
+    ["B2_RETENTION_PLAN_ONLY", "B2_RETENTION_ORPHANS_PRESENT"].includes(
+      report.status,
+    )
+  ) {
+    return 0;
+  }
+  return 75;
 }
 
 if (import.meta.main) {
@@ -5878,9 +6033,6 @@ if (import.meta.main) {
   // back for the existing Pi capabilities. A top-level await creates a cycle.
   void runBackblazePiController().then((report) => {
     console.log(JSON.stringify(report));
-    if (!report.healthy) Deno.exitCode = 1;
-  }).catch((error) => {
-    console.error(error instanceof Error ? error.message : String(error));
-    Deno.exitCode = 1;
+    if (!report.healthy || report.reportWriteError) Deno.exitCode = 1;
   });
 }

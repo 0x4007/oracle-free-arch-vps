@@ -287,7 +287,7 @@ The old watchdog only queued a changed combined status and sent it to the Mac's 
        [split("\n")[] | fromjson? | select(type == "object" and has("oracle") and has("b2"))] |
        length == 1 and (.[0] |
          .oracle.status == "ACCEPTED_BACKUP_CURRENT" and
-         (.b2.status | startswith("B2_BACKUP_CURRENT:") or . == "B2_RETENTION_EXECUTE_COMPLETE") and
+         (.b2.status | startswith("B2_BACKUP_CURRENT:")) and
          all(.oracle, .b2; .healthy == true and observed_since))
      '
    ```
@@ -308,28 +308,23 @@ The old watchdog only queued a changed combined status and sent it to the Mac's 
 
 Use the standard deployment procedure above through step 4. Keep the Backblaze service and its timer paused during the key and policy changes. Preserve the existing controller lock inode, accepted catalog and all retirement journals. Only the supervisor runs these commands against the Pi and Backblaze.
 
-1. **Install the archive and configure both scoped keys.** Rotate the exposed backup writer to a key restricted to `pavlovcik-arch-vps-backups` and prefix `restic/`. Its exact runtime capabilities are `listFiles`, `readFiles`, `writeFiles` and `deleteFiles`. Capture and restore authenticate under that existing scope. The separate retention key is restricted to the same single bucket with no filename prefix and needs `listFiles` for versions and unfinished-file listing, `writeFiles` to list parts and cancel unfinished large files, and `deleteFiles` to remove exact versions. Whole-bucket visible metadata supplies the byte denominator. The controller obtains the exact bucket ID and name from `b2_authorize_account`. It does not call `b2_list_buckets` and needs neither `listBuckets` nor `listAllBucketNames`. The latter capability reveals account-wide bucket names. The retention code confirms size and B2 SHA-1 metadata from exact versions, so the retention key does not require `readFiles`. Neither controller key needs bucket settings, delegation, or governance permissions. [Application keys](https://www.backblaze.com/docs/cloud-storage-application-keys) [List versions](https://www.backblaze.com/apidocs/b2-list-file-versions) [List unfinished files](https://www.backblaze.com/apidocs/b2-list-unfinished-large-files) [List parts](https://www.backblaze.com/apidocs/b2-list-parts) [Cancel large file](https://www.backblaze.com/apidocs/b2-cancel-large-file) [Delete exact version](https://www.backblaze.com/apidocs/b2-delete-file-version)
-
-   On the Pi update only `accessKeyId` and `secretAccessKey` in the private `.private/b2-file-backup.json` writer config. Preserve its bucket identity, sources and recipient binding. Put the separate retention key in `.private/file-backup/retention-key.json` with exactly `accessKeyId`, `secretAccessKey`, `bucketId` and `bucketName`. Keep both files at mode `0600` and publish their complete replacements atomically under the existing controller lock when both gates and transactions are settled. Use a private editor or secret manager separate from transcripts and shell history. The controller copies each selected key only in the root-owned mode-`0600` `settings.json` for its immutable VPS runtime under `/var/tmp/arch-vps-file-backup-runtime/jobs/<job-id>/`. Preserve past runtime bindings. Future jobs receive the selected new key through the existing authenticated installation transport.
-
-   Verify the writer without printing settings, IDs or B2 responses. From the deployed Pi controller directory, issue one bounded version-list read with the new writer's exact scope. This also exercises the same authorization capability check as capture. Keep the old key unreused and revoke it under the supervisor's rotation procedure once replacement key readback and settled custody are proved.
+1. **Install the owner's existing account master key.** Use the standard archive cutover on both hosts and verify the Pi install receipt before running the installer. On the Pi as `pi`, load `BACKBLAZE_MASTER_KEY_ID` and `BACKBLAZE_MASTER_KEY` from the owner's existing synced environment in a private shell with tracing off. Keep both values out of arguments, printed output and the transcript.
 
    ```bash
-   /usr/local/bin/safepi deno run --no-prompt --allow-read=.,.private \
-     --allow-run=/usr/bin/curl - <<'DENO'
-   import { loadSourceConfig, realPiDeps } from "./scripts/backblaze-file-backup.ts";
-   import { BACKUP_V2_NAMESPACE } from "./scripts/backup-v2-profile.ts";
-   import { BackupV2Store } from "./scripts/backup-v2-store.ts";
-   try {
-     const { b2 } = await loadSourceConfig(realPiDeps());
-     await new BackupV2Store(b2).versionsPage(BACKUP_V2_NAMESPACE, null);
-     console.log("B2_WRITER_KEY_SCOPE_PROVED");
-   } catch {
-     console.error("B2_WRITER_KEY_SCOPE_UNPROVED");
-     Deno.exitCode = 1;
-   }
-   DENO
+   cd /home/pi/ops/weekly-backup-controller
+   test "$(id -un)" = pi
+   command -v deno >/dev/null
+   test ! -e .private/file-backup/retention-key.json && test ! -L .private/file-backup/retention-key.json
+   bash config/backup-repair/install-b2-credential.sh install
    ```
+
+   The deployment normally uses the one writer credential for capture, verification and retention. If an explicit `retention-key.json` exists, the controller still uses it for retention and reports an error if it cannot validate that file. To switch that prior installation to the master key for both roles, preserve the explicit key privately and move it out of the configured path only under the same settled-custody and controller lock checks. The installation command changes only `accessKeyId` and `secretAccessKey` in `.private/b2-file-backup.json`. It holds the existing lock, verifies settled local and source gates, proves the credential with bounded read-only authorization and bucket identity calls, and writes mode `0600` config and rollback evidence. A nonzero exit reports a fixed reason. Keep the service and timer paused while correcting it.
+
+   The runtime validates the configured ID against the fixed `pavlovcik-arch-vps-backups` name and proves the pair with Backblaze. The master key grants account-wide authority. Keep the exact bucket and writer-prefix checks, `maxDeleteFraction`, upload-age grace, plan-first, exact object verification and accepted-catalog protection in force. A separate existing retention key still needs bucket-wide metadata scope, `listFiles` for version and unfinished-file listings, `writeFiles` for parts listing and cancellation, and `deleteFiles` for exact versions. [Application keys](https://www.backblaze.com/docs/cloud-storage-application-keys) [List buckets](https://www.backblaze.com/apidocs/b2-list-buckets)
+
+   Complete the release install on the VPS with the standard deployment procedure. The normal Pi controller retains the pinned writer credential in private `job.settings.B2Settings`. The Pi copies each selected credential through the existing authenticated installer into root-owned mode-`0600` `settings.json` inside each new immutable VPS job under `/var/tmp/arch-vps-file-backup-runtime/jobs/<job-id>/`. Older job directories retain their pinned settings. Leave settled historical directories in place. Revoking their older scoped key has no effect on new jobs, and any old invocation still eligible for continuation must settle before revocation.
+
+   Until the old key is revoked, use the exact saved config only if a rollback is required. Pause the services and settle custody again, then run `bash config/backup-repair/install-b2-credential.sh rollback` from the installed Pi controller directory before reverting its source files. The command verifies the current config still matches the installed snapshot and restores the previous private bytes. After revocation, a local rollback cannot restore server-side access for that scoped key.
 
 2. **Verify the live catalog, then review a read-only plan before opting into deletion.** Keep execution disabled while doing the initial review. The controller defaults to the policy below when `.private/file-backup/retention-policy.json` is absent. Each property is optional. Existing deployed four-generation retention records and old receipts cannot opt into execution. The manual catalog command checks only exact catalog objects with matching provider IDs, names, lengths and applicable hash metadata. It leaves the bucket untouched even when the execution flag is enabled and does not launch a capture or clean source scratch. Verification does not download or decrypt archive payloads.
 
@@ -343,32 +338,52 @@ Use the standard deployment procedure above through step 4. Keep the Backblaze s
    }
    ```
 
-   From the deployed Pi controller directory, use the same managed invocation for both commands. Each invocation reconciles one bounded slice. If it returns a running status, keep the exact transaction and rerun that command after its source unit progresses, or let the existing Backblaze service reconcile it. Inspect the private report for that run. Retention stays fenced while the exact source gate is held. A settled normal plan-only report allows the next due backup to start.
+   From the deployed Pi controller directory, use the same managed invocation for both commands. Each invocation reconciles one bounded slice. If it returns a running status, keep the exact transaction and rerun that command after its source unit progresses, or let the existing Backblaze service reconcile it. The commands print JSON. Exit 75 means an in-progress slice, exit 0 means the requested check finished, and exit 1 means a refusal or failure. Inspect `reason` and `message` on a refusal. Each command writes only its own report and supporting transaction evidence. The normal backup health file is `.private/reports/backblaze-file-backup.json`. Retention stays fenced while the exact source gate is held. A settled normal plan-only report allows the next due backup to start.
 
    ```bash
+   set -euo pipefail
    umask 077
    cd /home/pi/ops/weekly-backup-controller
-   /usr/local/bin/safepi deno run --no-prompt --allow-read=.,.private \
+   verification=$(/usr/local/bin/safepi deno run --no-prompt --allow-read=.,.private \
      --allow-write=.private --allow-run --allow-sys=uid --allow-net \
-     scripts/verify-backblaze-catalog.ts
+     scripts/verify-backblaze-catalog.ts) || {
+     status=$?
+     printf '%s\n' "$verification"
+     exit "$status"
+   }
+   printf '%s\n' "$verification"
+   verification_txn=$(printf '%s\n' "$verification" | jq -erRs '
+     [split("\n")[] | fromjson? | select(.status == "B2_RETENTION_CATALOG_VERIFIED") |
+       .retentionTransactionId] | if length == 1 then .[0] else empty end
+   ')
 
    november=generation-61d5c174-45ff-4d7d-baec-57d06da81e89
    october=generation-0846ac72-2994-4b1e-8629-9cab95462b3e
-   jq -e --arg november "$november" --arg october "$october" '
-     .status == "B2_RETENTION_CATALOG_VERIFIED" and .healthy and
+   jq -e --arg txn "$verification_txn" --arg november "$november" --arg october "$october" '
+     .transactionId == $txn and .status == "B2_RETENTION_CATALOG_VERIFIED" and .healthy and
      .summary.damagedCaptureIds == [] and
      (.checkedCaptureIds | index($november) != null and index($october) != null)
    ' .private/reports/backblaze-catalog-verification.json
 
-   /usr/local/bin/safepi deno run --no-prompt --allow-read=.,.private \
+   planning=$(/usr/local/bin/safepi deno run --no-prompt --allow-read=.,.private \
      --allow-write=.private --allow-run --allow-sys=uid --allow-net \
-     scripts/plan-backblaze-retention.ts
+     scripts/plan-backblaze-retention.ts) || {
+     status=$?
+     printf '%s\n' "$planning"
+     exit "$status"
+   }
+   printf '%s\n' "$planning"
+   planning_txn=$(printf '%s\n' "$planning" | jq -erRs '
+     [split("\n")[] | fromjson? |
+       select(.status == "B2_RETENTION_PLAN_ONLY" or .status == "B2_RETENTION_ORPHANS_PRESENT") |
+       .retentionTransactionId] | if length == 1 then .[0] else empty end
+   ')
    report=.private/reports/backblaze-retention.json
-   jq '{transactionId,observedAtUtc,status,policy,plan,retainedCaptureIds,summary}' "$report"
+   jq '{transactionId,observedAtUtc,status,reason,message,policy,plan,retainedCaptureIds,summary}' "$report"
    plan=$(jq -er '.plan.path | select(test("^\\.private/file-backup/retention/[0-9a-f-]{36}/plan\\.json$"))' "$report")
    test "$(sha256sum "$plan" | cut -d' ' -f1)" = "$(jq -er '.plan.sha256' "$report")"
-   jq -e --arg november "$november" --arg october "$october" '
-     .policy.execute == false and .summary.blockReason == null and
+   jq -e --arg txn "$planning_txn" --arg november "$november" --arg october "$october" '
+     .transactionId == $txn and .policy.execute == false and .summary.blockReason == null and
      .summary.damagedCaptureIds == [] and
      (.retainedCaptureIds | index($november) != null and index($october) != null)
    ' "$report"
@@ -378,6 +393,43 @@ Use the standard deployment procedure above through step 4. Keep the Backblaze s
    Confirm both named IDs and the transaction time before enabling execution. The report points to a private mode-`0600` plan with each candidate's exact identity, category, counts, bytes and eligibility evidence. Review version and unfinished-part bytes, unclassified/foreign bytes, and the cap. A damaged accepted generation raises an urgent alert with its ID. Keep intact older fallback entries while damage exists. A separately approved boot restore is still required for machine boot proof.
 
    A plan-only report can flag orphans while deletion is disabled. Review a candidate individually with `jq '.candidates[] | select(.reason == "UNACCEPTED_V2")' "$plan"` on the Pi. Share only counts, categories and the allowed named generation IDs. The controller state contains credential-bearing job settings. Every report and operator command above uses an allowlisted projection.
+
+   Check the installed policy before the first normal service start because a private policy can persist across a release rollback. Keep both gates settled and the timers paused. A valid absent policy or a valid policy with execution disabled permits the health check. On refusal, leave the service paused and inspect the private policy.
+
+   ```bash
+   /usr/local/bin/safepi deno run --no-prompt --cached-only --allow-read=.,.private - <<'DENO' || exit "$?"
+   import { backupV2RetentionPolicy } from "./scripts/backup-v2-controller.ts";
+   import { B2_RETENTION_POLICY_PATH } from "./scripts/backup-v2-retention-report.ts";
+   import { realPrivateSeam } from "./scripts/backblaze-file-backup.ts";
+   try {
+     const info = await Deno.lstat(B2_RETENTION_POLICY_PATH).catch((error) => {
+       if (error instanceof Deno.errors.NotFound) return undefined;
+       throw error;
+     });
+     if (info && (!info.isFile || info.isSymlink)) throw new Error("Invalid policy file");
+     const raw = await realPrivateSeam().read(B2_RETENTION_POLICY_PATH);
+     if (backupV2RetentionPolicy(raw).policy.execute) throw new Error("Execution is enabled");
+     console.log("B2_RETENTION_PLAN_ONLY_PROVED");
+   } catch {
+     console.error("B2_RETENTION_PLAN_ONLY_UNPROVED");
+     Deno.exitCode = 1;
+   }
+   DENO
+   ```
+
+   Start the installed normal Backblaze service once to regenerate the report overwritten by the prior release. A fresh `B2_BACKUP_CURRENT` must match the actual current capture and its accepted receipt. For the November 18 rollout, the current accepted capture is the `november` generation checked above. If the weekly period already changed, wait for a genuinely accepted capture in the new period before claiming current health.
+
+   ```bash
+   observed_after=$(date -u +%s)
+   systemctl --user start backblaze-file-backup.service
+   jq -e --arg generation "$november" --argjson since "$observed_after" '
+     .healthy == true and (.status | startswith("B2_BACKUP_CURRENT:")) and
+     .generation == $generation and
+     ((.observedAtUtc | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) >= $since)
+   ' .private/reports/backblaze-file-backup.json
+   ```
+
+   The watchdog reports catalog verification and retention separately under `.b2.maintenance`. An authorization, policy or plan failure remains visible there without changing the current accepted backup's health. Proven damage to the only current accepted capture makes backup health unhealthy. Keep both survivor generations protected while resolving a damage alert. Once the normal controller uses the master key and live verification and planning have passed with both survivors and settled custody, the owner can delete the exposed old scoped key in Backblaze.
 
 3. **Enable execution only after reviewing the real plan and verifying both survivors.** Leave `cleanLegacyOrphans` off for the first execution. Enabling the flag starts a fresh transaction that builds and writes its own complete plan before any effect. In the Pi directory, run the following under the existing controller lock with the service and its timer paused.
 
@@ -404,7 +456,7 @@ Use the standard deployment procedure above through step 4. Keep the Backblaze s
    '
    systemctl --user start backblaze-file-backup.service
    journalctl --user -u backblaze-file-backup.service --no-pager -o cat -n 30
-   jq '{status,summary,retainedCaptureIds}' .private/reports/backblaze-retention.json
+   jq '{status,reason,message,summary,retainedCaptureIds}' .private/reports/backblaze-retention.json
    ```
 
    Follow standard steps 5 through 7 to rearm existing schedules. A complete execution reports actual delete counts and bytes separately from prior removals reconciled as already absent. The transaction's private catalog retirement record preserves the preimage. A partial run retains the exact plan, mutation intent and source journal. To retry a transient failure, run the same existing service with that transaction, policy and credentials intact. After a catalog damage or identity mismatch, resolve the cause with the read-only verification command and retain all receipts. Avoid rerunning deletion with a new plan over an unsettled partial transaction. Verify both designated survivors again after the first execution. Before any rollback to a historical four-generation release, leave its Backblaze service paused until the supervisor explicitly reviews the retired legacy deletion path and catalog. That release predates the opt-in flag.

@@ -23,6 +23,7 @@ import {
   BACKUP_V2_LIMITS,
   BACKUP_V2_NAMESPACE,
 } from "../scripts/backup-v2-profile.ts";
+import { B2CredentialError } from "../scripts/backblaze-storage.ts";
 
 const encoder = new TextEncoder();
 const bucketId = "fixture-bucket";
@@ -280,6 +281,213 @@ function fakeWire(
     );
   };
 }
+
+function masterWire(
+  calls: BackupV2WireRequest[],
+  handle: (request: BackupV2WireRequest) => BackupV2WireResponse,
+): BackupV2Wire {
+  return (request) => {
+    calls.push(request);
+    if (request.url.endsWith("b2_authorize_account")) {
+      const value = auth();
+      Reflect.set(value.apiInfo.storageApi.allowed, "buckets", null);
+      Reflect.set(value.apiInfo.storageApi.allowed, "namePrefix", null);
+      value.apiInfo.storageApi.allowed.capabilities.push("listBuckets");
+      return Promise.resolve(
+        response({ ...value, accountId: "fixture-account" }),
+      );
+    }
+    if (request.url.endsWith("b2_list_buckets")) {
+      assert(
+        request.json === JSON.stringify({
+          accountId: "fixture-account",
+          bucketName: settings.bucketName,
+        }),
+      );
+      return Promise.resolve(response({
+        buckets: [{
+          accountId: "fixture-account",
+          bucketId,
+          bucketName: settings.bucketName,
+        }],
+      }));
+    }
+    return Promise.resolve(handle(request));
+  };
+}
+
+Deno.test("v2 master preflight refuses redirected configured bucket IDs and paired names", async () => {
+  const calls: BackupV2WireRequest[] = [];
+  const wire = masterWire(calls, () => {
+    throw Error("Object endpoint may not run");
+  });
+  const crossBucket = await rejects(new BackupV2Store({
+    ...settings,
+    bucketId: "different-fixture-bucket",
+  }, wire).reconcileExact(ref()));
+  assert(
+    crossBucket instanceof B2CredentialError &&
+      crossBucket.reason === "B2_BUCKET_IDENTITY_MISMATCH",
+  );
+  assert(calls.length === 2);
+  let invalidName;
+  try {
+    new BackupV2Store({
+      ...settings,
+      bucketId: "different-fixture-bucket",
+      bucketName: "different-fixture-name",
+    }, wire);
+  } catch (error) {
+    invalidName = error;
+  }
+  assert(invalidName instanceof B2CredentialError && calls.length === 2);
+});
+
+Deno.test("v2 master seeks exact scoped versions before reads or deletes", async () => {
+  const object = ref();
+  for (const variant of ["present", "absent", "foreign", "tampered"]) {
+    const calls: BackupV2WireRequest[] = [];
+    const wire = masterWire(calls, (request) => {
+      if (request.url.endsWith("b2_list_file_versions")) {
+        const query = JSON.parse(request.json!);
+        assert(
+          query.bucketId === bucketId && query.maxFileCount === 1 &&
+            query.prefix === name && query.startFileName === name &&
+            query.startFileId === object.fileId,
+        );
+        return response({
+          files: variant === "absent" ? [] : [{
+            ...listed(),
+            bucketId: variant === "foreign" ? "other-fixture-bucket" : bucketId,
+            uploadTimestamp: variant === "tampered"
+              ? 19
+              : object.uploadTimestamp,
+          }],
+          nextFileId: null,
+          nextFileName: null,
+        });
+      }
+      if (request.url.includes("b2_download_file_by_id")) {
+        assert(variant === "present");
+        const result = response("");
+        result.body = new ReadableStream({
+          start(controller) {
+            controller.enqueue(data);
+            controller.close();
+          },
+        });
+        result.headers.set("x-bz-file-id", object.fileId);
+        result.headers.set("x-bz-file-name", encodeURIComponent(name));
+        result.headers.set("x-bz-content-sha1", object.contentSha1);
+        return result;
+      }
+      assert(
+        variant === "present" && request.url.endsWith("b2_delete_file_version"),
+      );
+      return response({ fileId: object.fileId, fileName: name });
+    });
+    const store = new BackupV2Store(settings, wire);
+    if (variant === "present") {
+      assert(await store.reconcileExact(object) === "PRESENT");
+      await store.verifyExactReadback(object);
+      await store.removeExact(object);
+      assert(calls.length === 7);
+    } else {
+      if (variant === "absent") {
+        assert(await store.reconcileExact(object) === "ABSENT");
+      } else await rejects(store.reconcileExact(object));
+      await rejects(store.verifyExactReadback(object));
+      await rejects(store.removeExact(object));
+      assert(
+        calls.length === 5 &&
+          calls.slice(2).every((request) =>
+            request.url.endsWith("b2_list_file_versions")
+          ),
+      );
+    }
+  }
+});
+
+Deno.test("v2 master parts and cancel require an exact unfinished version in the bound bucket", async () => {
+  const unfinished = {
+    fileId: "fixture-unfinished-id",
+    fileName: name,
+    uploadTimestamp: 11,
+    contentLength: 0,
+    contentSha1: "",
+    action: "start" as const,
+    partsSha256: "e".repeat(64),
+    lastPartUploadedAt: 11,
+  };
+  for (
+    const variant of ["present", "foreign", "different-id", "wrong-part-id"]
+  ) {
+    const calls: BackupV2WireRequest[] = [];
+    const store = new BackupV2Store(
+      settings,
+      masterWire(calls, (request) => {
+        const input = JSON.parse(request.json!);
+        if (request.url.endsWith("b2_list_unfinished_large_files")) {
+          assert(
+            input.bucketId === bucketId &&
+              input.startFileId === unfinished.fileId &&
+              input.maxFileCount === 1,
+          );
+          return response({
+            files: [{
+              ...unfinished,
+              bucketId: variant === "foreign"
+                ? "other-fixture-bucket"
+                : bucketId,
+              fileId: variant === "different-id"
+                ? "other-fixture-id"
+                : unfinished.fileId,
+            }],
+            nextFileId: null,
+          });
+        }
+        assert(input.fileId === unfinished.fileId);
+        if (request.url.endsWith("b2_list_parts")) {
+          return response({
+            parts: [{
+              fileId: variant === "wrong-part-id"
+                ? "other-fixture-id"
+                : unfinished.fileId,
+              contentLength: 1,
+              partNumber: 1,
+              contentSha1: "a".repeat(40),
+              uploadTimestamp: 11,
+            }],
+            nextPartNumber: null,
+          });
+        }
+        assert(request.url.endsWith("b2_cancel_large_file"));
+        return response({ ...unfinished, bucketId });
+      }),
+      undefined,
+      "retention",
+    );
+    if (variant === "present") {
+      assert(
+        (await store.unfinishedPartsPage(unfinished.fileId, null)).items
+          .length === 1,
+      );
+      await store.removeRetentionVersion(unfinished);
+      assert(calls.length === 6);
+    } else {
+      await rejects(store.unfinishedPartsPage(unfinished.fileId, null));
+      if (variant !== "wrong-part-id") {
+        await rejects(store.removeRetentionVersion(unfinished));
+        assert(
+          calls.length === 4 &&
+            calls.slice(2).every((request) =>
+              request.url.endsWith("b2_list_unfinished_large_files")
+            ),
+        );
+      }
+    }
+  }
+});
 
 Deno.test("retention uses exact bucket unprefixed key and native multipart metadata/delete APIs", async () => {
   const calls: BackupV2WireRequest[] = [];
@@ -640,10 +848,10 @@ Deno.test("v2 control and payload chains expose separate finite wait bounds", as
   assert(bounds.controlMs === 120_000 && bounds.payloadMs === 21_600_000);
   assert(bounds.settlementMs === 30_000);
   assert(
-    bounds.putControlRequests === 2 && bounds.readbackControlRequests === 1,
+    bounds.putControlRequests === 3 && bounds.readbackControlRequests === 3,
   );
-  assert(bounds.putEpisodeMs === 21_870_000);
-  assert(bounds.readbackEpisodeMs === 21_750_000);
+  assert(bounds.putEpisodeMs === 21_990_000);
+  assert(bounds.readbackEpisodeMs === 21_990_000);
   const calls: BackupV2WireRequest[] = [];
   const store = new BackupV2Store(settings, (request) => {
     calls.push(request);

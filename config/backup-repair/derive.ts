@@ -24,6 +24,7 @@ const pending = [
   "scripts/scheduled-backblaze-file-backup.ts",
   "scripts/plan-backblaze-retention.ts",
   "scripts/verify-backblaze-catalog.ts",
+  "scripts/install-b2-credential.ts",
   "scripts/backup-watchdog.ts",
   "scripts/calendar-observations.ts",
   "scripts/pi-recovery-session.ts",
@@ -52,6 +53,7 @@ for (
     "config/weekly-backup.service",
     "config/backblaze-file-backup.service",
     "config/weekly-backup-watchdog.service",
+    "config/backup-repair/install-b2-credential.sh",
   ]
 ) {
   const stagePath = "tree/" + path;

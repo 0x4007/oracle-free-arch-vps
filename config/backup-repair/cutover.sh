@@ -11,8 +11,17 @@ selector=.private/backblaze-deployment.json
 units=(weekly-backup.service backblaze-file-backup.service weekly-backup-watchdog.service)
 targets=$rollback/targets
 before=$rollback/before
+installer_dir=$controller/config/backup-repair
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
+check_installer_directory() {
+  [[ -d $controller/config && ! -L $controller/config && -O $controller/config &&
+     ! -L $installer_dir ]] || fail "Unsafe installer parent directory"
+  if [[ -e $installer_dir ]]; then
+    [[ -d $installer_dir && -O $installer_dir ]] ||
+      fail "Unsafe installer parent directory"
+  fi
+}
 verify_hashes() {
   local hash_map=$1 directory=$2 list
   list=$(mktemp -- "$stage/checksums.XXXXXX")
@@ -59,6 +68,10 @@ flock -n "$controller_fd"
 
 if [[ $action == install ]]; then
   [[ ! -e $targets && ! -e $before ]] || fail "Use a fresh private rollback directory"
+  check_installer_directory
+  if [[ ! -d $installer_dir ]]; then
+    touch -- "$rollback/created-installer-directory"
+  fi
   jq -er '.hashes' "$controller/$receipt" > "$stage/live-hashes.json"
   verify_hashes "$stage/live-hashes.json" "$controller"
   verify_hashes "$stage/install-hashes.json" "$stage/tree"
@@ -75,6 +88,7 @@ if [[ $action == install ]]; then
   while IFS= read -r path; do
     [[ $path =~ ^scripts/[A-Za-z0-9_.-]+\.ts$ ||
        $path == deno.json ||
+       $path == config/backup-repair/install-b2-credential.sh ||
        $path == config/weekly-backup.service ||
        $path == config/backblaze-file-backup.service ||
        $path == config/weekly-backup-watchdog.service ]] || fail "Unexpected path in install list"
@@ -110,6 +124,9 @@ if [[ $action == install ]]; then
     ' "$saved_receipt" > "$rollback/receipt.new.json"
   jq --arg revision "$revision" '.sourceRevision = $revision' "$saved_selector" > "$rollback/selector.new.json"
   touch -- "$rollback/snapshot-ready"
+  if [[ -f $rollback/created-installer-directory ]]; then
+    mkdir -m 0700 -- "$installer_dir"
+  fi
 
   while IFS= read -r key; do
     origin=$(candidate "$key")
@@ -131,6 +148,7 @@ if [[ $action == install ]]; then
   ' "$controller/$receipt" >/dev/null
   [[ $(jq -er .sourceRevision "$controller/$selector") == "$revision" ]]
 else
+  check_installer_directory
   test -f "$rollback/snapshot-ready"
   [[ $(jq -er .sourceRevision "$rollback/receipt.new.json") == "$revision" ]]
   while IFS= read -r key; do
@@ -159,6 +177,9 @@ else
       mv -T -- "$dest" "$retained"
     fi
   done < "$targets"
+  if [[ -f $rollback/created-installer-directory && -d $installer_dir ]]; then
+    rmdir --ignore-fail-on-non-empty -- "$installer_dir"
+  fi
   jq -er '.hashes' "$controller/$receipt" > "$stage/live-hashes.json"
   verify_hashes "$stage/live-hashes.json" "$controller"
   [[ $(jq -er .sourceRevision "$controller/$selector") == "$(jq -er .sourceRevision "$controller/$receipt")" ]]

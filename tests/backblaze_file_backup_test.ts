@@ -32,6 +32,9 @@ import {
   B2_RETENTION_POLICY_PATH,
   B2_RETENTION_REPORT_PATH,
   type BackupV2PiRetentionReport,
+  maintenanceFailure,
+  publishMaintenanceReport,
+  readBackblazeMaintenance,
   retentionTransactionPath,
 } from "../scripts/backup-v2-retention-report.ts";
 import {
@@ -84,7 +87,10 @@ import {
   generationChunkName,
   UPLOAD_ROLE_ORDER,
 } from "../scripts/backblaze-upload.ts";
-import type { B2Object } from "../scripts/backblaze-storage.ts";
+import {
+  B2CredentialError,
+  type B2Object,
+} from "../scripts/backblaze-storage.ts";
 import type {
   IndexRecipient,
   PublishedIndex,
@@ -97,6 +103,8 @@ import type { DecryptedVerification } from "../scripts/backblaze-verifier.ts";
 import {
   assertVerifierHeadroom,
   assessBackblazeWatchdog,
+  B2_REPORT_PATH,
+  backblazeOperatorExitCode,
   buildCleanupScript,
   buildClearProof,
   buildRequestEnvelope,
@@ -121,6 +129,7 @@ import {
   type MetadataStore,
   newJobState,
   type ObservedUnit,
+  PI_CONTROLLER_CWD,
   type PiDeps,
   PIP_JOB_EVIDENCE_PATH,
   type PrivateSeam,
@@ -137,6 +146,7 @@ import {
   retainedIdsPresent,
   revalidatePruneDeletions,
   runBackblazeCycle,
+  runBackblazePiController,
   SCRATCH_SWEEP_MIN_AGE_SECONDS,
   selectPruneCandidates,
   SOURCE_HOST,
@@ -161,6 +171,10 @@ import {
   workerUnitNameOf,
 } from "../scripts/backblaze-file-backup.ts";
 import { shellQuote } from "../scripts/backup-guest.ts";
+import {
+  canUseBackupTestFixtures,
+  withBackupTestFixture,
+} from "./backup-test-fixtures.ts";
 
 function assert(value: unknown, message?: string): asserts value {
   if (!value) throw new Error(message ?? "Assertion failed");
@@ -2366,11 +2380,13 @@ Deno.test("legacy acceptance preserves the full catalog and delegates all cloud 
 });
 
 Deno.test("installed controller starts read-only maintenance against a settled historical catalog", async () => {
-  for (const mode of ["scheduled", "verify-catalog"] as const) {
+  for (const mode of ["scheduled", "plan", "verify-catalog"] as const) {
     const old = generationFixture(1, WINDOW_START + 1000);
     const sourceBootId = "10000000-0000-4000-8000-000000000000";
     let gate: BackupV2Gate | null = null;
     let launched = false;
+    const originalHealth =
+      '{  "status": "B2_RETENTION_BLOCKED", "healthy": false }\n';
     const trap = {
       ensure() {
         return Promise.reject(
@@ -2384,11 +2400,12 @@ Deno.test("installed controller starts read-only maintenance against a settled h
       },
     };
     const h = harness({
-      now: new Date(WINDOW_START + 120_000),
+      now: new Date(WINDOW_START + 6 * 3_600_000),
       seedPrivate(map) {
+        map.set(B2_REPORT_PATH, originalHealth);
         map.set(CONTROLLER_STATE_PATH, {
           schemaVersion: 1,
-          catalog: [catalogEntry(old, WINDOW_START + 3000)],
+          catalog: [catalogEntry(old, WINDOW_START + 5 * 3_600_000)],
         });
         map.set(`.private/file-backup/retention/${old.jobId}.json`, {
           schemaVersion: 2,
@@ -2397,18 +2414,20 @@ Deno.test("installed controller starts read-only maintenance against a settled h
         if (mode === "verify-catalog") {
           map.set(B2_RETENTION_POLICY_PATH, { execute: true });
         }
-        map.set(B2_RETENTION_KEY_PATH, {
-          accessKeyId: "retention-test-key",
-          secretAccessKey: "retention-fixture",
-          bucketId: "bucket",
-          bucketName: "pavlovcik-arch-vps-backups",
-        });
+        if (mode === "verify-catalog") {
+          map.set(B2_RETENTION_KEY_PATH, {
+            accessKeyId: "retention-test-key",
+            secretAccessKey: "retention-fixture",
+            bucketId: "bucket",
+            bucketName: "pavlovcik-arch-vps-backups",
+          });
+        }
       },
       rootResponder(script) {
         const ok = (stdout = "") => ({ code: 0, stdout, stderr: "" });
         if (script.includes("echo SOURCE_IDLE")) return ok("SOURCE_IDLE");
         if (script.includes("discoverBackupV2SourceGates")) {
-          assert(mode === "scheduled");
+          assert(mode !== "verify-catalog");
           return ok(
             JSON.stringify({ sourceBootId, gates: [], unresolvedPuts: [] }),
           );
@@ -2450,9 +2469,44 @@ Deno.test("installed controller starts read-only maintenance against a settled h
       if (path === GATE_PATH) gate = value as BackupV2Gate;
       await write(path, value);
     };
+    h.deps.verifyRetentionCredential = (settings) => {
+      assert(
+        settings.accessKeyId ===
+          (mode === "verify-catalog" ? "retention-test-key" : "key"),
+      );
+      return Promise.resolve();
+    };
     const report = await runBackupV2ControllerCycle(h.deps, trap, mode);
-    assert(report.status === "B2_RETENTION_PLAN_RUNNING", report.status);
-    const directory = mode === "scheduled"
+    if (mode === "scheduled") {
+      assert(
+        report.status === `B2_BACKUP_CURRENT:${old.jobId}` && report.healthy,
+        report.status,
+      );
+      assert(
+        report.maintenance?.retention?.status === "B2_RETENTION_PLAN_RUNNING",
+      );
+      assert(
+        (await h.deps.private.read<WatchdogAssessment>(B2_REPORT_PATH))
+          ?.healthy,
+      );
+    } else {
+      assert(report.status === "B2_RETENTION_PLAN_RUNNING", report.status);
+      assert(report.reason === "B2_RETENTION_RECONCILIATION_PENDING");
+      assert(backblazeOperatorExitCode(report, mode) === 75);
+      assert(h.privateMap.get(B2_REPORT_PATH) === originalHealth);
+      const reportPath = mode === "verify-catalog"
+        ? B2_CATALOG_REPORT_PATH
+        : B2_RETENTION_REPORT_PATH;
+      const persisted = await h.deps.private.read<WatchdogAssessment>(
+        reportPath,
+      );
+      assert(persisted?.status === report.status);
+      assert(
+        persisted.reason === report.reason &&
+          persisted.message === report.message,
+      );
+    }
+    const directory = mode !== "verify-catalog"
       ? B2_RETENTION_CONTROL_PATH
       : B2_CATALOG_CONTROL_PATH;
     const control = await h.deps.private.read<BackupV2RetentionControl>(
@@ -2481,6 +2535,141 @@ Deno.test("installed controller starts read-only maintenance against a settled h
       h.privateMap.has(`.private/file-backup/retention/${old.jobId}.json`),
     );
   }
+});
+
+Deno.test("retention credential refusals are safe and scheduled backup health is rebuilt from acceptance", async () => {
+  const current = generationFixture(1, WINDOW_START + 1000);
+  const protectedValue = "synthetic-provider-response-and-key";
+  const trap = {
+    ensure: () => Promise.reject(Error("maintenance started a bridge")),
+    close: () => Promise.reject(Error("maintenance closed a bridge")),
+  };
+  for (
+    const [fault, expected] of [
+      ["missing", "B2_CREDENTIAL_SETTINGS_INVALID"],
+      ["malformed", "B2_RETENTION_CREDENTIAL_INVALID"],
+      ["insufficient", "B2_CREDENTIAL_SCOPE_REJECTED"],
+      ["exception", "B2_RETENTION_STEP_FAILED"],
+      ["policy", "B2_RETENTION_POLICY_INVALID"],
+    ] as const
+  ) {
+    const h = harness({
+      now: new Date(WINDOW_START + 6 * 3_600_000),
+      seedPrivate(map) {
+        map.set(CONTROLLER_STATE_PATH, {
+          schemaVersion: 1,
+          catalog: [catalogEntry(current, WINDOW_START + 5 * 3_600_000)],
+        });
+        map.set(B2_REPORT_PATH, {
+          status: "B2_RETENTION_BLOCKED",
+          healthy: false,
+        });
+        if (fault === "missing") map.delete(B2_CONFIG_PATH_KEY);
+        if (fault === "malformed") {
+          map.set(B2_RETENTION_KEY_PATH, protectedValue);
+        }
+        if (fault === "policy") {
+          map.set(B2_RETENTION_POLICY_PATH, { execute: protectedValue });
+        }
+      },
+      rootResponder(script) {
+        if (script.includes("echo SOURCE_IDLE")) {
+          return { code: 0, stdout: "SOURCE_IDLE", stderr: "" };
+        }
+        throw new Error(protectedValue);
+      },
+    });
+    h.deps.verifyRetentionCredential = () => {
+      throw fault === "insufficient"
+        ? new B2CredentialError("B2_CREDENTIAL_SCOPE_REJECTED", protectedValue)
+        : new Error(protectedValue);
+    };
+    const report = await runBackupV2ControllerCycle(h.deps, trap);
+    assert(report.status === `B2_BACKUP_CURRENT:${current.jobId}`);
+    assert(report.healthy);
+    const maintenance = report.maintenance?.retention;
+    assert(maintenance?.status === "B2_RETENTION_BLOCKED");
+    assert(maintenance.reason === expected, `${fault}: ${maintenance.reason}`);
+    assert(maintenance.message && !maintenance.message.includes("\n"));
+    const saved = await h.deps.private.read<WatchdogAssessment>(
+      B2_RETENTION_REPORT_PATH,
+    );
+    assert(saved?.reason === expected && saved.message === maintenance.message);
+    assert(!JSON.stringify({ report, saved }).includes(protectedValue));
+    assert(h.installs.length === 0 && h.store.removed.length === 0);
+    h.clock.current = new Date(h.clock.current.getTime() + 60_000);
+    const next = await runBackupV2ControllerCycle(h.deps, trap);
+    assert(
+      next.healthy && next.status === report.status &&
+        next.generation === report.generation,
+    );
+    assert(next.maintenance?.retention?.reason === expected);
+    assert(
+      (await h.deps.private.read<WatchdogAssessment>(B2_REPORT_PATH))
+        ?.status === report.status,
+    );
+  }
+});
+
+Deno.test({
+  name:
+    "operator preflight refuses safely and preserves the backup health and sibling report bytes",
+  ignore: !canUseBackupTestFixtures,
+  async fn() {
+    await withBackupTestFixture("report-isolation", async (directory) => {
+      for (const mode of ["plan", "verify-catalog"] as const) {
+        const h = harness({ now: new Date(WINDOW_START + 6 * 3_600_000) });
+        const original =
+          '{   "status": "B2_BACKUP_CURRENT:fixture", "healthy": true }\n';
+        const sibling = '{"sibling":true}\n';
+        const chosen = mode === "plan"
+            ? B2_RETENTION_REPORT_PATH
+            : B2_CATALOG_REPORT_PATH,
+          other = mode === "plan"
+            ? B2_CATALOG_REPORT_PATH
+            : B2_RETENTION_REPORT_PATH;
+        const path = (file: string) => `${directory}/${file.split("/").at(-1)}`;
+        await Deno.writeTextFile(path(B2_REPORT_PATH), original, {
+          mode: 0o600,
+        });
+        await Deno.writeTextFile(path(other), sibling, { mode: 0o600 });
+        const privateIO = realPrivateSeam();
+        h.deps.private = {
+          ...h.deps.private,
+          read: <T>(file: string): Promise<T | undefined> => {
+            if (file === CONTROLLER_STATE_PATH) {
+              throw new Deno.errors.PermissionDenied(
+                "synthetic secret in an exception",
+              );
+            }
+            return privateIO.read<T>(path(file));
+          },
+          write: (file, value) => privateIO.write(path(file), value),
+        };
+        const report = await runBackblazePiController(
+          mode,
+          h.deps,
+          () => Promise.resolve(PI_CONTROLLER_CWD),
+        );
+        const saved = await privateIO.read<WatchdogAssessment>(path(chosen));
+        assert(report.reason === "B2_CONTROLLER_STATE_UNREADABLE");
+        assert(
+          saved?.reason === report.reason && saved.message === report.message,
+        );
+        assert(backblazeOperatorExitCode(report, mode) === 1);
+        assert(!JSON.stringify({ report, saved }).includes("synthetic secret"));
+        const cwdFailure = await runBackblazePiController(
+          mode,
+          h.deps,
+          () => Promise.resolve(directory),
+        );
+        assert(cwdFailure.reason === "B2_CONTROLLER_CWD_INVALID");
+        assert(cwdFailure.reportWriteError === "B2_REPORT_WRITE_FAILED");
+        assert(await Deno.readTextFile(path(B2_REPORT_PATH)) === original);
+        assert(await Deno.readTextFile(path(other)) === sibling);
+      }
+    });
+  },
 });
 
 Deno.test("an unfinished legacy deletion intent cannot resume outside the new policy", async () => {
@@ -6674,6 +6863,21 @@ Deno.test("managed retention publishes exact source PLAN before EXECUTE and trim
         result.retention!.damagedCaptureIds[0] === generations[2].generation,
       );
       assert(mutations.length === 0);
+      assert(result.reason === "DAMAGED_ACCEPTED_GENERATION" && result.message);
+      const { damaged } = await readBackblazeMaintenance(h.deps.private, now);
+      assert(damaged.length === 1 && damaged[0] === generations[2].generation);
+      const later = new Date(now.getTime() + 60_000);
+      await publishMaintenanceReport(
+        h.deps.private,
+        "scheduled",
+        maintenanceFailure("scheduled", later, "B2_CREDENTIAL_SCOPE_REJECTED"),
+        later,
+      );
+      const latest = await readBackblazeMaintenance(h.deps.private, later);
+      assert(latest.damaged[0] === generations[2].generation);
+      assert(
+        latest.reports.retention?.reason === "B2_CREDENTIAL_SCOPE_REJECTED",
+      );
     } else {
       assert(Number(mutations.length) === UPLOAD_ROLE_ORDER.length + 1);
       const control = await current();

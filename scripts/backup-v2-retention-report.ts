@@ -1,11 +1,18 @@
 /** Private Pi publication and safe aggregate projections. */
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { BackupV2PrunePlanReference } from "./backup-v2-protection.ts";
 import type {
   BackupV2RetentionPolicy,
   BackupV2RetentionSummary,
 } from "./backup-v2-retention.ts";
 import { BACKUP_V2_LIMITS } from "./backup-v2-profile.ts";
+import {
+  backblazeReportExplanation,
+  type BackblazeReportReason,
+  backblazeReportReason,
+  type BackblazeReportReasonFields,
+} from "./backup-v2-report-reasons.ts";
 
 export const B2_RETENTION_ROOT = ".private/file-backup/retention";
 export const B2_RETENTION_CONTROL_PATH = B2_RETENTION_ROOT +
@@ -35,13 +42,41 @@ export const B2_RETENTION_CATEGORIES = [
 export const B2_CATALOG_DAMAGED_ALERT = "B2_RETENTION_CATALOG_DAMAGED";
 export const B2_RETENTION_ORPHAN_ALERT = "B2_RETENTION_ORPHANS_PRESENT";
 
-export interface BackupV2PiRetentionReport {
+export type BackblazeMaintenanceMode = "scheduled" | "plan" | "verify-catalog";
+
+export interface BackblazeMaintenanceResult
+  extends BackblazeReportReasonFields {
+  status: string;
+  observedAtUtc: string;
+  healthy: boolean;
+  retention?: BackupV2RetentionSummary;
+  retentionTransactionId?: string;
+  checkedCaptureIds?: string[];
+}
+
+export interface BackblazeMaintenanceReports {
+  retention?: BackblazeMaintenanceResult;
+  catalog?: BackblazeMaintenanceResult;
+}
+
+interface CatalogFact {
+  captureId: string;
+  observedAtUtc: string;
+  state: "INTACT" | "DAMAGED";
+}
+
+interface BackblazeMaintenanceRecord extends BackblazeReportReasonFields {
   schemaVersion: 1;
   format: "backblaze-retention-report";
-  transactionId: string;
+  transactionId?: string;
   observedAtUtc: string;
   status: string;
   healthy: boolean;
+  catalogFacts?: CatalogFact[];
+}
+
+export interface BackupV2PiRetentionReport extends BackblazeMaintenanceRecord {
+  transactionId: string;
   policy: BackupV2RetentionPolicy;
   plan: BackupV2PrunePlanReference & { path: string };
   summary: BackupV2RetentionSummary;
@@ -51,6 +86,8 @@ export interface BackupV2PiRetentionReport {
 
 const uuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const hash = /^[a-f0-9]{64}$/;
+const maintenanceStatuses =
+  /^B2_RETENTION_(?:BLOCKED|BUSY|LEGACY_CUSTODY_UNSETTLED|CATALOG_(?:VERIFIED|DAMAGED|VERIFICATION_REFUSED)|ORPHANS_PRESENT|PLAN_(?:ONLY|BLOCKED|REFUSED)|(?:PLAN|EXECUTE)_(?:REQUESTED|RUNNING|SETTLED|COMPLETE|PARTIAL|CANCELLATION_BLOCKED))$/;
 
 function invalid(): never {
   throw new Error("Private Backblaze retention report is unproved");
@@ -64,6 +101,235 @@ function count(value: unknown): number {
     invalid();
   }
   return value;
+}
+
+function captureId(value: unknown): value is string {
+  return typeof value === "string" && value.startsWith("generation-") &&
+    uuid.test(value.slice(11));
+}
+
+function reportTime(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) &&
+    new Date(value).toISOString() === value;
+}
+
+interface MaintenanceReportIO {
+  read<T>(path: string): Promise<T | undefined>;
+  write(path: string, value: unknown): Promise<void>;
+}
+
+export function maintenanceReportPath(mode: BackblazeMaintenanceMode): string {
+  return mode === "verify-catalog"
+    ? B2_CATALOG_REPORT_PATH
+    : B2_RETENTION_REPORT_PATH;
+}
+
+export function maintenanceFailure(
+  mode: BackblazeMaintenanceMode,
+  now: Date,
+  reason: BackblazeReportReason,
+  status = mode === "verify-catalog"
+    ? "B2_RETENTION_CATALOG_VERIFICATION_REFUSED"
+    : mode === "plan"
+    ? "B2_RETENTION_PLAN_REFUSED"
+    : "B2_RETENTION_BLOCKED",
+): BackblazeMaintenanceResult {
+  return {
+    status,
+    observedAtUtc: now.toISOString(),
+    healthy: false,
+    ...backblazeReportExplanation(reason),
+  };
+}
+
+function reportFacts(
+  report: BackupV2PiRetentionReport,
+): CatalogFact[] {
+  // An interrupted execute may fall back to the plan's kept IDs without
+  // revalidating them. An explicit damage result still proves those losses.
+  const intact = report.status === "B2_RETENTION_EXECUTE_PARTIAL"
+    ? []
+    : report.retainedCaptureIds;
+  return [
+    ...intact.map((captureId) => ({
+      captureId,
+      observedAtUtc: report.observedAtUtc,
+      state: "INTACT" as const,
+    })),
+    ...report.summary.damagedCaptureIds.map((captureId) => ({
+      captureId,
+      observedAtUtc: report.observedAtUtc,
+      state: "DAMAGED" as const,
+    })),
+  ];
+}
+
+function newestCatalogFacts(
+  ...lists: (readonly CatalogFact[])[]
+): CatalogFact[] {
+  const facts = new Map<string, CatalogFact>();
+  for (const fact of lists.flat()) {
+    const previous = facts.get(fact.captureId);
+    if (
+      !previous || previous.observedAtUtc < fact.observedAtUtc ||
+      previous.observedAtUtc === fact.observedAtUtc && fact.state === "DAMAGED"
+    ) facts.set(fact.captureId, fact);
+  }
+  return [...facts.values()];
+}
+
+function readCatalogFacts(value: unknown, nowUtc: string): CatalogFact[] {
+  if (
+    !Array.isArray(value) || value.length > BACKUP_V2_LIMITS.pruneCandidates
+  ) invalid();
+  const ids = new Set<string>();
+  return value.map((value) => {
+    const fact = object(value);
+    const { captureId: id, observedAtUtc: observed, state } = fact;
+    if (
+      !captureId(id) || ids.has(id) || !reportTime(observed) ||
+      observed > nowUtc || (state !== "INTACT" && state !== "DAMAGED")
+    ) {
+      invalid();
+    }
+    ids.add(id);
+    return { captureId: id, observedAtUtc: observed, state };
+  });
+}
+
+function maintenanceRecord(
+  raw: BackblazeMaintenanceRecord | undefined,
+  now: Date,
+) {
+  if (raw === undefined) return undefined;
+  const { observedAtUtc, status, healthy, transactionId } = raw;
+  if (
+    raw.schemaVersion !== 1 || raw.format !== "backblaze-retention-report" ||
+    !reportTime(observedAtUtc) || observedAtUtc > now.toISOString() ||
+    typeof status !== "string" || !maintenanceStatuses.test(status) ||
+    typeof healthy !== "boolean" ||
+    transactionId !== undefined && !uuid.test(transactionId)
+  ) invalid();
+  const stored = raw.catalogFacts === undefined
+    ? []
+    : readCatalogFacts(raw.catalogFacts, now.toISOString());
+  let terminal: BackupV2PiRetentionReport | undefined;
+  if ("plan" in raw) {
+    terminal = raw as BackupV2PiRetentionReport;
+    const { plan, summary, retainedCaptureIds, checkedCaptureIds } = terminal;
+    if (
+      !transactionId ||
+      plan.path !== retentionTransactionPath(transactionId, "plan") ||
+      !Array.isArray(retainedCaptureIds) ||
+      retainedCaptureIds.length > BACKUP_V2_LIMITS.pruneCandidates ||
+      retainedCaptureIds.some((id) => !captureId(id)) ||
+      checkedCaptureIds !== undefined &&
+        (!Array.isArray(checkedCaptureIds) ||
+          checkedCaptureIds.length > BACKUP_V2_LIMITS.pruneCandidates ||
+          checkedCaptureIds.some((id) => !captureId(id)))
+    ) invalid();
+    validateRetentionPlanReference(plan);
+    terminal = { ...terminal, summary: validateRetentionSummary(summary) };
+  }
+  const reason = !healthy || raw.reason !== undefined
+    ? backblazeReportReason(
+      raw.reason ?? terminal?.summary.blockReason,
+      "B2_RETENTION_STATUS_UNPROVED",
+    )
+    : undefined;
+  const result: BackblazeMaintenanceResult = {
+    observedAtUtc,
+    status,
+    healthy,
+    ...(reason ? backblazeReportExplanation(reason) : {}),
+    ...(transactionId ? { retentionTransactionId: transactionId } : {}),
+    ...(terminal ? { retention: terminal.summary } : {}),
+    ...(terminal?.checkedCaptureIds
+      ? { checkedCaptureIds: terminal.checkedCaptureIds }
+      : {}),
+  };
+  return {
+    result,
+    catalogFacts: newestCatalogFacts(
+      stored,
+      terminal ? reportFacts(terminal) : [],
+    ),
+  };
+}
+
+/** A retention issue must not erase an earlier cloud observation. Only a
+ * later result which checked that generation can clear its proven damage. */
+export async function publishMaintenanceReport(
+  io: MaintenanceReportIO,
+  mode: BackblazeMaintenanceMode,
+  result: BackblazeMaintenanceResult,
+  now: Date,
+  terminal?: BackupV2PiRetentionReport,
+): Promise<void> {
+  const path = maintenanceReportPath(mode);
+  const saved = await io.read<BackblazeMaintenanceRecord>(path).catch(() =>
+    undefined
+  );
+  let previous: ReturnType<typeof maintenanceRecord>;
+  try {
+    previous = maintenanceRecord(saved, now);
+  } catch { /* A malformed earlier report cannot supply cloud evidence. */ }
+  if (
+    terminal && previous &&
+    previous.result.retentionTransactionId !== terminal.transactionId &&
+    previous.result.observedAtUtc > result.observedAtUtc
+  ) return;
+  const relatedFacts = newestCatalogFacts(
+    previous?.catalogFacts ?? [],
+    terminal ? reportFacts(terminal) : [],
+  );
+  const record: BackblazeMaintenanceRecord = {
+    ...(terminal ?? {}),
+    schemaVersion: 1,
+    format: "backblaze-retention-report",
+    status: result.status,
+    healthy: result.healthy,
+    observedAtUtc: result.observedAtUtc,
+    ...(result.reason ? backblazeReportExplanation(result.reason) : {}),
+    ...(result.retentionTransactionId
+      ? { transactionId: result.retentionTransactionId }
+      : {}),
+    ...(relatedFacts.length ? { catalogFacts: relatedFacts } : {}),
+  };
+  if (!isDeepStrictEqual(saved, record)) {
+    await io.write(path, record);
+  }
+}
+
+export async function readBackblazeMaintenance(
+  io: Pick<MaintenanceReportIO, "read">,
+  now: Date,
+): Promise<{ reports: BackblazeMaintenanceReports; damaged: string[] }> {
+  const read = async (mode: BackblazeMaintenanceMode) => {
+    try {
+      return maintenanceRecord(await io.read(maintenanceReportPath(mode)), now);
+    } catch {
+      return {
+        result: maintenanceFailure(mode, now, "B2_REPORT_INVALID"),
+        catalogFacts: [],
+      };
+    }
+  };
+  const [retention, catalog] = await Promise.all([
+    read("plan"),
+    read("verify-catalog"),
+  ]);
+  return {
+    reports: {
+      ...(retention ? { retention: retention.result } : {}),
+      ...(catalog ? { catalog: catalog.result } : {}),
+    },
+    damaged: newestCatalogFacts(
+      retention?.catalogFacts ?? [],
+      catalog?.catalogFacts ?? [],
+    )
+      .filter((fact) => fact.state === "DAMAGED").map((fact) => fact.captureId),
+  };
 }
 
 export function retentionTransactionPath(
