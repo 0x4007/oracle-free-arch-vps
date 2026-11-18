@@ -155,14 +155,14 @@ async function parts(
   do {
     advance();
     const page = await source.unfinishedPartsPage(version.fileId, next);
-    if (
-      page.items.length > BACKUP_V2_LIMITS.listEntries ||
-      next !== null && page.items[0]?.partNumber !== next
-    ) retentionInventoryError();
+    if (page.items.length > BACKUP_V2_LIMITS.listEntries) {
+      retentionInventoryError();
+    }
     for (const part of page.items) {
       if (
         part.fileId !== version.fileId ||
         !Number.isSafeInteger(part.partNumber) ||
+        next !== null && part.partNumber < next ||
         part.partNumber <= priorPart || part.partNumber > 10_000 ||
         !/^[a-f0-9]{40}$/.test(part.contentSha1)
       ) retentionInventoryError();
@@ -178,8 +178,8 @@ async function parts(
     }
     if (
       page.next !== null &&
-      (!page.items.length || !Number.isSafeInteger(page.next) ||
-        page.next <= priorPart || page.next > 10_000)
+      (!Number.isSafeInteger(page.next) ||
+        page.next <= Math.max(priorPart, next ?? 0) || page.next > 10_000)
     ) retentionInventoryError();
     next = page.next;
   } while (next !== null);
@@ -216,15 +216,13 @@ export async function readBackupV2RetentionInventory(
     }
   };
   let cursor: BackupV2Cursor | null = null;
+  const versionCursors = new Set<string>();
   do {
     advance();
     const page = await reader.bucketVersionsPage(cursor, exactName);
-    if (
-      page.items.length > BACKUP_V2_LIMITS.listEntries ||
-      cursor &&
-        (page.items[0]?.fileId !== cursor.fileId ||
-          page.items[0]?.fileName !== cursor.fileName)
-    ) retentionInventoryError();
+    if (page.items.length > BACKUP_V2_LIMITS.listEntries) {
+      retentionInventoryError();
+    }
     for (const input of page.items) {
       const item = validateRetentionListedVersion(input);
       if (seen.has(item.fileId)) retentionInventoryError();
@@ -241,10 +239,11 @@ export async function readBackupV2RetentionInventory(
     if (page.next !== null) {
       retentionText(page.next.fileId, 512);
       retentionText(page.next.fileName, 1_000);
-      if (
-        !page.items.length || seen.has(page.next.fileId) ||
-        exactName && !page.next.fileName.startsWith(exactName)
-      ) retentionInventoryError();
+      const key = JSON.stringify([page.next.fileName, page.next.fileId]);
+      // The continuation pair can describe a position rather than a file.
+      // Actual returned versions are checked against the requested prefix.
+      if (versionCursors.has(key)) retentionInventoryError();
+      versionCursors.add(key);
     }
     cursor = page.next;
   } while (cursor !== null);
@@ -253,13 +252,13 @@ export async function readBackupV2RetentionInventory(
   }
   let next: string | null = null;
   const unfinishedSeen = new Set<string>();
+  const unfinishedCursors = new Set<string>();
   do {
     advance();
     const page = await reader.unfinishedFilesPage(next, exactName);
-    if (
-      page.items.length > BACKUP_V2_LIMITS.listEntries ||
-      next !== null && page.items[0]?.fileId !== next
-    ) retentionInventoryError();
+    if (page.items.length > BACKUP_V2_LIMITS.listEntries) {
+      retentionInventoryError();
+    }
     for (const input of page.items) {
       const item = validateRetentionListedVersion(input);
       if (
@@ -281,9 +280,12 @@ export async function readBackupV2RetentionInventory(
     }
     if (page.next !== null) {
       retentionText(page.next, 512);
-      if (!page.items.length || unfinishedSeen.has(page.next)) {
+      // Backblaze permits a continuation token that does not identify any
+      // upload. The next page can begin with the first surviving upload.
+      if (unfinishedCursors.has(page.next)) {
         retentionInventoryError();
       }
+      unfinishedCursors.add(page.next);
     }
     next = page.next;
   } while (next !== null);

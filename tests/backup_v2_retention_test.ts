@@ -874,3 +874,58 @@ Deno.test("retention recensus settles a multipart orphan cancelled during its ow
   );
   assert(f.removed.length === 0);
 });
+
+Deno.test("retention follows opaque unfinished continuations and gaps in version and part cursors", async () => {
+  const f = fixture();
+  f.snapshot.policy.keepAccepted = 5;
+  f.snapshot.jobs = [{ captureId: capture(6), custody: "SETTLED_UNACCEPTED" }];
+  const fileId = "unfinished-id";
+  const start = {
+    fileId,
+    fileName: object(6).fileName,
+    action: "start" as const,
+    uploadTimestamp: 1,
+    contentLength: 0,
+    contentSha1: "",
+  };
+  f.reader.bucketVersionsPage = (cursor) =>
+    Promise.resolve(
+      cursor === null
+        ? {
+          items: [],
+          next: {
+            fileName: "foreign/removed-before-next-page",
+            fileId: "missing",
+          },
+        }
+        : { items: [...f.cloud.values(), start], next: null },
+    );
+  f.reader.unfinishedFilesPage = (cursor) =>
+    Promise.resolve(
+      cursor === null
+        ? { items: [], next: "opaque-continuation" }
+        : { items: [start], next: null },
+    );
+  f.reader.unfinishedPartsPage = (id, cursor) =>
+    Promise.resolve(
+      cursor === null ? { items: [], next: 2 } : {
+        items: [{
+          fileId: id,
+          partNumber: 3,
+          contentLength: 10,
+          contentSha1: "1".repeat(40),
+          uploadTimestamp: 1,
+        }],
+        next: null,
+      },
+    );
+  const plan = await f.plan();
+  assert(plan.summary.bucketBytes === 142);
+  assert(plan.candidates.some(({ object }) =>
+    object.fileId === fileId &&
+    object.action === "start" && object.contentLength === 10
+  ));
+  f.reader.unfinishedFilesPage = () =>
+    Promise.resolve({ items: [], next: "repeated-token" });
+  await rejects(f.plan);
+});
