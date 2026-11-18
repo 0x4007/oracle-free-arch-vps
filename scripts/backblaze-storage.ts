@@ -10,8 +10,10 @@
  * caller-driven retry decides exactly how duplicates are reconciled.
  *
  * Credentials are validated before any network call and held in memory only.
- * Authorization must prove exactly one bucket (id and name), the required
- * capabilities and namePrefix `restic/`, with HTTPS api/download endpoints
+ * Authorization must prove the exact deployed bucket and required capabilities.
+ * A scoped writer must have prefix `restic/`. For an unrestricted key, the
+ * client verifies the deployed bucket by name and each account-wide ID against
+ * its bucket-scoped version listing. API and download endpoints use HTTPS
  * under backblazeb2.com. The v3 upload target from b2_get_upload_url is
  * restricted separately to HTTPS hosts under backblazeb2.com or
  * backblaze.com (the pod-* upload hosts) and must echo the authorized
@@ -66,6 +68,67 @@ export interface B2Object {
 
 export type B2Fetcher = typeof fetch;
 
+export type B2CredentialReason =
+  | "B2_CREDENTIAL_SETTINGS_INVALID"
+  | "B2_RETENTION_CREDENTIAL_INVALID"
+  | "B2_CREDENTIAL_SCOPE_REJECTED"
+  | "B2_BUCKET_IDENTITY_MISMATCH"
+  | "B2_CREDENTIAL_AUTH_UNPROVED";
+
+/** Only fixed local descriptions may cross the credential/report boundary. */
+export class B2CredentialError extends Error {
+  constructor(readonly reason: B2CredentialReason, message: string) {
+    super(message);
+    this.name = "B2CredentialError";
+  }
+}
+
+export type B2KeyPurpose = "backup" | "retention";
+export type B2KeyScope = "scoped" | "unrestricted";
+
+const B2_SETTINGS_FIELDS = [
+  "accessKeyId",
+  "secretAccessKey",
+  "bucketId",
+  "bucketName",
+] as const;
+
+export function b2SettingsFromConfig(value: unknown): B2Settings {
+  const settings = Object.fromEntries(B2_SETTINGS_FIELDS.map((field) => [
+    field,
+    value && typeof value === "object" ? Reflect.get(value, field) : undefined,
+  ])) as unknown as B2Settings;
+  validateSettings(settings);
+  return settings;
+}
+
+export async function selectB2RetentionCredential(
+  writer: B2Settings,
+  readOverride: () => Promise<unknown>,
+): Promise<B2Settings> {
+  validateSettings(writer);
+  try {
+    const value = await readOverride();
+    if (value === undefined) return { ...writer };
+    if (
+      !value || typeof value !== "object" || Array.isArray(value) ||
+      Object.keys(value).length !== B2_SETTINGS_FIELDS.length ||
+      !B2_SETTINGS_FIELDS.every((field) => Object.hasOwn(value, field))
+    ) throw new Error("Invalid retention credential fields");
+    const settings = b2SettingsFromConfig(value);
+    if (
+      settings.bucketName !== writer.bucketName ||
+      settings.bucketId !== writer.bucketId
+    ) throw new Error("Retention credential bucket mismatch");
+    return settings;
+  } catch {
+    throw new B2CredentialError(
+      "B2_RETENTION_CREDENTIAL_INVALID",
+      "The explicit Backblaze retention credential is malformed, unreadable, or bound to a different bucket",
+    );
+  }
+}
+
 // Pure policy checks shared with the separately versioned, bounded v2 wire adapter.
 export {
   assertBackblazeUrl as validateB2ApiUrl,
@@ -79,6 +142,7 @@ interface AuthorizedScope {
   token: string;
   apiUrl: string;
   downloadUrl: string;
+  keyScope: B2KeyScope;
 }
 
 interface UploadTarget {
@@ -140,25 +204,31 @@ function stringArray(value: unknown): string[] | null {
 
 function validateSettings(settings: B2Settings): void {
   if (typeof settings !== "object" || settings === null) {
-    throw new Error("settings rejected: missing settings");
+    throw new B2CredentialError(
+      "B2_CREDENTIAL_SETTINGS_INVALID",
+      "settings rejected: missing settings",
+    );
   }
-  if (
-    typeof settings.accessKeyId !== "string" ||
-    settings.accessKeyId.length === 0
-  ) {
-    throw new Error("settings rejected: empty accessKeyId");
-  }
-  if (
-    typeof settings.secretAccessKey !== "string" ||
-    settings.secretAccessKey.length === 0
-  ) {
-    throw new Error("settings rejected: empty secretAccessKey");
-  }
-  if (typeof settings.bucketId !== "string" || settings.bucketId.length === 0) {
-    throw new Error("settings rejected: empty bucketId");
+  for (const field of ["accessKeyId", "secretAccessKey", "bucketId"] as const) {
+    const value = settings[field];
+    if (
+      typeof value !== "string" || value.length === 0 ||
+      value.length > 8192 || /[\s:]/u.test(value) ||
+      [...value].some((char) =>
+        char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127
+      )
+    ) {
+      throw new B2CredentialError(
+        "B2_CREDENTIAL_SETTINGS_INVALID",
+        `settings rejected: invalid or empty ${field}`,
+      );
+    }
   }
   if (settings.bucketName !== BUCKET_NAME) {
-    throw new Error(`settings rejected: bucketName must be ${BUCKET_NAME}`);
+    throw new B2CredentialError(
+      "B2_BUCKET_IDENTITY_MISMATCH",
+      "settings rejected: backup bucket name does not match the deployment",
+    );
   }
 }
 
@@ -188,7 +258,8 @@ function assertBackblazeUrl(
   if (
     url.protocol !== "https:" || url.username !== "" ||
     url.password !== "" || (url.port !== "" && url.port !== "443") ||
-    !allowedHost
+    !allowedHost || url.pathname !== "/" || url.search || url.hash ||
+    value !== url.origin
   ) {
     throw operationError(operation, `${label} host rejected`);
   }
@@ -302,15 +373,27 @@ async function readJson(
   response: Response,
 ): Promise<JsonRecord> {
   const status = response.status;
-  let text: string;
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
   try {
-    text = await response.text();
+    if (response.body === null) throw invalidResponse(operation);
+    for await (const chunk of response.body) {
+      bytes += chunk.length;
+      if (bytes > BACKUP_V2_LIMITS.controlResponseBytes) {
+        throw invalidResponse(operation);
+      }
+      chunks.push(chunk);
+    }
   } catch {
     throw new Error(`${operation} failed (HTTP ${status}): unreadable body`);
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(
+        joinChunks(chunks, bytes),
+      ),
+    );
   } catch {
     throw new Error(`${operation} failed (HTTP ${status}): invalid body`);
   }
@@ -362,31 +445,87 @@ function verifyAllowedScope(
   operation: string,
   settings: B2Settings,
   allowed: JsonRecord,
-  scope: "backup" | "retention" = "backup",
-): void {
+  purpose: B2KeyPurpose = "backup",
+): B2KeyScope {
+  const reject = (detail: string): never => {
+    throw new B2CredentialError(
+      "B2_CREDENTIAL_SCOPE_REJECTED",
+      `${operation} failed: ${detail}`,
+    );
+  };
   const capabilities = stringArray(allowed["capabilities"]);
-  if (capabilities === null) throw invalidResponse(operation, "capabilities");
-  const requiredCapabilities = scope === "retention"
+  if (capabilities === null) return reject("invalid response (capabilities)");
+  const requiredCapabilities = purpose === "retention"
     ? ["listFiles", "writeFiles", "deleteFiles"]
     : REQUIRED_CAPABILITIES;
   for (const required of requiredCapabilities) {
     if (!capabilities.includes(required)) {
-      throw operationError(operation, `capability ${required} not granted`);
+      return reject(`capability ${required} not granted`);
     }
+  }
+  const bucketsValue = allowed["buckets"];
+  if (
+    bucketsValue === null ||
+    (Array.isArray(bucketsValue) && bucketsValue.length === 0)
+  ) {
+    if (!capabilities.includes("listBuckets")) {
+      return reject(
+        "bucket scope missing and capability listBuckets not granted",
+      );
+    }
+    if (allowed["namePrefix"] !== null) {
+      return reject("allowed namePrefix rejected");
+    }
+    return "unrestricted";
   }
   if (
     allowed["namePrefix"] !==
-      (scope === "retention" ? null : ALLOWED_NAME_PREFIX)
+      (purpose === "retention" ? null : ALLOWED_NAME_PREFIX)
   ) {
-    throw operationError(operation, "allowed namePrefix rejected");
+    return reject("allowed namePrefix rejected");
   }
-  const buckets = bucketScope(operation, allowed);
+  let buckets;
+  try {
+    buckets = bucketScope(operation, allowed);
+  } catch {
+    return reject("bucket scope missing or malformed");
+  }
   if (buckets.length !== 1) {
-    throw operationError(operation, "scope must contain exactly one bucket");
+    return reject("scope must contain exactly one bucket");
   }
   const exact = buckets[0];
   if (exact.id !== settings.bucketId || exact.name !== BUCKET_NAME) {
-    throw operationError(operation, "bucket scope mismatch");
+    throw new B2CredentialError(
+      "B2_BUCKET_IDENTITY_MISMATCH",
+      `${operation} failed: bucket scope mismatch`,
+    );
+  }
+  return "scoped";
+}
+
+/** The filter comes from the deployment, never from supplied bucket settings. */
+export function b2BucketLookup(accountId: string): JsonRecord {
+  return { accountId, bucketName: BUCKET_NAME };
+}
+
+export function validateB2BucketLookup(
+  value: JsonRecord,
+  accountId: string,
+  settings: B2Settings,
+): void {
+  const buckets = value["buckets"];
+  const entry = Array.isArray(buckets) && buckets.length === 1
+    ? buckets[0]
+    : null;
+  if (
+    !entry || typeof entry !== "object" || Array.isArray(entry) ||
+    entry.accountId !== accountId || entry.bucketId !== settings.bucketId ||
+    entry.bucketName !== BUCKET_NAME
+  ) {
+    throw new B2CredentialError(
+      "B2_BUCKET_IDENTITY_MISMATCH",
+      "b2_list_buckets failed: exact backup bucket identity is unproved",
+    );
   }
 }
 
@@ -395,21 +534,89 @@ async function authorizeAccount(
   fetcher: B2Fetcher,
 ): Promise<AuthorizedScope> {
   const operation = "b2_authorize_account";
-  const response = await sendRequest(fetcher, operation, AUTH_URL, {
-    headers: { authorization: basicAuthorization(settings) },
-  });
-  if (!response.ok) await failHttp(operation, response);
-  const body = await readJson(operation, response);
-  const token = requiredString(operation, body, "authorizationToken");
-  const apiInfo = expectRecord(operation, body["apiInfo"]);
-  const storageApi = expectRecord(operation, apiInfo["storageApi"]);
-  const apiUrl = requiredString(operation, storageApi, "apiUrl");
-  const downloadUrl = requiredString(operation, storageApi, "downloadUrl");
-  const allowed = expectRecord(operation, storageApi["allowed"]);
-  assertBackblazeUrl(operation, "apiUrl", apiUrl);
-  assertBackblazeUrl(operation, "downloadUrl", downloadUrl);
-  verifyAllowedScope(operation, settings, allowed);
-  return { token, apiUrl, downloadUrl };
+  try {
+    const response = await sendRequest(fetcher, operation, AUTH_URL, {
+      headers: { authorization: basicAuthorization(settings) },
+    });
+    if (!response.ok) await failHttp(operation, response);
+    const body = await readJson(operation, response);
+    const token = requiredString(operation, body, "authorizationToken");
+    const apiInfo = expectRecord(operation, body["apiInfo"]);
+    const storageApi = expectRecord(operation, apiInfo["storageApi"]);
+    const apiUrl = requiredString(operation, storageApi, "apiUrl");
+    const downloadUrl = requiredString(operation, storageApi, "downloadUrl");
+    const allowed = expectRecord(operation, storageApi["allowed"]);
+    assertBackblazeUrl(operation, "apiUrl", apiUrl);
+    assertBackblazeUrl(operation, "downloadUrl", downloadUrl);
+    const keyScope = verifyAllowedScope(operation, settings, allowed);
+    if (keyScope === "unrestricted") {
+      const accountId = requiredString(operation, body, "accountId");
+      const lookup = "b2_list_buckets";
+      validateB2BucketLookup(
+        await sendJson(
+          fetcher,
+          lookup,
+          `${apiUrl}${API_PATH}${lookup}`,
+          token,
+          b2BucketLookup(accountId),
+        ),
+        accountId,
+        settings,
+      );
+    }
+    return { token, apiUrl, downloadUrl, keyScope };
+  } catch (error) {
+    if (error instanceof B2CredentialError) throw error;
+    throw new B2CredentialError(
+      "B2_CREDENTIAL_AUTH_UNPROVED",
+      error instanceof Error ? error.message : "Backblaze authorization failed",
+    );
+  }
+}
+
+/** Authenticate and prove the expected role without touching any objects. */
+export const B2_VERSION_LOOKUP = "b2_list_file_versions";
+type B2VersionPointer = Pick<B2Object, "fileId" | "fileName">;
+
+export function b2ExactVersionRequest(
+  bucketId: string,
+  { fileId, fileName }: B2VersionPointer,
+): JsonRecord {
+  return {
+    bucketId,
+    prefix: fileName,
+    startFileName: fileName,
+    startFileId: fileId,
+    maxFileCount: 1,
+  };
+}
+
+/** Backblaze returns the requested name and ID first if the version exists.
+ * A foreign-bucket ID can therefore never reach an account-wide ID endpoint. */
+export function validateB2ExactVersionLookup(
+  value: JsonRecord,
+  bucketId: string,
+  expected: B2VersionPointer,
+): JsonRecord | null {
+  const { files, nextFileName, nextFileId } = value;
+  if (
+    !Array.isArray(files) || files.length > 1 ||
+    !(nextFileName === null && nextFileId === null ||
+      files.length === 1 && typeof nextFileName === "string" && nextFileName &&
+        typeof nextFileId === "string" && nextFileId)
+  ) throw invalidResponse(B2_VERSION_LOOKUP);
+  if (!files.length) return null;
+  const row = expectRecord(B2_VERSION_LOOKUP, files[0]);
+  const name = requiredString(B2_VERSION_LOOKUP, row, "fileName");
+  const id = requiredString(B2_VERSION_LOOKUP, row, "fileId");
+  if (row.bucketId !== bucketId || !name.startsWith(expected.fileName)) {
+    throw operationError(B2_VERSION_LOOKUP, "exact lookup scope mismatch");
+  }
+  if (id !== expected.fileId) return null;
+  if (name !== expected.fileName) {
+    throw operationError(B2_VERSION_LOOKUP, "version name mismatch");
+  }
+  return row;
 }
 
 function markerNonnegativeIntegerOrDefault(
@@ -518,6 +725,15 @@ function joinChunks(
   return joined;
 }
 
+function matchesDownloadName(response: Response, name: string): boolean {
+  try {
+    return decodeURIComponent(response.headers.get("x-bz-file-name") ?? "") ===
+      name;
+  } catch {
+    return false;
+  }
+}
+
 export class B2Store {
   readonly #settings: B2Settings;
   readonly #fetch: B2Fetcher;
@@ -553,6 +769,36 @@ export class B2Store {
       if (this.#scope === pending) this.#scope = null;
       throw error;
     }
+  }
+
+  async #proveExact(
+    scope: AuthorizedScope,
+    object: B2Object,
+  ): Promise<void> {
+    if (scope.keyScope === "scoped") return;
+    const row = validateB2ExactVersionLookup(
+      await sendJson(
+        this.#fetch,
+        B2_VERSION_LOOKUP,
+        `${scope.apiUrl}${API_PATH}${B2_VERSION_LOOKUP}`,
+        scope.token,
+        b2ExactVersionRequest(this.#settings.bucketId, object),
+      ),
+      this.#settings.bucketId,
+      object,
+    );
+    if (!row) throw operationError(B2_VERSION_LOOKUP, "version is absent");
+    const listed = listedObject(
+      B2_VERSION_LOOKUP,
+      this.#settings.bucketId,
+      row,
+    );
+    if (
+      listed.action !== object.action ||
+      listed.contentLength !== object.contentLength ||
+      listed.contentSha1 !== object.contentSha1 ||
+      listed.uploadTimestamp !== object.uploadTimestamp
+    ) throw operationError(B2_VERSION_LOOKUP, "version metadata mismatch");
   }
 
   async #uploadUrl(scope: AuthorizedScope): Promise<UploadTarget> {
@@ -673,6 +919,7 @@ export class B2Store {
       throw new Error("get failed: invalid content sha1");
     }
     const scope = await this.#authorizeOnce();
+    await this.#proveExact(scope, object);
     const operation = "b2_download_file_by_id";
     const url = `${scope.downloadUrl}${API_PATH}b2_download_file_by_id?fileId=${
       encodeURIComponent(object.fileId)
@@ -682,6 +929,15 @@ export class B2Store {
       headers: { authorization: scope.token },
     });
     if (!response.ok) await failHttp(operation, response);
+    if (
+      scope.keyScope === "unrestricted" &&
+      (response.headers.get("x-bz-file-id") !== object.fileId ||
+        !matchesDownloadName(response, object.fileName) ||
+        response.headers.get("x-bz-content-sha1") !== object.contentSha1)
+    ) {
+      await cancelBody(response);
+      throw operationError(operation, "response binding mismatch");
+    }
     const declaredLength = response.headers.get("content-length");
     if (declaredLength !== null) {
       const declared = Number(declaredLength);
@@ -833,6 +1089,7 @@ export class B2Store {
       throw new Error("remove failed: empty file id");
     }
     const scope = await this.#authorizeOnce();
+    await this.#proveExact(scope, object);
     const operation = "b2_delete_file_version";
     const body = await sendJson(
       this.#fetch,
@@ -846,7 +1103,10 @@ export class B2Store {
     );
     const returnedName = requiredString(operation, body, "fileName");
     const returnedId = requiredString(operation, body, "fileId");
-    if (returnedName !== object.fileName || returnedId !== object.fileId) {
+    if (
+      returnedName !== object.fileName || returnedId !== object.fileId ||
+      (body.bucketId !== undefined && body.bucketId !== this.#settings.bucketId)
+    ) {
       throw operationError(operation, "response mismatch");
     }
   }

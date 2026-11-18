@@ -4,10 +4,18 @@
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, resolve } from "node:path";
 import {
+  B2_VERSION_LOOKUP,
   b2BasicAuthorization,
+  b2BucketLookup,
+  B2CredentialError,
+  b2ExactVersionRequest,
+  type B2KeyPurpose,
+  type B2KeyScope,
   type B2Settings,
   validateB2AllowedScope,
   validateB2ApiUrl,
+  validateB2BucketLookup,
+  validateB2ExactVersionLookup,
   validateB2Settings,
   validateB2UploadUrl,
 } from "./backblaze-storage.ts";
@@ -58,11 +66,17 @@ export const BACKUP_V2_TRANSPORT_BOUNDS = Object.freeze({
   controlMs: CONTROL_MS,
   payloadMs: LIMIT.blockedTransportMs,
   settlementMs: SETTLEMENT_MS,
-  putControlRequests: 2,
-  readbackControlRequests: 1,
-  putEpisodeMs: 2 * CONTROL_MS + LIMIT.blockedTransportMs + SETTLEMENT_MS,
-  readbackEpisodeMs: CONTROL_MS + LIMIT.blockedTransportMs + SETTLEMENT_MS,
+  putControlRequests: 3,
+  readbackControlRequests: 3,
+  putEpisodeMs: 3 * CONTROL_MS + LIMIT.blockedTransportMs + SETTLEMENT_MS,
+  readbackEpisodeMs: 3 * CONTROL_MS + LIMIT.blockedTransportMs + SETTLEMENT_MS,
 });
+type AuthorizedScope = {
+  token: string;
+  api: string;
+  download: string;
+  keyScope: B2KeyScope;
+};
 export type BackupV2ExactObjectState = "PRESENT" | "ABSENT";
 export interface BackupV2ExactObjectStore extends BackupV2ObjectStore {
   reconcileExact(
@@ -617,14 +631,14 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
   readonly #settings: B2Settings;
   readonly #wire: BackupV2Wire;
   readonly #ancestors: BackupV2AncestorIO;
-  readonly #keyScope: "backup" | "retention";
+  readonly #purpose: B2KeyPurpose;
   readonly #usedPuts = new Set<string>();
-  #scope?: Promise<{ token: string; api: string; download: string }>;
+  #scope?: Promise<AuthorizedScope>;
   constructor(
     settings: B2Settings,
     wire: BackupV2Wire = createCurlBackupV2Wire(),
     metadata: BackupV2KernelCommand = realBackupV2KernelCommand,
-    keyScope: "backup" | "retention" = "backup",
+    purpose: B2KeyPurpose = "backup",
   ) {
     validateB2Settings(settings);
     for (
@@ -637,7 +651,7 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
     this.#settings = { ...settings };
     this.#wire = wire;
     this.#ancestors = { ...ancestorIO, metadata };
-    this.#keyScope = keyScope;
+    this.#purpose = purpose;
   }
   async #request(
     url: string,
@@ -686,18 +700,29 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
         b2BasicAuthorization(this.#settings),
         undefined,
         signal,
-      ).then((body) => {
+      ).then(async (body) => {
         const storage = record(record(body.apiInfo).storageApi);
         const api = text(storage.apiUrl), download = text(storage.downloadUrl);
         validateB2ApiUrl("v2 authorize", "api", api);
         validateB2ApiUrl("v2 authorize", "download", download);
-        validateB2AllowedScope(
+        const keyScope = validateB2AllowedScope(
           "v2 authorize",
           this.#settings,
           record(storage.allowed),
-          this.#keyScope,
+          this.#purpose,
         );
-        return { token: text(body.authorizationToken), api, download };
+        const token = text(body.authorizationToken);
+        if (keyScope === "unrestricted") {
+          const accountId = text(body.accountId);
+          const buckets = await this.#request(
+            `${api}${API}b2_list_buckets`,
+            token,
+            b2BucketLookup(accountId),
+            signal,
+          );
+          validateB2BucketLookup(buckets, accountId, this.#settings);
+        }
+        return { token, api, download, keyScope };
       });
       this.#scope = pending;
       pending.catch(() => {
@@ -706,10 +731,67 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
     }
     return this.#scope;
   }
+
+  /** Read-only credential and bucket proof without listing any objects. */
+  async verifyCredential(signal?: AbortSignal): Promise<B2KeyScope> {
+    try {
+      return (await this.#authorized(signal)).keyScope;
+    } catch (error) {
+      if (error instanceof B2CredentialError) throw error;
+      throw new B2CredentialError(
+        "B2_CREDENTIAL_AUTH_UNPROVED",
+        "Backblaze authorization or bucket readback failed",
+      );
+    }
+  }
+
+  #matchesObject(
+    body: Record<string, unknown>,
+    object: BackupV2ObjectRef,
+  ): boolean {
+    return body.bucketId === this.#settings.bucketId &&
+      body.fileId === object.fileId && body.fileName === object.fileName &&
+      body.action === object.action &&
+      body.contentLength === object.contentLength &&
+      body.contentSha1 === object.contentSha1 &&
+      body.uploadTimestamp === object.uploadTimestamp;
+  }
+
+  async #lookupVersion(
+    scope: AuthorizedScope,
+    object: Pick<BackupV2ListedVersion, "fileId" | "fileName">,
+    signal?: AbortSignal,
+  ): Promise<Record<string, unknown> | null> {
+    return validateB2ExactVersionLookup(
+      await this.#request(
+        `${scope.api}${API}${B2_VERSION_LOOKUP}`,
+        scope.token,
+        b2ExactVersionRequest(this.#settings.bucketId, object),
+        signal,
+      ),
+      this.#settings.bucketId,
+      object,
+    );
+  }
+
+  async #requireObjectInBucket(
+    scope: AuthorizedScope,
+    object: BackupV2ObjectRef,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (scope.keyScope === "scoped") return;
+    const exact = await this.#lookupVersion(scope, object, signal);
+    require(
+      exact && this.#matchesObject(exact, object),
+      "exact object metadata mismatch",
+    );
+  }
+
   async putFileOnce(
     value: BackupV2PutIntent,
     signal?: AbortSignal,
   ): Promise<BackupV2ObjectRef> {
+    require(this.#purpose === "backup", "writer scope required");
     const intent = validateBackupV2PutIntent(value);
     await verifySlot(intent.slot, this.#ancestors);
     const scope = await this.#authorized(signal);
@@ -789,6 +871,7 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
   ): Promise<number> {
     const object = validateBackupV2ObjectRef(value);
     const scope = await this.#authorized(signal);
+    await this.#requireObjectInBucket(scope, object, signal);
     const response = await this.#wire({
       url: `${scope.download}${API}b2_download_file_by_id?fileId=${
         encodeURIComponent(object.fileId)
@@ -972,21 +1055,18 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
   ): Promise<BackupV2ExactObjectState> {
     const object = validateBackupV2ObjectRef(value);
     const scope = await this.#authorized(signal);
-    const body = await this.#request(
-      `${scope.api}${API}b2_get_file_info`,
-      scope.token,
-      { fileId: object.fileId },
-      signal,
-      true,
-    );
+    const body = scope.keyScope === "unrestricted"
+      ? await this.#lookupVersion(scope, object, signal)
+      : await this.#request(
+        `${scope.api}${API}b2_get_file_info`,
+        scope.token,
+        { fileId: object.fileId },
+        signal,
+        true,
+      );
     if (body === null) return "ABSENT";
     require(
-      body.bucketId === this.#settings.bucketId &&
-        body.fileId === object.fileId && body.fileName === object.fileName &&
-        body.action === object.action &&
-        body.contentLength === object.contentLength &&
-        body.contentSha1 === object.contentSha1 &&
-        body.uploadTimestamp === object.uploadTimestamp,
+      this.#matchesObject(body, object),
       "exact object metadata mismatch",
     );
     return "PRESENT";
@@ -997,6 +1077,7 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
   ): Promise<void> {
     const object = validateBackupV2ObjectRef(value);
     const scope = await this.#authorized(signal);
+    await this.#requireObjectInBucket(scope, object, signal);
     const body = await this.#request(
       `${scope.api}${API}b2_delete_file_version`,
       scope.token,
@@ -1004,14 +1085,15 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
       signal,
     );
     require(
-      body.fileId === object.fileId && body.fileName === object.fileName,
+      body.fileId === object.fileId && body.fileName === object.fileName &&
+        (body.bucketId === undefined ||
+          body.bucketId === this.#settings.bucketId),
       "DELETE response binding mismatch",
     );
   }
 
   #retentionRequest(endpoint: string, payload: unknown, signal?: AbortSignal) {
-    require(this.#keyScope === "retention", "whole-bucket key scope required");
-    return this.#authorized(signal).then((scope) =>
+    return this.#retentionScope(signal).then((scope) =>
       this.#request(
         `${scope.api}${API}${endpoint}`,
         scope.token,
@@ -1019,6 +1101,42 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
         signal,
       )
     );
+  }
+
+  #retentionScope(signal?: AbortSignal): Promise<AuthorizedScope> {
+    require(this.#purpose === "retention", "whole-bucket key scope required");
+    return this.#authorized(signal);
+  }
+
+  async #lookupUnfinished(
+    scope: AuthorizedScope,
+    fileId: string,
+    signal?: AbortSignal,
+    fileName?: string,
+  ): Promise<Extract<BackupV2ListedVersion, { action: "start" }>> {
+    const body = await this.#request(
+      `${scope.api}${API}b2_list_unfinished_large_files`,
+      scope.token,
+      {
+        bucketId: this.#settings.bucketId,
+        startFileId: fileId,
+        maxFileCount: 1,
+        ...(fileName === undefined ? {} : { namePrefix: fileName }),
+      },
+      signal,
+    );
+    require(
+      Array.isArray(body.files) && body.files.length === 1 &&
+        (body.nextFileId === null || retentionText(body.nextFileId, 512)),
+      "exact unfinished version is absent or unproved",
+    );
+    const exact = this.#retentionVersion(body.files[0], "start");
+    require(
+      exact.action === "start" && exact.fileId === fileId &&
+        (fileName === undefined || exact.fileName === fileName),
+      "exact unfinished version mismatch",
+    );
+    return exact;
   }
 
   #retentionVersion(value: unknown, action?: "start"): BackupV2ListedVersion {
@@ -1075,10 +1193,13 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
         fileName: retentionText(body.nextFileName, 1_000),
         fileId: retentionText(body.nextFileId, 512),
       };
-    return {
-      items: body.files.map((item) => this.#retentionVersion(item)),
-      next,
-    };
+    const items = body.files.map((item) => this.#retentionVersion(item));
+    require(
+      prefix === undefined ||
+        items.every((item) => item.fileName.startsWith(prefix)),
+      "retention version name outside prefix",
+    );
+    return { items, next };
   }
 
   async unfinishedFilesPage(
@@ -1107,6 +1228,10 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
     const items = body.files.map((item) => {
       const version = this.#retentionVersion(item, "start");
       require(version.action === "start", "unfinished version missing");
+      require(
+        prefix === undefined || version.fileName.startsWith(prefix),
+        "unfinished name outside prefix",
+      );
       return version;
     });
     return {
@@ -1122,13 +1247,23 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
     cursor: number | null,
     signal?: AbortSignal,
   ): Promise<{ items: BackupV2RetentionPart[]; next: number | null }> {
-    const body = await this.#retentionRequest("b2_list_parts", {
-      fileId: retentionText(fileId, 512),
-      maxPartCount: LIMIT.listEntries,
-      ...(cursor === null
-        ? {}
-        : { startPartNumber: retentionInteger(cursor, 1) }),
-    }, signal);
+    retentionText(fileId, 512);
+    const scope = await this.#retentionScope(signal);
+    if (scope.keyScope === "unrestricted") {
+      await this.#lookupUnfinished(scope, fileId, signal);
+    }
+    const body = await this.#request(
+      `${scope.api}${API}b2_list_parts`,
+      scope.token,
+      {
+        fileId,
+        maxPartCount: LIMIT.listEntries,
+        ...(cursor === null
+          ? {}
+          : { startPartNumber: retentionInteger(cursor, 1) }),
+      },
+      signal,
+    );
     require(
       Array.isArray(body.parts) && body.parts.length <= LIMIT.listEntries,
       "retention parts page exceeded",
@@ -1136,11 +1271,14 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
     return {
       items: body.parts.map((value) => {
         const item = record(value);
+        require(item.fileId === fileId, "part file ID mismatch");
+        const contentSha1 = text(item.contentSha1);
+        require(/^[a-f0-9]{40}$/.test(contentSha1), "part hash rejected");
         return {
-          fileId: retentionText(item.fileId, 512),
+          fileId,
           partNumber: retentionInteger(item.partNumber, 1),
           contentLength: retentionInteger(item.contentLength, 1),
-          contentSha1: text(item.contentSha1),
+          contentSha1,
           uploadTimestamp: retentionInteger(item.uploadTimestamp, 1),
         };
       }),
@@ -1165,9 +1303,23 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
           retentionOwnedResticName(fileName, retiredResticPrefix),
       "retention name not owned",
     );
+    const scope = await this.#retentionScope(signal);
     if (object.action === "start") {
-      const body = await this.#retentionRequest(
-        "b2_cancel_large_file",
+      if (scope.keyScope === "unrestricted") {
+        const exact = await this.#lookupUnfinished(
+          scope,
+          fileId,
+          signal,
+          fileName,
+        );
+        require(
+          exact.uploadTimestamp === object.uploadTimestamp,
+          "unfinished upload timestamp mismatch",
+        );
+      }
+      const body = await this.#request(
+        `${scope.api}${API}b2_cancel_large_file`,
+        scope.token,
         { fileId },
         signal,
       );
@@ -1182,13 +1334,28 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
       object.action === "upload" || object.action === "hide",
       "retention delete action rejected",
     );
-    const body = await this.#retentionRequest(
-      "b2_delete_file_version",
+    if (scope.keyScope === "unrestricted") {
+      const row = await this.#lookupVersion(scope, object, signal);
+      require(row, "retention version is absent");
+      const current = this.#retentionVersion(row);
+      require(
+        current.action === object.action &&
+          current.contentLength === object.contentLength &&
+          current.contentSha1 === object.contentSha1 &&
+          current.uploadTimestamp === object.uploadTimestamp,
+        "retention version metadata mismatch",
+      );
+    }
+    const body = await this.#request(
+      `${scope.api}${API}b2_delete_file_version`,
+      scope.token,
       { fileName, fileId },
       signal,
     );
     require(
-      body.fileId === fileId && body.fileName === fileName,
+      body.fileId === fileId && body.fileName === fileName &&
+        (body.bucketId === undefined ||
+          body.bucketId === this.#settings.bucketId),
       "DELETE response binding mismatch",
     );
   }

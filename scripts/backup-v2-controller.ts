@@ -86,7 +86,10 @@ import {
   validateBackupV2ObjectRef,
   validateBackupV2PutIntent,
 } from "./backup-v2-contract.ts";
-import { type B2Settings, validateB2Settings } from "./backblaze-storage.ts";
+import {
+  type B2Settings,
+  selectB2RetentionCredential,
+} from "./backblaze-storage.ts";
 import {
   type BackupV2RetentionJob,
   type BackupV2RetentionPolicy,
@@ -2054,7 +2057,7 @@ export function backupV2RetentionNeedsReconcile(
 }
 
 export async function readBackupV2RetentionControl(
-  privateIO: PrivateSeam,
+  privateIO: Pick<PrivateSeam, "read">,
   verifyCatalogOnly = false,
 ): Promise<BackupV2RetentionControl | undefined> {
   const control = await privateIO.read<BackupV2RetentionControl>(
@@ -2277,19 +2280,10 @@ async function discoverRetentionCustody(
 
 async function configuredRetentionKey(deps: PiDeps): Promise<B2Settings> {
   const config = await loadSourceConfig(deps);
-  const secret = record(await deps.private.read(B2_RETENTION_KEY_PATH), [
-    "accessKeyId",
-    "secretAccessKey",
-    "bucketId",
-    "bucketName",
-  ]) as unknown as B2Settings;
-  validateB2Settings(secret);
-  if (
-    secret.bucketId !== config.b2.bucketId ||
-    secret.bucketName !== config.b2.bucketName ||
-    secret.accessKeyId === config.b2.accessKeyId
-  ) fail();
-  return secret;
+  return await selectB2RetentionCredential(
+    config.b2,
+    () => deps.private.read(B2_RETENTION_KEY_PATH),
+  );
 }
 
 async function startRetentionControl(
@@ -2301,7 +2295,6 @@ async function startRetentionControl(
   verifyCatalogOnly: boolean,
 ): Promise<BackupV2RetentionControl> {
   await proveRetentionIdle(deps);
-  await configuredRetentionKey(deps);
   const settings = withoutKey(
     await caps.create(weekWindow(deps.now()).periodKey),
   );
@@ -2626,6 +2619,7 @@ interface BackupV2RetentionCycleSeam {
     control: BackupV2RetentionControl,
     deps: PiDeps,
     caps: BackupV2ControllerCapabilities,
+    preflightCredential?: B2Settings,
   ): Promise<void>;
   readPlan(
     control: BackupV2RetentionControl,
@@ -2636,10 +2630,12 @@ interface BackupV2RetentionCycleSeam {
 const retentionIO: BackupV2RetentionCycleSeam = {
   proveIdle: proveRetentionIdle,
   readPlan: readPrivatePlan,
-  async installRuntime(control, deps, caps) {
+  async installRuntime(control, deps, caps, preflightCredential) {
+    const key = preflightCredential ?? await configuredRetentionKey(deps);
+    if (!preflightCredential) await deps.verifyRetentionCredential?.(key);
     await caps.install({
       ...control.settings,
-      B2Settings: await configuredRetentionKey(deps),
+      B2Settings: key,
     });
   },
 };
@@ -2755,12 +2751,15 @@ export async function runBackupV2RetentionCycle(
       : null,
     ...options,
   });
+  let preflightCredential: B2Settings | undefined;
   if (!control || !backupV2RetentionNeedsReconcile(control)) {
     if (live !== null) return null;
     if (!planOnly && control?.anchor === anchor) {
       return retentionReport(control, deps, control.phase !== "PLAN_BLOCKED");
     }
     if (!planOnly && !state.catalog.length) return null;
+    preflightCredential = await configuredRetentionKey(deps);
+    await deps.verifyRetentionCredential?.(preflightCredential);
     control = await startRetentionControl(
       state,
       deps,
@@ -2874,7 +2873,7 @@ export async function runBackupV2RetentionCycle(
       same(validateRetentionPlanReference(saved.plan), input.plan);
       await authorizeCatalogRetirement(deps, caps, current);
     }
-    await io.installRuntime(current, deps, caps);
+    await io.installRuntime(current, deps, caps, preflightCredential);
     if (input.scratchCleanupRequestSha256 !== null) {
       if (
         state.job?.settings.envelope.requestSha256 !==

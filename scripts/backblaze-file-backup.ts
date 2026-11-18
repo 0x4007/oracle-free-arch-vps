@@ -81,8 +81,10 @@ import {
   workerUnitName,
 } from "./backblaze-source-worker.ts";
 import {
+  B2CredentialError,
   type B2Object,
   type B2Settings,
+  b2SettingsFromConfig,
   B2Store,
 } from "./backblaze-storage.ts";
 import type { UploadResult } from "./backblaze-upload.ts";
@@ -100,6 +102,7 @@ import {
   verifyDecryptedGeneration,
 } from "./backblaze-verifier.ts";
 import type { BackupV2RetentionSummary } from "./backup-v2-retention.ts";
+import { B2_RETENTION_KEY_PATH } from "./backup-v2-retention-report.ts";
 import { withBackupLock } from "./backup-lock.ts";
 import { backupV2ChildEnvironment } from "./backup-v2-supervisor.ts";
 import { shellQuote } from "./backup-guest.ts";
@@ -1848,9 +1851,30 @@ export interface PrivateSeam {
   readText(path: string, maxBytes: number): Promise<string | undefined>;
 }
 
+async function readOptionalRetentionKey<T>(
+  path: string,
+): Promise<T | undefined> {
+  let info: Deno.FileInfo;
+  try {
+    info = await Deno.lstat(path);
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) return undefined;
+    throw error;
+  }
+  if (
+    !info.isFile || info.uid !== Deno.uid() || info.nlink !== 1 ||
+    info.mode === null || (info.mode & 0o7777) !== 0o600 ||
+    info.size > 32 * 1024
+  ) throw new Error("Unsafe retention credential file");
+  return await readPrivateJson<T>(path);
+}
+
 export function realPrivateSeam(): PrivateSeam {
   return {
     async read<T>(path: string): Promise<T | undefined> {
+      if (path === B2_RETENTION_KEY_PATH) {
+        return await readOptionalRetentionKey(path);
+      }
       try {
         return await readPrivateJson<T>(path);
       } catch (error) {
@@ -3812,6 +3836,7 @@ export interface PiDeps {
   gate: GateSeam;
   logger: (message: string) => void;
   sleep: (ms: number) => Promise<void>;
+  verifyRetentionCredential?(settings: B2Settings): Promise<void>;
   reconcileScheduledClaim?: (
     oracleState: unknown,
     claim: unknown,
@@ -3832,6 +3857,11 @@ export function realPiDeps(): PiDeps {
     gate: realGateSeam(),
     logger: (message) => console.log(message),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    async verifyRetentionCredential(settings) {
+      const { BackupV2Store } = await import("./backup-v2-store.ts");
+      await new BackupV2Store(settings, undefined, undefined, "retention")
+        .verifyCredential(AbortSignal.timeout(20_000));
+    },
     reconcileScheduledClaim: async (...args) =>
       await (await import("./backup-scheduled.ts"))
         .readScheduledClaimForBackblaze(...args),
@@ -3937,10 +3967,22 @@ export async function loadDeployment(deps: PiDeps): Promise<PiDeployment> {
 }
 
 export async function loadSourceConfig(deps: PiDeps): Promise<PiSourceConfig> {
-  const config = await deps.private.read<Record<string, unknown>>(
-    B2_CONFIG_PATH,
-  );
-  if (!isRecord(config)) throw new Error("B2 scoped configuration is missing");
+  let config: unknown;
+  try {
+    config = await deps.private.read(B2_CONFIG_PATH);
+  } catch {
+    throw new B2CredentialError(
+      "B2_CREDENTIAL_SETTINGS_INVALID",
+      "The private Backblaze writer configuration is unreadable",
+    );
+  }
+  if (!isRecord(config)) {
+    throw new B2CredentialError(
+      "B2_CREDENTIAL_SETTINGS_INVALID",
+      "The private Backblaze writer configuration is missing or malformed",
+    );
+  }
+  const b2 = b2SettingsFromConfig(config);
   const deployment = await loadDeployment(deps);
   const recipientPath = RECIPIENT_PATH;
   const recipientBytes = await deps.private.readBytes(recipientPath, 64 * 1024);
@@ -3958,16 +4000,11 @@ export async function loadSourceConfig(deps: PiDeps): Promise<PiSourceConfig> {
     throw new Error("Approved exclusions file is missing");
   }
   if (!Array.isArray(config.sources)) {
-    throw new Error("B2 scoped configuration sources are missing");
+    throw new Error("B2 source configuration sources are missing");
   }
   return {
     sources: config.sources as FileSource[],
-    b2: {
-      accessKeyId: config.accessKeyId as string,
-      secretAccessKey: config.secretAccessKey as string,
-      bucketId: config.bucketId as string,
-      bucketName: config.bucketName as string,
-    },
+    b2,
     recipientPath,
     recipientBytes,
     exclusionsText,

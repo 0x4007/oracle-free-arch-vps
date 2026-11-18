@@ -7,12 +7,14 @@ import { BACKUP_V2_NAMESPACE } from "../scripts/backup-v2-profile.ts";
  * validation and error redaction are exercised end to end.
  */
 import {
+  B2CredentialError,
   type B2Fetcher,
   type B2Object,
   type B2Settings,
   B2Store,
   DIRECT_PREFIX,
   MAX_CHUNK_BYTES,
+  selectB2RetentionCredential,
 } from "../scripts/backblaze-storage.ts";
 import { isRetriableB2Error } from "../scripts/backblaze-source-worker.ts";
 
@@ -146,6 +148,193 @@ function jsonResponse(body: unknown, status = 200): Response {
     headers: { "content-type": "application/json" },
   });
 }
+
+function masterAllowed(buckets: unknown) {
+  return authBody({
+    buckets,
+    namePrefix: null,
+    capabilities: [
+      "listFiles",
+      "readFiles",
+      "writeFiles",
+      "deleteFiles",
+      "listBuckets",
+    ],
+  });
+}
+
+Deno.test("master writer proves the fixed backup bucket before any upload", async () => {
+  const bytes = new Uint8Array([1, 2, 3]);
+  const object = chunkObject();
+  const upload = orderedUploadHandler(
+    object.fileName,
+    await sha1Hex(bytes),
+    bytes.length,
+  );
+  for (const unrestrictedBuckets of [null, []]) {
+    const { fetch, calls } = fakeFetch((call, index) => {
+      if (index === 0) return jsonResponse(masterAllowed(unrestrictedBuckets));
+      if (index === 1) {
+        assert(call.url === `${API_URL}/b2api/v3/b2_list_buckets`);
+        assert(
+          JSON.stringify(bodyOf(call)) === JSON.stringify({
+            accountId: "account-id",
+            bucketName: BUCKET_NAME,
+          }),
+        );
+        return jsonResponse({
+          buckets: [{
+            accountId: "account-id",
+            bucketId: BUCKET_ID,
+            bucketName: BUCKET_NAME,
+          }],
+        });
+      }
+      return upload(call, index);
+    });
+    const store = new B2Store(settings(), fetch);
+    await rejectWith(store.put("not-a-backup/chunk", bytes));
+    assert(calls.length === 0);
+    await store.put(object.fileName, bytes);
+    assert(Number(calls.length) === 4);
+  }
+});
+
+Deno.test("master writer refuses tampered config and provider bucket identities", async () => {
+  const bucket = {
+    accountId: "account-id",
+    bucketId: BUCKET_ID,
+    bucketName: BUCKET_NAME,
+  };
+  for (
+    const [requested, reply] of [
+      [settings({ bucketId: "other-bucket" }), [bucket]],
+      [settings(), [{ ...bucket, accountId: "other-account" }]],
+      [settings(), [{ ...bucket, bucketName: "other-bucket" }]],
+      [settings(), [bucket, bucket]],
+    ] as const
+  ) {
+    const { fetch, calls } = fakeFetch((_call, index) =>
+      jsonResponse(index === 0 ? masterAllowed(null) : { buckets: reply })
+    );
+    const error = await rejectWith(new B2Store(requested, fetch).authorize());
+    assert(
+      error instanceof B2CredentialError &&
+        error.reason === "B2_BUCKET_IDENTITY_MISMATCH",
+    );
+    assert(calls.length === 2);
+  }
+  const { fetch, calls } = fakeFetch(() => jsonResponse(masterAllowed(null)));
+  assertThrows(() =>
+    new B2Store(
+      settings({
+        bucketId: "other-bucket-id",
+        bucketName: "other-bucket",
+      }),
+      fetch,
+    )
+  );
+  assert(calls.length === 0);
+});
+
+Deno.test("master writer binds exact legacy reads and deletes through the approved bucket", async () => {
+  const data = new Uint8Array([1, 2, 3]);
+  const object = chunkObject(undefined, { contentSha1: await sha1Hex(data) });
+  for (const variant of ["present", "absent", "wrong-bucket", "wrong-hash"]) {
+    const { fetch, calls } = fakeFetch((call, index) => {
+      if (index === 0) return jsonResponse(masterAllowed(null));
+      if (index === 1) {
+        return jsonResponse({
+          buckets: [{
+            accountId: "account-id",
+            bucketId: BUCKET_ID,
+            bucketName: BUCKET_NAME,
+          }],
+        });
+      }
+      if (call.url.endsWith("b2_list_file_versions")) {
+        const args = bodyOf(call);
+        assert(
+          args.bucketId === BUCKET_ID && args.prefix === object.fileName &&
+            args.startFileName === object.fileName &&
+            args.startFileId === object.fileId &&
+            args.maxFileCount === 1,
+        );
+        return jsonResponse({
+          files: variant === "absent" ? [] : [{
+            ...object,
+            bucketId: variant === "wrong-bucket" ? "foreign" : BUCKET_ID,
+            contentSha1: variant === "wrong-hash"
+              ? "a".repeat(40)
+              : object.contentSha1,
+          }],
+          nextFileName: null,
+          nextFileId: null,
+        });
+      }
+      if (call.url.includes("b2_download_file_by_id")) {
+        return bytesResponse(data, {
+          "x-bz-file-id": object.fileId,
+          "x-bz-file-name": encodeURIComponent(object.fileName),
+          "x-bz-content-sha1": object.contentSha1,
+        });
+      }
+      assert(call.url.endsWith("b2_delete_file_version"));
+      return jsonResponse({ fileName: object.fileName, fileId: object.fileId });
+    });
+    const store = new B2Store(settings(), fetch);
+    if (variant === "present") {
+      assertBytes(await store.get(object), data);
+      await store.remove(object);
+      assert(calls.length === 6);
+    } else {
+      await rejectWith(store.get(object));
+      await rejectWith(store.remove(object));
+      assert(
+        calls.length === 4 &&
+          calls.slice(2).every(({ url }) =>
+            url.endsWith("b2_list_file_versions")
+          ),
+      );
+    }
+  }
+});
+
+Deno.test("retention selects the writer only when its private override is absent", async () => {
+  const writer = settings();
+  const explicit = settings({
+    accessKeyId: "retention-fixture",
+    secretAccessKey: "different-fake-key",
+  });
+  assert(
+    (await selectB2RetentionCredential(
+      writer,
+      () => Promise.resolve(undefined),
+    )).accessKeyId === writer.accessKeyId,
+  );
+  assert(
+    (await selectB2RetentionCredential(writer, () => Promise.resolve(explicit)))
+      .accessKeyId === explicit.accessKeyId,
+  );
+  for (
+    const override of [
+      () => Promise.resolve(null),
+      () => Promise.resolve({ ...explicit, sources: [] }),
+      () => Promise.resolve({ ...explicit, secretAccessKey: "" }),
+      () => Promise.resolve({ ...explicit, bucketId: "other" }),
+      () => Promise.reject(new Error("fake non-reportable detail")),
+    ]
+  ) {
+    const error = await rejectWith(
+      selectB2RetentionCredential(writer, override),
+    );
+    assert(
+      error instanceof B2CredentialError &&
+        error.reason === "B2_RETENTION_CREDENTIAL_INVALID",
+    );
+    assert(!error.message.includes("fake non-reportable detail"));
+  }
+});
 
 function bytesResponse(
   bytes: Uint8Array<ArrayBuffer>,
