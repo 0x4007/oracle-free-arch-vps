@@ -31,12 +31,16 @@ import {
   GATE_SOURCE_LOCK_PATH,
 } from "../scripts/backblaze-controller-contract.ts";
 import type { PiDeps, RemoteRunner } from "../scripts/backblaze-file-backup.ts";
+import { shellQuote } from "../scripts/backup-guest.ts";
 
 function assert(value: unknown): asserts value {
   if (!value) throw Error("Assertion failed");
 }
 function equal(a: unknown, b: unknown) {
-  assert(JSON.stringify(a) === JSON.stringify(b));
+  const observed = JSON.stringify(a), expected = JSON.stringify(b);
+  if (observed !== expected) {
+    throw Error(`Expected ${expected}, received ${observed}`);
+  }
 }
 function throws(work: () => unknown) {
   let rejected = false;
@@ -411,7 +415,12 @@ Deno.test("clean source exit with a temporarily nonterminal status is bounded", 
   );
 });
 
-async function terminalBridgeFixture() {
+async function terminalBridgeFixture(
+  nativeProof?: (
+    program: string,
+    keeper: { cgroup: string; invocationId: string },
+  ) => ReturnType<RemoteRunner>,
+) {
   const paths = backupV2BridgeRuntimePaths(gate),
     records = new Map<string, unknown>();
   const keeper = {
@@ -460,7 +469,7 @@ async function terminalBridgeFixture() {
     keeperRunning = false,
     failSettledWrite = false,
     remoteObservation = observation(true);
-  const runner: RemoteRunner = (command, args) => {
+  const runner: RemoteRunner = async (command, args) => {
     if (command === "/usr/bin/env") {
       command = args[2];
       args = args.slice(3);
@@ -471,7 +480,16 @@ async function terminalBridgeFixture() {
       assert(args[0] === "/proc/sys/kernel/random/boot_id");
       stdout = ID + "\n";
     } else if (command === "/bin/sh") {
-      if (args[1].includes("systemctl --user stop")) {
+      const stopping = args[1].includes("systemctl --user stop");
+      if (nativeProof && args[1].includes("cgroup.procs")) {
+        const result = await nativeProof(args[1], keeper);
+        if (stopping && result.code === 0 && !result.stdout.trim()) {
+          stopped = true;
+          stops++;
+        }
+        return result;
+      }
+      if (stopping) {
         assert(args[1].includes(keeper.invocationId));
         assert(args[1].includes(paths.unitName));
         assert(args[1].includes("cgroup.procs"));
@@ -588,6 +606,280 @@ Deno.test("terminal bridge waits for verifier status and keeper exit before sett
   equal(await f.runtime.close(gate), "CLOSED");
   assert(f.records.has(f.paths.settled));
   equal(f.stops(), 1);
+});
+
+const nativeBridgeProof = Deno.build.os === "linux" && (
+  await Promise.all(
+    ["/usr/bin/cc", "/usr/bin/bash", "/bin/sh"].map((command) =>
+      Deno.permissions.query({ name: "run", command })
+    ),
+  )
+).every((permission) => permission.state === "granted");
+
+const listeningAgentFixture = String.raw`
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+  struct sockaddr_un address = {.sun_family = AF_UNIX};
+  const char *path = getenv("BACKUP_TEST_SOCKET");
+  const char *hello = getenv("BACKUP_TEST_GREETING");
+  if (!path || !hello || strlen(path) >= sizeof address.sun_path) return 1;
+  strcpy(address.sun_path, path);
+  int listener = socket(AF_UNIX, SOCK_STREAM, 0), ready[2];
+  if (listener < 0 || bind(listener, (void *)&address, sizeof address) ||
+      listen(listener, 4) || pipe(ready)) return 1;
+  pid_t parent = getpid(), child = fork();
+  if (child < 0) return 1;
+  if (!child) {
+    alarm(25);
+    close(ready[0]);
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM) || getppid() != parent ||
+        prctl(PR_SET_DUMPABLE, 0) || write(ready[1], "1", 1) != 1) return 1;
+    close(ready[1]);
+    for (;;) {
+      int peer = accept(listener, NULL, NULL);
+      if (peer < 0) return 1;
+      if (*hello) {
+        send(peer, hello, 1, MSG_NOSIGNAL);
+        usleep(20000);
+        send(peer, hello + 1, strlen(hello) - 1, MSG_NOSIGNAL);
+      }
+      char ignored;
+      recv(peer, &ignored, 1, 0);
+      close(peer);
+    }
+  }
+  close(listener);
+  close(ready[1]);
+  char byte;
+  if (read(ready[0], &byte, 1) == 1) {
+    printf("%d\n", child);
+    fflush(stdout);
+    read(STDIN_FILENO, &byte, 1);
+  }
+  close(ready[0]);
+  kill(child, SIGTERM);
+  return waitpid(child, NULL, 0) == child ? 0 : 1;
+}
+`;
+
+Deno.test({
+  name:
+    "terminal settlement uses the nondumpable socket sender and leaves foreign agents running",
+  ignore: !nativeBridgeProof,
+  async fn() {
+    const directory = await Deno.makeTempDir({ prefix: "bridge-peer." }),
+      processDirectory = directory + "/cgroup",
+      keyring = directory + "/keyring",
+      socketSelection = directory + "/configured-socket",
+      bootFile = directory + "/boot-id";
+    const children: Deno.ChildProcess[] = [];
+    try {
+      await Deno.mkdir(processDirectory);
+      await Deno.writeTextFile(bootFile, ID + "\n");
+      await Deno.writeTextFile(directory + "/agent.c", listeningAgentFixture);
+      const built = await new Deno.Command("/usr/bin/cc", {
+        args: ["-o", directory + "/agent", directory + "/agent.c"],
+      }).output();
+      assert(built.success);
+      await Deno.writeTextFile(
+        directory + "/gpgconf",
+        [
+          "#!/bin/sh",
+          'test "$#" = 4 && test "$1" = --homedir &&',
+          `test "$2" = ${shellQuote(keyring)} &&`,
+          'test "$3" = --list-dirs && test "$4" = agent-socket || exit 1',
+          `cat ${shellQuote(socketSelection)}`,
+          "",
+        ].join("\n"),
+        { mode: 0o700 },
+      );
+      const launch = async (
+        argv0: string,
+        n: number,
+        greeting = "OK ready\n",
+      ) => {
+        const socket = `${directory}/agent-${n}.socket`;
+        const child = new Deno.Command("/usr/bin/bash", {
+          args: [
+            "-c",
+            'exec -a "$1" "$2" --homedir "$3" --use-standard-socket --daemon',
+            "agent-fixture",
+            argv0,
+            directory + "/agent",
+            keyring,
+          ],
+          clearEnv: true,
+          env: { BACKUP_TEST_SOCKET: socket, BACKUP_TEST_GREETING: greeting },
+          stdin: "piped",
+          stdout: "piped",
+        }).spawn();
+        children.push(child);
+        const reader = child.stdout.getReader();
+        const { value } = await reader.read();
+        reader.releaseLock();
+        const pid = Number(new TextDecoder().decode(value).trim());
+        assert(Number.isSafeInteger(pid) && pid > 1);
+        const executable = await new Deno.Command("/bin/sh", {
+          args: [
+            "-c",
+            'LC_ALL=C readlink -v "/proc/$1/exe"',
+            "fixture",
+            String(pid),
+          ],
+        }).output();
+        if (
+          executable.code !== 1 ||
+          !new TextDecoder().decode(executable.stderr).includes(
+            "Permission denied",
+          )
+        ) {
+          throw Error("Expected EACCES for a same-user nondumpable process");
+        }
+        return { pid, socket };
+      };
+      const first = await launch("gpg-agent", 1),
+        second = await launch("/usr/bin/gpg-agent", 2);
+      const procGroup = await new Deno.Command("/bin/sh", {
+        args: ["-c", 'cat "/proc/$1/cgroup"', "fixture", String(first.pid)],
+      }).output();
+      const membershipLine = new TextDecoder().decode(procGroup.stdout).trim();
+      assert(procGroup.success && membershipLine.startsWith("0::/"));
+      const group = membershipLine.slice(3);
+      const membership = async (pids: number[], descendants = 0) => {
+        await Deno.writeTextFile(
+          processDirectory + "/cgroup.procs",
+          pids.map((pid) => pid + "\n").join(""),
+        );
+        await Deno.writeTextFile(
+          processDirectory + "/cgroup.events",
+          `populated ${pids.length ? 1 : 0}\n`,
+        );
+        await Deno.writeTextFile(
+          processDirectory + "/cgroup.stat",
+          `nr_descendants ${descendants}\n`,
+        );
+      };
+      const select = (socket: string) =>
+        Deno.writeTextFile(socketSelection, socket);
+      let betweenProofs: (() => Promise<void>) | undefined,
+        managerGroup = group;
+      const native: Parameters<typeof terminalBridgeFixture>[0] = async (
+        program,
+        keeper,
+      ) => {
+        const properties = [
+          "LoadState=loaded",
+          "ActiveState=active",
+          "SubState=exited",
+          "Result=success",
+          "MainPID=0",
+          "ControlPID=0",
+          "KillMode=control-group",
+          `InvocationID=${keeper.invocationId}`,
+          `ControlGroup=${managerGroup}`,
+        ].map(shellQuote).join(" ");
+        const payload = "systemctl() {\n" +
+          `case "$2" in show) printf '%s\\n' ${properties};; stop) :;; *) exit 1;; esac\n}\n` +
+          program.replaceAll(keeper.cgroup, group)
+            .replaceAll("/sys/fs/cgroup$group", processDirectory)
+            .replaceAll("/proc/sys/kernel/random/boot_id", bootFile)
+            .replaceAll(
+              "/home/pi/ops/weekly-backup-controller/.private/file-backup/gnupg",
+              keyring,
+            )
+            .replaceAll("/usr/bin/gpgconf", directory + "/gpgconf");
+        const raw = await new Deno.Command("/bin/sh", {
+          args: ["-c", payload],
+        }).output();
+        if (raw.success && !program.includes("systemctl --user stop")) {
+          await betweenProofs?.();
+        }
+        const decoder = new TextDecoder();
+        return {
+          code: raw.code,
+          stdout: decoder.decode(raw.stdout),
+          stderr: decoder.decode(raw.stderr),
+        };
+      };
+      const blocked = {
+        state: "CANCELLATION_BLOCKED",
+        reason: "BRIDGE_TERMINAL_PROCESSES_UNPROVED",
+      };
+      const f = await terminalBridgeFixture(native);
+      await membership([first.pid]);
+      await select(second.socket);
+      equal(await f.runtime.close(gate), blocked);
+      await select(first.socket);
+      await membership([first.pid, second.pid]);
+      equal(await f.runtime.close(gate), blocked);
+      await membership([first.pid], 1);
+      equal(await f.runtime.close(gate), blocked);
+      await membership([first.pid]);
+      assert(!f.records.has(f.paths.settlementIntent));
+
+      betweenProofs = async () => {
+        await membership([second.pid]);
+        await select(second.socket);
+      };
+      equal(await f.runtime.close(gate), blocked);
+      assert(f.records.has(f.paths.settlementIntent));
+      assert(!f.records.has(f.paths.settled));
+      equal(f.stops(), 0);
+      betweenProofs = undefined;
+      managerGroup = "";
+      equal(await f.runtime.close(gate), {
+        state: "CANCELLATION_BLOCKED",
+        reason: "BRIDGE_EXACT_STOP_UNPROVED",
+      });
+      equal(f.stops(), 0);
+      managerGroup = group;
+      equal(await f.runtime.close(gate), "CLOSED");
+      equal(f.stops(), 1);
+
+      const commandName = await terminalBridgeFixture(native);
+      await membership([first.pid]);
+      await select(first.socket);
+      equal(await commandName.runtime.close(gate), "CLOSED");
+      const foreign = await launch("gpg-agent", 3, "ERR wrong protocol\n");
+      const silent = await launch("gpg-agent", 4, "");
+      for (const peer of [foreign, silent]) {
+        await membership([peer.pid]);
+        await select(peer.socket);
+        const invalid = await terminalBridgeFixture(native);
+        equal(await invalid.runtime.close(gate), blocked);
+        equal(invalid.stops(), 0);
+      }
+      const outside = await terminalBridgeFixture(native);
+      await membership([]);
+      await Deno.remove(socketSelection);
+      managerGroup = "";
+      equal(await outside.runtime.close(gate), "CLOSED");
+      for (const peer of [first, second, foreign, silent]) {
+        const live = await new Deno.Command("/bin/sh", {
+          args: ["-c", 'test -d "/proc/$1"', "fixture", String(peer.pid)],
+        }).output();
+        assert(live.success);
+      }
+    } finally {
+      try {
+        await Promise.all(children.map(async (child) => {
+          await child.stdin.getWriter().close();
+          assert((await child.status).success);
+        }));
+      } finally {
+        await Deno.remove(directory, { recursive: true });
+      }
+    }
+  },
 });
 
 Deno.test("real bridge close refuses absent or mismatched custody without stopping anything", async () => {

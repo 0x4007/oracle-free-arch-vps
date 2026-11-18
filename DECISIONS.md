@@ -8,7 +8,11 @@ The Pi reconciles a successful verifier from the exact invocation's terminal sta
 
 A successful keeper can leave the dedicated Pi keyring's GPG agent in its cgroup after closing its SSH tunnel. Settlement requires the bound keeper to have exited successfully with zero main and control PIDs, recorded terminal closure, no pending bridge work and an absent custom socket with the default socket unchanged. The exact unit can then be stopped after proving its original cgroup empty or containing only the known GPG agent for that keyring. The Pi retains proof of the intended exact stop and requires an empty original cgroup after it. Unknown children and changed identities keep the gate.
 
+The Pi agent is non-dumpable, so its executable symlink can be unreadable to the Pi user. For a populated keeper cgroup, require its sole member's exact keyring argv, cgroup and stable PID/start time, plus Linux credentials from the sender of the Assuan greeting at the configured keyring socket. The kernel identifies the greeting sender even when the process that created the listener forked before serving clients. The probe resolves the socket without starting an agent and reads a bounded greeting without issuing commands. Recheck the same process instance or an empty cgroup before stopping the exact keeper invocation. An agent outside the keeper cgroup is left running.
+
 The supervisor can reconcile the named existing blocked verifier from verified staged Pi code under the shared controller lock. That route checks fresh proof against the original immutable source revision and follows the common protection and catalog finalization. Ordinary retention runs separately. Controller and retention records and journals carry fixed reason codes for blocked cancellation checks. The missing reason on the pre-fix record leaves its exact historical failed check unclassified until supported by live evidence.
+
+The VPS source observer checks mount namespace links and open namespace descriptors through the existing root execution path. It continues to inspect each descriptor when another closes. A disappearing descriptor during enumeration gets one fresh scan if the process is still visible. Persistent missing or unreadable descriptors on a live process keep namespace custody unknown and retain the gate.
 
 ## Post-trial Free Tier account evidence — 2026-11-17
 

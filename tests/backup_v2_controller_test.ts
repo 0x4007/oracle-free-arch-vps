@@ -20,6 +20,11 @@ import {
   type BackupV2Receipt,
 } from "../scripts/backup-v2-contract.ts";
 import { backupV2SourceConfigSha256 } from "../scripts/backup-v2-metadata.ts";
+import {
+  type BackupV2BridgeRuntimeInput,
+  backupV2BridgeRuntimePaths,
+  realBackupV2BridgeRuntime,
+} from "../scripts/backup-v2-bridge-runtime.ts";
 import { BACKUP_V2_PROFILE_ID } from "../scripts/backup-v2-profile.ts";
 import {
   type BackupV2Gate,
@@ -688,6 +693,115 @@ Deno.test("bridge snapshot crossing clean verifier exit is recoverable on a late
   equal(state.catalog.length, 1);
   assert(!f.calls.includes("cancel"));
   equal(f.live, null);
+});
+
+Deno.test("a verified receipt reaches COMPLETE through real terminal bridge reconciliation", async () => {
+  let { f, state, gate } = await verifying();
+  const result = verifiedResult(state);
+  f.observation = completeObservation(gate, result, "ACCEPTED");
+  const accepted = status(gate, "ACCEPTED", backupV2ArtifactBytes(result)),
+    paths = backupV2BridgeRuntimePaths(gate);
+  const keeper = {
+    unitName: paths.unitName,
+    invocationId: "d".repeat(32),
+    mainPid: 777,
+    mainStartTicks: "888",
+    cgroup: `/user.slice/user-1000.slice/${paths.unitName}`,
+  };
+  const input: BackupV2BridgeRuntimeInput = {
+    schemaVersion: 1,
+    format: "backup-v2-bridge-runtime",
+    gate,
+    binding: {
+      jobId: gate.envelope.request.jobId,
+      captureId: gate.envelope.request.captureId,
+      requestSha256: gate.envelope.requestSha256,
+      gateId: gate.gateId,
+      source: { ...gate.custody!, sourceBootId: gate.sourceBootId },
+      publicHome: "/fixture/public",
+      remoteSocket: "/run/user/1002/gnupg/d.fixture/S.gpg-agent",
+      defaultSocket: "/run/user/1002/gnupg/S.gpg-agent",
+    },
+    sourceDirectory: backupV2GateDirectory(gate),
+    defaultSocketIdentity: "ABSENT",
+  };
+  const inputBytes = new TextEncoder().encode(JSON.stringify(input) + "\n");
+  const records = new Map<string, unknown>([
+    [paths.settings, input],
+    [paths.status, {
+      schemaVersion: 1,
+      inputSha256: backupV2ArtifactSha256(inputBytes),
+      keeperBootId: gate.sourceBootId,
+      updatedAtUtc: END,
+      bridge: {
+        state: "CLOSED",
+        keeper,
+        binding: input.binding,
+        reason: "TERMINAL",
+        pendingOperations: 0,
+      },
+    }],
+  ]);
+  let stopped = false, published = false;
+  const bridge = realBackupV2BridgeRuntime(
+    {
+      now: f.deps.now,
+      private: {
+        read: async (path: string) => records.get(path),
+        write: async (path: string, value: unknown) => records.set(path, value),
+      },
+      remote: {
+        root: async () => ({
+          code: 0,
+          stderr: "",
+          stdout: [
+            "__PROPS__",
+            `LoadState=loaded\nActiveState=active\nSubState=exited\nResult=success\nMainPID=0\nControlPID=0\nInvocationID=${
+              gate.custody!.invocationId
+            }\nControlGroup=${gate.custody!.cgroup}`,
+            "__PROCESS__\n__CGROUP__\nABSENT\n__STATUS__",
+            JSON.stringify(published ? accepted : status(gate, "VERIFYING")),
+            `__RESULT__\n${published ? accepted.resultSha256 : "MISSING"}`,
+            "__SOCKETS__\nCUSTOM_ABSENT\nABSENT",
+          ].join("\n"),
+        }),
+      },
+    } as unknown as Pick<PiDeps, "now" | "private" | "remote">,
+    async (tool, args) => {
+      const command = tool === "/usr/bin/env" ? args[2] : tool;
+      const program = args[4];
+      let stdout = "";
+      if (command === "/usr/bin/id") stdout = "1000\n";
+      else if (command === "/usr/bin/cat") stdout = gate.sourceBootId;
+      else if (command === "/usr/bin/systemctl") {
+        stdout = [
+          `LoadState=${stopped ? "not-found" : "loaded"}`,
+          `ActiveState=${stopped ? "inactive" : "active"}`,
+          `SubState=${stopped ? "dead" : "exited"}`,
+          "Result=success\nMainPID=0\nControlPID=0",
+          `InvocationID=${stopped ? "" : keeper.invocationId}`,
+          "ControlGroup=",
+        ].join("\n");
+      } else if (program?.includes("systemctl --user stop")) stopped = true;
+      else if (program?.includes("SO_PASSCRED")) stdout = "999:1111\n";
+      else stdout = stopped ? "ABSENT\n" : "populated 1\n";
+      return { code: 0, stdout, stderr: "" };
+    },
+  );
+  f.deps.bridge.close = bridge.close;
+  state = await stepBackupV2Controller(state, f.deps);
+  equal(state.job!.phase, "VERIFY_SETTLED");
+  state = await stepBackupV2Controller(state, f.deps);
+  equal(state.job!.phase, "VERIFY_SETTLED");
+  equal(f.live, gate);
+  published = true;
+  state = await stepBackupV2Controller(state, f.deps);
+  equal(state.job!.phase, "COMPLETE");
+  assert(records.has(paths.settled));
+  assert(stopped);
+  equal(state.catalog.length, 1);
+  equal(f.live, null);
+  assert(!f.calls.includes("cancel"));
 });
 
 Deno.test("exact blocked verifier accepts only after fresh native proof and retries after gate removal", async () => {

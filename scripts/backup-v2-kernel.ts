@@ -396,7 +396,11 @@ function result(
   maximum = MAX_BYTES,
 ): string {
   if (value.code !== 0) {
-    if (value.stderr.includes("No such file or directory")) fail("ABSENT");
+    if (
+      value.stderr.trimEnd().split("\n").every((line) =>
+        line.endsWith("No such file or directory")
+      )
+    ) fail("ABSENT");
     throw new BackupV2KernelEvidenceError("UNREADABLE", value.stderr === "");
   }
   if (new TextEncoder().encode(value.stdout).length > maximum) {
@@ -847,39 +851,57 @@ async function namespaceCensus(
   allPids: number[],
   run: BackupV2KernelCommand,
 ): Promise<{ references: number; manager: number }> {
-  let references = 0, manager = 0;
-  for (const current of allPids) {
+  const matches = async (path: string) => {
     try {
-      if (privateIds.has(await namespaceId(`/proc/${current}/ns/mnt`, run))) {
-        references++;
-      }
-      const found = result(
-        await run("/usr/bin/find", [
-          `/proc/${current}/fd`,
-          "-mindepth",
-          "1",
-          "-maxdepth",
-          "1",
-          "-type",
-          "l",
-          "-lname",
-          "mnt:[[]*[]]",
-          "-printf",
-          "%f\\0",
-        ]),
-      );
-      const fds = numbers(found, true);
-      if (fds.length > MAX_FDS) fail("BOUNDED");
-      for (const fd of fds) {
-        if (
-          privateIds.has(await namespaceId(`/proc/${current}/fd/${fd}`, run))
-        ) {
-          references++;
-          if (current === 1) manager++;
-        }
-      }
+      return privateIds.has(await namespaceId(path, run));
     } catch (error) {
       if (!absent(error)) throw error;
+      return false;
+    }
+  };
+  const descriptors = async (current: number) =>
+    result(
+      await run("/usr/bin/find", [
+        `/proc/${current}/fd`,
+        "-mindepth",
+        "1",
+        "-maxdepth",
+        "1",
+        "-type",
+        "l",
+        "-lname",
+        "mnt:[[]*[]]",
+        "-printf",
+        "%f\\0",
+      ]),
+    );
+  let references = 0, manager = 0;
+  for (const current of allPids) {
+    // A task can retain namespace FDs after its mount link disappears.
+    if (await matches(`/proc/${current}/ns/mnt`)) references++;
+    let found: string;
+    try {
+      found = await descriptors(current);
+    } catch (error) {
+      if (!absent(error)) throw error;
+      try {
+        result(await run("/usr/bin/cat", ["--", `/proc/${current}/stat`]));
+      } catch (processError) {
+        if (absent(processError)) continue;
+        throw processError;
+      }
+      // Retry one scan when an FD may have closed during find. Suppressing
+      // readdir races in find would also hide a missing starting directory.
+      found = await descriptors(current);
+    }
+    const fds = numbers(found, true);
+    if (fds.length > MAX_FDS) fail("BOUNDED");
+    for (const fd of fds) {
+      // Closing one FD does not invalidate the remaining descriptor list.
+      if (await matches(`/proc/${current}/fd/${fd}`)) {
+        references++;
+        if (current === 1) manager++;
+      }
     }
   }
   return { references, manager };

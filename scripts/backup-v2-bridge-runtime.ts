@@ -462,15 +462,62 @@ function statusBinding(
   ) fail();
 }
 
-/** A terminal keeper closed its exact tunnel, but gpgconf can leave the
- * dedicated keyring's agent in the keeper cgroup after MainPID exits. */
+// SO_PEERCRED can identify the process that listened before the agent forked.
+// The kernel attaches the actual greeting sender's credentials via SO_PASSCRED.
+const agentSocketPeerProgram = String.raw`
+import os, socket, stat, struct, sys, time
+
+path, pid = sys.argv[1:]
+uid = os.getuid()
+credentials = struct.Struct("=iII")
+expected = (int(pid), uid)
+
+def socket_identity():
+    info = os.lstat(path)
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != uid:
+        sys.exit(1)
+    return (info.st_dev, info.st_ino)
+
+if not os.path.isabs(path) or os.path.realpath(path) != path:
+    sys.exit(1)
+before = socket_identity()
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+    deadline = time.monotonic() + 2
+    client.settimeout(2)
+    client.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    client.connect(path)
+    greeting = b""
+    while b"\n" not in greeting and len(greeting) < 1024:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            sys.exit(1)
+        client.settimeout(remaining)
+        chunk, messages, flags, _ = client.recvmsg(
+            1024 - len(greeting), socket.CMSG_SPACE(credentials.size))
+        if not chunk or flags & socket.MSG_CTRUNC or len(messages) != 1:
+            sys.exit(1)
+        level, kind, value = messages[0]
+        if (level, kind) != (socket.SOL_SOCKET, socket.SCM_CREDENTIALS) or (
+            credentials.unpack(value)[:2] != expected
+        ):
+            sys.exit(1)
+        greeting += chunk
+line, newline, _ = greeting.partition(b"\n")
+if not newline or not (line == b"OK" or line.startswith(b"OK ")):
+    sys.exit(1)
+if socket_identity() != before:
+    sys.exit(1)
+`;
+
+/** A terminal keeper can leave its key agent in the cgroup. Prove the socket's
+ * sender alongside the exact argv and process identity, even when exe is hidden. */
 function terminalBridgeCgroupProgram(
   keeper: BackupV2SupervisorIdentity,
-  home: string,
+  keyring: string,
 ): string {
   return [
     `group=${shellQuote(keeper.cgroup)}`,
-    `home=${shellQuote(home)}`,
+    `keyring=${shellQuote(keyring)}`,
     'root="/sys/fs/cgroup$group"',
     'if test -d "$root"; then',
     '  test "$(awk \'$1 == "nr_descendants" { print $2 }\' "$root/cgroup.stat")" = 0',
@@ -479,16 +526,21 @@ function terminalBridgeCgroupProgram(
     '    case "$pid" in *[!0-9]*) exit 1;; esac',
     '    test "$pid" -gt 1',
     '    test "$(cat "/proc/$pid/cgroup")" = "0::$group"',
-    '    test "$(readlink "/proc/$pid/exe")" = /usr/bin/gpg-agent',
     '    start=$(awk \'{ sub(/^.*\\) /,""); print $20 }\' "/proc/$pid/stat")',
-    '    test -n "$start"',
+    '    case "$start" in ""|0|*[!0-9]*) exit 1;; esac',
     "    match_agent() {",
-    '      printf "%s\\000" "$1" --homedir "$home" --use-standard-socket --daemon | cmp -s - "/proc/$pid/cmdline"',
+    '      printf "%s\\000" "$1" --homedir "$keyring" --use-standard-socket --daemon | cmp -s - "/proc/$pid/cmdline"',
     "    }",
     "    match_agent /usr/bin/gpg-agent || match_agent gpg-agent",
+    '    socket=$(/usr/bin/timeout 5 /usr/bin/gpgconf --homedir "$keyring" --list-dirs agent-socket)',
+    `    /usr/bin/python3 -IS -c ${
+      shellQuote(agentSocketPeerProgram)
+    } "$socket" "$pid"`,
     '    test "$(cat "/proc/$pid/cgroup")" = "0::$group"',
     '    test "$(awk \'{ sub(/^.*\\) /,""); print $20 }\' "/proc/$pid/stat")" = "$start"',
     '    test "$(cat "$root/cgroup.procs")" = "$pid"',
+    '    test "$(awk \'$1 == "nr_descendants" { print $2 }\' "$root/cgroup.stat")" = 0',
+    '    printf "%s:%s\\n" "$pid" "$start"',
     "  else",
     '    test "$(awk \'$1 == "populated" { print $2 }\' "$root/cgroup.events")" = 0',
     "  fi",
@@ -897,8 +949,15 @@ export function realBackupV2BridgeRuntime(
           )
           : "";
         reason = "BRIDGE_TERMINAL_PROCESSES_UNPROVED";
-        if (cgroupProof) {
-          await checked(ctx.run, "/bin/sh", ["-c", `set -eu\n${cgroupProof}`]);
+        const provedAgent = cgroupProof
+          ? (await checked(ctx.run, "/bin/sh", [
+            "-c",
+            `set -eu\n${cgroupProof}`,
+          ]))
+            .trim()
+          : "";
+        if (provedAgent && !/^[1-9][0-9]*:[1-9][0-9]*$/.test(provedAgent)) {
+          fail();
         }
         reason = "BRIDGE_EXACT_STOP_UNPROVED";
         if (mode === "terminal" && !priorIntent) {
@@ -916,7 +975,7 @@ export function realBackupV2BridgeRuntime(
             "KillMode=control-group",
           ]
           : [];
-        await checked(ctx.run, "/bin/sh", [
+        const stop = await checked(ctx.run, "/bin/sh", [
           "-c",
           [
             "set -eu",
@@ -925,7 +984,16 @@ export function realBackupV2BridgeRuntime(
             }`,
             ...(properties.length
               ? [
-                `props=$(systemctl --user show ${unitArg} --property=LoadState,ActiveState,SubState,Result,MainPID,ControlPID,KillMode,InvocationID)`,
+                `if ! agent=$(/bin/sh -c ${
+                  shellQuote(`set -eu\n${cgroupProof}`)
+                }) ||`,
+                `   { test -n "$agent" && test "$agent" != ${
+                  shellQuote(provedAgent)
+                }; }; then`,
+                "  printf '%s\\n' BRIDGE_TERMINAL_PROCESSES_UNPROVED",
+                "  exit 0",
+                "fi",
+                `props=$(systemctl --user show ${unitArg} --property=LoadState,ActiveState,SubState,Result,MainPID,ControlPID,KillMode,InvocationID,ControlGroup)`,
                 ...[
                   ...properties,
                   `InvocationID=${status.bridge.keeper.invocationId}`,
@@ -935,7 +1003,9 @@ export function realBackupV2BridgeRuntime(
                       shellQuote(property)
                     }`
                   ),
-                cgroupProof,
+                `printf '%s\\n' "$props" | grep -Fxq ${
+                  shellQuote(`ControlGroup=${status.bridge.keeper.cgroup}`)
+                } || { test -z "$agent" && printf '%s\\n' "$props" | grep -Fxq ControlGroup=; } || exit 1`,
               ]
               : [
                 `test "$(systemctl --user show ${unitArg} --property=InvocationID --value)" = ${
@@ -945,6 +1015,10 @@ export function realBackupV2BridgeRuntime(
             `systemctl --user stop ${unitArg}`,
           ].join("\n"),
         ]);
+        if (stop.trim() === "BRIDGE_TERMINAL_PROCESSES_UNPROVED") {
+          reason = "BRIDGE_TERMINAL_PROCESSES_UNPROVED";
+          fail();
+        }
         unit = await localUnit(
           ctx.run,
           paths.unitName,
