@@ -12,6 +12,8 @@ The Pi agent is non-dumpable, so its executable symlink can be unreadable to the
 
 The supervisor can reconcile the named existing blocked verifier from verified staged Pi code under the shared controller lock. That route checks fresh proof against the original immutable source revision and follows the common protection and catalog finalization. Ordinary retention runs separately. Controller and retention records and journals carry fixed reason codes for blocked cancellation checks. The missing reason on the pre-fix record leaves its exact historical failed check unclassified until supported by live evidence.
 
+The VPS source observer checks mount namespace links and open namespace descriptors through the existing root execution path. It continues to inspect each descriptor when another closes. A disappearing descriptor during enumeration gets one fresh scan if the process is still visible. Persistent missing or unreadable descriptors on a live process keep namespace custody unknown and retain the gate.
+
 ## Post-trial Free Tier account evidence — 2026-11-17
 
 The 2026-11-17 OCI Organizations query through the Pi controller's own profile returned one `ACTIVE` subscription, with compartment equal to the tenancy, `subscription-tier=FREE`, `payment-model=FREE_TRIAL` and `time-updated=2026-10-31T05:56:26.015Z`. The 30-day USD 300 trial promotion showed `EXPIRED` with a 2026-09-29 23:59:59 UTC expiry. [Provider reference and dated observation](SOURCES.md#oracle-cloud-infrastructure)

@@ -1052,6 +1052,85 @@ Deno.test("kernel exact manager namespace FD is counted then fresh post-stop pro
   ], [false, 0, 0, 0, 0, 0, true]);
 });
 
+Deno.test("a closed mount FD cannot hide a later manager namespace reference", async () => {
+  const f = await nativeFixture({ privateMount: true });
+  const run: BackupV2KernelCommand = (command, args) => {
+    if (command === "/usr/bin/find" && args[0] === "/proc/1/fd") {
+      return Promise.resolve(ok("7\0" + "8\0"));
+    }
+    if (command === "/usr/bin/stat" && args.at(-1) === "/proc/1/fd/7") {
+      return Promise.resolve(missing());
+    }
+    return f.run(command, args);
+  };
+  const observed = await observeBackupV2Kernel(gate, run);
+  equal(observed.tree?.namespaceReferences, 1);
+  equal(observed.managerNamespaceReferences, 1);
+  assert(f.calls.some(([, args]) => args.at(-1) === "/proc/1/fd/8"));
+});
+
+Deno.test("a missing mount namespace link does not hide still-visible namespace descriptors", async () => {
+  const f = await nativeFixture({ privateMount: true });
+  const run: BackupV2KernelCommand = (command, args) => {
+    if (command === "/usr/bin/find" && args[0] === "/proc") {
+      return Promise.resolve(ok("1\0" + "45\0"));
+    }
+    if (command === "/usr/bin/stat" && args.at(-1) === "/proc/45/ns/mnt") {
+      return Promise.resolve(missing());
+    }
+    if (command === "/usr/bin/find" && args[0] === "/proc/45/fd") {
+      return Promise.resolve(ok("9\0"));
+    }
+    return f.run(command, args);
+  };
+  const observed = await observeBackupV2Kernel(gate, run);
+  equal(observed.tree?.namespaceReferences, 2);
+  equal(observed.managerNamespaceReferences, 1);
+});
+
+Deno.test("namespace census retries a live FD enumeration and rejects lost visibility", async () => {
+  for (const fault of ["gone", "raced", "live", "denied", "mixed"]) {
+    const f = await nativeFixture({ privateMount: true });
+    let attempts = 0;
+    const run: BackupV2KernelCommand = (command, args) => {
+      if (command === "/usr/bin/find" && args[0] === "/proc") {
+        return Promise.resolve(ok("1\0" + "45\0"));
+      }
+      if (command === "/usr/bin/find" && args[0] === "/proc/45/fd") {
+        attempts++;
+        if (fault === "raced" && attempts === 2) {
+          return Promise.resolve(ok("9\0"));
+        }
+        const stderr = fault === "denied"
+          ? "Permission denied"
+          : fault === "mixed"
+          ? "Permission denied\nNo such file or directory"
+          : "No such file or directory";
+        return Promise.resolve({ ...missing(), stderr });
+      }
+      if (command === "/usr/bin/stat" && args.at(-1) === "/proc/45/ns/mnt") {
+        return Promise.resolve(ok("4:1000"));
+      }
+      if (command === "/usr/bin/cat" && args.at(-1) === "/proc/45/stat") {
+        return Promise.resolve(
+          fault === "live" || fault === "raced" ? ok(stat(45)) : missing(),
+        );
+      }
+      return f.run(command, args);
+    };
+    const observed = await observeBackupV2Kernel(gate, run);
+    equal(
+      observed.tree?.namespaceReferences,
+      fault === "gone" ? 1 : fault === "raced" ? 2 : null,
+    );
+    equal(
+      observed.managerNamespaceReferences,
+      fault === "gone" || fault === "raced" ? 1 : null,
+    );
+    equal(attempts, fault === "live" || fault === "raced" ? 2 : 1);
+  }
+});
+
 Deno.test("kernel malformed exact-stop proof and another invocation cannot authorize absent-unit reconciliation", async () => {
   const f = await nativeFixture();
   const before = await observeBackupV2Kernel(gate, f.run);
