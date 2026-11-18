@@ -220,6 +220,69 @@ Deno.test("legacy claim uses the approved period age and exact predecessor, incl
   assert(wrongPredecessor.calls.length === 0);
 });
 
+Deno.test("claim recovery journals the first failed check without external error text", async () => {
+  const messages: unknown[][] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => messages.push(args);
+  try {
+    const owner = fixture();
+    owner.deps.ownerState = () =>
+      Promise.reject(new Error("private owner probe text"));
+    await rejects(() => owner.recover(), "SCHEDULED_CLAIM_CUSTODY_UNDECIDABLE");
+
+    const journal = fixture();
+    const changed = structuredClone(predecessor);
+    changed.cycle.updatedAtUtc = now.toISOString();
+    await rejects(
+      () => journal.recover(changed),
+      "SCHEDULED_CLAIM_CUSTODY_UNDECIDABLE",
+    );
+
+    const idle = fixture();
+    idle.deps.proveIdle = () =>
+      Promise.reject(new Error("private provider command output"));
+    await rejects(
+      () => idle.recover(predecessor, new Date("2026-11-19T00:00:00Z")),
+      "SCHEDULED_CLAIM_CUSTODY_OVERDUE",
+    );
+
+    const archive = fixture();
+    archive.deps.read = () =>
+      Promise.reject(new Error("private archive read error"));
+    await rejects(
+      () => archive.recover(),
+      "SCHEDULED_CLAIM_CUSTODY_UNDECIDABLE",
+    );
+
+    const settlement = fixture();
+    const write = settlement.deps.write;
+    settlement.deps.write = (path, claim) =>
+      path === CLAIM_PATH
+        ? Promise.reject(new Error("private settlement write error"))
+        : write(path, claim);
+    await rejects(
+      () => settlement.recover(),
+      "SCHEDULED_CLAIM_CUSTODY_UNDECIDABLE",
+    );
+
+    const checks = [
+      "OWNER_OBSERVATION",
+      "RUNTIME_PREDECESSOR_MISMATCH",
+      "REMOTE_IDLE_PROOF",
+      "CLAIM_ARCHIVE",
+      "CLAIM_SETTLEMENT_WRITE",
+    ];
+    assert(
+      JSON.stringify(messages) ===
+        JSON.stringify(
+          checks.map((check) => ["SCHEDULED_CLAIM_CHECK_FAILED", check]),
+        ),
+    );
+  } finally {
+    console.error = original;
+  }
+});
+
 Deno.test("a committed runtime repairs claim completion without a fresh scheduled launch", async () => {
   const f = fixture();
   const completed = structuredClone(predecessor);

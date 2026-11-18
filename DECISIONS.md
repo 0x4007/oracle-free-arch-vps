@@ -2,6 +2,14 @@
 
 Recorded 2026-09-22 for the online Backblaze backup path in this repository. These are implementation decisions made under the owner-controlled [PROJECT-VISION.md](PROJECT-VISION.md) charter. They do not amend, replace, or claim the authority of that charter, which wins on any conflict, and they stay inside the resource-budget and request-transport scope described here.
 
+## Backblaze verifier terminal reconciliation — 2026-11-18
+
+The Pi reconciles a successful verifier from the exact invocation's terminal status, result digest, native custody and receipt before settling the decrypt bridge. A clean exit can overlap a controller observation. A bounded pending observation keeps the gate, and the next reconciliation checks for terminal success before cancelling an ambiguously blocked verifier.
+
+A successful keeper can leave the dedicated Pi keyring's GPG agent in its cgroup after closing its SSH tunnel. Settlement requires the bound keeper to have exited successfully with zero main and control PIDs, recorded terminal closure, no pending bridge work and an absent custom socket with the default socket unchanged. The exact unit can then be stopped after proving its original cgroup empty or containing only the known GPG agent for that keyring. The Pi retains proof of the intended exact stop and requires an empty original cgroup after it. Unknown children and changed identities keep the gate.
+
+The supervisor can reconcile the named existing blocked verifier from verified staged Pi code under the shared controller lock. That route checks fresh proof against the original immutable source revision and follows the common protection and catalog finalization. Ordinary retention runs separately. Controller and retention records and journals carry fixed reason codes for blocked cancellation checks. The missing reason on the pre-fix record leaves its exact historical failed check unclassified until supported by live evidence.
+
 ## Post-trial Free Tier account evidence — 2026-11-17
 
 The 2026-11-17 OCI Organizations query through the Pi controller's own profile returned one `ACTIVE` subscription, with compartment equal to the tenancy, `subscription-tier=FREE`, `payment-model=FREE_TRIAL` and `time-updated=2026-10-31T05:56:26.015Z`. The 30-day USD 300 trial promotion showed `EXPIRED` with a 2026-09-29 23:59:59 UTC expiry. [Provider reference and dated observation](SOURCES.md#oracle-cloud-infrastructure)
