@@ -7,9 +7,8 @@ filesystem archives.
 The backup covers six filesystem roles: Arch root, EFI, staging boot, staging
 EFI, Oracle fallback root, and Oracle OLED. Each role is a GNU tar archive
 compressed with zstd and encrypted to a public GPG recipient. A seventh
-encrypted archive contains recovery metadata. The scoped Backblaze credential is
-separate from the master credential. Private decryption keys stay off the VPS
-and out of this repository.
+encrypted archive contains recovery metadata. Private decryption keys stay off
+the VPS and out of this repository.
 
 This is a live file copy. It is not an atomic filesystem snapshot or proof of
 database consistency. Package and boot-file checks detect relevant changes
@@ -43,6 +42,8 @@ V2 requests have no inherited twelve-hour whole-job deadline. Source and bridge 
 Cancellation is separate from successful archive verification. An exact observed invocation and successful exact-unit stop must be followed by fresh process/start, cgroup, namespace, FD and source-lock evidence. Independently dead children can establish cancellation settlement even when the interrupted journal lacks EXIT records; no record, exit status, result or receipt is invented. Missing/malformed custody, a live escape, unresolved namespace, contradictory identity or uncertain closure remains `CANCELLATION_BLOCKED`, retaining ownership and preventing overlapping work or cleanup. Ambiguous upload/delete intents remain for later reconciliation. A missing unit alone proves nothing.
 
 V1 indexes, readers, original requests, FAILED statuses, receipts and timestamps remain preserved behind strict version dispatch. The November 18 policy defaults to keeping the latest two intact accepted generations in plan-only mode. It protects exact references reachable from retained roots, reused roles, metadata, receipts and recovery tools, plus active and unresolved operations. A private verified plan and fresh protection proofs precede any exact-version deletion. The older four-generation policy is historical. The Oracle recovery pair and unowned Restic data are outside B2 retention. [Retention rollout](BACKUP-REPAIR-RUNBOOK.md#backblaze-retention-rollout)
+
+The scheduled controller uses the owner's existing Backblaze master key through the Pi's private writer settings, with a fixed bucket binding and explicit writer namespace. Retention uses the same credential when a separate retention key file is absent. The scheduler and watchdog report accepted backup health independently of the private catalog verification and retention reports. A missing or changed accepted cloud reference still counts as actual damage. [Credential installation and report paths](BACKUP-REPAIR-RUNBOOK.md#backblaze-retention-rollout)
 
 The schedule contract remains Sunday 00:05 America/New_York with fifteen-minute/startup rechecks and one current due period. A completed capture in that period satisfies it; migration must not manufacture a second generation. Required acceptance includes retained-v1 streaming recovery, real failure/cancellation/fidelity and capacity fixtures, one genuine all-role due-period v2 capture with independent complete cloud verification, hash-matched Pi/VPS and recovery-tool releases, safe retention/cleanup, settled gates/units/locks/tunnels, current timers and unchanged production continuity. Pi keeper continuity across the source transfer/startup windows remains part of that acceptance. A later natural weekly cycle is separate repeatability evidence. New archive verification may establish `decryptedRestoreProved=true`; `machineBootRestoreProved` stays false without a separately approved boot drill. Historical boot proof below does not transfer to a new capture.
 
