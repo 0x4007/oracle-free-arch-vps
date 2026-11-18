@@ -9,7 +9,6 @@ import {
   validateBackupV2ManifestRef,
   validateBackupV2ObjectRef,
   validateBackupV2PutIntent,
-  validateBackupV2VersionPage,
 } from "./backup-v2-contract.ts";
 import {
   type BackupV2ProtectionDescriptor,
@@ -28,22 +27,25 @@ import {
   type BackupV2RetentionReader,
   executeBackupV2Retention,
   planBackupV2Retention,
+  validateBackupV2RetentionJob,
+  validateBackupV2RetentionPlan,
+  validateBackupV2RetentionPolicy,
+  validateBackupV2RetiredRestic,
 } from "./backup-v2-retention.ts";
 import {
   validateBackupRuntimeCatalogEntry,
   validateBackupV2Gate,
 } from "./backup-v2-runtime-contract.ts";
-import {
-  BACKUP_V2_LIMITS,
-  BACKUP_V2_NAMESPACE,
-  BACKUP_V2_WORKSPACE,
-} from "./backup-v2-profile.ts";
-import type { BackupV2ExactObjectStore } from "./backup-v2-store.ts";
+import { BACKUP_V2_LIMITS, BACKUP_V2_WORKSPACE } from "./backup-v2-profile.ts";
+import type { BackupV2Store } from "./backup-v2-store.ts";
 
 export interface BackupV2SourcePrunerCapabilities {
   exactStore: Pick<
-    BackupV2ExactObjectStore,
-    "versionsPage" | "reconcileExact" | "removeExact"
+    BackupV2Store,
+    | "bucketVersionsPage"
+    | "unfinishedFilesPage"
+    | "unfinishedPartsPage"
+    | "removeRetentionVersion"
   >;
   /** Reads are root600, no symlinks, identity-bound and bounded before allocation. */
   readGraphManifest(
@@ -118,7 +120,7 @@ function planReference(value: unknown): BackupV2PrunePlanReference {
   ) fail();
   return { sha256: r.sha256, digest: r.digest, bytes: r.bytes as number };
 }
-function validateInput(
+export function validateBackupV2PruneInput(
   value: unknown,
   legacy: BackupV2RetentionReader["validateLegacy"],
 ): BackupV2PruneInput {
@@ -129,13 +131,16 @@ function validateInput(
     "gate",
     "transactionId",
     "stage",
+    "scratchCleanupRequestSha256",
     "snapshot",
     "graphs",
     "plan",
   ]);
   if (
     r.schemaVersion !== 2 || r.format !== "backup-v2-prune" ||
-    !uuid(r.transactionId) || !["PLAN", "EXECUTE"].includes(String(r.stage))
+    !uuid(r.transactionId) || !["PLAN", "EXECUTE"].includes(String(r.stage)) ||
+    r.scratchCleanupRequestSha256 !== null &&
+      !hash(r.scratchCleanupRequestSha256)
   ) fail();
   const gate = validateBackupV2Gate(r.gate);
   if (gate.kind !== "prune" || gate.state !== "ACTIVE" || !gate.custody) fail();
@@ -144,6 +149,15 @@ function validateInput(
       "catalog",
       "protection",
       "receipts",
+      "policy",
+      "plannedAtUtc",
+      "jobs",
+      ...(r.snapshot && Object.hasOwn(r.snapshot as object, "retiredRestic")
+        ? ["retiredRestic"]
+        : []),
+      ...(r.snapshot && Object.hasOwn(r.snapshot as object, "verifyCatalogOnly")
+        ? ["verifyCatalogOnly"]
+        : []),
     ]),
     custody = record(snapshot.custody, [
       "lockId",
@@ -165,19 +179,34 @@ function validateInput(
       : entry.envelope.request.captureId
   );
   if (
-    catalog.length < 4 || new Set(captures).size !== catalog.length ||
+    new Set(captures).size !== catalog.length ||
     custody.sourceBootId !== gate.sourceBootId ||
     custody.sourceSettled !== true || typeof custody.lockId !== "string" ||
     !/^[\x21-\x7e]{1,256}$/.test(custody.lockId)
   ) fail();
   const plan = r.stage === "PLAN" ? null : planReference(r.plan);
-  if (r.stage === "PLAN" && r.plan !== null) fail();
+  const policy = validateBackupV2RetentionPolicy(snapshot.policy);
+  const plannedAtUtc = snapshot.plannedAtUtc;
+  if (
+    r.stage === "PLAN" && r.plan !== null ||
+    r.stage === "EXECUTE" && !policy.execute ||
+    Object.hasOwn(snapshot, "verifyCatalogOnly") &&
+      (snapshot.verifyCatalogOnly !== true || policy.execute ||
+        r.stage !== "PLAN" ||
+        r.scratchCleanupRequestSha256 !== null) ||
+    typeof plannedAtUtc !== "string" ||
+    !Number.isFinite(Date.parse(plannedAtUtc)) ||
+    new Date(plannedAtUtc).toISOString() !== plannedAtUtc
+  ) fail();
+  const jobs = list(snapshot.jobs).map(validateBackupV2RetentionJob);
+  if (new Set(jobs.map((job) => job.captureId)).size !== jobs.length) fail();
   return {
     schemaVersion: 2,
     format: "backup-v2-prune",
     gate,
     transactionId: r.transactionId,
     stage: r.stage as "PLAN" | "EXECUTE",
+    scratchCleanupRequestSha256: r.scratchCleanupRequestSha256,
     plan,
     snapshot: {
       custody: {
@@ -186,6 +215,17 @@ function validateInput(
         sourceSettled: true,
       },
       catalog,
+      policy,
+      plannedAtUtc,
+      jobs,
+      ...(Object.hasOwn(snapshot, "retiredRestic")
+        ? {
+          retiredRestic: validateBackupV2RetiredRestic(snapshot.retiredRestic),
+        }
+        : {}),
+      ...(snapshot.verifyCatalogOnly === true
+        ? { verifyCatalogOnly: true }
+        : {}),
       protection: {
         acceptedRoots: list(protection.acceptedRoots).map(
           validateBackupV2ManifestRef,
@@ -206,13 +246,13 @@ function validateInput(
   };
 }
 
-/** PLAN publishes metadata only. EXECUTE requires that exact file and fresh
- * source/controller custody; it cannot issue legacy or prefix deletions. */
+/** PLAN publishes metadata only. EXECUTE requires its exact file and fresh
+ * source/controller custody. Both formats use the same bounded version plan. */
 export async function runBackupV2SourcePruner(
   raw: BackupV2PruneInput,
   caps: BackupV2SourcePrunerCapabilities,
 ): Promise<BackupV2PruneResult> {
-  const input = validateInput(raw, caps.validateLegacy);
+  const input = validateBackupV2PruneInput(raw, caps.validateLegacy);
   caps.signal?.throwIfAborted();
   let inventoryMembers = 0, graphBytes = 0, planBytes = 0, journalBytes = 0;
   const controlBytes = encoded(input).length;
@@ -339,7 +379,7 @@ export async function runBackupV2SourcePruner(
     }
     return graphs;
   };
-  let graphs = await graphsFor(input);
+  const graphs = await graphsFor(input);
   const references = (root: BackupV2ManifestRef) => {
     const refs = graphs.get(rootKey(root));
     if (!refs) fail();
@@ -349,16 +389,34 @@ export async function runBackupV2SourcePruner(
     references,
     roleReferences: references,
     validateLegacy: caps.validateLegacy,
-    async versionsPage(cursor) {
+    async bucketVersionsPage(cursor, prefix) {
       caps.signal?.throwIfAborted();
-      const page = validateBackupV2VersionPage(
-        await caps.exactStore.versionsPage(
-          BACKUP_V2_NAMESPACE,
-          cursor,
-          caps.signal,
-        ),
+      const page = await caps.exactStore.bucketVersionsPage(
+        cursor,
+        prefix,
+        caps.signal,
       );
-      await advance(page.items.length);
+      await advance(1 + page.items.length);
+      return page;
+    },
+    async unfinishedFilesPage(cursor, prefix) {
+      caps.signal?.throwIfAborted();
+      const page = await caps.exactStore.unfinishedFilesPage(
+        cursor,
+        prefix,
+        caps.signal,
+      );
+      await advance(1 + page.items.length);
+      return page;
+    },
+    async unfinishedPartsPage(fileId, cursor) {
+      caps.signal?.throwIfAborted();
+      const page = await caps.exactStore.unfinishedPartsPage(
+        fileId,
+        cursor,
+        caps.signal,
+      );
+      await advance(1 + page.items.length);
       return page;
     },
   };
@@ -368,35 +426,10 @@ export async function runBackupV2SourcePruner(
       BACKUP_V2_LIMITS.journalBytes,
     );
     if (bytes.length !== ref.bytes || sha(bytes) !== ref.sha256) fail();
-    const value = JSON.parse(decoder.decode(bytes)) as BackupV2RetentionPlan;
-    record(value, [
-      "schemaVersion",
-      "format",
-      "dryRun",
-      "preconditionSha256",
-      "retainedCaptureIds",
-      "obsoleteLegacyCaptureIds",
-      "candidates",
-      "digest",
-    ]);
-    if (
-      !value || value.schemaVersion !== 2 ||
-      value.format !== "backup-v2-retention" || value.dryRun !== true ||
-      value.digest !== ref.digest || !hash(value.preconditionSha256) ||
-      !Array.isArray(value.retainedCaptureIds) ||
-      value.retainedCaptureIds.length !== 4 ||
-      new Set(value.retainedCaptureIds).size !== 4 ||
-      value.retainedCaptureIds.some((id) =>
-        typeof id !== "string" || !id.startsWith("generation-") ||
-        !uuid(id.slice(11))
-      ) || !Array.isArray(value.obsoleteLegacyCaptureIds) ||
-      value.obsoleteLegacyCaptureIds.some((id) =>
-        typeof id !== "string" || !id.startsWith("generation-") ||
-        !uuid(id.slice(11))
-      ) || !Array.isArray(value.candidates) ||
-      value.candidates.length > BACKUP_V2_LIMITS.pruneCandidates
-    ) fail();
-    for (const object of value.candidates) validateBackupV2ObjectRef(object);
+    const value = validateBackupV2RetentionPlan(
+      JSON.parse(decoder.decode(bytes)),
+      ref.digest,
+    );
     planBytes = bytes.length;
     budget();
     await advance(1);
@@ -404,8 +437,14 @@ export async function runBackupV2SourcePruner(
   };
   let plan: BackupV2RetentionPlan,
     ref: BackupV2PrunePlanReference,
-    state: BackupV2PruneResult["state"];
+    state: BackupV2PruneResult["state"],
+    summary: BackupV2PruneResult["summary"],
+    retainedCaptureIds: string[];
   if (input.stage === "PLAN") {
+    if (
+      !Number.isFinite(caps.now().getTime()) ||
+      Date.parse(input.snapshot.plannedAtUtc) > caps.now().getTime()
+    ) fail();
     plan = await planBackupV2Retention(input.snapshot, reader);
     const bytes = encoded(plan);
     boundedBytes(bytes, BACKUP_V2_LIMITS.journalBytes);
@@ -416,6 +455,8 @@ export async function runBackupV2SourcePruner(
     await advance(1);
     if (!isDeepStrictEqual(await readPlan(ref), plan)) fail();
     state = "PLAN_PROVED";
+    summary = plan.summary;
+    retainedCaptureIds = plan.retainedCaptureIds;
   } else {
     ref = input.plan!;
     plan = await readPlan(ref);
@@ -423,9 +464,10 @@ export async function runBackupV2SourcePruner(
       const outcome = await executeBackupV2Retention(plan, ref.digest, {
         reader,
         signal: caps.signal,
+        now: caps.now,
         async observeFresh() {
           caps.signal?.throwIfAborted();
-          const fresh = validateInput(
+          const fresh = validateBackupV2PruneInput(
             await caps.observeFresh(),
             caps.validateLegacy,
           );
@@ -433,12 +475,14 @@ export async function runBackupV2SourcePruner(
             fresh.transactionId !== input.transactionId ||
             fresh.stage !== "EXECUTE" ||
             !isDeepStrictEqual(fresh.plan, input.plan) ||
+            !isDeepStrictEqual(fresh.graphs, input.graphs) ||
+            fresh.scratchCleanupRequestSha256 !==
+              input.scratchCleanupRequestSha256 ||
             !isDeepStrictEqual({
               ...fresh.gate,
               updatedAtUtc: input.gate.updatedAtUtc,
             }, input.gate)
           ) fail();
-          graphs = await graphsFor(fresh);
           return fresh.snapshot;
         },
         async loadJournal() {
@@ -471,20 +515,22 @@ export async function runBackupV2SourcePruner(
           journalBytes += bytes;
           await advance(1);
         },
-        async reconcileExact(object, signal) {
-          const state = await caps.exactStore.reconcileExact(object, signal);
-          if (state !== "PRESENT" && state !== "ABSENT") fail();
-          await advance(1);
-          return state === "PRESENT" ? "present" : "absent";
-        },
         async removeExact(object, signal) {
-          await caps.exactStore.removeExact(object, signal);
+          await caps.exactStore.removeRetentionVersion(
+            object,
+            signal,
+            input.snapshot.retiredRestic?.prefix,
+          );
           await advance(1);
         },
       });
       state = outcome.status === "COMPLETE" ? "COMPLETE" : "PARTIAL";
+      summary = outcome.summary;
+      retainedCaptureIds = outcome.retainedCaptureIds;
     } catch {
       state = "PARTIAL";
+      summary = { ...plan.summary, blockReason: "PLAN_CHANGED" };
+      retainedCaptureIds = plan.retainedCaptureIds;
     }
   }
   const now = caps.now();
@@ -497,8 +543,12 @@ export async function runBackupV2SourcePruner(
     stage: input.stage,
     state,
     plan: ref,
-    retainedCaptureIds: [...plan.retainedCaptureIds],
-    obsoleteLegacyCaptureIds: [...plan.obsoleteLegacyCaptureIds],
+    retainedCaptureIds: [...retainedCaptureIds],
+    retiredCaptureIds: state === "PARTIAL" ? [] : [...plan.retiredCaptureIds],
+    obsoleteLegacyCaptureIds: state === "PARTIAL"
+      ? []
+      : [...plan.obsoleteLegacyCaptureIds],
+    summary,
     finishedAtUtc: now.toISOString(),
   };
 }

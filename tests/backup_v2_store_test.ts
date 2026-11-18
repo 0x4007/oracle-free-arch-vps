@@ -281,6 +281,104 @@ function fakeWire(
   };
 }
 
+Deno.test("retention uses exact bucket unprefixed key and native multipart metadata/delete APIs", async () => {
+  const calls: BackupV2WireRequest[] = [];
+  const allowed = auth();
+  Reflect.set(allowed.apiInfo.storageApi.allowed, "namePrefix", null);
+  allowed.apiInfo.storageApi.allowed.capabilities = [
+    "listFiles",
+    "writeFiles",
+    "deleteFiles",
+  ];
+  const item = {
+    fileId: "multipart-id",
+    fileName: name,
+    uploadTimestamp: 11,
+    bucketId,
+  };
+  const store = new BackupV2Store(
+    settings,
+    (request) => {
+      calls.push(request);
+      if (request.url.endsWith("b2_authorize_account")) {
+        return Promise.resolve(
+          response(allowed),
+        );
+      }
+      const args = JSON.parse(request.json!);
+      if (request.url.endsWith("b2_list_file_versions")) {
+        assert(args.bucketId === bucketId && !Object.hasOwn(args, "prefix"));
+        return Promise.resolve(response({
+          files: [
+            listed(ref({ contentLength: 8_000_000_000, contentSha1: "none" })),
+            { ...item, contentLength: 0, action: "start" },
+          ],
+          nextFileId: null,
+          nextFileName: null,
+        }));
+      }
+      if (request.url.endsWith("b2_list_unfinished_large_files")) {
+        assert(
+          args.bucketId === bucketId && args.namePrefix === name &&
+            args.startFileId === item.fileId,
+        );
+        return Promise.resolve(response({ files: [item], nextFileId: null }));
+      }
+      if (request.url.endsWith("b2_list_parts")) {
+        assert(args.fileId === item.fileId && args.startPartNumber === 2);
+        return Promise.resolve(response({
+          parts: [{
+            fileId: item.fileId,
+            partNumber: 2,
+            contentLength: 1024,
+            contentSha1: "a".repeat(40),
+            uploadTimestamp: 12,
+          }],
+          nextPartNumber: null,
+        }));
+      }
+      if (request.url.endsWith("b2_cancel_large_file")) {
+        assert(args.fileId === item.fileId);
+        return Promise.resolve(response(item));
+      }
+      if (request.url.endsWith("b2_delete_file_version")) {
+        assert(args.fileName === name && args.fileId === ref().fileId);
+        return Promise.resolve(
+          response({ fileId: ref().fileId, fileName: name }),
+        );
+      }
+      throw Error("Unexpected API");
+    },
+    undefined,
+    "retention",
+  );
+  const versions = await store.bucketVersionsPage(null);
+  assert(versions.items[0].contentLength === 8_000_000_000);
+  const { items } = await store.unfinishedFilesPage(item.fileId, name);
+  assert(
+    (await store.unfinishedPartsPage(item.fileId, 2)).items[0].contentLength ===
+      1024,
+  );
+  assert(items[0].uploadTimestamp === 11 && items[0].contentLength === 0);
+  await store.removeRetentionVersion({
+    ...items[0],
+    contentLength: 1024,
+    lastPartUploadedAt: 12,
+    partsSha256: "a".repeat(64),
+  });
+  const { sha256: _sha256, ...upload } = ref();
+  await store.removeRetentionVersion(upload);
+  assert(calls.length === 6);
+  await rejects(
+    store.removeRetentionVersion({ ...upload, fileName: "foreign/name" }),
+  );
+  assert(calls.length === 6);
+  await rejects(
+    new BackupV2Store(settings, fakeWire({}), undefined, "retention")
+      .bucketVersionsPage(null),
+  );
+});
+
 Deno.test("v2 curl awaits tracked START ACK before writing config and keeps one wire request", async () => {
   let ready!: (child: BackupV2TrackedProcess) => void;
   const registered = new Promise<BackupV2TrackedProcess>((resolve) => {

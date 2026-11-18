@@ -10,6 +10,7 @@ import { BACKUP_V2_PROFILE_ID } from "../scripts/backup-v2-profile.ts";
 import {
   BACKUP_V2_BOOT_SAMPLES,
   BACKUP_V2_ROLES,
+  type BackupV2ListedVersion,
   type BackupV2ManifestRef,
   backupV2ObjectName,
   type BackupV2ObjectRef,
@@ -21,9 +22,11 @@ import {
   type BackupV2RetentionReader,
   type BackupV2RetentionSnapshot,
   collectBackupV2ProtectedReferences,
+  DEFAULT_BACKUP_V2_RETENTION_POLICY,
   executeBackupV2Retention,
   planBackupV2Retention,
 } from "../scripts/backup-v2-retention.ts";
+import type { BackupV2RetentionPart } from "../scripts/backup-v2-retention-inventory.ts";
 const C = "generation-00000000-0000-4000-8000-000000000001",
   A = "00000000-0000-4000-8000-000000000002",
   P = "00000000-0000-4000-8000-000000000003";
@@ -328,37 +331,62 @@ function legacy(point: number) {
     },
   };
 }
+
+const NOW = "2026-11-18T19:00:00.000Z";
+const CUTOFF = Date.parse(NOW) - 72 * 3_600_000;
+const listed = ({ sha256: _sha256, ...value }: BackupV2ObjectRef) => value;
+
 function fixture() {
   const shared = object(1),
     exclusive = object(1, "data", 1),
     page = object(1, "manifest", 20),
-    orphan = object(1, "tools", 99);
-  const graph = new Map([[link(1).object.fileId, [shared, exclusive, page]], [
-    link(5).object.fileId,
-    [shared],
-  ]]);
-  const cloud = new Map(
-    [
+    unattached = object(1, "tools", 99);
+  const graph = new Map([
+    [link(1).object.fileId, [shared, exclusive, page]],
+    [link(5).object.fileId, [shared]],
+  ]);
+  const cloud = new Map<string, BackupV2ListedVersion>();
+  const put = (version: BackupV2ListedVersion) =>
+    cloud.set(version.fileId, version);
+  for (
+    const ref of [
       shared,
       exclusive,
       page,
-      orphan,
+      unattached,
       link(1).object,
       link(1, 101, "receipt").object,
       link(5).object,
       link(5, 101, "receipt").object,
-    ].map((ref) => [ref.fileId, ref]),
-  );
+    ]
+  ) put(listed(ref));
+  for (const entry of [legacy(2), legacy(3), legacy(4)]) {
+    put({ ...entry.entry.publishedIndex.object, action: "upload" });
+    for (const archive of entry.entry.index.archives) {
+      for (const chunk of archive.chunks) {
+        put({
+          fileId: chunk.fileId,
+          fileName: chunk.name,
+          contentLength: chunk.size,
+          contentSha1: chunk.sha1,
+          uploadTimestamp: chunk.uploadTimestamp,
+          action: "upload",
+        });
+      }
+    }
+  }
+  put({ ...listed(object(8)), fileName: "foreign/file", contentLength: 100 });
   const snapshot: BackupV2RetentionSnapshot = {
-    custody: {
-      lockId: "retention-transaction-1",
-      sourceBootId: A,
-      sourceSettled: true,
-    },
+    custody: { lockId: "retention", sourceBootId: A, sourceSettled: true },
     catalog: [v2(1), legacy(2), legacy(3), legacy(4), v2(5)],
     protection: empty(),
     receipts: [],
+    jobs: [],
+    policy: { ...DEFAULT_BACKUP_V2_RETENTION_POLICY, execute: true },
+    plannedAtUtc: NOW,
   };
+  const parts = new Map<string, BackupV2RetentionPart[]>();
+  const trace: (string | undefined)[] = [];
   const reader: BackupV2RetentionReader = {
     validateLegacy: validateCatalogEntry,
     references: (root) => {
@@ -367,17 +395,33 @@ function fixture() {
       return Promise.resolve(structuredClone(refs));
     },
     roleReferences: () => Promise.resolve([exclusive]),
-    versionsPage: () =>
-      Promise.resolve({
-        items: [...cloud.values()].map(({ sha256: _sha, ...ref }) => ref),
+    bucketVersionsPage(_cursor, prefix) {
+      trace.push(prefix);
+      return Promise.resolve({
+        items: [...cloud.values()].filter((ref) =>
+          !prefix || ref.fileName.startsWith(prefix)
+        ),
         next: null,
-      }),
+      });
+    },
+    unfinishedFilesPage(_cursor, prefix) {
+      return Promise.resolve({
+        items: [...cloud.values()].filter((
+          ref,
+        ): ref is Extract<BackupV2ListedVersion, { action: "start" }> =>
+          ref.action === "start" && (!prefix || ref.fileName.startsWith(prefix))
+        ),
+        next: null,
+      });
+    },
+    unfinishedPartsPage: (fileId) =>
+      Promise.resolve({ items: parts.get(fileId) ?? [], next: null }),
   };
-  const journal: BackupV2RetentionJournalEntry[] = [],
-    removed: string[] = [],
-    events: string[] = [];
+  const journal: BackupV2RetentionJournalEntry[] = [];
+  const removed: string[] = [], events: string[] = [];
   const caps: BackupV2RetentionExecution = {
     reader,
+    now: () => new Date(NOW),
     observeFresh: () => Promise.resolve(snapshot),
     loadJournal: () => Promise.resolve(structuredClone(journal)),
     appendDurable: (entry) => {
@@ -385,8 +429,6 @@ function fixture() {
       events.push(entry.state);
       return Promise.resolve();
     },
-    reconcileExact: (ref) =>
-      Promise.resolve(cloud.has(ref.fileId) ? "present" : "absent"),
     removeExact: (ref) => {
       assert(cloud.has(ref.fileId));
       cloud.delete(ref.fileId);
@@ -399,280 +441,436 @@ function fixture() {
     snapshot,
     reader,
     cloud,
+    put,
     graph,
     shared,
     exclusive,
     page,
-    orphan,
+    unattached,
     journal,
     removed,
     events,
     caps,
+    parts,
+    trace,
+    plan: () => planBackupV2Retention(snapshot, reader),
   };
 }
 
-Deno.test("retention plan binds mixed accepted roots and shared references, ignoring unattached inventory", async () => {
-  const f = fixture(), plan = await planBackupV2Retention(f.snapshot, f.reader);
+Deno.test("retention selects newest two mixed-format accepted generations and keeps shared exact references", async () => {
+  const f = fixture(), plan = await f.plan();
   assert(
-    plan.dryRun && plan.retainedCaptureIds.length === 4 &&
-      plan.candidates.length === 4,
+    plan.dryRun &&
+      plan.retainedCaptureIds.join() === [capture(5), capture(4)].join(),
   );
   assert(
-    !plan.candidates.some((ref) =>
-      [f.shared.fileId, f.orphan.fileId].includes(ref.fileId)
+    plan.retiredCaptureIds.length === 3 &&
+      plan.obsoleteLegacyCaptureIds.length === 2,
+  );
+  assert(plan.candidates.length === 20 && plan.summary.bucketBytes === 132);
+  assert(
+    plan.candidates.every(({ object }) =>
+      ![f.shared.fileId, f.unattached.fileId].includes(object.fileId)
     ),
   );
-  f.snapshot.catalog = [...f.snapshot.catalog].reverse();
-  f.reader.versionsPage = () =>
-    Promise.resolve({
-      items: [...f.cloud.values()].reverse().map(({ sha256: _sha, ...ref }) =>
-        ref
-      ),
-      next: null,
-    });
-  assert(
-    (await planBackupV2Retention(f.snapshot, f.reader)).digest === plan.digest,
-  );
-  f.snapshot.catalog = [legacy(1), legacy(2), legacy(3), legacy(4), v2(5)];
-  const legacyPlan = await planBackupV2Retention(f.snapshot, f.reader);
-  assert(
-    legacyPlan.candidates.length === 0 &&
-      legacyPlan.obsoleteLegacyCaptureIds[0] === capture(1),
-  );
+  const versions = [...f.cloud.values()].reverse();
+  f.cloud.clear();
+  for (const version of versions) f.put(version);
+  assert((await f.plan()).digest === plan.digest);
+  f.snapshot.catalog = [v2(5)];
+  assert((await f.plan()).retainedCaptureIds.join() === capture(5));
+  f.snapshot.catalog = [];
+  assert((await f.plan()).summary.blockReason === "NO_ACCEPTED_GENERATION");
 });
-Deno.test("retention protects reusable roles active objects unresolved PUT names and receipt references", async () => {
+
+Deno.test("retention protects unsettled jobs, explicit active references and unknown v2 names", async () => {
   const f = fixture(), protection = empty();
   protection.activeObjects.push(f.exclusive);
   protection.sealedRoleManifests.push({ object: f.page, plaintextSha256: H });
-  const pending = link(1, 101, "receipt").object;
-  protection.unresolvedPuts.push({
-    captureId: C,
-    attemptId: A,
-    role: "root",
-    kind: "receipt",
-    ordinal: 101,
-    offset: 0,
-    putId: P,
-    createdAtUtc: START,
-    name: pending.fileName,
-    slot: {
-      index: 0,
-      path: "/var/tmp/fixture/slot-0",
-      device: 1,
-      inode: 2,
-      bytes: 1,
-      sha1: "1".repeat(40),
-      sha256: H,
-      uid: 0,
-      mode: 384,
-      links: 1,
-    },
-  });
   f.snapshot.protection = protection;
-  const plan = await planBackupV2Retention(f.snapshot, f.reader);
-  assert(
-    plan.candidates.length === 1 &&
-      plan.candidates[0].fileId === link(1).object.fileId,
-  );
+  f.snapshot.jobs = [{ captureId: capture(6), custody: "PROTECTED" }];
+  f.put(listed(object(6)));
+  f.put(listed(object(7)));
+  const plan = await f.plan();
+  assert(plan.retiredCaptureIds.length === 0 && plan.candidates.length === 0);
+  assert(plan.retainedCaptureIds.length === 5);
+  assert(plan.summary.categories.PROTECTED.objects >= 2);
 });
-Deno.test("retention rejects fewer than four unique roots unknown formats and unsettled custody", async () => {
+
+Deno.test("whole-bucket retention plans old orphan classes and includes paged multipart bytes", async () => {
   const f = fixture();
-  f.snapshot.catalog = [legacy(2), legacy(3), v2(5)];
-  await rejects(() => planBackupV2Retention(f.snapshot, f.reader));
-  f.snapshot.catalog = [legacy(2), legacy(3), v2(5), v2(5)];
-  await rejects(() => planBackupV2Retention(f.snapshot, f.reader));
-  f.snapshot.catalog = [legacy(2), legacy(3), v2(5), {
-    schemaVersion: 3,
-    format: "backup-v3",
-  }];
-  await rejects(() => planBackupV2Retention(f.snapshot, f.reader));
-  const g = fixture();
-  g.snapshot.custody.sourceSettled = false as true;
-  await rejects(() => planBackupV2Retention(g.snapshot, g.reader));
-});
-Deno.test("retention rejects incomplete inventory unreadable graphs conflicting identities and nonterminal pagination", async () => {
-  const f = fixture();
-  f.cloud.delete(f.shared.fileId);
-  await rejects(() => planBackupV2Retention(f.snapshot, f.reader));
-  const g = fixture();
-  g.graph.delete(link(5).object.fileId);
-  await rejects(() => planBackupV2Retention(g.snapshot, g.reader));
-  const h = fixture();
-  h.graph.get(link(1).object.fileId)!.push({
-    ...h.shared,
-    sha256: "f".repeat(64),
+  f.snapshot.policy.keepAccepted = 5;
+  f.snapshot.jobs = [
+    { captureId: capture(6), custody: "SETTLED_UNACCEPTED" },
+    {
+      captureId: capture(7),
+      custody: "SETTLED_UNACCEPTED",
+      format: "backup-v1",
+      evidenceSha256: H,
+    },
+  ];
+  const candidate = { ...listed(object(6)), uploadTimestamp: CUTOFF };
+  f.put(candidate);
+  f.put({ ...candidate, fileId: "noncurrent", uploadTimestamp: CUTOFF - 2 });
+  f.put({
+    ...candidate,
+    fileId: "young",
+    fileName: object(6, "data", 1).fileName,
+    uploadTimestamp: CUTOFF + 1,
   });
-  await rejects(() => planBackupV2Retention(h.snapshot, h.reader));
-  const i = fixture();
-  i.reader.versionsPage = () =>
-    Promise.resolve({
-      items: [],
-      next: { fileName: i.shared.fileName, fileId: i.shared.fileId },
+  const hideName = object(6, "data", 2).fileName;
+  f.put({
+    ...candidate,
+    fileId: "hidden",
+    fileName: hideName,
+    uploadTimestamp: CUTOFF - 1,
+  });
+  f.put({
+    fileId: "hide",
+    fileName: hideName,
+    contentLength: 0,
+    contentSha1: "",
+    action: "hide",
+    uploadTimestamp: CUTOFF,
+  });
+  const start = {
+    fileId: "start",
+    fileName: object(6, "data", 3).fileName,
+    contentLength: 0,
+    contentSha1: "",
+    action: "start" as const,
+    uploadTimestamp: 1,
+  };
+  f.put(start);
+  f.reader.unfinishedPartsPage = (fileId, cursor) => {
+    const part = (partNumber: number) => ({
+      fileId,
+      partNumber,
+      contentLength: 10,
+      contentSha1: "1".repeat(40),
+      uploadTimestamp: fileId === "part-young" ? CUTOFF + 1 : CUTOFF,
     });
-  await rejects(() => planBackupV2Retention(i.snapshot, i.reader));
-  const hidden = fixture();
-  hidden.reader.versionsPage = () =>
-    Promise.resolve({
-      items: [{
-        fileId: hidden.shared.fileId,
-        fileName: hidden.shared.fileName,
-        contentLength: 0,
-        contentSha1: "",
-        uploadTimestamp: 1,
-        action: "hide",
-      }],
-      next: null,
-    });
-  await rejects(() => planBackupV2Retention(hidden.snapshot, hidden.reader));
-  i.reader.versionsPage = () =>
-    Promise.resolve({
-      items: Array.from({ length: 101 }, () => {
-        const { sha256: _sha, ...ref } = i.shared;
-        return ref;
-      }),
-      next: null,
-    });
-  await rejects(() => planBackupV2Retention(i.snapshot, i.reader));
+    return Promise.resolve(
+      cursor === null
+        ? { items: [part(1)], next: 2 }
+        : { items: [part(2)], next: null },
+    );
+  };
+  f.put({
+    ...start,
+    fileId: "part-young",
+    fileName: object(6, "data", 4).fileName,
+  });
+  f.put({
+    ...candidate,
+    fileId: "legacy",
+    fileName: generationChunkName(capture(7), "root", 0),
+  });
+  f.snapshot.retiredRestic = {
+    prefix: "restic/old-repo/",
+    evidenceSha256: H,
+    retiredAtUtc: END,
+  };
+  f.put({ ...candidate, fileId: "restic", fileName: "restic/old-repo/config" });
+  f.put({
+    ...candidate,
+    fileId: "unknown-layout",
+    fileName: "restic/unowned/config",
+  });
+  const plan = await f.plan();
+  const planned = new Map(
+    plan.candidates.map(({ object, reason }) => [object.fileId, reason]),
+  );
+  assert(planned.get(candidate.fileId) === "UNACCEPTED_V2");
+  assert(planned.get("noncurrent") === "NONCURRENT_VERSION");
+  assert(
+    planned.get("hide") === "HIDE_MARKER" &&
+      planned.get("hidden") === "NONCURRENT_VERSION",
+  );
+  assert(planned.get("start") === "UNFINISHED_LARGE_FILE");
+  assert(
+    !planned.has("young") && !planned.has("part-young") &&
+      !planned.has("legacy") && !planned.has("restic"),
+  );
+  assert(plan.summary.categories.UNFINISHED_LARGE_FILE.bytes === 40);
+  assert(plan.summary.categories.LEGACY_ORPHAN.objects === 2);
+  assert(plan.summary.bucketBytes === 179);
+  f.snapshot.policy.cleanLegacyOrphans = true;
+  const enabled = await f.plan();
+  assert(enabled.candidates.some(({ object }) => object.fileId === "legacy"));
+  assert(enabled.candidates.some(({ object }) => object.fileId === "restic"));
+  assert(
+    !enabled.candidates.some(({ object }) =>
+      object.fileId === "unknown-layout"
+    ),
+  );
 });
-Deno.test("retention exact execution persists intent before deletion and resumes completed journals without another wire", async () => {
-  const f = fixture(), plan = await planBackupV2Retention(f.snapshot, f.reader);
-  assert(
-    (await executeBackupV2Retention(plan, plan.digest, f.caps)).status ===
-      "COMPLETE",
-  );
-  assert(
-    f.removed.length === plan.candidates.length &&
-      f.cloud.has(f.shared.fileId) && f.cloud.has(f.orphan.fileId),
-  );
-  for (let i = 0; i < f.events.length; i += 3) {
-    assert(f.events.slice(i, i + 3).join() === "INTENT,DELETE,DELETED");
-  }
-  const records = f.journal.length;
-  assert(
-    (await executeBackupV2Retention(plan, plan.digest, f.caps)).status ===
-      "COMPLETE",
-  );
-  assert(
-    f.journal.length === records && f.removed.length === plan.candidates.length,
-  );
+
+Deno.test("retention keeps a hide marker when planned upload deletion would reveal a protected older version", async () => {
+  const f = fixture(), shared = { ...f.shared, fileName: object(6).fileName };
+  f.graph.set(link(1).object.fileId, [shared, f.exclusive, f.page]);
+  f.graph.set(link(5).object.fileId, [shared]);
+  f.put(listed(shared));
+  f.snapshot.jobs = [{ captureId: capture(6), custody: "SETTLED_UNACCEPTED" }];
+  f.put({
+    fileId: "hide",
+    fileName: shared.fileName,
+    contentLength: 0,
+    contentSha1: "",
+    action: "hide",
+    uploadTimestamp: 2,
+  });
+  f.put({ ...listed(shared), fileId: "current", uploadTimestamp: 3 });
+  const plan = await f.plan();
+  assert(plan.candidates.some(({ object }) => object.fileId === "current"));
+  assert(!plan.candidates.some(({ object }) => object.fileId === "hide"));
 });
-Deno.test("retention refuses digest mutation and changed graph or custody before any delete", async () => {
-  const f = fixture(), plan = await planBackupV2Retention(f.snapshot, f.reader);
-  await rejects(() => executeBackupV2Retention(plan, "0".repeat(64), f.caps));
-  const changed = structuredClone(plan);
-  changed.candidates[0].sha256 = "f".repeat(64);
+
+Deno.test("metadata damage preserves older intact points and verify-catalog reads only accepted names", async () => {
+  const f = fixture();
+  f.cloud.delete(link(5).object.fileId);
+  const legacyChunk = f.cloud.get("legacy-4-root")!;
+  f.put({ ...legacyChunk, contentSha1: "9".repeat(40) });
+  let plan = await f.plan();
+  assert(plan.summary.blockReason === "DAMAGED_ACCEPTED_GENERATION");
+  assert(
+    plan.summary.damagedCaptureIds.join() === [capture(4), capture(5)].join(),
+  );
+  assert(
+    plan.summary.keptGenerations === 3 && plan.retiredCaptureIds.length === 0,
+  );
+  const result = await executeBackupV2Retention(plan, plan.digest, f.caps);
+  assert(result.status === "PARTIAL" && f.removed.length === 0);
+  f.trace.length = 0;
+  f.snapshot.verifyCatalogOnly = true;
+  f.snapshot.policy.execute = false;
+  f.reader.unfinishedFilesPage = () =>
+    Promise.reject(Error("unexpected orphan query"));
+  plan = await f.plan();
+  assert(
+    plan.verifyCatalogOnly && plan.candidates.length === 0 &&
+      f.trace.every(Boolean),
+  );
+  assert(plan.summary.damagedCaptureIds.length === 2);
+});
+
+Deno.test("retention reports new accepted damage between irreversible older capture boundaries", async () => {
+  const f = fixture(), plan = await f.plan(), remove = f.caps.removeExact;
+  f.caps.removeExact = async (object) => {
+    await remove(object);
+    if (f.removed.length === 1) f.cloud.delete(link(5).object.fileId);
+  };
+  const result = await executeBackupV2Retention(plan, plan.digest, f.caps);
+  assert(result.summary.blockReason === "DAMAGED_ACCEPTED_GENERATION");
+  assert(result.summary.damagedCaptureIds.join() === capture(5));
+  assert(
+    result.retainedCaptureIds.includes(capture(4)) &&
+      result.retainedCaptureIds.includes(capture(3)),
+  );
+  assert(f.cloud.has("legacy-2-root") && f.cloud.has("legacy-3-root"));
+});
+
+Deno.test("retention refuses cap overruns, new or changed identities, and altered plan digests", async () => {
+  const capped = fixture();
+  capped.snapshot.policy.maxDeleteFraction = 0.1;
+  const blocked = await capped.plan();
+  assert(blocked.summary.blockReason === "CAP_EXCEEDED");
+  assert(
+    (await executeBackupV2Retention(blocked, blocked.digest, capped.caps))
+      .status === "PARTIAL",
+  );
+  assert(capped.removed.length === 0);
+  const f = fixture(), plan = await f.plan(), changed = structuredClone(plan);
+  changed.candidates[0].object.contentLength++;
   await rejects(() => executeBackupV2Retention(changed, plan.digest, f.caps));
-  f.snapshot.protection = { ...empty(), activeObjects: [f.exclusive] };
-  await rejects(() => executeBackupV2Retention(plan, plan.digest, f.caps));
-  f.snapshot.protection = empty();
-  f.snapshot.custody.lockId = "different-custody";
-  await rejects(() => executeBackupV2Retention(plan, plan.digest, f.caps));
+  f.snapshot.policy.maxDeleteFraction = 1;
+  assert(
+    (await executeBackupV2Retention(plan, plan.digest, f.caps)).summary
+      .blockReason === "PLAN_CHANGED",
+  );
+  f.snapshot.policy.maxDeleteFraction = 0.5;
+  f.cloud.delete("8-data-0");
+  assert(
+    (await executeBackupV2Retention(plan, plan.digest, f.caps)).summary
+      .blockReason === "PLAN_CHANGED",
+  );
   assert(f.removed.length === 0);
 });
-Deno.test("retention rechecks protection after durable intent and recovers a never-sent intent by exact presence", async () => {
-  const f = fixture(),
-    plan = await planBackupV2Retention(f.snapshot, f.reader),
-    append = f.caps.appendDurable;
-  f.caps.appendDurable = async (entry) => {
-    await append(entry);
-    if (entry.state === "INTENT") {
-      f.snapshot.protection = {
-        ...empty(),
-        activeObjects: [plan.candidates[0]],
-      };
-    }
-  };
-  await rejects(() => executeBackupV2Retention(plan, plan.digest, f.caps));
-  assert(f.removed.length === 0 && f.journal[0].state === "INTENT");
-  f.snapshot.protection = empty();
-  f.caps.appendDurable = append;
-  await executeBackupV2Retention(plan, plan.digest, f.caps);
-  assert(
-    f.journal[1].state === "PRESENT" && f.journal[2].attempt === 2 &&
-      f.removed.length === plan.candidates.length,
-  );
-});
-Deno.test("retention reconciles a lost delete response as absent without blindly deleting again", async () => {
-  const f = fixture(),
-    plan = await planBackupV2Retention(f.snapshot, f.reader),
-    remove = f.caps.removeExact;
+
+Deno.test("retention journals before deletion and recovers a lost response without repeating a wire delete", async () => {
+  const f = fixture(), plan = await f.plan(), remove = f.caps.removeExact;
   f.caps.removeExact = async (ref) => {
     await remove(ref);
     throw Error("response lost");
   };
   assert(
     (await executeBackupV2Retention(plan, plan.digest, f.caps)).status ===
-      "AMBIGUOUS",
+      "PARTIAL",
   );
-  assert(f.removed.length === 1);
+  assert(f.events.join() === "INTENT,DELETE,AMBIGUOUS");
   f.caps.removeExact = remove;
-  await executeBackupV2Retention(plan, plan.digest, f.caps);
+  const resumed = await executeBackupV2Retention(plan, plan.digest, f.caps);
+  assert(
+    resumed.status === "COMPLETE" &&
+      resumed.summary.reconciledAbsentObjects === 1,
+  );
   assert(
     f.journal[2].state === "ABSENT" &&
       f.removed.length === plan.candidates.length,
   );
-});
-Deno.test("retention leaves unknown outcomes blocked, then permits a fresh exact-presence retry", async () => {
-  const f = fixture(),
-    plan = await planBackupV2Retention(f.snapshot, f.reader),
-    remove = f.caps.removeExact,
-    reconcile = f.caps.reconcileExact;
-  f.caps.removeExact = () => Promise.reject(Error("ambiguous before response"));
-  await executeBackupV2Retention(plan, plan.digest, f.caps);
-  f.caps.reconcileExact = () => Promise.resolve("unknown");
   assert(
     (await executeBackupV2Retention(plan, plan.digest, f.caps)).status ===
-        "AMBIGUOUS" && f.removed.length === 0,
+      "COMPLETE",
   );
-  f.caps.removeExact = remove;
-  f.caps.reconcileExact = reconcile;
-  await executeBackupV2Retention(plan, plan.digest, f.caps);
-  assert(
-    f.journal[2].state === "PRESENT" && f.journal[3].attempt === 2 &&
-      f.removed.length === plan.candidates.length,
-  );
+  assert(f.removed.length === plan.candidates.length);
 });
-Deno.test("retention result fsync failure recovers from durable intent and rejects foreign journals or cancellation", async () => {
-  const f = fixture(),
-    plan = await planBackupV2Retention(f.snapshot, f.reader),
-    append = f.caps.appendDurable;
+
+Deno.test("retention treats reviewed orphans already gone before and during DELETE as successful absence", async () => {
+  const f = fixture();
+  f.snapshot.policy.keepAccepted = 5;
+  f.snapshot.jobs = [{ captureId: capture(6), custody: "SETTLED_UNACCEPTED" }];
+  const prior = listed(object(6, "data", 1)),
+    raced = listed(object(6, "data", 2));
+  f.put(prior);
+  f.put(raced);
+  const plan = await f.plan();
+  f.cloud.delete(prior.fileId);
+  f.caps.removeExact = (object) => {
+    assert(object.fileId === raced.fileId);
+    f.cloud.delete(raced.fileId);
+    return Promise.reject(Error("file_not_present"));
+  };
+  const outcome = await executeBackupV2Retention(plan, plan.digest, f.caps);
+  assert(
+    outcome.status === "COMPLETE" &&
+      outcome.summary.reconciledAbsentObjects === 2,
+  );
+  assert(outcome.summary.deletedObjects === 0 && f.journal.length === 3);
+});
+
+Deno.test("retention rejects contradictory catalog roots, malformed listing cursor and foreign journal", async () => {
+  const f = fixture(), plan = await f.plan();
+  f.journal.push({
+    planSha256: "0".repeat(64),
+    ordinal: 0,
+    fileId: plan.candidates[0].object.fileId,
+    fileName: plan.candidates[0].object.fileName,
+    attempt: 1,
+    state: "INTENT",
+  });
+  assert(
+    (await executeBackupV2Retention(plan, plan.digest, f.caps)).status ===
+      "PARTIAL",
+  );
+  f.reader.bucketVersionsPage = () =>
+    Promise.resolve({
+      items: [],
+      next: { fileName: f.shared.fileName, fileId: f.shared.fileId },
+    });
+  await rejects(f.plan);
+  f.graph.get(link(1).object.fileId)!.push({
+    ...f.shared,
+    sha256: "f".repeat(64),
+  });
+  await rejects(f.plan);
+  await rejects(() =>
+    planBackupV2Retention({ ...f.snapshot, catalog: [v2(5), v2(5)] }, f.reader)
+  );
+  await rejects(() =>
+    planBackupV2Retention({
+      ...f.snapshot,
+      custody: { ...f.snapshot.custody, sourceSettled: false as true },
+    }, f.reader)
+  );
+  assert(f.removed.length === 0);
+});
+
+Deno.test("retention rechecks custody after intent and resumes a never-sent request through fresh presence", async () => {
+  const f = fixture(), plan = await f.plan(), append = f.caps.appendDurable;
+  f.caps.appendDurable = async (entry) => {
+    await append(entry);
+    if (entry.state === "INTENT") {
+      f.snapshot.protection = { ...empty(), activeObjects: [f.exclusive] };
+    }
+  };
+  const blocked = await executeBackupV2Retention(plan, plan.digest, f.caps);
+  assert(blocked.summary.blockReason === "PLAN_CHANGED");
+  assert(f.journal[0].state === "INTENT" && f.removed.length === 0);
+  f.caps.signal = AbortSignal.abort();
+  assert(
+    (await executeBackupV2Retention(plan, plan.digest, f.caps)).status ===
+      "PARTIAL",
+  );
+  assert(f.removed.length === 0);
+  f.caps.signal = undefined;
+  f.snapshot.protection = empty();
+  f.caps.appendDurable = append;
+  const resumed = await executeBackupV2Retention(plan, plan.digest, f.caps);
+  assert(resumed.status === "COMPLETE");
+  assert(f.journal[1].state === "PRESENT" && f.journal[2].attempt === 2);
+});
+
+Deno.test("retention resumes a missing post-wire result record and a transport failure with a still-present exact version", async () => {
+  const f = fixture(), plan = await f.plan(), append = f.caps.appendDurable;
   f.caps.appendDurable = (entry) =>
     entry.state === "DELETED"
       ? Promise.reject(Error("result fsync failed"))
       : append(entry);
-  await rejects(() => executeBackupV2Retention(plan, plan.digest, f.caps));
-  assert(f.removed.length === 1 && f.journal[0].state === "INTENT");
+  assert(
+    (await executeBackupV2Retention(plan, plan.digest, f.caps)).status ===
+      "PARTIAL",
+  );
+  assert(f.journal[0].state === "INTENT" && f.removed.length === 1);
   f.caps.appendDurable = append;
-  await executeBackupV2Retention(plan, plan.digest, f.caps);
+  assert(
+    (await executeBackupV2Retention(plan, plan.digest, f.caps)).status ===
+      "COMPLETE",
+  );
   assert(
     f.journal[1].state === "ABSENT" &&
       f.removed.length === plan.candidates.length,
   );
-  const g = fixture(),
-    gplan = await planBackupV2Retention(g.snapshot, g.reader);
-  g.journal.push({
-    planSha256: "0".repeat(64),
-    ordinal: 0,
-    fileId: gplan.candidates[0].fileId,
-    fileName: gplan.candidates[0].fileName,
-    attempt: 1,
-    state: "INTENT",
-  });
-  await rejects(() => executeBackupV2Retention(gplan, gplan.digest, g.caps));
-  g.journal.length = 0;
-  for (const state of ["INTENT", "DELETED"] as const) {
-    g.journal.push({
-      planSha256: gplan.digest,
-      ordinal: "0" as unknown as number,
-      fileId: gplan.candidates[0].fileId,
-      fileName: gplan.candidates[0].fileName,
-      attempt: 1,
-      state,
-    });
-  }
-  await rejects(() => executeBackupV2Retention(gplan, gplan.digest, g.caps));
-  g.journal.length = 0;
-  g.caps.signal = AbortSignal.abort();
-  await rejects(() => executeBackupV2Retention(gplan, gplan.digest, g.caps));
-  assert(g.removed.length === 0);
+  const g = fixture(), separate = await g.plan(), remove = g.caps.removeExact;
+  g.caps.removeExact = () => Promise.reject(Error("no response"));
+  assert(
+    (await executeBackupV2Retention(separate, separate.digest, g.caps))
+      .status === "PARTIAL",
+  );
+  assert(g.journal[1].state === "AMBIGUOUS" && g.removed.length === 0);
+  g.caps.removeExact = remove;
+  assert(
+    (await executeBackupV2Retention(separate, separate.digest, g.caps))
+      .status === "COMPLETE",
+  );
+  assert(g.journal[2].state === "PRESENT" && g.journal[3].attempt === 2);
+});
+
+Deno.test("retention recensus settles a multipart orphan cancelled during its own parts listing", async () => {
+  const f = fixture();
+  f.snapshot.policy.keepAccepted = 5;
+  f.snapshot.jobs = [{ captureId: capture(6), custody: "SETTLED_UNACCEPTED" }];
+  const start = {
+    fileId: "multipart-race",
+    fileName: object(6).fileName,
+    contentLength: 0,
+    contentSha1: "",
+    action: "start" as const,
+    uploadTimestamp: 1,
+  };
+  f.put(start);
+  const plan = await f.plan(), list = f.reader.unfinishedPartsPage;
+  let reads = 0;
+  f.reader.unfinishedPartsPage = (fileId, cursor) => {
+    if (++reads === 2) {
+      f.cloud.delete(fileId);
+      return Promise.reject(Error("file_not_present"));
+    }
+    return list(fileId, cursor);
+  };
+  const outcome = await executeBackupV2Retention(plan, plan.digest, f.caps);
+  assert(
+    outcome.status === "COMPLETE" &&
+      outcome.summary.reconciledAbsentObjects === 1,
+  );
+  assert(f.removed.length === 0);
 });

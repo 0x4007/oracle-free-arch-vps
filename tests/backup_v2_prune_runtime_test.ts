@@ -29,6 +29,7 @@ import {
   type BackupV2PruneRuntimeDependencies,
   createBackupV2PruneRuntime,
 } from "../scripts/backup-v2-prune-runtime.ts";
+import { DEFAULT_BACKUP_V2_RETENTION_POLICY } from "../scripts/backup-v2-retention.ts";
 
 function assert(value: unknown): asserts value {
   if (!value) throw Error("Assertion failed");
@@ -238,6 +239,7 @@ function fixture() {
     gate,
     transactionId: id(7),
     stage: "PLAN",
+    scratchCleanupRequestSha256: null,
     plan: null,
     snapshot: {
       custody: {
@@ -246,6 +248,9 @@ function fixture() {
         sourceSettled: true,
       },
       catalog: [],
+      jobs: [],
+      plannedAtUtc: utc,
+      policy: { ...DEFAULT_BACKUP_V2_RETENTION_POLICY, execute: true },
       protection: {
         acceptedRoots: [],
         activeObjects: [],
@@ -271,9 +276,11 @@ function fixture() {
   const deps: BackupV2PruneRuntimeDependencies = {
     io,
     exactStore: {
-      versionsPage: () => Promise.reject(Error("provider prohibited")),
-      reconcileExact: () => Promise.reject(Error("provider prohibited")),
-      removeExact: () => Promise.reject(Error("provider prohibited")),
+      bucketVersionsPage: () => Promise.reject(Error("provider prohibited")),
+      unfinishedFilesPage: () => Promise.reject(Error("provider prohibited")),
+      unfinishedPartsPage: () => Promise.reject(Error("provider prohibited")),
+      removeRetentionVersion: () =>
+        Promise.reject(Error("provider prohibited")),
     },
     observeFresh: () => Promise.resolve(structuredClone(input)),
     validateLegacy: () => {
@@ -437,7 +444,8 @@ Deno.test("prune runtime poisons uncertain writes on fsync/zero progress and nev
   g.io.zeroWrite = true;
   await rejects(() => g.publish());
   assert(
-    g.io.nodes.has(`${g.directory}/plan.json`) && g.io.opened === g.io.closed,
+    g.io.nodes.has(`${g.directory}/journal.jsonl`) &&
+      g.io.opened === g.io.closed,
   );
   const h = fixture();
   await h.publish();

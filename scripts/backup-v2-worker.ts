@@ -134,7 +134,10 @@ import {
   validateCatalogEntry,
   validateReleaseManifest,
 } from "./backblaze-file-backup.ts";
-import { runBackupV2SourcePruner } from "./backup-v2-source-pruner.ts";
+import {
+  runBackupV2SourcePruner,
+  validateBackupV2PruneInput,
+} from "./backup-v2-source-pruner.ts";
 import {
   BACKUP_V2_PRUNE_TRANSACTIONS,
   createBackupV2PruneRuntime,
@@ -785,6 +788,7 @@ export interface BackupV2ScratchCleanupReceipt {
 export async function cleanupBackupV2Scratch(
   proofs: { gate: BackupV2Gate; options: BackupV2KernelObservationOptions }[],
   managedGate: BackupV2Gate,
+  acceptedRequestSha256 = managedGate.envelope.requestSha256,
 ): Promise<BackupV2ScratchCleanupReceipt> {
   if (
     managedGate.kind !== "prune" || !managedGate.custody ||
@@ -801,7 +805,7 @@ export async function cleanupBackupV2Scratch(
     !gates.some((gate) => gate.kind === "verify")
   ) fail();
   same(gates[0].envelope, gates[1].envelope);
-  same(gates[0].envelope, managedGate.envelope);
+  if (gates[0].envelope.requestSha256 !== acceptedRequestSha256) fail();
   let entries = 0, logicalBytesRemoved = 0;
   const paths: { path: string; info: Deno.FileInfo }[] = [];
   // The managed pruner caller already holds the source lock.
@@ -1346,27 +1350,27 @@ export async function runBackupV2RemoteWorker(
         entry.sha256
     ) fail();
   }
-  let prunePath: string | undefined;
-  if (kind === "prune") {
-    prunePath = `${runtime}/prune-execute-request.json`;
-    try {
-      await rootRead(prunePath);
-    } catch (error) {
-      if (!(error instanceof Deno.errors.NotFound)) throw error;
-      prunePath = `${runtime}/prune-plan-request.json`;
-    }
-  }
+  const pruneGateId = kind === "prune"
+    ? Deno.env.get("BACKUP_V2_PRUNE_GATE_ID")
+    : undefined;
+  if (
+    kind === "prune" &&
+    !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(pruneGateId ?? "")
+  ) fail();
   const readPrune = async (): Promise<BackupV2PruneInput> => {
-    if (!prunePath) fail();
+    if (!pruneGateId) fail();
     const input = JSON.parse(
       new TextDecoder("utf-8", { fatal: true }).decode(
-        await rootRead(prunePath),
+        await rootRead(`${runtime}/prune-${pruneGateId}-request.json`),
       ),
     ) as BackupV2PruneInput;
     const expected = validateBackupV2Gate(input.gate);
-    if (expected.kind !== "prune") fail();
+    if (expected.kind !== "prune" || expected.gateId !== pruneGateId) fail();
     same(expected.envelope, settings.envelope);
-    return { ...input, gate: await ownExecution(expected) };
+    return validateBackupV2PruneInput(
+      { ...input, gate: await ownExecution(expected) },
+      validateCatalogEntry,
+    );
   };
   let pruneInput = kind === "prune" ? await readPrune() : null;
   const gate = await ownExecution(
@@ -1518,6 +1522,8 @@ export async function runBackupV2RemoteWorker(
     const store = new BackupV2Store(
       settings.B2Settings,
       createCurlBackupV2Wire(undefined, processes.spawn),
+      undefined,
+      kind === "prune" ? "retention" : "backup",
     );
     const native = {
       async assertManaged() {
@@ -1936,24 +1942,7 @@ export async function runBackupV2RemoteWorker(
         );
       } else {
         if (!pruneInput) fail();
-        const scratchCleanup = pruneInput.stage === "PLAN"
-          ? await cleanupBackupV2Scratch(
-            JSON.parse(
-              new TextDecoder("utf-8", { fatal: true }).decode(
-                await rootRead(`${runtime}/prune-cleanup-proofs.json`),
-              ),
-            ),
-            gate,
-          )
-          : undefined;
-        if (scratchCleanup) {
-          await atomicArtifact(
-            directory,
-            "scratch-cleanup.json",
-            scratchCleanup,
-            true,
-          );
-        }
+        await rootDirectory(BACKUP_V2_PROTECTION_SOURCE_BASE);
         const caps = await createBackupV2PruneRuntime(pruneInput, {
           exactStore: store,
           async observeFresh() {
@@ -1968,8 +1957,38 @@ export async function runBackupV2RemoteWorker(
           now: () => new Date(),
           signal: supervisor.signal,
         });
+        const pruning = await runBackupV2SourcePruner(pruneInput, caps);
+        const cleanupRequest = pruneInput.scratchCleanupRequestSha256;
+        const scratchCleanup = pruneInput.stage === "PLAN" &&
+            cleanupRequest !== null &&
+            pruning.summary.damagedCaptureIds.length === 0 &&
+            pruneInput.snapshot.catalog.some((entry) =>
+              entry.format === "backup-v2" &&
+              entry.envelope.requestSha256 === cleanupRequest &&
+              pruning.retainedCaptureIds.includes(
+                entry.envelope.request.captureId,
+              )
+            )
+          ? await cleanupBackupV2Scratch(
+            JSON.parse(
+              new TextDecoder("utf-8", { fatal: true }).decode(
+                await rootRead(`${runtime}/prune-cleanup-proofs.json`),
+              ),
+            ),
+            gate,
+            cleanupRequest,
+          )
+          : undefined;
+        if (scratchCleanup) {
+          await atomicArtifact(
+            directory,
+            "scratch-cleanup.json",
+            scratchCleanup,
+            true,
+          );
+        }
         result = {
-          ...await runBackupV2SourcePruner(pruneInput, caps),
+          ...pruning,
           ...(scratchCleanup ? { scratchCleanup } : {}),
         };
       }
