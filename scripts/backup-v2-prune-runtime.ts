@@ -17,7 +17,11 @@ import { validateBackupV2Gate } from "./backup-v2-runtime-contract.ts";
 import type { BackupV2RetentionJournalEntry } from "./backup-v2-retention.ts";
 import type { BackupV2SourcePrunerCapabilities } from "./backup-v2-source-pruner.ts";
 import { writeBackupV2All } from "./backup-v2-spool.ts";
-import { parseBackupV2ObjectName } from "./backup-v2-contract.ts";
+import {
+  retentionOwnedName,
+  retentionOwnedResticName,
+  retentionText,
+} from "./backup-v2-retention-inventory.ts";
 
 type FileInfo = Pick<
   Deno.FileInfo,
@@ -60,6 +64,7 @@ export type BackupV2PruneRuntimeDependencies =
   & { io?: BackupV2PruneIO };
 export const BACKUP_V2_PRUNE_TRANSACTIONS =
   `${BACKUP_V2_PROTECTION_SOURCE_BASE}/transactions`;
+export const BACKUP_V2_RETENTION_PLAN_PAGE_BYTES = 128 * 1024;
 const nativeIO: BackupV2PruneIO = {
   lstat: Deno.lstat,
   realPath: Deno.realPath,
@@ -112,6 +117,71 @@ function reference(value: Uint8Array): BackupV2PrunePlanReference {
     plan.dryRun !== true || !/^[a-f0-9]{64}$/.test(plan.digest)
   ) invalid();
   return { bytes: value.length, sha256: hash(value), digest: plan.digest };
+}
+
+/** The controller reconstructs the full plan and verifies its SHA-256 before
+ * publishing it privately. Each page comes from a stable exact inode. */
+export async function readBackupV2RetentionPlanPage(
+  transactionId: string,
+  reference: BackupV2PrunePlanReference,
+  offset: number,
+): Promise<Uint8Array> {
+  if (
+    !uuid(transactionId) || !/^[a-f0-9]{64}$/.test(reference.sha256) ||
+    !/^[a-f0-9]{64}$/.test(reference.digest) ||
+    !Number.isSafeInteger(reference.bytes) || reference.bytes < 1 ||
+    reference.bytes > BACKUP_V2_LIMITS.journalBytes ||
+    !Number.isSafeInteger(offset) || offset < 0 || offset >= reference.bytes ||
+    offset % BACKUP_V2_RETENTION_PLAN_PAGE_BYTES !== 0
+  ) invalid();
+  const directory = `${BACKUP_V2_PRUNE_TRANSACTIONS}/${transactionId}`;
+  const parents = [
+    BACKUP_V2_PROTECTION_SOURCE_BASE,
+    BACKUP_V2_PRUNE_TRANSACTIONS,
+    directory,
+  ];
+  const before = await Promise.all(parents.map(async (path) => {
+    const info = await Deno.lstat(path);
+    if (
+      !info.isDirectory || info.isSymlink || info.uid !== 0 ||
+      info.mode === null ||
+      (info.mode & 0o777) !== 0o700 ||
+      !Number.isSafeInteger(info.dev) || !Number.isSafeInteger(info.ino) ||
+      await Deno.realPath(path) !== path
+    ) invalid();
+    return info;
+  }));
+  const path = `${directory}/plan.json`;
+  const named = await Deno.lstat(path);
+  regular(named);
+  if (named.size !== reference.bytes || await Deno.realPath(path) !== path) {
+    invalid();
+  }
+  using file = await Deno.open(path, { read: true });
+  if (!sameFile(named, await file.stat())) invalid();
+  const length = Math.min(
+    BACKUP_V2_RETENTION_PLAN_PAGE_BYTES,
+    named.size - offset,
+  );
+  const page = new Uint8Array(length);
+  if (await file.seek(offset, Deno.SeekMode.Start) !== offset) invalid();
+  let at = 0;
+  while (at < length) {
+    const count = await file.read(page.subarray(at));
+    if (!count || count < 0 || count > length - at) invalid();
+    at += count;
+  }
+  if (
+    !sameFile(named, await file.stat()) ||
+    !sameFile(named, await Deno.lstat(path)) ||
+    await Deno.realPath(path) !== path
+  ) invalid();
+  for (let index = 0; index < parents.length; index++) {
+    if (!sameIdentity(before[index], await Deno.lstat(parents[index]))) {
+      invalid();
+    }
+  }
+  return page;
 }
 
 export async function createBackupV2PruneRuntime(
@@ -330,7 +400,12 @@ export async function createBackupV2PruneRuntime(
         entry.state,
       )
     ) invalid();
-    parseBackupV2ObjectName(entry.fileName);
+    const name = retentionText(entry.fileName, 1_000);
+    if (
+      retentionOwnedName(name) === null &&
+      (!expected.snapshot.retiredRestic ||
+        !retentionOwnedResticName(name, expected.snapshot.retiredRestic.prefix))
+    ) invalid();
     return structuredClone(entry);
   };
   const readJournal = async () => {
@@ -449,15 +524,28 @@ export async function createBackupV2PruneRuntime(
       try {
         await fresh();
         const ref = reference(data);
-        const newPlan = await create(planPath, data);
+        // Persist the empty immutable journal header first. A crash before
+        // plan publication can finish the same transaction without replacing it.
+        let published = true;
+        try {
+          await io.lstat(planPath);
+        } catch (error) {
+          if (!(error instanceof Deno.errors.NotFound)) throw error;
+          published = false;
+        }
+        planRef = ref;
+        if (!published) {
+          await create(journalPath, bytes(header(ref)));
+          const prior = await readJournal();
+          if (prior.entries.length) invalid();
+          await create(planPath, data);
+        }
         const saved = await read(planPath, data.length);
         if (
           hash(saved.data) !== ref.sha256 || saved.data.length !== ref.bytes
         ) invalid();
-        planRef = ref;
         await syncFile(planPath, saved.info);
         await syncDirectory(directory);
-        if (newPlan) await create(journalPath, bytes(header(ref)));
         await readJournal();
       } catch (error) {
         poisoned = true;

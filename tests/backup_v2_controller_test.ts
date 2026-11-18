@@ -60,6 +60,7 @@ import {
   backupV2PiReleaseRoot,
   backupV2RemoteProgram,
   type BackupV2RetentionControl,
+  backupV2RetentionPolicy,
   backupV2RuntimeLeaseCleanupProgram,
   collectBackupV2Release,
   copyBackupV2Protection,
@@ -74,6 +75,18 @@ import {
   backupV2ProtectionPageName,
   buildBackupV2Protection,
 } from "../scripts/backup-v2-protection.ts";
+
+import {
+  B2_RETENTION_CONTROL_PATH,
+  B2_RETENTION_PAGE_BYTES,
+  persistPrivateRetentionPlan,
+} from "../scripts/backup-v2-retention-report.ts";
+import { DEFAULT_BACKUP_V2_RETENTION_POLICY } from "../scripts/backup-v2-retention.ts";
+
+import {
+  canUseBackupTestFixtures,
+  withBackupTestFixture,
+} from "./backup-test-fixtures.ts";
 
 function assert(value: unknown, message = "Assertion failed"): asserts value {
   if (!value) throw new Error(message);
@@ -1334,8 +1347,11 @@ Deno.test("managed retention persists launch intent once and binds cold source c
     };
   const f = fixture(), calls: string[] = [];
   let live: BackupV2Gate | null = null;
+  const { B2Settings: _key, ...safeSettings } = s;
   let control = {
-    schemaVersion: 2,
+    schemaVersion: 3,
+    anchor: "a".repeat(64),
+    settings: safeSettings,
     format: "backup-v2-retention-controller",
     phase: "REQUESTED",
     gate: pending,
@@ -1347,9 +1363,13 @@ Deno.test("managed retention persists launch intent once and binds cold source c
       transactionId: uuid(18),
       stage: "PLAN",
       plan: null,
+      scratchCleanupRequestSha256: null,
       graphs: [],
       snapshot: {
         catalog: [],
+        jobs: [],
+        plannedAtUtc: END,
+        policy: DEFAULT_BACKUP_V2_RETENTION_POLICY,
         custody: {
           lockId: GATE_SOURCE_LOCK_PATH,
           sourceBootId: pending.sourceBootId,
@@ -1366,10 +1386,13 @@ Deno.test("managed retention persists launch intent once and binds cold source c
     },
   } as BackupV2RetentionControl;
   // Acceptance is upstream; this fixture isolates the managed-stage crash seam.
-  const state = {
-    job: { phase: "COMPLETE", settings: s, verified: { protectedGraph: {} } },
-    catalog: [{}, {}, {}, {}],
-  } as unknown as BackupV2ControllerState;
+  const state: BackupV2ControllerState = {
+    schemaVersion: 2,
+    format: "backup-v2-controller",
+    legacy: { schemaVersion: 1, catalog: [] },
+    job: null,
+    catalog: [],
+  };
   let observed = {
     sourceBootId: pending.sourceBootId,
     unit: "ABSENT",
@@ -1381,7 +1404,10 @@ Deno.test("managed retention persists launch intent once and binds cold source c
   const pi = {
     now: () => new Date(END),
     private: {
-      read: async () => structuredClone(control),
+      read: async (path: string) =>
+        path === B2_RETENTION_CONTROL_PATH
+          ? structuredClone(control)
+          : undefined,
       write: async (_path: string, value: unknown) => {
         control = structuredClone(value) as BackupV2RetentionControl;
         calls.push(`save:${control.phase}`);
@@ -1410,13 +1436,19 @@ Deno.test("managed retention persists launch intent once and binds cold source c
       calls.push("ack");
     },
   };
-  await runBackupV2RetentionCycle(state, pi, caps);
+  const reconcile = () =>
+    runBackupV2RetentionCycle(state, pi, caps, "scheduled", {
+      proveIdle: async () => {},
+      installRuntime: async () => {},
+      readPlan: async () => {},
+    });
+  await reconcile();
   equal(calls, ["install", "gate", "save:RUNNING", "launch"]);
   observed = { ...observed, unit: "STARTING" };
-  assert((await runBackupV2RetentionCycle(state, pi, caps))!.healthy);
+  assert((await reconcile())!.healthy);
   equal(calls.filter((call) => call === "launch").length, 1);
   observed = observation(pending);
-  await runBackupV2RetentionCycle(state, pi, caps);
+  await reconcile();
   assert(control.gate.custody !== null);
   assert(calls.indexOf("bind") < calls.indexOf("ack"));
   equal(calls.filter((call) => call === "launch").length, 1);
@@ -1433,6 +1465,7 @@ Deno.test("managed retention persists launch intent once and binds cold source c
     argv.filter((arg) => arg.startsWith("--allow-sys")),
     ["--allow-sys=statfs"],
   );
+  assert(argv.includes(`--setenv=BACKUP_V2_PRUNE_GATE_ID=${pending.gateId}`));
   assert(argv.at(-1)!.endsWith("/scripts/backup-v2-worker.ts"));
   assert(
     argv.includes("--property=Type=notify") &&
@@ -1442,7 +1475,7 @@ Deno.test("managed retention persists launch intent once and binds cold source c
     ...observed,
     status: status(control.gate, "CANCELLATION_BLOCKED"),
   };
-  const blocked = await runBackupV2RetentionCycle(state, pi, caps);
+  const blocked = await reconcile();
   equal(blocked?.status, "B2_RETENTION_PLAN_CANCELLATION_BLOCKED");
   equal(
     control.cancellationBlockedReason,
@@ -1453,6 +1486,58 @@ Deno.test("managed retention persists launch intent once and binds cold source c
       "kind=prune reason=SOURCE_STATUS_CANCELLATION_BLOCKED",
     ),
   );
+});
+
+Deno.test("retention execution needs a current explicit boolean policy", async () => {
+  equal(
+    backupV2RetentionPolicy(undefined).policy,
+    DEFAULT_BACKUP_V2_RETENTION_POLICY,
+  );
+  equal(backupV2RetentionPolicy({ execute: true }).policy.execute, true);
+  equal(backupV2RetentionPolicy({ execute: true }, true).policy.execute, false);
+  await rejects(() => backupV2RetentionPolicy({ execute: "true" }));
+  await rejects(() => backupV2RetentionPolicy({ enabled: true }));
+  await rejects(() => backupV2RetentionPolicy({ keepAccepted: 0 }));
+  await rejects(() => backupV2RetentionPolicy({ maxDeleteFraction: 1.5 }));
+});
+
+Deno.test({
+  name:
+    "Pi publishes exact bounded plan pages privately and rejects changed or truncated copies",
+  ignore: !canUseBackupTestFixtures,
+  async fn() {
+    await withBackupTestFixture("retention-plan", async (dir) => {
+      const bytes = new Uint8Array(B2_RETENTION_PAGE_BYTES + 37).fill(1);
+      bytes[0] = 3;
+      const reference = {
+        sha256: backupV2ArtifactSha256(bytes),
+        bytes: bytes.length,
+        digest: SHA,
+      };
+      const path = `${dir}/run/plan.json`, pages: number[] = [];
+      await rejects(() =>
+        persistPrivateRetentionPlan(
+          path,
+          reference,
+          async () => bytes.subarray(0, 1),
+        )
+      );
+      await rejects(() => Deno.stat(path));
+      await persistPrivateRetentionPlan(path, reference, async (offset) => {
+        pages.push(offset);
+        return bytes.slice(offset, offset + B2_RETENTION_PAGE_BYTES);
+      });
+      equal(pages, [0, B2_RETENTION_PAGE_BYTES]);
+      equal((await Deno.stat(path)).mode! & 0o777, 0o600);
+      await persistPrivateRetentionPlan(path, reference);
+      await rejects(() =>
+        persistPrivateRetentionPlan(path, { ...reference, sha256: SHA })
+      );
+      assert(
+        backupV2ArtifactSha256(await Deno.readFile(path)) === reference.sha256,
+      );
+    });
+  },
 });
 
 Deno.test("verification work bounds cover replay without enlarging source admission", () => {

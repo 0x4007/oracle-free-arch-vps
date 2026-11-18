@@ -6,6 +6,7 @@ import {
 import {
   type BackupAlertOutcome,
   backupAlertReason,
+  backupRetentionAlert,
   notifyBackupAlerts,
   runWithBackupAlert,
 } from "./backup-mac-alert.ts";
@@ -14,6 +15,9 @@ import { redactOcid } from "./oci.ts";
 export function backblazeScheduledOutcome(
   report: BackblazeRunReport,
 ): BackupAlertOutcome {
+  if (backupRetentionAlert(report)) {
+    return report.healthy ? "HEALTHY" : "DEFERRED";
+  }
   if (report.healthy) return "HEALTHY";
   const [status] = report.status.split(":", 1);
   if (
@@ -45,6 +49,8 @@ export async function runScheduledBackblaze(
     run,
     backblazeScheduledOutcome,
     notify,
+    console.error,
+    backupRetentionAlert,
   );
 }
 

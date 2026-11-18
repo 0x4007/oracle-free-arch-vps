@@ -14,6 +14,10 @@ import type {
   BackupRuntimeCatalogEntry,
   BackupV2Gate,
 } from "./backup-v2-runtime-contract.ts";
+import type {
+  BackupV2RetentionSnapshot,
+  BackupV2RetentionSummary,
+} from "./backup-v2-retention.ts";
 
 export const BACKUP_V2_PROTECTION_PAGE_OBJECTS = 100;
 export const BACKUP_V2_PROTECTION_SOURCE_BASE =
@@ -71,12 +75,18 @@ export interface BackupV2PruneInput {
   gate: BackupV2Gate;
   transactionId: string;
   stage: "PLAN" | "EXECUTE";
-  snapshot: {
-    custody: { lockId: string; sourceBootId: string; sourceSettled: true };
-    catalog: BackupRuntimeCatalogEntry[];
-    protection: BackupV2ProtectedReferences;
-    receipts: BackupV2ManifestRef[];
-  };
+  scratchCleanupRequestSha256: string | null;
+  snapshot:
+    & {
+      custody: { lockId: string; sourceBootId: string; sourceSettled: true };
+      catalog: BackupRuntimeCatalogEntry[];
+      protection: BackupV2ProtectedReferences;
+      receipts: BackupV2ManifestRef[];
+    }
+    & Pick<
+      BackupV2RetentionSnapshot,
+      "jobs" | "plannedAtUtc" | "policy" | "retiredRestic" | "verifyCatalogOnly"
+    >;
   graphs: BackupV2ProtectionDescriptor[];
   plan: BackupV2PrunePlanReference | null;
 }
@@ -93,7 +103,9 @@ export interface BackupV2PruneResult {
   state: "PLAN_PROVED" | "COMPLETE" | "PARTIAL";
   plan: BackupV2PrunePlanReference;
   retainedCaptureIds: string[];
+  retiredCaptureIds: string[];
   obsoleteLegacyCaptureIds: string[];
+  summary: BackupV2RetentionSummary;
   finishedAtUtc: string;
 }
 

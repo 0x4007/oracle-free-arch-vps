@@ -13,6 +13,7 @@ import {
 } from "./backblaze-storage.ts";
 import {
   type BackupV2Cursor,
+  type BackupV2ListedVersion,
   type BackupV2ObjectRef,
   type BackupV2ObjectStore,
   type BackupV2PutIntent,
@@ -25,6 +26,15 @@ import {
   validateBackupV2SealedSlot,
   validateBackupV2VersionPage,
 } from "./backup-v2-contract.ts";
+import {
+  type BackupV2RetentionPart,
+  type BackupV2RetentionVersion,
+  retentionInteger,
+  retentionOwnedName,
+  retentionOwnedResticName,
+  retentionText,
+  validateRetentionListedVersion,
+} from "./backup-v2-retention-inventory.ts";
 import {
   BACKUP_V2_LIMITS as LIMIT,
   BACKUP_V2_NAMESPACE,
@@ -607,12 +617,14 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
   readonly #settings: B2Settings;
   readonly #wire: BackupV2Wire;
   readonly #ancestors: BackupV2AncestorIO;
+  readonly #keyScope: "backup" | "retention";
   readonly #usedPuts = new Set<string>();
   #scope?: Promise<{ token: string; api: string; download: string }>;
   constructor(
     settings: B2Settings,
     wire: BackupV2Wire = createCurlBackupV2Wire(),
     metadata: BackupV2KernelCommand = realBackupV2KernelCommand,
+    keyScope: "backup" | "retention" = "backup",
   ) {
     validateB2Settings(settings);
     for (
@@ -625,6 +637,7 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
     this.#settings = { ...settings };
     this.#wire = wire;
     this.#ancestors = { ...ancestorIO, metadata };
+    this.#keyScope = keyScope;
   }
   async #request(
     url: string,
@@ -682,6 +695,7 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
           "v2 authorize",
           this.#settings,
           record(storage.allowed),
+          this.#keyScope,
         );
         return { token: text(body.authorizationToken), api, download };
       });
@@ -991,6 +1005,190 @@ export class BackupV2Store implements BackupV2ExactObjectStore {
     );
     require(
       body.fileId === object.fileId && body.fileName === object.fileName,
+      "DELETE response binding mismatch",
+    );
+  }
+
+  #retentionRequest(endpoint: string, payload: unknown, signal?: AbortSignal) {
+    require(this.#keyScope === "retention", "whole-bucket key scope required");
+    return this.#authorized(signal).then((scope) =>
+      this.#request(
+        `${scope.api}${API}${endpoint}`,
+        scope.token,
+        payload,
+        signal,
+      )
+    );
+  }
+
+  #retentionVersion(value: unknown, action?: "start"): BackupV2ListedVersion {
+    const item = record(value);
+    require(item.bucketId === this.#settings.bucketId, "list bucket mismatch");
+    const kind = action ?? item.action;
+    require(
+      kind === "upload" || kind === "hide" || kind === "start",
+      "list version action rejected",
+    );
+    require(
+      action === undefined || item.action === undefined ||
+        item.action === action,
+      "unfinished version action mismatch",
+    );
+    return validateRetentionListedVersion({
+      fileId: retentionText(item.fileId, 512),
+      fileName: retentionText(item.fileName, 1_000),
+      action: kind,
+      contentLength: retentionInteger(
+        action === "start" && item.contentLength === undefined
+          ? 0
+          : item.contentLength,
+      ),
+      contentSha1: kind === "upload" ? text(item.contentSha1) : "",
+      uploadTimestamp: retentionInteger(item.uploadTimestamp, 1),
+    });
+  }
+
+  async bucketVersionsPage(
+    cursor: BackupV2Cursor | null,
+    prefix?: string,
+    signal?: AbortSignal,
+  ): Promise<BackupV2VersionPage> {
+    if (prefix !== undefined) retentionText(prefix, 1_000);
+    const body = await this.#retentionRequest("b2_list_file_versions", {
+      bucketId: this.#settings.bucketId,
+      maxFileCount: LIMIT.listEntries,
+      ...(prefix === undefined ? {} : { prefix }),
+      ...(cursor
+        ? {
+          startFileName: retentionText(cursor.fileName, 1_000),
+          startFileId: retentionText(cursor.fileId, 512),
+        }
+        : {}),
+    }, signal);
+    require(
+      Array.isArray(body.files) && body.files.length <= LIMIT.listEntries,
+      "retention version page exceeded",
+    );
+    const next = body.nextFileName === null && body.nextFileId === null
+      ? null
+      : {
+        fileName: retentionText(body.nextFileName, 1_000),
+        fileId: retentionText(body.nextFileId, 512),
+      };
+    return {
+      items: body.files.map((item) => this.#retentionVersion(item)),
+      next,
+    };
+  }
+
+  async unfinishedFilesPage(
+    cursor: string | null,
+    prefix?: string,
+    signal?: AbortSignal,
+  ): Promise<{
+    items: Extract<BackupV2ListedVersion, { action: "start" }>[];
+    next: string | null;
+  }> {
+    if (prefix !== undefined) retentionText(prefix, 1_000);
+    const body = await this.#retentionRequest(
+      "b2_list_unfinished_large_files",
+      {
+        bucketId: this.#settings.bucketId,
+        maxFileCount: LIMIT.listEntries,
+        ...(prefix === undefined ? {} : { namePrefix: prefix }),
+        ...(cursor === null ? {} : { startFileId: retentionText(cursor, 512) }),
+      },
+      signal,
+    );
+    require(
+      Array.isArray(body.files) && body.files.length <= LIMIT.listEntries,
+      "retention unfinished page exceeded",
+    );
+    const items = body.files.map((item) => {
+      const version = this.#retentionVersion(item, "start");
+      require(version.action === "start", "unfinished version missing");
+      return version;
+    });
+    return {
+      items,
+      next: body.nextFileId === null
+        ? null
+        : retentionText(body.nextFileId, 512),
+    };
+  }
+
+  async unfinishedPartsPage(
+    fileId: string,
+    cursor: number | null,
+    signal?: AbortSignal,
+  ): Promise<{ items: BackupV2RetentionPart[]; next: number | null }> {
+    const body = await this.#retentionRequest("b2_list_parts", {
+      fileId: retentionText(fileId, 512),
+      maxPartCount: LIMIT.listEntries,
+      ...(cursor === null
+        ? {}
+        : { startPartNumber: retentionInteger(cursor, 1) }),
+    }, signal);
+    require(
+      Array.isArray(body.parts) && body.parts.length <= LIMIT.listEntries,
+      "retention parts page exceeded",
+    );
+    return {
+      items: body.parts.map((value) => {
+        const item = record(value);
+        return {
+          fileId: retentionText(item.fileId, 512),
+          partNumber: retentionInteger(item.partNumber, 1),
+          contentLength: retentionInteger(item.contentLength, 1),
+          contentSha1: text(item.contentSha1),
+          uploadTimestamp: retentionInteger(item.uploadTimestamp, 1),
+        };
+      }),
+      next: body.nextPartNumber === null
+        ? null
+        : retentionInteger(body.nextPartNumber, 1),
+    };
+  }
+
+  /** The retention executor has already reconciled exact current identity
+   * against its immutable plan and fsynced intent before this single request. */
+  async removeRetentionVersion(
+    object: BackupV2RetentionVersion,
+    signal?: AbortSignal,
+    retiredResticPrefix?: string,
+  ): Promise<void> {
+    const fileName = retentionText(object.fileName, 1_000);
+    const fileId = retentionText(object.fileId, 512);
+    require(
+      retentionOwnedName(fileName) !== null ||
+        retiredResticPrefix !== undefined &&
+          retentionOwnedResticName(fileName, retiredResticPrefix),
+      "retention name not owned",
+    );
+    if (object.action === "start") {
+      const body = await this.#retentionRequest(
+        "b2_cancel_large_file",
+        { fileId },
+        signal,
+      );
+      require(
+        body.fileId === fileId && body.fileName === fileName &&
+          body.bucketId === this.#settings.bucketId,
+        "CANCEL response binding mismatch",
+      );
+      return;
+    }
+    require(
+      object.action === "upload" || object.action === "hide",
+      "retention delete action rejected",
+    );
+    const body = await this.#retentionRequest(
+      "b2_delete_file_version",
+      { fileName, fileId },
+      signal,
+    );
+    require(
+      body.fileId === fileId && body.fileName === fileName,
       "DELETE response binding mismatch",
     );
   }

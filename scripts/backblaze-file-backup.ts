@@ -99,6 +99,7 @@ import {
   validateVerifierReceipt,
   verifyDecryptedGeneration,
 } from "./backblaze-verifier.ts";
+import type { BackupV2RetentionSummary } from "./backup-v2-retention.ts";
 import { withBackupLock } from "./backup-lock.ts";
 import { backupV2ChildEnvironment } from "./backup-v2-supervisor.ts";
 import { shellQuote } from "./backup-guest.ts";
@@ -3980,6 +3981,9 @@ export interface BackblazeRunReport {
   generation?: string;
   healthy: boolean;
   detail?: string;
+  retention?: BackupV2RetentionSummary;
+  retentionTransactionId?: string;
+  checkedCaptureIds?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -5105,305 +5109,46 @@ async function acceptCatalogEntry(
   return { ...state, catalog };
 }
 
+/** Cloud retirement belongs to the v2 policy transaction. A deployed v1
+ * acceptance may still finish its local cleanup under exact custody. */
 async function pruneStep(
   deps: PiDeps,
   state: ControllerState,
   now: Date,
 ): Promise<ControllerState> {
   const job = state.job;
-  if (job === undefined) throw new Error("No controller job to prune");
-  const config = await loadSourceConfig(deps);
-  const store = deps.metadataStore(config.b2);
-  let fresh: B2Object[];
-  try {
-    fresh = await store.versions();
-  } catch (error) {
-    // A transient provider/transport inventory failure is never allowed to
-    // escape to the step dispatcher (which would permanently mark the job
-    // FAILED): keep the current job/catalog/phase and resumable evidence.
-    const reason = error instanceof Error ? error.message : String(error);
-    deps.logger(`Prune inventory failed: ${reason.slice(0, 200)}`);
-    if (job.prune === undefined) {
-      // No prune plan exists yet: never invent an empty completed plan that
-      // would drop catalog membership without deleting eligible objects.
-      // ACCEPTED and the pending plan allocation are preserved for the
-      // next normal poll.
+  if (
+    !job ||
+    !state.catalog.some((entry) =>
+      entry.index.generation === job.envelope.request.generation
+    )
+  ) throw new Error("Accepted legacy recovery point is missing");
+  if (job.prune?.plan.length) {
+    // An older transaction may have deleted some versions already. Preserve
+    // its exact intent and catalog until an operator can verify the evidence.
+    if (job.prune.completedAtUtc === undefined) {
+      deps.logger("B2_LEGACY_RETIREMENT_UNSETTLED");
       return state;
     }
+    // Keep historic catalog evidence until the current policy has checked
+    // exact stored versions. Old receipts do not authorize new effects.
     return await persist(deps, {
       ...state,
-      job: {
-        ...job,
-        prune: {
-          ...job.prune,
-          failedAtUtc: now.toISOString(),
-          evidence: `inventory failed: ${reason.slice(0, 200)}`,
-        },
-      },
+      job: { ...job, phase: "CLEANUP_PENDING" },
     });
   }
-  const selection = selectPruneCandidates(fresh, state.catalog);
-  const currentAccepted = state.catalog.some((entry) =>
-    entry.index.generation === job.envelope.request.generation
-  );
-  if (!currentAccepted) {
-    return await persist(deps, {
-      ...state,
-      job: {
-        ...job,
-        phase: "PRUNING",
-        prune: {
-          plan: [],
-          startedAtUtc: now.toISOString(),
-          failedAtUtc: now.toISOString(),
-          evidence: "Current generation is not in the accepted catalog",
-        },
-      },
-    });
-  }
-  if (job.prune === undefined) {
-    if (!retainedIdsPresent(fresh, selection.retainedFileIds)) {
-      return await persist(deps, {
-        ...state,
-        job: {
-          ...job,
-          phase: "PRUNING",
-          prune: {
-            plan: [],
-            startedAtUtc: now.toISOString(),
-            failedAtUtc: now.toISOString(),
-            evidence: "Retained-generation guard failed before any deletion",
-          },
-        },
-      });
-    }
-    if (selection.toDelete.length === 0 && selection.toPrune.length === 0) {
-      const completed = {
-        ...job,
-        phase: "PRUNED" as ControllerPhase,
-        prune: {
-          plan: [],
-          startedAtUtc: now.toISOString(),
-          completedAtUtc: now.toISOString(),
-        },
-      };
-      return await persist(deps, { ...state, job: completed });
-    }
-    // Every eligible older generation enters the plan even with zero
-    // remaining IDs: a later fresh inventory may prove that its data is
-    // already gone, and the catalog membership still has to shrink to the
-    // four retained accepted generations.
-    const plan: PrunePlanEntry[] = [];
-    for (const generation of selection.toPrune) {
-      const ids = selection.toDelete
-        .filter((object) =>
-          object.fileName.startsWith(`${GENERATIONS_PREFIX}${generation}/`) ||
-          object.fileName.startsWith(`${INDEXES_PREFIX}${generation}/`)
-        )
-        .map((object) => object.fileId);
-      plan.push({ generation, fileIds: ids });
-    }
-    const planned = {
+  return await persist(deps, {
+    ...state,
+    job: {
       ...job,
-      phase: "PRUNING" as ControllerPhase,
-      prune: { plan, startedAtUtc: now.toISOString() },
-    };
-    return await persist(deps, { ...state, job: planned });
-  }
-  if (job.prune.failedAtUtc !== undefined) {
-    // Idempotent resume: re-inventory and continue with the persisted plan.
-    return await deletePruned(deps, state, job, now, fresh);
-  }
-  if (job.prune.completedAtUtc !== undefined) {
-    return await finishPruneCatalog(deps, state, job);
-  }
-  return await deletePruned(deps, state, job, now, fresh);
-}
-
-async function deletePruned(
-  deps: PiDeps,
-  state: ControllerState,
-  job: ControllerJob,
-  now: Date,
-  inventory: B2Object[],
-): Promise<ControllerState> {
-  const plan = job.prune;
-  if (plan === undefined) throw new Error("Prune plan is missing");
-  const config = await loadSourceConfig(deps);
-  const store = deps.metadataStore(config.b2);
-  let fresh = inventory;
-  const guard = selectPruneCandidates(fresh, state.catalog);
-  if (!retainedIdsPresent(fresh, guard.retainedFileIds)) {
-    return await persist(deps, {
-      ...state,
-      job: {
-        ...job,
-        prune: {
-          ...plan,
-          failedAtUtc: now.toISOString(),
-          evidence: "Retained-generation guard failed after inventory",
-        },
+      phase: "PRUNED",
+      prune: {
+        plan: [],
+        startedAtUtc: now.toISOString(),
+        completedAtUtc: now.toISOString(),
       },
-    });
-  }
-  const rechecked = revalidatePruneDeletions(
-    fresh,
-    plan.plan,
-    guard.toPrune,
-    guard.retainedFileIds,
-  );
-  if (rechecked.violation !== null) {
-    return await persist(deps, {
-      ...state,
-      job: {
-        ...job,
-        prune: {
-          ...plan,
-          failedAtUtc: now.toISOString(),
-          evidence: rechecked.violation,
-        },
-      },
-    });
-  }
-  for (const object of rechecked.pending) {
-    try {
-      await store.remove(object);
-    } catch (error) {
-      // Never let one removal failure escape to the outer cycle step
-      // dispatcher: from the unchanged PRUNING state it would immediately
-      // re-mark the job FAILED and the persisted plan would lose its
-      // resumability. Persist the same catalog/job/plan in PRUNING with the
-      // failure time and a short bounded evidence string; the next normal
-      // step inventories again, treats already-absent IDs as already removed
-      // and retries only the still-present eligible IDs.
-      const reason = error instanceof Error ? error.message : String(error);
-      return await persist(deps, {
-        ...state,
-        job: {
-          ...job,
-          prune: {
-            ...plan,
-            failedAtUtc: now.toISOString(),
-            evidence: `remove ${object.fileId} failed: ${reason.slice(0, 200)}`,
-          },
-        },
-      });
-    }
-    const total = plan.plan.reduce(
-      (sum, entry) => sum + entry.fileIds.length,
-      0,
-    );
-    await persist(deps, {
-      ...state,
-      job: {
-        ...job,
-        prune: {
-          ...plan,
-          evidence:
-            `${rechecked.pending.length} of ${total} pending after deletion`,
-        },
-      },
-    });
-  }
-  try {
-    fresh = await store.versions();
-  } catch (error) {
-    // The post-delete refresh is a transient provider/transport inventory
-    // failure too: it must never escape and permanently mark the job FAILED.
-    // Keep PRUNING with the exact plan and all planned IDs, write bounded
-    // failure evidence and let the next normal poll re-inventory fresh
-    // (already-absent IDs are treated as already removed).
-    const reason = error instanceof Error ? error.message : String(error);
-    return await persist(deps, {
-      ...state,
-      job: {
-        ...job,
-        prune: {
-          ...plan,
-          failedAtUtc: now.toISOString(),
-          evidence: `refresh inventory failed: ${reason.slice(0, 200)}`,
-        },
-      },
-    });
-  }
-  const afterGuard = selectPruneCandidates(fresh, state.catalog);
-  const after = revalidatePruneDeletions(
-    fresh,
-    plan.plan,
-    afterGuard.toPrune,
-    afterGuard.retainedFileIds,
-  );
-  if (after.violation !== null) {
-    return await persist(deps, {
-      ...state,
-      job: {
-        ...job,
-        prune: {
-          ...plan,
-          failedAtUtc: now.toISOString(),
-          evidence: after.violation,
-        },
-      },
-    });
-  }
-  if (after.pending.length !== 0) {
-    return await persist(deps, {
-      ...state,
-      job: {
-        ...job,
-        prune: {
-          ...plan,
-          failedAtUtc: now.toISOString(),
-          evidence: `${after.pending.length} planned versions still present`,
-        },
-      },
-    });
-  }
-  const kept = selectPruneCandidates(fresh, state.catalog);
-  if (!retainedIdsPresent(fresh, kept.retainedFileIds)) {
-    return await persist(deps, {
-      ...state,
-      job: {
-        ...job,
-        prune: {
-          ...plan,
-          failedAtUtc: now.toISOString(),
-          evidence: "Retained IDs are not all present after pruning",
-        },
-      },
-    });
-  }
-  const completed = {
-    ...job,
-    prune: {
-      ...plan,
-      completedAtUtc: now.toISOString(),
-      // A resumed plan carries failedAtUtc; only the fresh absent+retained
-      // proof above may complete the prune, and it clears the failure mark
-      // so the dispatch reaches finishPruneCatalog instead of re-deleting.
-      failedAtUtc: undefined,
-      evidence: undefined,
     },
-  };
-  return await persist(deps, { ...state, job: completed });
-}
-
-async function finishPruneCatalog(
-  deps: PiDeps,
-  state: ControllerState,
-  job: ControllerJob,
-): Promise<ControllerState> {
-  const prunedGenerations = new Set(
-    job.prune!.plan.map((entry) => entry.generation),
-  );
-  const catalog = state.catalog.filter((entry) =>
-    !prunedGenerations.has(entry.index.generation)
-  );
-  const next = {
-    ...job,
-    phase: "CLEANUP_PENDING" as ControllerPhase,
-  };
-  return await persist(deps, { ...state, job: next, catalog });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -6093,7 +5838,9 @@ export async function runBackblazeCycle(
   return reportValue;
 }
 
-export async function runBackblazePiController(): Promise<BackblazeRunReport> {
+export async function runBackblazePiController(
+  mode: "scheduled" | "plan" | "verify-catalog" = "scheduled",
+): Promise<BackblazeRunReport> {
   const cwd = await Deno.realPath(".");
   if (cwd !== PI_CONTROLLER_CWD) {
     throw new Error(`File backup runs only from ${PI_CONTROLLER_CWD}`);
@@ -6106,7 +5853,14 @@ export async function runBackblazePiController(): Promise<BackblazeRunReport> {
     const legacyActive = saved?.schemaVersion === 1 &&
       saved.job !== undefined &&
       !["COMPLETE", "FAILED"].includes(saved.job.phase);
-    if (legacyActive) return await runBackblazeCycle(deps);
+    if (legacyActive) {
+      if (mode === "scheduled") return await runBackblazeCycle(deps);
+      return {
+        status: "B2_RETENTION_BUSY",
+        healthy: false,
+        observedAtUtc: deps.now().toISOString(),
+      };
+    }
     const runtime = await import("./backup-v2-controller.ts"),
       bridge = await import("./backup-v2-bridge-runtime.ts");
     const deployment = await loadDeployment(deps);
@@ -6114,6 +5868,7 @@ export async function runBackblazePiController(): Promise<BackblazeRunReport> {
     return await runtime.runBackupV2ControllerCycle(
       deps,
       bridge.realBackupV2BridgeRuntime(deps),
+      mode,
     );
   });
 }

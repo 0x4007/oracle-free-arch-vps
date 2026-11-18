@@ -13,6 +13,46 @@
  * and the production command wiring. No payload, credential or live access
  * occurs here.
  */
+import {
+  authorizeCatalogRetirement,
+  type BackupV2ControllerCapabilities,
+  type BackupV2ControllerObservation,
+  type BackupV2ControllerState,
+  type BackupV2RetentionControl,
+  runBackupV2ControllerCycle,
+  runBackupV2RetentionCycle,
+} from "../scripts/backup-v2-controller.ts";
+import {
+  B2_CATALOG_CONTROL_PATH,
+  B2_CATALOG_DAMAGED_ALERT,
+  B2_CATALOG_REPORT_PATH,
+  B2_RETENTION_CATEGORIES,
+  B2_RETENTION_CONTROL_PATH,
+  B2_RETENTION_KEY_PATH,
+  B2_RETENTION_POLICY_PATH,
+  B2_RETENTION_REPORT_PATH,
+  type BackupV2PiRetentionReport,
+  retentionTransactionPath,
+} from "../scripts/backup-v2-retention-report.ts";
+import {
+  type BackupV2Gate,
+  type BackupV2Request,
+  backupV2RequestSha256,
+  validateBackupV2Gate,
+} from "../scripts/backup-v2-runtime-contract.ts";
+import type { BackupV2ListedVersion } from "../scripts/backup-v2-contract.ts";
+import { backupV2SourceConfigSha256 } from "../scripts/backup-v2-metadata.ts";
+import { BACKUP_V2_PROFILE_ID } from "../scripts/backup-v2-profile.ts";
+import { runBackupV2SourcePruner } from "../scripts/backup-v2-source-pruner.ts";
+import {
+  backupV2ArtifactBytes,
+  backupV2ArtifactSha256,
+} from "../scripts/backup-v2-worker.ts";
+import {
+  type BackupV2RetentionJournalEntry,
+  type BackupV2RetentionSummary,
+  DEFAULT_BACKUP_V2_RETENTION_POLICY,
+} from "../scripts/backup-v2-retention.ts";
 import { createHash } from "node:crypto";
 import type {
   WorkerRequest,
@@ -27,11 +67,18 @@ import {
 } from "../scripts/backblaze-source-worker.ts";
 import {
   type BackupControllerGate,
+  GATE_BACKUP_CGROUP_ROOT,
   GATE_DEADLINE_HOURS,
   GATE_DEADLINE_MS,
+  GATE_OWNER,
+  GATE_REMOTE_HOST,
+  GATE_SOURCE_LOCK_PATH,
   type OrphanReason,
 } from "../scripts/backblaze-controller-contract.ts";
-import type { CaptureResult } from "../scripts/backblaze-capture.ts";
+import type {
+  CaptureResult,
+  CaptureSettings,
+} from "../scripts/backblaze-capture.ts";
 import type { UploadResult } from "../scripts/backblaze-upload.ts";
 import {
   generationChunkName,
@@ -66,6 +113,7 @@ import {
   deriveVerifierGate,
   entryVerifyText,
   entryWorkerText,
+  GATE_PATH,
   type GateSeam,
   generationPrefixes,
   JOBS_RUNTIME_ROOT,
@@ -98,6 +146,7 @@ import {
   type TunnelHandle,
   type TunnelSeam,
   validateAcceptedReceipt,
+  validateCatalogEntry,
   validateControllerState,
   validateReleaseManifest,
   validateSavedWorkerResult,
@@ -2283,7 +2332,7 @@ Deno.test("orchestration: corrupt verifier receipt is never accepted or pruned",
   assert(after.job.phase === "FAILED");
 });
 
-Deno.test("orchestration: acceptance precedes deletion and prune is idempotent", async () => {
+Deno.test("legacy acceptance preserves the full catalog and delegates all cloud retirement", async () => {
   const fixtures = [1, 2, 3, 4, 5].map((seed) =>
     generationFixture(seed, WINDOW_START + seed * 3_600_000)
   );
@@ -2304,204 +2353,250 @@ Deno.test("orchestration: acceptance precedes deletion and prune is idempotent",
     now: new Date(WINDOW_START + 60_000),
     versions: inventoryFor(fixtures),
   });
+  h.store.versions = () =>
+    Promise.reject(new Error("Legacy cloud inventory must not run"));
   let final = state;
-  for (let step = 0; step < 6; step += 1) {
+  for (let step = 0; step < 6; step++) {
     final = await stepBackupController(final, h.deps, h.deps.now());
-    if (final.job!.phase === "COMPLETE" || final.job!.phase === "FAILED") break;
+    if (final.job!.phase === "COMPLETE") break;
   }
+  assert(final.job!.phase === "COMPLETE");
+  assert(final.catalog.length === catalog.length);
+  assert(h.store.removed.length === 0);
+});
+
+Deno.test("installed controller starts read-only maintenance against a settled historical catalog", async () => {
+  for (const mode of ["scheduled", "verify-catalog"] as const) {
+    const old = generationFixture(1, WINDOW_START + 1000);
+    const sourceBootId = "10000000-0000-4000-8000-000000000000";
+    let gate: BackupV2Gate | null = null;
+    let launched = false;
+    const trap = {
+      ensure() {
+        return Promise.reject(
+          Error("Maintenance must never open the verifier bridge"),
+        );
+      },
+      close() {
+        return Promise.reject(
+          Error("Maintenance must never close the verifier bridge"),
+        );
+      },
+    };
+    const h = harness({
+      now: new Date(WINDOW_START + 120_000),
+      seedPrivate(map) {
+        map.set(CONTROLLER_STATE_PATH, {
+          schemaVersion: 1,
+          catalog: [catalogEntry(old, WINDOW_START + 3000)],
+        });
+        map.set(`.private/file-backup/retention/${old.jobId}.json`, {
+          schemaVersion: 2,
+          phase: "COMPLETE",
+        });
+        if (mode === "verify-catalog") {
+          map.set(B2_RETENTION_POLICY_PATH, { execute: true });
+        }
+        map.set(B2_RETENTION_KEY_PATH, {
+          accessKeyId: "retention-test-key",
+          secretAccessKey: "retention-fixture",
+          bucketId: "bucket",
+          bucketName: "pavlovcik-arch-vps-backups",
+        });
+      },
+      rootResponder(script) {
+        const ok = (stdout = "") => ({ code: 0, stdout, stderr: "" });
+        if (script.includes("echo SOURCE_IDLE")) return ok("SOURCE_IDLE");
+        if (script.includes("discoverBackupV2SourceGates")) {
+          assert(mode === "scheduled");
+          return ok(
+            JSON.stringify({ sourceBootId, gates: [], unresolvedPuts: [] }),
+          );
+        }
+        if (script.includes("observeBackupV2Kernel")) {
+          assert(!launched || gate);
+          const identity = launched
+            ? {
+              unitName: gate!.unitName,
+              invocationId: INVOCATION_A,
+              mainPid: 123,
+              mainStartTicks: "456",
+              cgroup: `${GATE_BACKUP_CGROUP_ROOT}/${gate!.unitName}`,
+            }
+            : null;
+          return ok(JSON.stringify({
+            sourceBootId,
+            unit: launched ? "RUNNING" : "ABSENT",
+            identity,
+            status: null,
+            resultBytes: null,
+            tree: null,
+          }));
+        }
+        if (script.includes("systemd-run")) {
+          assert(
+            !launched && script.includes("-prune-") &&
+              script.includes(REVISION),
+          );
+          launched = true;
+        }
+        return ok();
+      },
+    });
+    h.deps.remote.source = () =>
+      Promise.resolve({ code: 0, stdout: sourceBootId, stderr: "" });
+    const write = h.deps.private.write.bind(h.deps.private);
+    h.deps.private.write = async (path, value) => {
+      if (path === GATE_PATH) gate = value as BackupV2Gate;
+      await write(path, value);
+    };
+    const report = await runBackupV2ControllerCycle(h.deps, trap, mode);
+    assert(report.status === "B2_RETENTION_PLAN_RUNNING", report.status);
+    const directory = mode === "scheduled"
+      ? B2_RETENTION_CONTROL_PATH
+      : B2_CATALOG_CONTROL_PATH;
+    const control = await h.deps.private.read<BackupV2RetentionControl>(
+      directory,
+    );
+    assert(
+      control?.phase === "RUNNING" && control.gate.kind === "prune" &&
+        control.gate.custody,
+    );
+    assert(
+      control.input.stage === "PLAN" && !control.input.snapshot.policy.execute,
+    );
+    assert(control.gate.envelope.request.sourceRevision === REVISION);
+    assert(control.gate.envelope.request.jobId !== old.jobId);
+    assert(
+      control.input.snapshot.verifyCatalogOnly ===
+        (mode === "verify-catalog" ? true : undefined),
+    );
+    assert(control.input.scratchCleanupRequestSha256 === null);
+    assert(!JSON.stringify(control).includes("retention-fixture"));
+    assert(
+      h.installs.length === 1 && h.launches.length === 0 &&
+        h.store.removed.length === 0,
+    );
+    assert(
+      h.privateMap.has(`.private/file-backup/retention/${old.jobId}.json`),
+    );
+  }
+});
+
+Deno.test("an unfinished legacy deletion intent cannot resume outside the new policy", async () => {
+  const oldest = generationFixture(1, WINDOW_START),
+    current = generationFixture(2, WINDOW_START + 1000);
+  const catalog = [
+    catalogEntry(oldest, WINDOW_START),
+    catalogEntry(current, WINDOW_START + 1000),
+  ];
+  const startedAtUtc = new Date(WINDOW_START + 2000).toISOString();
+  const state = validateControllerState({
+    schemaVersion: 1,
+    catalog,
+    job: {
+      ...stateWithJob(current, "PRUNING").job!,
+      prune: {
+        plan: [{
+          generation: oldest.generation,
+          fileIds: [oldest.publishedIndex.object.fileId],
+        }],
+        startedAtUtc,
+      },
+    },
+  });
+  const h = harness({
+    now: new Date(WINDOW_START + 60_000),
+    versions: inventoryFor([oldest, current]),
+  });
+  h.store.versions = () =>
+    Promise.reject(new Error("Legacy cloud inventory must not run"));
+  const next = await stepBackupController(state, h.deps, h.deps.now());
+  assert(next.job?.phase === "PRUNING");
+  assert(JSON.stringify(next.job.prune) === JSON.stringify(state.job?.prune));
   assert(
-    final.job!.phase === "COMPLETE",
-    `phase=${final.job!.phase} events=${h.events.join("|")}`,
-  );
-  const planIndex = h.events.findIndex((entry) => entry.endsWith(":plan"));
-  const firstRemove = h.events.findIndex((entry) =>
-    entry.startsWith("remove:")
-  );
-  assert(planIndex !== -1, "The deletion plan must be persisted");
-  assert(planIndex < firstRemove, "The plan is written before any removal");
-  const oldestIds2 = new Set(
-    fixtures[0].upload.archives.flatMap((archive) =>
-      archive.chunks.map((chunk) => chunk.fileId)
-    ).concat([fixtures[0].publishedIndex.object.fileId]),
-  );
-  assert(
-    h.events.filter((entry) => entry.startsWith("remove:")).every((entry) =>
-      oldestIds2.has(entry.slice("remove:".length))
-    ),
-    "Only the oldest generation may be deleted",
-  );
-  const persisted = h.privateMap.get(CONTROLLER_STATE_PATH);
-  const after = JSON.parse(
-    persisted instanceof Uint8Array
-      ? new TextDecoder().decode(persisted)
-      : JSON.stringify(persisted),
-  );
-  assert(
-    after.catalog.length === 4,
-    "Catalog membership shrinks only after the prune is proved",
-  );
-  assert(
-    after.catalog.every((entry: { index: { generation: string } }) =>
-      entry.index.generation !== fixtures[0].generation
-    ),
-  );
-  assert(h.store.removed.length > 0);
-  assert(
-    h.store.versionsList.every((object) => !oldestIds2.has(object.fileId)),
-    "Pruned IDs must be absent from the fresh inventory",
+    next.catalog.length === catalog.length && h.store.removed.length === 0,
   );
 });
 
-Deno.test("orchestration: prune removal failure persists resumable PRUNING and resumes to completion", async () => {
-  const fixtures = [1, 2, 3, 4, 5, 6].map((seed) =>
+Deno.test("Pi journals the exact catalog retirement but retains fallback until confirmed completion", async () => {
+  const fixtures = [1, 2, 3].map((seed) =>
     generationFixture(seed, WINDOW_START + seed * 3_600_000)
   );
   const catalog = fixtures.map((fixture, i) =>
     catalogEntry(fixture, WINDOW_START + i * 1000)
   );
-  const current = fixtures[5];
-  const state = validateControllerState({
-    schemaVersion: 1,
-    catalog,
-    job: {
-      ...stateWithJob(current, "ACCEPTED").job!,
-      workerStatus: workerPendingStatus(current, INVOCATION_A),
-      resultSha256: "77".repeat(32),
+  const h = harness({ now: new Date(WINDOW_START + 60_000) });
+  const transactionId = "61d5c174-45ff-4d7d-baec-57d06da81e89";
+  const categories = Object.fromEntries(
+    B2_RETENTION_CATEGORIES.map((
+      name,
+    ) => [name, { objects: 0, bytes: 0, plannedObjects: 0, plannedBytes: 0 }]),
+  ) as BackupV2RetentionSummary["categories"];
+  const before = { schemaVersion: 1 as const, catalog };
+  await h.deps.private.write(CONTROLLER_STATE_PATH, before);
+  const policy = { ...DEFAULT_BACKUP_V2_RETENTION_POLICY, execute: true };
+  const control = {
+    input: {
+      snapshot: {
+        policy,
+        catalog: catalog.map((entry) => ({
+          schemaVersion: 1,
+          format: "backup-v1",
+          entry,
+        })),
+      },
+      transactionId,
     },
+    plannedResult: {
+      plan: { sha256: "a".repeat(64) },
+      retainedCaptureIds: [fixtures[2].generation, fixtures[1].generation],
+      retiredCaptureIds: [fixtures[0].generation],
+      summary: {
+        blockReason: null,
+        damagedCaptureIds: [],
+        categories,
+        maxDeleteBytes: 40,
+      },
+    },
+  } as unknown as BackupV2RetentionControl;
+  let persisted = 0;
+  const caps = {
+    async persist(next) {
+      persisted++;
+      await h.deps.private.write(CONTROLLER_STATE_PATH, next);
+    },
+  } as Pick<
+    BackupV2ControllerCapabilities,
+    "persist"
+  > as BackupV2ControllerCapabilities;
+  await authorizeCatalogRetirement(h.deps, caps, control);
+  const evidence = retentionTransactionPath(transactionId, "retirement");
+  assert(await h.deps.private.read(evidence));
+  assert(
+    persisted === 0 &&
+      (await h.deps.private.read<ControllerState>(CONTROLLER_STATE_PATH))!
+          .catalog.length === 3,
+  );
+  await h.deps.private.write(CONTROLLER_STATE_PATH, {
+    ...before,
+    catalog: catalog.slice(0, 2),
   });
-  const inventory = inventoryFor(fixtures);
-  const pending = generationFixture(7, WINDOW_START + 7 * 3_600_000);
-  inventory.push(...inventoryFor([pending]));
-  inventory.push({
-    fileId: "foreign000000000000",
-    fileName: "restic/direct-v1/other/generation-11111/role/00000000",
-    contentLength: 10,
-    contentSha1: "11".repeat(20),
-    action: "upload",
-    uploadTimestamp: 1,
-  });
-  inventory.push({
-    fileId: "start0000000000000",
-    fileName: `${generationPrefixes(fixtures[1].generation)[0]}root/00000000`,
-    contentLength: 1,
-    contentSha1: "11".repeat(20),
-    action: "start",
-    uploadTimestamp: 1,
-  });
-  inventory.push({
-    fileId: "hide00000000000000",
-    fileName: `${generationPrefixes(fixtures[0].generation)[0]}root/00000000`,
-    contentLength: 0,
-    contentSha1: "11".repeat(20),
-    action: "hide",
-    uploadTimestamp: 1,
-  });
-  const h = harness({
-    now: new Date(WINDOW_START + 60_000),
-    versions: inventory,
-  });
-  // The first removal throws (transient or an ambiguous already-removed
-  // answer); every later removal succeeds.
-  const originalRemove = h.store.remove.bind(
-    h.store,
-  ) as MetadataStore["remove"];
-  let failOnce = true;
-  h.store.remove = async (object) => {
-    if (failOnce) {
-      failOnce = false;
-      throw new Error("remove failed: 500 transient");
-    }
-    return await originalRemove(object);
-  };
-  const expectedIds = new Set(
-    inventoryFor([fixtures[0], fixtures[1]]).map((object) => object.fileId),
-  );
-  expectedIds.add("hide00000000000000");
-  let final = state;
-  for (let step = 0; step < 4; step += 1) {
-    final = await stepBackupController(final, h.deps, h.deps.now());
-    if (final.job!.prune?.failedAtUtc !== undefined) break;
-    if (final.job!.phase === "COMPLETE" || final.job!.phase === "FAILED") break;
+  let rejected = false;
+  try {
+    await authorizeCatalogRetirement(h.deps, caps, control, true);
+  } catch {
+    rejected = true;
   }
-  const failedPhase: ControllerPhase = final.job!.phase;
+  assert(rejected);
+  await h.deps.private.write(CONTROLLER_STATE_PATH, before);
+  await authorizeCatalogRetirement(h.deps, caps, control, true);
+  await authorizeCatalogRetirement(h.deps, caps, control, true);
+  assert(Number(persisted) === 1);
   assert(
-    failedPhase === "PRUNING",
-    `the removal failure must stay resumable, phase=${failedPhase}`,
+    (await h.deps.private.read<ControllerState>(CONTROLLER_STATE_PATH))!.catalog
+      .length === 2,
   );
-  assert(final.job!.prune!.failedAtUtc !== undefined);
-  assert(
-    final.catalog.length === 6,
-    "the catalog is never discarded by a removal failure",
-  );
-  assert(
-    JSON.stringify(final.job!.prune!.plan.map((entry) => entry.generation)) ===
-      JSON.stringify([fixtures[0].generation, fixtures[1].generation]),
-    "the existing plan is preserved",
-  );
-  const planIds = final.job!.prune!.plan.flatMap((entry) => entry.fileIds);
-  assert(planIds.length === expectedIds.size);
-  assert(
-    planIds.every((id) => expectedIds.has(id)),
-    "no planned id is dropped or replaced",
-  );
-  assert(
-    (final.job!.prune!.evidence ?? "").length <= 300,
-    "failure evidence is bounded",
-  );
-  assert(h.store.removed.length === 0, "the throwing removal deleted nothing");
-  // A concurrent actor already removed one planned ID before the resume
-  // inventory: it must be skipped, and the remaining IDs retried.
-  const firstPlanned = planIds[0];
-  h.store.versionsList = h.store.versionsList.filter(
-    (object) => object.fileId !== firstPlanned,
-  );
-  for (let step = 0; step < 14; step += 1) {
-    final = await stepBackupController(final, h.deps, h.deps.now());
-    if (final.job!.phase === "COMPLETE" || final.job!.phase === "FAILED") break;
-  }
-  assert(
-    final.job!.phase === "COMPLETE",
-    `resume must complete, phase=${final.job!.phase}`,
-  );
-  assert(final.catalog.length === 4, "catalog shrinks to the newest four");
-  for (const entry of final.catalog) {
-    assert(
-      entry.index.generation !== fixtures[0].generation &&
-        entry.index.generation !== fixtures[1].generation,
-    );
-  }
-  const removedIds = new Set(h.store.removed.map((object) => object.fileId));
-  assert(
-    removedIds.size === expectedIds.size - 1,
-    "every still-present planned id was removed once",
-  );
-  assert(
-    !removedIds.has(firstPlanned),
-    "the already-absent id is not re-removed",
-  );
-  for (const id of expectedIds) {
-    if (id !== firstPlanned) {
-      assert(removedIds.has(id), `planned id ${id} must be removed`);
-    }
-  }
-  const surviving = new Set(
-    h.store.versionsList.map((object) => object.fileId),
-  );
-  const newestIds = new Set(
-    fixtures.slice(2).flatMap((fixture) =>
-      inventoryFor([fixture]).map((object) => object.fileId)
-    ),
-  );
-  for (const id of newestIds) {
-    assert(surviving.has(id), `newest id ${id} must survive`);
-  }
-  for (const fixture of [pending]) {
-    for (const object of inventoryFor([fixture])) {
-      assert(surviving.has(object.fileId), "pending data must survive");
-    }
-  }
-  assert(surviving.has("foreign000000000000"), "foreign data must survive");
-  assert(surviving.has("start0000000000000"), "start markers must survive");
 });
 
 Deno.test("orchestration: completed or failed period never creates a replacement", async () => {
@@ -2816,7 +2911,7 @@ Deno.test("wiring: gate and catalog validation reject identity drift", () => {
   assert(threw, "A catalog entry with a different recipient must be rejected");
 });
 
-Deno.test("orchestration: end-to-end weekly generation is accepted then pruned", async () => {
+Deno.test("orchestration: end-to-end legacy weekly generation is accepted and settled", async () => {
   const oracleState = {
     policy: {
       source: {
@@ -4923,7 +5018,7 @@ Deno.test("retention: resume revalidates plan IDs and trims a zero-remaining pla
   assert(staleEligible.violation !== null);
 });
 
-Deno.test("retention: empty older inventory trims catalog to the four accepted", async () => {
+Deno.test("retention: missing legacy inventory requires the new catalog check", async () => {
   const fixtures = [1, 2, 3, 4, 5, 6].map((seed) =>
     generationFixture(seed, WINDOW_START + seed * 3_600_000)
   );
@@ -4955,30 +5050,10 @@ Deno.test("retention: empty older inventory trims catalog to the four accepted",
   }
   assert(final.job!.phase === "COMPLETE", `phase=${final.job!.phase}`);
   assert(
-    final.catalog.length === 4,
-    "catalog membership must shrink to the newest four",
+    final.catalog.length === fixtures.length,
+    "legacy acceptance preserves historical catalog evidence",
   );
-  for (const entry of final.catalog) {
-    assert(
-      entry.index.generation !== fixtures[0].generation &&
-        entry.index.generation !== fixtures[1].generation,
-    );
-  }
-  // Only the still-present second-oldest data may be removed; the oldest
-  // generation had no data left (zero remaining plan IDs) yet its catalog
-  // membership was still trimmed.
-  const secondOldestIds = new Set(
-    fixtures[1].upload.archives.flatMap((archive) =>
-      archive.chunks.map((chunk) => chunk.fileId)
-    ).concat([fixtures[1].publishedIndex.object.fileId]),
-  );
-  assert(
-    h.store.removed.length === secondOldestIds.size,
-    "only the second-oldest present data was removed",
-  );
-  assert(
-    h.store.removed.every((object) => secondOldestIds.has(object.fileId)),
-  );
+  assert(h.store.removed.length === 0, "no independent cloud deletion");
 });
 
 Deno.test("cleanup: allowed names derive from the output contracts and reject foreign entries", () => {
@@ -6167,7 +6242,7 @@ Deno.test("cycle: the default run stays bounded at the request deadline with a p
     schemaVersion: 1,
     catalog: [catalogEntry(fixture, WINDOW_START + 1000)],
     job: {
-      ...stateWithJob(fixture, "ACCEPTED", {
+      ...stateWithJob(fixture, "PRUNING", {
         workerStatus: workerPendingStatus(fixture, INVOCATION_A),
         verifierStatus: verifierAcceptedStatus(
           fixture,
@@ -6176,6 +6251,13 @@ Deno.test("cycle: the default run stays bounded at the request deadline with a p
         ),
         resultSha256: "77".repeat(32),
       }).job!,
+      prune: {
+        plan: [{
+          generation: fixture.generation,
+          fileIds: [fixture.publishedIndex.object.fileId],
+        }],
+        startedAtUtc: new Date(WINDOW_START + 3000).toISOString(),
+      },
     },
   });
   let versionsCalls = 0;
@@ -6194,8 +6276,8 @@ Deno.test("cycle: the default run stays bounded at the request deadline with a p
     `detail=${report.detail}`,
   );
   assert(
-    versionsCalls === 1,
-    `one final expiry assessment only (calls=${versionsCalls})`,
+    versionsCalls === 0,
+    `no legacy cloud requests (calls=${versionsCalls})`,
   );
   const persisted = h.privateMap.get(CONTROLLER_STATE_PATH);
   const after = JSON.parse(
@@ -6203,169 +6285,12 @@ Deno.test("cycle: the default run stays bounded at the request deadline with a p
       ? new TextDecoder().decode(persisted)
       : JSON.stringify(persisted),
   );
-  assert(after.job.phase === "ACCEPTED", "no durable state is rewritten stale");
-  assert(after.job.prune === undefined, "no invented prune plan");
+  assert(after.job.phase === "PRUNING", "no durable state is rewritten stale");
+  assert(
+    JSON.stringify(after.job.prune) === JSON.stringify(state.job?.prune),
+    "unchanged old intent",
+  );
   assert(after.catalog.length === 1, "the catalog is preserved");
-});
-
-Deno.test("orchestration: transient inventory failures before planning and after deletion stay resumable", async () => {
-  const fixtures = [1, 2, 3, 4, 5, 6].map((seed) =>
-    generationFixture(seed, WINDOW_START + seed * 3_600_000)
-  );
-  const catalog = fixtures.map((fixture, i) =>
-    catalogEntry(fixture, WINDOW_START + i * 1000)
-  );
-  const current = fixtures[5];
-  const state = validateControllerState({
-    schemaVersion: 1,
-    catalog,
-    job: {
-      ...stateWithJob(current, "ACCEPTED").job!,
-      workerStatus: workerPendingStatus(current, INVOCATION_A),
-      resultSha256: "77".repeat(32),
-    },
-  });
-  const inventory = inventoryFor(fixtures);
-  const pending = generationFixture(7, WINDOW_START + 7 * 3_600_000);
-  inventory.push(...inventoryFor([pending]));
-  inventory.push({
-    fileId: "foreign000000000000",
-    fileName: "restic/direct-v1/other/generation-11111/role/00000000",
-    contentLength: 10,
-    contentSha1: "11".repeat(20),
-    action: "upload",
-    uploadTimestamp: 1,
-  });
-  inventory.push({
-    fileId: "start0000000000000",
-    fileName: `${generationPrefixes(fixtures[1].generation)[0]}root/00000000`,
-    contentLength: 1,
-    contentSha1: "11".repeat(20),
-    action: "start",
-    uploadTimestamp: 1,
-  });
-  inventory.push({
-    fileId: "hide00000000000000",
-    fileName: `${generationPrefixes(fixtures[0].generation)[0]}root/00000000`,
-    contentLength: 0,
-    contentSha1: "11".repeat(20),
-    action: "hide",
-    uploadTimestamp: 1,
-  });
-  const expectedIds = new Set(
-    inventoryFor([fixtures[0], fixtures[1]]).map((object) => object.fileId),
-  );
-  expectedIds.add("hide00000000000000");
-  const h = harness({
-    now: new Date(WINDOW_START + 60_000),
-    versions: inventory,
-  });
-  const originalVersions = h.store.versions.bind(h.store) as () => Promise<
-    B2Object[]
-  >;
-  let versionsCalls = 0;
-  h.store.versions = async () => {
-    versionsCalls += 1;
-    // First call: before any prune plan exists. Fifth call: the post-delete
-    // refresh after the partial deletions ran. Both must stay resumable.
-    if (versionsCalls === 1 || versionsCalls === 5) {
-      throw new Error("inventory transport down");
-    }
-    return await originalVersions();
-  };
-  const originalRemove = h.store.remove.bind(h.store) as (
-    object: B2Object,
-  ) => Promise<void>;
-  let removeFailedOnce = false;
-  h.store.remove = async (object) => {
-    if (!removeFailedOnce) {
-      removeFailedOnce = true;
-      throw new Error("remove failed: 500 transient");
-    }
-    return await originalRemove(object);
-  };
-  let final = state;
-  const phaseOf = (value: ControllerState): ControllerPhase => value.job!.phase;
-  // Inventory failure before any plan: ACCEPTED and the pending plan
-  // allocation are preserved; no empty completed plan drops membership.
-  final = await stepBackupController(final, h.deps, h.deps.now());
-  assert(phaseOf(final) === "ACCEPTED", `phase=${phaseOf(final)}`);
-  assert(final.job!.prune === undefined, "no invented empty plan");
-  assert(final.job!.failure === undefined, "no terminal FAILED");
-  assert(final.catalog.length === 6, "the catalog is preserved");
-  // Fresh inventory allocates the exact plan.
-  final = await stepBackupController(final, h.deps, h.deps.now());
-  assert(phaseOf(final) === "PRUNING", `phase=${phaseOf(final)}`);
-  const planIds = final.job!.prune!.plan.flatMap((entry) => entry.fileIds);
-  assert(planIds.length === expectedIds.size);
-  assert(
-    planIds.every((id) => expectedIds.has(id)),
-    "the plan holds every eligible id",
-  );
-  // A removal failure leaves partial deletion: PRUNING and every planned id
-  // survive with bounded remove evidence (the existing resumability).
-  final = await stepBackupController(final, h.deps, h.deps.now());
-  assert(phaseOf(final) === "PRUNING", `phase=${phaseOf(final)}`);
-  assert(final.job!.prune!.failedAtUtc !== undefined);
-  assert(final.job!.failure === undefined, "no terminal FAILED");
-  assert(h.store.removed.length === 0, "the throwing removal deleted nothing");
-  // The post-delete refresh then fails too: PRUNING, every planned id and
-  // the catalog survive with bounded refresh evidence.
-  final = await stepBackupController(final, h.deps, h.deps.now());
-  assert(phaseOf(final) === "PRUNING", `phase=${phaseOf(final)}`);
-  assert(final.job!.prune!.failedAtUtc !== undefined);
-  assert(final.job!.failure === undefined, "no terminal FAILED");
-  assert(final.catalog.length === 6, "catalog membership survives");
-  assert(
-    JSON.stringify(final.job!.prune!.plan.map((entry) => entry.generation)) ===
-      JSON.stringify([fixtures[0].generation, fixtures[1].generation]),
-    "the existing plan and its IDs are preserved",
-  );
-  assert(
-    final.job!.prune!.plan.flatMap((entry) => entry.fileIds).every((id) =>
-      expectedIds.has(id)
-    ),
-    "no planned id is dropped or replaced",
-  );
-  assert(
-    (final.job!.prune!.evidence ?? "").length <= 300,
-    "failure evidence is bounded",
-  );
-  assert(
-    final.job!.prune!.evidence!.includes("refresh inventory failed"),
-    final.job!.prune!.evidence,
-  );
-  assert(h.store.removed.length === expectedIds.size, "deletions ran");
-  // Subsequent normal polls re-inventory fresh, prove the absent IDs and
-  // complete; newest four, pending, foreign and start data stay intact.
-  for (let step = 0; step < 12; step += 1) {
-    final = await stepBackupController(final, h.deps, h.deps.now());
-    const phase = phaseOf(final);
-    if (phase === "COMPLETE" || phase === "FAILED") break;
-  }
-  assert(phaseOf(final) === "COMPLETE", `phase=${phaseOf(final)}`);
-  assert(final.catalog.length === 4, "catalog shrinks to the newest four");
-  const removedIds = new Set(h.store.removed.map((object) => object.fileId));
-  assert(
-    removedIds.size === expectedIds.size,
-    "every still-present planned id was removed exactly once",
-  );
-  for (const id of expectedIds) {
-    assert(removedIds.has(id), `planned id ${id} must be removed`);
-  }
-  const surviving = new Set(
-    h.store.versionsList.map((object) => object.fileId),
-  );
-  for (const fixture of fixtures.slice(2)) {
-    for (const object of inventoryFor([fixture])) {
-      assert(surviving.has(object.fileId), "newest data must survive");
-    }
-  }
-  for (const object of inventoryFor([pending])) {
-    assert(surviving.has(object.fileId), "pending data must survive");
-  }
-  assert(surviving.has("foreign000000000000"), "foreign data must survive");
-  assert(surviving.has("start0000000000000"), "start markers must survive");
 });
 
 Deno.test({
@@ -6390,4 +6315,406 @@ Deno.test({
     assert(result.stdout.length === 262149);
     assert(result.stdout.endsWith("done\n"));
   },
+});
+Deno.test("managed retention publishes exact source PLAN before EXECUTE and trims only after intact completion", async () => {
+  for (const damage of [false, true]) {
+    const generations = [1, 2, 3].map((seed) =>
+      generationFixture(seed, WINDOW_START + seed * 3_600_000)
+    );
+    const entries = generations.map((generation, index) =>
+      catalogEntry(
+        generation,
+        WINDOW_START + index * 1000,
+      )
+    );
+    const old = {
+      schemaVersion: 1 as const,
+      catalog: entries,
+    };
+    const state: BackupV2ControllerState = {
+      schemaVersion: 2,
+      format: "backup-v2-controller",
+      legacy: old,
+      job: null,
+      catalog: entries.map((entry) => ({
+        schemaVersion: 1,
+        format: "backup-v1",
+        entry,
+      })),
+    };
+    const now = new Date(WINDOW_START + 10 * 86_400_000);
+    const h = harness({ now });
+    await h.deps.private.write(CONTROLLER_STATE_PATH, old);
+    const policy = { ...DEFAULT_BACKUP_V2_RETENTION_POLICY, execute: true };
+    await h.deps.private.write(B2_RETENTION_POLICY_PATH, policy);
+    await h.deps.private.write(B2_RETENTION_KEY_PATH, {
+      accessKeyId: "isolated-fixture-key",
+      secretAccessKey: "synthetic",
+      bucketId: "bucket",
+      bucketName: "pavlovcik-arch-vps-backups",
+    });
+    const uid = "00000000-0000-4000-8000-000000000099";
+    const boot = "00000000-0000-4000-8000-000000000098";
+    const date = now.toISOString();
+    const captureSettings: CaptureSettings = {
+      generation: "generation-" + uid,
+      sources: sourceConfig(),
+      recipientFile: "/fixture/recipient.asc",
+      recipientSha256: RECIPIENT_SHA256,
+      recipientFingerprint: RECIPIENT_FINGERPRINT,
+      exclusionsText: EXCLUSIONS_TEXT,
+    };
+    const cloud = new Map<string, BackupV2ListedVersion>(
+      inventoryFor(generations).map(
+        (object) => [object.fileId, { ...object, action: "upload" }],
+      ),
+    );
+    cloud.set("foreign-ballast", {
+      fileId: "foreign-ballast",
+      fileName: "foreign/blob",
+      contentLength: 256 * 1024 * 1024,
+      contentSha1: "a".repeat(40),
+      action: "upload",
+      uploadTimestamp: 1,
+    });
+    const journal: BackupV2RetentionJournalEntry[] = [];
+    const mutations: string[] = [];
+    let sourcePlan: Uint8Array | undefined, piPlan: Uint8Array | undefined;
+    let live: BackupV2Gate | null = null;
+    let observed: BackupV2ControllerObservation | null = null;
+    const cleared = new Set<string>();
+    const nativeDigest = "a".repeat(64);
+    const current = async () =>
+      (await h.deps.private.read<BackupV2RetentionControl>(
+        B2_RETENTION_CONTROL_PATH,
+      ))!;
+    const absent = (): BackupV2ControllerObservation => ({
+      sourceBootId: boot,
+      unit: "ABSENT",
+      identity: null,
+      status: null,
+      resultBytes: null,
+      tree: null,
+    });
+    h.deps.remote.root = (script) => {
+      if (script.includes("discoverBackupV2UnresolvedPuts")) {
+        return Promise.resolve({
+          code: 0,
+          stdout: JSON.stringify({
+            sourceBootId: boot,
+            gates: [],
+            unresolvedPuts: [],
+          }),
+          stderr: "",
+        });
+      }
+      if (script.includes("echo SOURCE_IDLE")) {
+        return Promise.resolve({
+          code: 0,
+          stdout: "SOURCE_IDLE\n",
+          stderr: "",
+        });
+      }
+      if (
+        script.includes("systemd-run") &&
+        script.includes("BACKUP_V2_PRUNE_GATE_ID")
+      ) {
+        assert(live !== null && script.includes(live.gateId));
+        assert(script.includes(REVISION + "/scripts/backup-v2-worker.ts"));
+        observed = {
+          ...absent(),
+          unit: "RUNNING",
+          identity: {
+            unitName: live.unitName,
+            invocationId: "a".repeat(32),
+            mainPid: 123,
+            mainStartTicks: "456",
+            cgroup: GATE_BACKUP_CGROUP_ROOT + "/" + live.unitName,
+          },
+        };
+      }
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    };
+    const caps = {
+      create(periodKey: string) {
+        const request: BackupV2Request = {
+          schemaVersion: 2,
+          format: "backup-v2",
+          profile: BACKUP_V2_PROFILE_ID,
+          jobId: "job-" + uid,
+          captureId: captureSettings.generation,
+          requestedAtUtc: date,
+          periodKey,
+          sourceRevision: REVISION,
+          sourceConfigSha256: backupV2SourceConfigSha256(captureSettings),
+          recipientSha256: RECIPIENT_SHA256,
+          recipientFingerprint: RECIPIENT_FINGERPRINT,
+        };
+        const envelope = {
+          request,
+          requestSha256: backupV2RequestSha256(request),
+        };
+        const gate = (kind: "worker" | "verify", gateId: string) =>
+          validateBackupV2Gate({
+            schemaVersion: 2,
+            format: "backup-v2",
+            owner: GATE_OWNER,
+            envelope,
+            gateId,
+            sourceBootId: boot,
+            kind,
+            unitName: ["arch-vps-b2-v2", kind, uid, gateId].join("-") +
+              ".service",
+            state: "PENDING",
+            custody: null,
+            remoteHost: GATE_REMOTE_HOST,
+            sourceLockPath: GATE_SOURCE_LOCK_PATH,
+            createdAtUtc: date,
+            updatedAtUtc: date,
+          });
+        return Promise.resolve({
+          schemaVersion: 2,
+          format: "backup-v2",
+          envelope,
+          captureSettings,
+          B2Settings: {
+            accessKeyId: "fixture-current-writer",
+            secretAccessKey: "synthetic",
+            bucketId: "bucket",
+            bucketName: "pavlovcik-arch-vps-backups",
+          },
+          workerGate: gate("worker", crypto.randomUUID()),
+          verifierGate: gate("verify", crypto.randomUUID()),
+          publicationAttemptId: crypto.randomUUID(),
+        });
+      },
+      gate: {
+        read: () => Promise.resolve(live),
+        replace(
+          expected: BackupV2Gate | null,
+          next: BackupV2Gate | null,
+        ) {
+          assert(JSON.stringify(expected) === JSON.stringify(live));
+          live = next;
+          if (!next && expected) {
+            cleared.add(expected.gateId);
+            observed = null;
+          }
+          return Promise.resolve();
+        },
+        cleared: (gate: BackupV2Gate) =>
+          Promise.resolve(cleared.has(gate.gateId)),
+      },
+      observe() {
+        return Promise.resolve(observed ?? absent());
+      },
+      async acknowledge() {},
+      async stop() {},
+      async persist(next: BackupV2ControllerState) {
+        await h.deps.private.write(CONTROLLER_STATE_PATH, next);
+      },
+    } as unknown as BackupV2ControllerCapabilities;
+    const cycle = () =>
+      runBackupV2RetentionCycle(state, h.deps, caps, "scheduled", {
+        async proveIdle() {},
+        async installRuntime() {},
+        readPlan(control, _deps, fetch) {
+          const ref = (control.plannedResult ?? control.result)!.plan;
+          if (fetch) {
+            assert(sourcePlan && !piPlan);
+            piPlan = sourcePlan.slice();
+          }
+          assert(piPlan && backupV2ArtifactSha256(piPlan) === ref.sha256);
+          return Promise.resolve();
+        },
+      });
+    const finishSource = async () => {
+      const control = await current(), gate = control.gate;
+      assert(gate.custody && observed);
+      const input = { ...control.input, gate };
+      const result = {
+        ...await runBackupV2SourcePruner(input, {
+          exactStore: {
+            bucketVersionsPage: (_cursor, prefix) =>
+              Promise.resolve({
+                items: [...cloud.values()].filter((object) =>
+                  !prefix || object.fileName.startsWith(prefix)
+                ),
+                next: null,
+              }),
+            unfinishedFilesPage: () =>
+              Promise.resolve({ items: [], next: null }),
+            unfinishedPartsPage: () =>
+              Promise.resolve({ items: [], next: null }),
+            async removeRetentionVersion(object) {
+              assert(piPlan);
+              assert(
+                await h.deps.private.read(
+                  retentionTransactionPath(input.transactionId, "report"),
+                ),
+              );
+              assert(
+                await h.deps.private.read(
+                  retentionTransactionPath(input.transactionId, "retirement"),
+                ),
+              );
+              assert(
+                (await h.deps.private.read<ControllerState>(
+                  CONTROLLER_STATE_PATH,
+                ))!.catalog.length === 3,
+              );
+              assert(cloud.delete(object.fileId));
+              mutations.push(object.fileId);
+            },
+          },
+          readGraphManifest: () => Promise.reject(Error("unexpected graph")),
+          readGraphPage: () => Promise.reject(Error("unexpected page")),
+          readPlan: () => Promise.resolve(sourcePlan!),
+          writePlanDurable(_id, bytes) {
+            sourcePlan = bytes.slice();
+            return Promise.resolve();
+          },
+          loadJournal: () => Promise.resolve(structuredClone(journal)),
+          appendDurable(_id, entry) {
+            journal.push(entry);
+            return Promise.resolve();
+          },
+          observeFresh: () => Promise.resolve(input),
+          validateLegacy: validateCatalogEntry,
+          now: () => now,
+          progress: () => Promise.resolve(),
+        }),
+        nativeCustodySha256: nativeDigest,
+      };
+      const resultBytes = backupV2ArtifactBytes(result);
+      observed = {
+        ...observed,
+        unit: "EXITED",
+        nativeCustodySha256: nativeDigest,
+        managerNamespaceReferences: 0,
+        resultBytes,
+        status: {
+          schemaVersion: 2,
+          format: "backup-v2",
+          envelope: gate.envelope,
+          gateId: gate.gateId,
+          sourceBootId: boot,
+          custody: gate.custody,
+          kind: "prune",
+          phase: "CLEANED",
+          activeRoleAttempt: null,
+          startedAtUtc: date,
+          updatedAtUtc: date,
+          finishedAtUtc: date,
+          resultSha256: backupV2ArtifactSha256(resultBytes),
+          progress: {
+            phase: "CLEANED",
+            observedMonotonicMs: 10,
+            sourceBytes: 0,
+            compressionInputBytes: 0,
+            verifiedChunks: 0,
+            decryptedBytes: 0,
+            inventoryMembers: 1,
+          },
+          lease: {
+            observedMonotonicMs: 10,
+            usefulProgressAtMs: 10,
+            usefulProgressExpiresAtMs: 120010,
+            retryEpisode: null,
+          },
+        },
+        tree: {
+          identity: gate.custody,
+          observedMonotonicMs: 10,
+          mainPid: 0,
+          controlPid: 0,
+          cgroupPopulated: false,
+          descendants: 0,
+          escapedProcesses: 0,
+          namespaceReferences: 0,
+          openPipelineHandles: 0,
+          pendingOperations: 0,
+          sourceLockFree: true,
+        },
+      };
+      return result;
+    };
+    await cycle(); // Plan launch from a settled old-format catalog.
+    await cycle(); // Bind and acknowledge.
+    const source = await finishSource();
+    assert(
+      source.state === "PLAN_PROVED" && source.summary.blockReason === null,
+      source.summary.blockReason ?? source.state,
+    );
+    await cycle(); // Accept bound plan result.
+    await cycle(); // Publish exact bytes and private report.
+    assert(piPlan && mutations.length === 0);
+    assert(
+      (await current()).input.stage === "EXECUTE",
+      (await current()).phase,
+    );
+    await cycle(); // Publish retirement intent, then launch.
+    await cycle(); // Bind and acknowledge.
+    if (damage) cloud.delete(generations[2].publishedIndex.object.fileId);
+    assert((await finishSource()).state === (damage ? "PARTIAL" : "COMPLETE"));
+    await cycle(); // Accept the bound CLEANED status even if result is PARTIAL.
+    const result = await cycle(); // Trim only after source final integrity proof.
+    const final = await h.deps.private.read<ControllerState>(
+      CONTROLLER_STATE_PATH,
+    );
+    assert(final?.catalog.length === (damage ? 3 : 2));
+    assert(
+      result?.status ===
+        (damage
+          ? "B2_RETENTION_CATALOG_DAMAGED"
+          : "B2_RETENTION_EXECUTE_COMPLETE"),
+    );
+    if (damage) {
+      assert(
+        result.retention!.damagedCaptureIds[0] === generations[2].generation,
+      );
+      assert(mutations.length === 0);
+    } else {
+      assert(Number(mutations.length) === UPLOAD_ROLE_ORDER.length + 1);
+      const control = await current();
+      const finished = (await h.deps.private.read<BackupV2PiRetentionReport>(
+        B2_RETENTION_REPORT_PATH,
+      ))!;
+      const newer = new Date(now.getTime() + 60_000).toISOString();
+      const damageId = "00000000-0000-4000-8000-000000000097";
+      await h.deps.private.write(B2_CATALOG_REPORT_PATH, {
+        ...finished,
+        transactionId: damageId,
+        status: B2_CATALOG_DAMAGED_ALERT,
+        observedAtUtc: newer,
+        healthy: false,
+        plan: {
+          ...finished.plan,
+          path: retentionTransactionPath(damageId, "plan"),
+        },
+        summary: {
+          ...finished.summary,
+          blockReason: "DAMAGED_ACCEPTED_GENERATION",
+          damagedCaptureIds: [generations[2].generation],
+        },
+      });
+      // Controller reached COMPLETE before its report publication settled.
+      h.privateMap.delete(
+        retentionTransactionPath(control.input.transactionId, "report"),
+      );
+      h.privateMap.delete(B2_RETENTION_REPORT_PATH);
+      h.clock.current = new Date(now.getTime() + 120_000);
+      const replay = await cycle();
+      assert(replay?.observedAtUtc === control.result!.finishedAtUtc);
+      const rebuilt = await h.deps.private.read<BackupV2PiRetentionReport>(
+        B2_RETENTION_REPORT_PATH,
+      );
+      const detected = await h.deps.private.read<BackupV2PiRetentionReport>(
+        B2_CATALOG_REPORT_PATH,
+      );
+      assert(
+        rebuilt && detected && rebuilt.observedAtUtc < detected.observedAtUtc,
+      );
+    }
+  }
 });

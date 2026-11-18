@@ -2,6 +2,16 @@
 
 Recorded 2026-09-22 for the online Backblaze backup path in this repository. These are implementation decisions made under the owner-controlled [PROJECT-VISION.md](PROJECT-VISION.md) charter. They do not amend, replace, or claim the authority of that charter, which wins on any conflict, and they stay inside the resource-budget and request-transport scope described here.
 
+## Two accepted Backblaze generations and orphan cleanup — 2026-11-18
+
+The owner approved this on 2026-11-18. “can you update the backup controller to only keep the latest two weeks of backups? also ideally if it can clear orphaned uploads...self cleaning....because we have a lot of failed uploads costing me storage $$$”
+
+Keep the newest two independently verified catalog generations by acceptance time, with exact capture ID breaking ties. The weekly scheduler normally records one accepted point per period. When fewer than two exist, preserve every intact point. If a retained exact version is missing or its metadata differs, mark that generation damaged, exclude it from the kept count, keep all intact older fallback entries, and block mutation. This handles the supervisor’s 2026-11-18 report of simultaneous manual deletions. A separate catalog verification command checks exact references without touching the bucket.
+
+Grace defaults to 72 hours. One transaction may delete at most half of the bucket's measured version and unfinished-part bytes by default. Execution and cleanup of eligible legacy orphan layouts require separate opt-ins. The same fenced source transaction handles exact accepted retirement and orphan cleanup, while foreign, unsettled, unknown, and shared references stay protected. Before deletion the controller verifies the source plan byte-for-byte on the Pi, writes a private report and journals any proposed catalog retirement. It compares the original catalog during handoff. Only after source completion and retained integrity proof does the Pi publish the trimmed catalog. Reports distinguish this run’s deletions, already-absent orphan attempts and damaged generations. Plans, outcomes and source journals are private; alerts project only fixed reasons, aggregate counts/bytes and affected generation IDs.
+
+The provider key remains scoped separately for backup and whole-bucket retention metadata. Historical retention records cannot enable execution. Maintenance uses the current verified release, leaving pinned capture settings and existing backup schedules intact. The policy, safe rollout and key requirements are in the [retention runbook](BACKUP-REPAIR-RUNBOOK.md#backblaze-retention-rollout). The upload-size proposal changes no exclusions.
+
 ## Backblaze verifier terminal reconciliation — 2026-11-18
 
 The Pi reconciles a successful verifier from the exact invocation's terminal status, result digest, native custody and receipt before settling the decrypt bridge. A clean exit can overlap a controller observation. A bounded pending observation keeps the gate, and the next reconciliation checks for terminal success before cancelling an ambiguously blocked verifier.

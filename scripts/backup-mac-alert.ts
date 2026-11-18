@@ -1,11 +1,19 @@
 import { withBackupLock } from "./backup-lock.ts";
 import { readPrivateJson, writePrivateJson } from "./oci.ts";
+import {
+  B2_CATALOG_DAMAGED_ALERT,
+  B2_RETENTION_ORPHAN_ALERT,
+  retentionAlertSummary,
+  validateRetentionSummary,
+} from "./backup-v2-retention-report.ts";
+import type { BackupV2RetentionSummary } from "./backup-v2-retention.ts";
 
 export const DEFAULT_ALERT_DESTINATION = "https://ntfy.pavlovcik.com/alerts";
 export const ALERT_REMINDER_MS = 6 * 60 * 60_000;
 export const ALERT_RETRY_MS = 15 * 60_000;
 const ALERT_DELIVERY_TIMEOUT_MS = 10_000;
 const MAX_DELIVERIES_PER_RUN = 4;
+const MAX_DAMAGED_GENERATIONS_PER_ALERT = 16;
 const MAX_RECEIPT_BYTES = 8192;
 const CLAIM_CUSTODY_OVERDUE = "SCHEDULED_CLAIM_CUSTODY_OVERDUE";
 
@@ -14,6 +22,7 @@ const streams = [
   "backblaze-scheduled",
   "oracle-watchdog",
   "backblaze-watchdog",
+  "backblaze-retention",
 ] as const;
 
 const reasons = [
@@ -38,6 +47,9 @@ const reasons = [
   "B2_PROGRESS_FAILED",
   "B2_PROGRESS_STALLED",
   "B2_RETENTION_BLOCKED",
+  "B2_RETENTION_REPORT_AVAILABLE",
+  B2_RETENTION_ORPHAN_ALERT,
+  B2_CATALOG_DAMAGED_ALERT,
   "B2_WATCHDOG_CHECK_FAILED",
   "SCHEDULE_CLAIM_RECONCILIATION_REQUIRED",
   "SCHEDULED_CLAIM_OWNER_LIVE",
@@ -53,9 +65,16 @@ type AlertStream = typeof streams[number];
 type AlertReason = typeof reasons[number];
 export type BackupAlertOutcome = AlertReason | "HEALTHY" | "DEFERRED";
 
+interface RetentionAlertEvidence {
+  transactionId: string;
+  summary: BackupV2RetentionSummary;
+  damagedTotal?: number;
+}
+
 export interface BackupAlertObservation {
   stream: AlertStream;
   outcome: BackupAlertOutcome;
+  retention?: RetentionAlertEvidence;
 }
 
 interface AlertRecord {
@@ -67,6 +86,7 @@ interface AlertRecord {
   stream?: AlertStream;
   lastAttemptAtUtc?: string;
   deliveredAtUtc?: string;
+  retention?: RetentionAlertEvidence;
 }
 
 interface AlertLedger {
@@ -90,6 +110,42 @@ export function backupAlertReason(
 ): AlertReason {
   const code = typeof status === "string" ? status.split(":", 1)[0] : undefined;
   return reasons.find((reason) => reason === code) ?? fallback;
+}
+
+export function backupRetentionAlert(report: {
+  status?: unknown;
+  retentionStatus?: unknown;
+  retentionTransactionId?: unknown;
+  retention?: unknown;
+}): BackupAlertObservation | undefined {
+  const status = report.retentionStatus ?? report.status;
+  const txn = report.retentionTransactionId;
+  if (
+    typeof txn !== "string" ||
+    !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(txn) ||
+    typeof status !== "string" ||
+    ![
+      "B2_RETENTION_EXECUTE_COMPLETE",
+      "B2_RETENTION_EXECUTE_PARTIAL",
+      "B2_RETENTION_PLAN_ONLY",
+      "B2_RETENTION_PLAN_BLOCKED",
+      "B2_RETENTION_CATALOG_VERIFIED",
+      B2_RETENTION_ORPHAN_ALERT,
+      B2_CATALOG_DAMAGED_ALERT,
+    ].includes(status)
+  ) return undefined;
+  const summary = validateRetentionSummary(report.retention);
+  return {
+    stream: "backblaze-retention",
+    outcome: summary.damagedCaptureIds.length
+      ? B2_CATALOG_DAMAGED_ALERT
+      : status === B2_RETENTION_ORPHAN_ALERT
+      ? B2_RETENTION_ORPHAN_ALERT
+      : summary.blockReason || status.endsWith("_PARTIAL")
+      ? "B2_RETENTION_BLOCKED"
+      : "B2_RETENTION_REPORT_AVAILABLE",
+    retention: { transactionId: txn, summary },
+  };
 }
 
 function isAlertStream(value: unknown): value is AlertStream {
@@ -166,8 +222,54 @@ function updateLedger(
   now: Date,
 ): boolean {
   let updated = false;
-  for (const { stream, outcome } of observations) {
+  for (const { stream, outcome, retention } of observations) {
     if (outcome === "DEFERRED") continue;
+    if (stream === "backblaze-retention") {
+      const proposed = retention;
+      if (!proposed) continue;
+      const summary = validateRetentionSummary(proposed.summary),
+        damagedTotal = summary.damagedCaptureIds.length;
+      for (
+        let offset = 0;
+        offset < Math.max(damagedTotal, 1);
+        offset += MAX_DAMAGED_GENERATIONS_PER_ALERT
+      ) {
+        const batch = {
+          ...summary,
+          damagedCaptureIds: summary.damagedCaptureIds.slice(
+            offset,
+            offset + MAX_DAMAGED_GENERATIONS_PER_ALERT,
+          ),
+        };
+        const previous = ledger.records.findLast((record) =>
+          record.stream === stream &&
+          record.retention?.transactionId === proposed.transactionId &&
+          record.status === outcome &&
+          JSON.stringify(record.retention.summary) === JSON.stringify(batch)
+        );
+        const reminderDue = (outcome === B2_RETENTION_ORPHAN_ALERT ||
+          outcome === B2_CATALOG_DAMAGED_ALERT) &&
+          previous?.deliveredAtUtc !== undefined &&
+          now.getTime() - Date.parse(previous.deliveredAtUtc) >=
+            ALERT_REMINDER_MS;
+        if (previous && !reminderDue) continue;
+        ledger.records.push({
+          id: crypto.randomUUID(),
+          stream,
+          status: outcome,
+          healthy: outcome === "B2_RETENTION_REPORT_AVAILABLE",
+          observedAtUtc: now.toISOString(),
+          attempts: 0,
+          retention: {
+            transactionId: proposed.transactionId,
+            summary: batch,
+            damagedTotal,
+          },
+        });
+        updated = true;
+      }
+      continue;
+    }
     const previous = ledger.records.findLast((record) =>
       record.stream === stream
     );
@@ -202,16 +304,35 @@ async function publishAlert(
   request: typeof fetch,
 ): Promise<boolean> {
   const service = record.stream ?? "backup-watchdog";
-  const reason = record.healthy
+  const reason = record.healthy && !record.retention
     ? "BACKUP_RECOVERED"
     : backupAlertReason(record.status, "WATCHDOG_CHECK_FAILED");
   const timestamp = new Date(record.observedAtUtc).toISOString();
-  const message = `${service} ${reason} ${timestamp}`;
+  const summary = record.retention
+    ? validateRetentionSummary(record.retention.summary)
+    : undefined;
+  const damaged = summary?.damagedCaptureIds ?? [];
+  const total = record.retention?.damagedTotal;
+  const message = [
+    `${service} ${reason} ${timestamp}`,
+    ...(summary ? [retentionAlertSummary(summary)] : []),
+    ...(damaged.length
+      ? [
+        `Damaged accepted generations (${
+          Number.isSafeInteger(total) ? total : damaged.length
+        }) include ${damaged.join(", ")}`,
+      ]
+      : []),
+  ].join("\n");
   const response = await request(destination, {
     method: "POST",
     redirect: "error",
     signal: AbortSignal.timeout(ALERT_DELIVERY_TIMEOUT_MS),
-    headers: { Title: "VPS backups", "Content-Type": "text/plain" },
+    headers: {
+      Title: "VPS backups",
+      "Content-Type": "text/plain",
+      ...(damaged.length ? { Priority: "5" } : {}),
+    },
     body: message,
   });
   const reader = response.body?.getReader();
@@ -310,9 +431,10 @@ async function reportScheduledObservation(
   observation: BackupAlertObservation,
   notify: AlertNotifier,
   log: (message: string) => void,
+  extra?: BackupAlertObservation,
 ): Promise<void> {
   try {
-    const delivery = await notify([observation]);
+    const delivery = await notify(extra ? [observation, extra] : [observation]);
     if (delivery.notificationError) log(delivery.notificationError);
   } catch {
     log("BACKUP_ALERT_RECORD_FAILED");
@@ -327,6 +449,7 @@ export async function runWithBackupAlert<T>(
   classify: (result: T) => BackupAlertOutcome,
   notify: AlertNotifier = notifyBackupAlerts,
   log: (message: string) => void = console.error,
+  extra?: (result: T) => BackupAlertObservation | undefined,
 ): Promise<T> {
   let result: T, outcome: BackupAlertOutcome;
   try {
@@ -344,7 +467,12 @@ export async function runWithBackupAlert<T>(
     );
     throw error;
   }
-  await reportScheduledObservation({ stream, outcome }, notify, log);
+  await reportScheduledObservation(
+    { stream, outcome },
+    notify,
+    log,
+    extra?.(result),
+  );
   return result;
 }
 

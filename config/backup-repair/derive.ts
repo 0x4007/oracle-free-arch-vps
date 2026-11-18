@@ -22,6 +22,8 @@ const pending = [
   ...b2Entries,
   "scripts/alerting-backup-scheduled.ts",
   "scripts/scheduled-backblaze-file-backup.ts",
+  "scripts/plan-backblaze-retention.ts",
+  "scripts/verify-backblaze-catalog.ts",
   "scripts/backup-watchdog.ts",
   "scripts/calendar-observations.ts",
   "scripts/pi-recovery-session.ts",

@@ -304,6 +304,145 @@ The old watchdog only queued a changed combined status and sent it to the Mac's 
 
    The rollback checks each managed file against the saved snapshots, restores the former bytes and modes, and preserves any candidate additions in the rollback directory. Verify the old receipt, selector, top-level manifest and effective unit paths. After confirming the previous revision can run, restore the timer states captured in step 2 and use the applicable rearm checks in steps 6 and 7. Preserve any new refusal evidence for exact-job diagnosis.
 
+## Backblaze retention rollout
+
+Use the standard deployment procedure above through step 4. Keep the Backblaze service and its timer paused during the key and policy changes. Preserve the existing controller lock inode, accepted catalog and all retirement journals. Only the supervisor runs these commands against the Pi and Backblaze.
+
+1. **Install the archive and configure both scoped keys.** Rotate the exposed backup writer to a key restricted to `pavlovcik-arch-vps-backups` and prefix `restic/`. Its exact runtime capabilities are `listFiles`, `readFiles`, `writeFiles` and `deleteFiles`. Capture and restore authenticate under that existing scope. The separate retention key is restricted to the same single bucket with no filename prefix and needs `listFiles` for versions and unfinished-file listing, `writeFiles` to list parts and cancel unfinished large files, and `deleteFiles` to remove exact versions. Whole-bucket visible metadata supplies the byte denominator. The controller obtains the exact bucket ID and name from `b2_authorize_account`. It does not call `b2_list_buckets` and needs neither `listBuckets` nor `listAllBucketNames`. The latter capability reveals account-wide bucket names. The retention code confirms size and B2 SHA-1 metadata from exact versions, so the retention key does not require `readFiles`. Neither controller key needs bucket settings, delegation, or governance permissions. [Application keys](https://www.backblaze.com/docs/cloud-storage-application-keys) [List versions](https://www.backblaze.com/apidocs/b2-list-file-versions) [List unfinished files](https://www.backblaze.com/apidocs/b2-list-unfinished-large-files) [List parts](https://www.backblaze.com/apidocs/b2-list-parts) [Cancel large file](https://www.backblaze.com/apidocs/b2-cancel-large-file) [Delete exact version](https://www.backblaze.com/apidocs/b2-delete-file-version)
+
+   On the Pi update only `accessKeyId` and `secretAccessKey` in the private `.private/b2-file-backup.json` writer config. Preserve its bucket identity, sources and recipient binding. Put the separate retention key in `.private/file-backup/retention-key.json` with exactly `accessKeyId`, `secretAccessKey`, `bucketId` and `bucketName`. Keep both files at mode `0600` and publish their complete replacements atomically under the existing controller lock when both gates and transactions are settled. Use a private editor or secret manager separate from transcripts and shell history. The controller copies each selected key only in the root-owned mode-`0600` `settings.json` for its immutable VPS runtime under `/var/tmp/arch-vps-file-backup-runtime/jobs/<job-id>/`. Preserve past runtime bindings. Future jobs receive the selected new key through the existing authenticated installation transport.
+
+   Verify the writer without printing settings, IDs or B2 responses. From the deployed Pi controller directory, issue one bounded version-list read with the new writer's exact scope. This also exercises the same authorization capability check as capture. Keep the old key unreused and revoke it under the supervisor's rotation procedure once replacement key readback and settled custody are proved.
+
+   ```bash
+   /usr/local/bin/safepi deno run --no-prompt --allow-read=.,.private \
+     --allow-run=/usr/bin/curl - <<'DENO'
+   import { loadSourceConfig, realPiDeps } from "./scripts/backblaze-file-backup.ts";
+   import { BACKUP_V2_NAMESPACE } from "./scripts/backup-v2-profile.ts";
+   import { BackupV2Store } from "./scripts/backup-v2-store.ts";
+   try {
+     const { b2 } = await loadSourceConfig(realPiDeps());
+     await new BackupV2Store(b2).versionsPage(BACKUP_V2_NAMESPACE, null);
+     console.log("B2_WRITER_KEY_SCOPE_PROVED");
+   } catch {
+     console.error("B2_WRITER_KEY_SCOPE_UNPROVED");
+     Deno.exitCode = 1;
+   }
+   DENO
+   ```
+
+2. **Verify the live catalog, then review a read-only plan before opting into deletion.** Keep execution disabled while doing the initial review. The controller defaults to the policy below when `.private/file-backup/retention-policy.json` is absent. Each property is optional. Existing deployed four-generation retention records and old receipts cannot opt into execution. The manual catalog command checks only exact catalog objects with matching provider IDs, names, lengths and applicable hash metadata. It leaves the bucket untouched even when the execution flag is enabled and does not launch a capture or clean source scratch. Verification does not download or decrypt archive payloads.
+
+   ```json
+   {
+     "keepAccepted": 2,
+     "orphanGraceHours": 72,
+     "maxDeleteFraction": 0.5,
+     "cleanLegacyOrphans": false,
+     "execute": false
+   }
+   ```
+
+   From the deployed Pi controller directory, use the same managed invocation for both commands. Each invocation reconciles one bounded slice. If it returns a running status, keep the exact transaction and rerun that command after its source unit progresses, or let the existing Backblaze service reconcile it. Inspect the private report for that run. Retention stays fenced while the exact source gate is held. A settled normal plan-only report allows the next due backup to start.
+
+   ```bash
+   umask 077
+   cd /home/pi/ops/weekly-backup-controller
+   /usr/local/bin/safepi deno run --no-prompt --allow-read=.,.private \
+     --allow-write=.private --allow-run --allow-sys=uid --allow-net \
+     scripts/verify-backblaze-catalog.ts
+
+   november=generation-61d5c174-45ff-4d7d-baec-57d06da81e89
+   october=generation-0846ac72-2994-4b1e-8629-9cab95462b3e
+   jq -e --arg november "$november" --arg october "$october" '
+     .status == "B2_RETENTION_CATALOG_VERIFIED" and .healthy and
+     .summary.damagedCaptureIds == [] and
+     (.checkedCaptureIds | index($november) != null and index($october) != null)
+   ' .private/reports/backblaze-catalog-verification.json
+
+   /usr/local/bin/safepi deno run --no-prompt --allow-read=.,.private \
+     --allow-write=.private --allow-run --allow-sys=uid --allow-net \
+     scripts/plan-backblaze-retention.ts
+   report=.private/reports/backblaze-retention.json
+   jq '{transactionId,observedAtUtc,status,policy,plan,retainedCaptureIds,summary}' "$report"
+   plan=$(jq -er '.plan.path | select(test("^\\.private/file-backup/retention/[0-9a-f-]{36}/plan\\.json$"))' "$report")
+   test "$(sha256sum "$plan" | cut -d' ' -f1)" = "$(jq -er '.plan.sha256' "$report")"
+   jq -e --arg november "$november" --arg october "$october" '
+     .policy.execute == false and .summary.blockReason == null and
+     .summary.damagedCaptureIds == [] and
+     (.retainedCaptureIds | index($november) != null and index($october) != null)
+   ' "$report"
+   jq '{retainedCaptureIds,retiredCaptureIds,evidence,summary}' "$plan"
+   ```
+
+   Confirm both named IDs and the transaction time before enabling execution. The report points to a private mode-`0600` plan with each candidate's exact identity, category, counts, bytes and eligibility evidence. Review version and unfinished-part bytes, unclassified/foreign bytes, and the cap. A damaged accepted generation raises an urgent alert with its ID. Keep intact older fallback entries while damage exists. A separately approved boot restore is still required for machine boot proof.
+
+   A plan-only report can flag orphans while deletion is disabled. Review a candidate individually with `jq '.candidates[] | select(.reason == "UNACCEPTED_V2")' "$plan"` on the Pi. Share only counts, categories and the allowed named generation IDs. The controller state contains credential-bearing job settings. Every report and operator command above uses an allowlisted projection.
+
+3. **Enable execution only after reviewing the real plan and verifying both survivors.** Leave `cleanLegacyOrphans` off for the first execution. Enabling the flag starts a fresh transaction that builds and writes its own complete plan before any effect. In the Pi directory, run the following under the existing controller lock with the service and its timer paused.
+
+   ```bash
+   flock -n .private/backup-controller.lock bash -euo pipefail -c '
+     umask 077
+     gate=.private/backup-controller-gate.json
+     test ! -e "$gate" && test ! -L "$gate"
+     for file in .private/file-backup/retention/{controller-v2,catalog-controller-v2}.json; do
+       if [[ -e $file ]]; then
+         jq -e '\''(.phase == "PLAN_ONLY" or .phase == "COMPLETE")'\'' "$file" >/dev/null
+       fi
+     done
+     policy=.private/file-backup/retention-policy.json
+     candidate=$(mktemp "${policy}.XXXXXX")
+     trap '\''rm -f -- "$candidate"'\'' EXIT
+     if [[ -e $policy ]]; then
+       jq '\''.execute = true'\'' "$policy" > "$candidate"
+     else
+       printf '\''%s\n'\'' '\''{"execute":true}'\'' > "$candidate"
+     fi
+     chmod 0600 "$candidate"
+     mv -T -- "$candidate" "$policy"
+   '
+   systemctl --user start backblaze-file-backup.service
+   journalctl --user -u backblaze-file-backup.service --no-pager -o cat -n 30
+   jq '{status,summary,retainedCaptureIds}' .private/reports/backblaze-retention.json
+   ```
+
+   Follow standard steps 5 through 7 to rearm existing schedules. A complete execution reports actual delete counts and bytes separately from prior removals reconciled as already absent. The transaction's private catalog retirement record preserves the preimage. A partial run retains the exact plan, mutation intent and source journal. To retry a transient failure, run the same existing service with that transaction, policy and credentials intact. After a catalog damage or identity mismatch, resolve the cause with the read-only verification command and retain all receipts. Avoid rerunning deletion with a new plan over an unsettled partial transaction. Verify both designated survivors again after the first execution. Before any rollback to a historical four-generation release, leave its Backblaze service paused until the supervisor explicitly reviews the retired legacy deletion path and catalog. That release predates the opt-in flag.
+
+   For a later legacy cleanup review, put reviewed authority in the private policy. For a settled old direct-v1 capture outside the accepted catalog, `retiredLegacyCaptures` may list exact `captureId`, ISO UTC `retiredAtUtc` and SHA-256 `evidenceSha256` for the operator's ownership and retirement record. For an explicitly retired historic Restic repository, `retiredRestic` can identify its exact `prefix`, `retiredAtUtc` and `evidenceSha256`. Only recognized names under that reviewed path are eligible after the grace period. An active or unknown job or a live accepted reference still protects its data. Plan those changes and review before setting `cleanLegacyOrphans: true`.
+
+### Native B2 lifecycle rules
+
+Use the controller for the deployed shared backup namespaces. A native rule cannot verify catalog IDs, active custody, the upload-age grace for hidden data, fractional byte caps, or the private plan and delete journal. A retained exact version can have been hidden by a later upload or an explicit hide. A native one-day hidden rule can therefore remove a retained older version, and the one-day clock starts at hiding, not original upload. Backblaze applies lifecycle rules daily and uses the shortest value where matching prefixes overlap. Do not add a rule for `""`, `restic/`, `restic/backup-v2/`, or `restic/direct-v1/`.
+
+A separately approved, isolated, retired prefix can use the exact rule below only after the operator verifies the prefix has no accepted references, active writers or ongoing uploads, all versions already satisfy the configured upload grace, the resulting deletion fits the approved byte cap, and any overlapping rule leaves the same limits. Replace the placeholder with that exact verified prefix. The cancellation value is the configured upload grace rounded up to whole days (3 for the default 72 hours). The hidden rule removes hidden versions on a later daily pass once one day hidden. It does not age out current visible versions. Keep automatic hiding null. No native rule is required for the current active bucket paths. Only the supervisor can update a lifecycle rule with the appropriate separate bucket settings authority. [B2 lifecycle rules](https://www.backblaze.com/docs/cloud-storage-lifecycle-rules) [Update bucket](https://www.backblaze.com/apidocs/b2-update-bucket)
+
+```json
+[
+  {
+    "fileNamePrefix": "<reviewed-isolated-retired-prefix>/",
+    "daysFromStartingToCancelingUnfinishedLargeFiles": 3,
+    "daysFromHidingToDeleting": 1,
+    "daysFromUploadingToHiding": null
+  }
+]
+```
+
+### Upload-size proposal
+
+No exclusions change in this release. The following VPS numbers are allocated disk bytes from a bounded `nice -n 19 du -sx -B1` pass as `codex` on 2026-11-18. They are neither encrypted archive sizes nor bucket inventory.
+
+| Candidate | Observed allocated bytes | Restore consequence |
+| --- | ---: | --- |
+| Worktree `.data` under seven accessible repo worktrees | 18,583,552 | `/home/codex/repos` already covers these paths. Build artifacts must be regenerated. Private app repos excluded from the observation were skipped. No further upload saving from a nested exclusion. |
+| User cache, Codex cache and Codex downloaded packages | 2,884,886,528 + 85,565,440 + 1,954,066,432 | Existing exclusions already cover these. Restore repopulates download/cache data. Codex sessions and config remain covered. |
+| Pacman package cache | 1,012,047,872 | Already excluded. Restore retains the package database and redownloads package archives as needed. |
+| `/var/tmp/arch-vps-file-backup*` | Unmeasured with ordinary user access | `/var/tmp` already covers backup scratch and immutable source runtimes. Restore reinstalls the checked release and recreates task scratch. Live recovery does not depend on copied temporary directories. |
+| `~/.bun/install/cache` and `~/.cargo/registry/cache` | 845,766,656 + 89,337,856 | Candidates for a later exclusion after reviewing package sources. Restore redownloads registries and package caches, so offline or retired packages lose the local copy. Keep credentials and non-cache toolchain state. |
+| `~/.cargo/registry/src` and `~/.npm/_npx` | Cargo source timed out in the bounded pass; npm 8,192 | Registry source may contain local modifications. Review ownership before excluding. npm temporary packages can be reinstalled, with negligible observed saving. |
+| Docker image/build layers and containerd overlay data | Unmeasured with ordinary user access | Keep writable layers, volumes and stateful container data. Exclude only confirmed reproducible image/build-cache subtrees after an operator measures them and proves image redeploy or pull by digest. A whole Docker/containerd exclusion would lose local container state. |
+
+
 ## Use another ntfy hostname
 
 The shipped Oracle and watchdog commands permit `ntfy.pavlovcik.com`. Editing only the private notification JSON is sufficient for a different topic at that host. For another host or port, use existing systemd user drop-ins with the exact corresponding permission. In these examples replace `alerts.example.net:443` with the permitted server including its port when nondefault. Preserve the archived source and manifest bytes.

@@ -362,15 +362,22 @@ function verifyAllowedScope(
   operation: string,
   settings: B2Settings,
   allowed: JsonRecord,
+  scope: "backup" | "retention" = "backup",
 ): void {
   const capabilities = stringArray(allowed["capabilities"]);
   if (capabilities === null) throw invalidResponse(operation, "capabilities");
-  for (const required of REQUIRED_CAPABILITIES) {
+  const requiredCapabilities = scope === "retention"
+    ? ["listFiles", "writeFiles", "deleteFiles"]
+    : REQUIRED_CAPABILITIES;
+  for (const required of requiredCapabilities) {
     if (!capabilities.includes(required)) {
       throw operationError(operation, `capability ${required} not granted`);
     }
   }
-  if (allowed["namePrefix"] !== ALLOWED_NAME_PREFIX) {
+  if (
+    allowed["namePrefix"] !==
+      (scope === "retention" ? null : ALLOWED_NAME_PREFIX)
+  ) {
     throw operationError(operation, "allowed namePrefix rejected");
   }
   const buckets = bucketScope(operation, allowed);

@@ -10,16 +10,17 @@ import {
   type BackupV2ObjectRef,
 } from "../scripts/backup-v2-contract.ts";
 import { createBackupV2InventorySummary } from "../scripts/backup-v2-inventory.ts";
-import {
-  BACKUP_V2_NAMESPACE,
-  BACKUP_V2_PROFILE_ID,
-} from "../scripts/backup-v2-profile.ts";
+import { BACKUP_V2_PROFILE_ID } from "../scripts/backup-v2-profile.ts";
 import {
   type BackupV2ProtectionBundle,
   type BackupV2PruneInput,
   buildBackupV2Protection,
 } from "../scripts/backup-v2-protection.ts";
-import type { BackupV2RetentionJournalEntry } from "../scripts/backup-v2-retention.ts";
+import {
+  type BackupV2RetentionJournalEntry,
+  DEFAULT_BACKUP_V2_RETENTION_POLICY,
+} from "../scripts/backup-v2-retention.ts";
+import type { BackupV2ListedVersion } from "../scripts/backup-v2-contract.ts";
 import {
   type BackupV2CatalogEntry,
   type BackupV2Request,
@@ -283,7 +284,9 @@ function fixture() {
     exclusive = object(1, 201),
     orphan = object(1, 999, "tools"),
     bundles = new Map<string, BackupV2ProtectionBundle>(),
-    cloud = new Map<string, BackupV2ObjectRef>();
+    cloud = new Map<string, BackupV2ListedVersion>();
+  const add = ({ sha256: _sha, ...ref }: BackupV2ObjectRef) =>
+    cloud.set(ref.fileId, ref);
   for (const entry of entries) {
     const number = entries.indexOf(entry) + 1;
     const bundle = buildBackupV2Protection(entry.selectedRoot.reference, [
@@ -292,20 +295,18 @@ function fixture() {
     ]);
     bundles.set(bundle.descriptor.manifestSha256, bundle);
     for (const page of bundle.pages) {
-      for (const ref of page.value.objects) cloud.set(ref.fileId, ref);
+      for (const ref of page.value.objects) add(ref);
     }
-    cloud.set(
-      entry.receiptReference.object.fileId,
-      entry.receiptReference.object,
-    );
+    add(entry.receiptReference.object);
   }
-  cloud.set(orphan.fileId, orphan);
+  add(orphan);
   const input: BackupV2PruneInput = {
     schemaVersion: 2,
     format: "backup-v2-prune",
     gate,
     transactionId,
     stage: "PLAN",
+    scratchCleanupRequestSha256: null,
     plan: null,
     snapshot: {
       custody: {
@@ -314,6 +315,13 @@ function fixture() {
         sourceSettled: true,
       },
       catalog: entries,
+      plannedAtUtc: END,
+      jobs: [],
+      policy: {
+        ...DEFAULT_BACKUP_V2_RETENTION_POLICY,
+        keepAccepted: 4,
+        execute: true,
+      },
       protection: {
         acceptedRoots: [],
         activeObjects: [],
@@ -331,22 +339,18 @@ function fixture() {
   let lists = 0, reads = 0, writes = 0;
   const caps: BackupV2SourcePrunerCapabilities = {
     exactStore: {
-      versionsPage(prefix) {
-        assert(prefix === BACKUP_V2_NAMESPACE);
+      bucketVersionsPage(_cursor, prefix) {
         lists++;
         return Promise.resolve({
-          items: [...cloud.values()].map(({ sha256: _sha, ...ref }) => ref),
+          items: [...cloud.values()].filter((ref) =>
+            !prefix || ref.fileName.startsWith(prefix)
+          ),
           next: null,
         });
       },
-      reconcileExact(ref) {
-        const found = cloud.get(ref.fileId);
-        if (found && !isDeepStrictEqual(found, ref)) {
-          throw Error("Identity drift");
-        }
-        return Promise.resolve(found ? "PRESENT" : "ABSENT");
-      },
-      removeExact(ref) {
+      unfinishedFilesPage: () => Promise.resolve({ items: [], next: null }),
+      unfinishedPartsPage: () => Promise.resolve({ items: [], next: null }),
+      removeRetentionVersion(ref) {
         assert(cloud.has(ref.fileId));
         cloud.delete(ref.fileId);
         removed.push(ref.fileId);
@@ -552,7 +556,7 @@ Deno.test("source pruner rejects stale protection/gate custody and preserves par
   const plan = JSON.parse(
       new TextDecoder().decode(h.plans.get(h.input.transactionId)!),
     ),
-    target = plan.candidates[0];
+    target = plan.candidates[0].object;
   h.caps.loadJournal = () =>
     Promise.resolve([{
       planSha256: plan.digest,
@@ -571,8 +575,8 @@ Deno.test("source pruner rejects stale protection/gate custody and preserves par
 Deno.test("source pruner keeps an ambiguous journal and reconciles definite absence before resume", async () => {
   const f = fixture();
   await f.execute();
-  const remove = f.caps.exactStore.removeExact;
-  f.caps.exactStore.removeExact = async (ref) => {
+  const remove = f.caps.exactStore.removeRetentionVersion;
+  f.caps.exactStore.removeRetentionVersion = async (ref) => {
     await remove(ref);
     throw Error("Response lost");
   };
@@ -580,7 +584,7 @@ Deno.test("source pruner keeps an ambiguous journal and reconciles definite abse
     (await runBackupV2SourcePruner(f.input, f.caps)).state === "PARTIAL" &&
       f.removed.length === 1 && f.journal[1].state === "AMBIGUOUS",
   );
-  f.caps.exactStore.removeExact = remove;
+  f.caps.exactStore.removeRetentionVersion = remove;
   assert(
     (await runBackupV2SourcePruner(f.input, f.caps)).state === "COMPLETE" &&
       Number(f.removed.length) === 10 && f.journal[2].state === "ABSENT",
@@ -602,11 +606,14 @@ Deno.test("source pruner rejects absent journals and stops on durable intent fai
       g.removed.length === 0,
   );
 });
-Deno.test("source pruner preserves the mixed four-root floor and leaves legacy obsolete IDs to core", async () => {
+Deno.test("source pruner keeps a single verified root and deletes legacy exact versions in the same journal", async () => {
   const f = fixture();
-  f.input.snapshot.catalog = [catalog(3), catalog(4), catalog(5)];
-  await rejects(() => runBackupV2SourcePruner(f.input, f.caps));
-  assert(f.stats().lists === 0);
+  f.input.snapshot.catalog = [catalog(5)];
+  f.input.graphs = [f.input.graphs[4]];
+  assert(
+    (await runBackupV2SourcePruner(f.input, f.caps)).retainedCaptureIds
+      .length === 1,
+  );
   const g = fixture();
   g.input.snapshot.catalog = [
     legacy(1),
@@ -615,11 +622,27 @@ Deno.test("source pruner preserves the mixed four-root floor and leaves legacy o
     legacy(4),
     catalog(5),
   ];
+  for (let n = 1; n <= 4; n++) {
+    const entry = legacy(n).entry, object = entry.publishedIndex.object;
+    g.cloud.set(object.fileId, { ...object, action: "upload" });
+    for (const archive of entry.index.archives) {
+      for (const chunk of archive.chunks) {
+        g.cloud.set(chunk.fileId, {
+          fileId: chunk.fileId,
+          fileName: chunk.name,
+          contentLength: chunk.size,
+          contentSha1: chunk.sha1,
+          uploadTimestamp: chunk.uploadTimestamp,
+          action: "upload",
+        });
+      }
+    }
+  }
   g.input.graphs = [g.input.graphs[4]];
   const result = await g.execute();
   assert(result.obsoleteLegacyCaptureIds[0] === capture(1));
   assert(
     (await runBackupV2SourcePruner(g.input, g.caps)).state === "COMPLETE" &&
-      g.removed.length === 0,
+      g.removed.length === 8,
   );
 });

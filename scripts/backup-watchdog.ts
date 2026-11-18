@@ -7,8 +7,10 @@ import {
 import { readPrivateJson, writePrivateJson } from "./oci.ts";
 import {
   type BackupAlertDelivery,
+  type BackupAlertObservation,
   type BackupAlertOutcome,
   backupAlertReason,
+  backupRetentionAlert,
   notifyBackupAlerts,
 } from "./backup-mac-alert.ts";
 import { readGate } from "./backblaze-controller-gate.ts";
@@ -22,6 +24,7 @@ import {
   assessBackblazeWatchdog,
   type ControllerState,
   type ObservedSource,
+  realPrivateSeam,
   realRemoteRunner,
   realRemoteSeam,
   STALE_AFTER_MS,
@@ -35,6 +38,7 @@ import {
   type BackupV2ControllerState,
   observeBackupV2Source,
   readBackupRuntimeGate,
+  readBackupV2RetentionControl,
   validateBackupV2ControllerState,
 } from "./backup-v2-controller.ts";
 import {
@@ -45,18 +49,59 @@ import {
   validateBackupV2Status,
 } from "./backup-v2-runtime-contract.ts";
 
+import {
+  B2_CATALOG_DAMAGED_ALERT,
+  B2_CATALOG_REPORT_PATH,
+  B2_RETENTION_REPORT_PATH,
+  type BackupV2PiRetentionReport,
+  retentionTransactionPath,
+  validateRetentionPlanReference,
+  validateRetentionSummary,
+} from "./backup-v2-retention-report.ts";
+
+async function readRetentionReport(path: string, now: Date) {
+  try {
+    const value = await readPrivateJson<BackupV2PiRetentionReport>(path);
+    if (
+      value.schemaVersion !== 1 ||
+      value.format !== "backblaze-retention-report" ||
+      new Date(value.observedAtUtc).toISOString() !== value.observedAtUtc ||
+      Date.parse(value.observedAtUtc) > now.getTime() ||
+      value.plan.path !== retentionTransactionPath(value.transactionId, "plan")
+    ) return undefined;
+    validateRetentionPlanReference(value.plan);
+    const report = {
+      observedAtUtc: value.observedAtUtc,
+      retentionStatus: value.status,
+      retentionTransactionId: value.transactionId,
+      retention: validateRetentionSummary(value.summary),
+    };
+    return backupRetentionAlert(report) ? report : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export const B2_REPORT_PATH = ".private/reports/backblaze-file-backup.json";
 export const ORACLE_REPORT_PATH = ".private/reports/backup-watchdog.json";
 export const B2_STATE_PATH = ".private/file-backup/controller.json";
 
 /** Actual capture intervals and independently accepted receipts determine
  * freshness. A request, heartbeat or new verification date cannot refresh it. */
-export function acceptedBackupRuntimeCapture(value: unknown, now: Date) {
+export function acceptedBackupRuntimeCapture(
+  value: unknown,
+  now: Date,
+  damaged: readonly string[] = [],
+) {
   const window = weekWindow(now),
     start = Date.parse(window.startAtUtc),
     end = Date.parse(window.endAtUtc);
   let unknown = false;
   const entries = backupRuntimeCatalog(value).flatMap((entry) => {
+    const capture = entry.schemaVersion === 2
+      ? entry.envelope.request.captureId
+      : entry.entry.index.generation;
+    if (damaged.includes(capture)) return [];
     const verifiedAtUtc = entry.schemaVersion === 1
       ? entry.entry.receipt.verifiedAtUtc
       : entry.receipt.verifiedAtUtc;
@@ -107,6 +152,7 @@ export function assessBackupV2Watchdog(
   source?: BackupV2ControllerObservation,
   progress?: unknown,
   retention?: unknown,
+  damaged: readonly string[] = [],
 ): WatchdogAssessment {
   const state = validateBackupV2ControllerState(stateInput), job = state.job;
   let gate: BackupV2Gate | null = null;
@@ -116,6 +162,24 @@ export function assessBackupV2Watchdog(
     return { status: "B2_BACKUP_GATE_UNKNOWN", healthy: false };
   }
   const jobId = job?.settings.envelope.request.jobId;
+  if (
+    gate?.kind === "prune" &&
+    (retention as { schemaVersion?: unknown } | null | undefined)
+        ?.schemaVersion === 3
+  ) {
+    const report = assessBackupV2Retention(
+      gate.envelope,
+      gate,
+      now,
+      retention,
+      source,
+    );
+    const accepted = acceptedBackupRuntimeCapture(state, now, damaged);
+    return {
+      ...report,
+      healthy: report.healthy && !accepted.unknown && accepted.current !== null,
+    };
+  }
   if (
     job?.phase === "COMPLETE" &&
     (gate?.kind === "prune" || retention !== undefined)
@@ -127,7 +191,7 @@ export function assessBackupV2Watchdog(
       retention,
       source,
     );
-    const accepted = acceptedBackupRuntimeCapture(state, now);
+    const accepted = acceptedBackupRuntimeCapture(state, now, damaged);
     return {
       ...report,
       healthy: report.healthy && !accepted.unknown && accepted.current !== null,
@@ -144,7 +208,7 @@ export function assessBackupV2Watchdog(
       healthy: false,
     };
   }
-  const accepted = acceptedBackupRuntimeCapture(state, now);
+  const accepted = acceptedBackupRuntimeCapture(state, now, damaged);
   if (accepted.unknown) {
     return {
       status: "B2_BACKUP_ACCEPTANCE_UNKNOWN",
@@ -292,7 +356,7 @@ export function assessBackupV2Retention(
     control = value as Record<string, unknown>;
     const input = control.input as Record<string, unknown>;
     if (
-      control.schemaVersion !== 2 ||
+      control.schemaVersion !== 2 && control.schemaVersion !== 3 ||
       control.format !== "backup-v2-retention-controller" || !input ||
       input.schemaVersion !== 2 || input.format !== "backup-v2-prune" ||
       !["PLAN", "EXECUTE"].includes(String(input.stage)) ||
@@ -636,16 +700,29 @@ export async function main(): Promise<void> {
       let source: BackupV2ControllerObservation | undefined,
         progress: unknown,
         retention: unknown;
-      if (state.job?.phase === "COMPLETE") {
+      if (gate?.schemaVersion === 2 && gate.kind === "prune") {
         try {
-          retention = await readPrivateJson(
-            `.private/file-backup/retention/${state.job.settings.envelope.request.jobId}.json`,
-          );
-        } catch (error) {
-          if (!(error instanceof Deno.errors.NotFound)) retention = null;
+          const privateIO = realPrivateSeam();
+          for (const verifyCatalogOnly of [false, true]) {
+            const control = await readBackupV2RetentionControl(
+              privateIO,
+              verifyCatalogOnly,
+            );
+            if (control?.gate.gateId === gate.gateId) {
+              retention = control;
+              break;
+            }
+          }
+          if (retention === undefined && state.job?.phase === "COMPLETE") {
+            retention = await readPrivateJson(
+              `.private/file-backup/retention/${state.job.settings.envelope.request.jobId}.json`,
+            );
+          }
+        } catch {
+          retention = null;
         }
       }
-      if (gate?.schemaVersion === 2 && state.job) {
+      if (gate?.schemaVersion === 2 && (state.job || gate.kind === "prune")) {
         try {
           source = await observeBackupV2Source(gate);
         } catch { /* unavailable source is unknown, not a fresh heartbeat */ }
@@ -660,8 +737,17 @@ export async function main(): Promise<void> {
           } catch { /* no usable work observation */ }
         }
       }
-      const observedNow = new Date(),
-        accepted = acceptedBackupRuntimeCapture(state, observedNow);
+      const observedNow = new Date();
+      const [planReport, catalogReport] = await Promise.all([
+        readRetentionReport(B2_RETENTION_REPORT_PATH, observedNow),
+        readRetentionReport(B2_CATALOG_REPORT_PATH, observedNow),
+      ]);
+      const latest = [planReport, catalogReport].filter((item) =>
+        item !== undefined
+      )
+        .sort((a, b) => b.observedAtUtc.localeCompare(a.observedAtUtc))[0];
+      const damage = latest?.retention.damagedCaptureIds ?? [];
+      const accepted = acceptedBackupRuntimeCapture(state, observedNow, damage);
       b2Report = {
         lastSuccessfulCaptureAtUtc: accepted.latest?.captureFinishedAtUtc ??
           null,
@@ -678,7 +764,18 @@ export async function main(): Promise<void> {
           source,
           progress,
           retention,
+          damage,
         ),
+        ...(latest
+          ? {
+            retentionStatus: latest.retentionStatus,
+            retentionTransactionId: latest.retentionTransactionId,
+            retention: latest.retention,
+          }
+          : {}),
+        ...(damage.length
+          ? { status: B2_CATALOG_DAMAGED_ALERT, healthy: false }
+          : {}),
         observedAtUtc: observedNow.toISOString(),
         notificationSent: false,
       };
@@ -760,16 +857,21 @@ export async function main(): Promise<void> {
   }
   let delivery: BackupAlertDelivery | undefined;
   try {
-    delivery = await notifyBackupAlerts([
+    const retention = backupRetentionAlert(b2Report);
+    const observations: BackupAlertObservation[] = [
       {
         stream: "oracle-watchdog",
         outcome: watchdogAlertOutcome(oracleReport, "WATCHDOG_CHECK_FAILED"),
       },
       {
         stream: "backblaze-watchdog",
-        outcome: watchdogAlertOutcome(b2Report, "B2_WATCHDOG_CHECK_FAILED"),
+        outcome: retention && b2Report.status === B2_CATALOG_DAMAGED_ALERT
+          ? "DEFERRED"
+          : watchdogAlertOutcome(b2Report, "B2_WATCHDOG_CHECK_FAILED"),
       },
-    ]);
+    ];
+    if (retention) observations.push(retention);
+    delivery = await notifyBackupAlerts(observations);
   } catch {
     for (const report of [b2Report, oracleReport]) {
       report.notificationError = "BACKUP_ALERT_RECORD_FAILED";
