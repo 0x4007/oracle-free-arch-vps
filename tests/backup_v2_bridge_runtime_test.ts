@@ -18,6 +18,13 @@ import {
 } from "../scripts/backup-v2-runtime-contract.ts";
 import { BACKUP_V2_PROFILE_ID } from "../scripts/backup-v2-profile.ts";
 import {
+  type CaptureSettings,
+  REQUIRED_EXCLUSIONS,
+  ROLE_ORDER,
+} from "../scripts/backblaze-capture.ts";
+import { backupV2SourceConfigSha256 } from "../scripts/backup-v2-metadata.ts";
+import type { BackupV2WorkerSettings } from "../scripts/backup-v2-worker.ts";
+import {
   GATE_BACKUP_CGROUP_ROOT,
   GATE_OWNER,
   GATE_REMOTE_HOST,
@@ -42,6 +49,28 @@ function throws(work: () => unknown) {
 }
 const ID = "11111111-1111-1111-1111-111111111111",
   GATE = "22222222-2222-2222-2222-222222222222";
+const captureSettings: CaptureSettings = {
+  generation: `generation-${ID}`,
+  recipientFile: "/fixture/recipient.asc",
+  recipientSha256: "c".repeat(64),
+  recipientFingerprint: "D".repeat(40),
+  exclusionsText: REQUIRED_EXCLUSIONS.join("\n") + "\n",
+  sources: ROLE_ORDER.map((name, i) => ({
+    name,
+    uuid: `aaaaaaa${i}-1111-2222-3333-444444444444`,
+    filesystem: name === "root"
+      ? "ext4"
+      : name.includes("efi")
+      ? "vfat"
+      : "xfs",
+    size: 1024 * (i + 1),
+    ...(name === "root"
+      ? { livePath: "/" as const }
+      : name === "efi"
+      ? { livePath: "/efi" as const }
+      : {}),
+  })),
+};
 const request: BackupV2Request = {
   schemaVersion: 2,
   format: "backup-v2",
@@ -51,9 +80,9 @@ const request: BackupV2Request = {
   periodKey: "2026-10-18",
   requestedAtUtc: "2026-10-18T15:00:00.000Z",
   sourceRevision: "a".repeat(40),
-  sourceConfigSha256: "b".repeat(64),
-  recipientSha256: "c".repeat(64),
-  recipientFingerprint: "D".repeat(40),
+  sourceConfigSha256: backupV2SourceConfigSha256(captureSettings),
+  recipientSha256: captureSettings.recipientSha256,
+  recipientFingerprint: captureSettings.recipientFingerprint,
 };
 const sourceName = `arch-vps-b2-v2-verify-${ID}-${GATE}.service`;
 const gate: BackupV2Gate = {
@@ -77,6 +106,29 @@ const gate: BackupV2Gate = {
   sourceLockPath: GATE_SOURCE_LOCK_PATH,
   createdAtUtc: request.requestedAtUtc,
   updatedAtUtc: request.requestedAtUtc,
+};
+const workerGateId = "33333333-3333-3333-3333-333333333333";
+const settings: BackupV2WorkerSettings = {
+  schemaVersion: 2,
+  format: "backup-v2",
+  envelope: gate.envelope,
+  captureSettings,
+  B2Settings: {
+    accessKeyId: "fixture",
+    secretAccessKey: "fixture",
+    bucketId: "fixture",
+    bucketName: "pavlovcik-arch-vps-backups",
+  },
+  verifierGate: { ...gate, state: "PENDING", custody: null },
+  workerGate: {
+    ...gate,
+    kind: "worker",
+    gateId: workerGateId,
+    unitName: `arch-vps-b2-v2-worker-${ID}-${workerGateId}.service`,
+    state: "PENDING",
+    custody: null,
+  },
+  publicationAttemptId: "44444444-4444-4444-4444-444444444444",
 };
 const input: BackupV2BridgeRuntimeInput = {
   schemaVersion: 1,
@@ -343,7 +395,23 @@ Deno.test("real source waits for process exit after final status and rejects fai
   );
 });
 
-Deno.test("real bridge close stops only proved retained invocation and is idempotent", async () => {
+Deno.test("clean source exit with a temporarily nonterminal status is bounded", () => {
+  equal(
+    decodeBackupV2BridgeSource(observation(true, status(false)), input, now)
+      .terminalStatusPending,
+    true,
+  );
+  equal(
+    decodeBackupV2BridgeSource(
+      observation(true, status(false)),
+      input,
+      new Date(now.getTime() + 90_001),
+    ).terminalStatusPending,
+    false,
+  );
+});
+
+async function terminalBridgeFixture() {
   const paths = backupV2BridgeRuntimePaths(gate),
     records = new Map<string, unknown>();
   const keeper = {
@@ -365,7 +433,7 @@ Deno.test("real bridge close stops only proved retained invocation and is idempo
     (byte) => byte.toString(16).padStart(2, "0"),
   ).join("");
   records.set(paths.settings, input);
-  records.set(paths.status, {
+  const terminalStatus = {
     schemaVersion: 1,
     inputSha256,
     keeperBootId: ID,
@@ -383,8 +451,15 @@ Deno.test("real bridge close stops only proved retained invocation and is idempo
       },
       pendingOperations: 0,
     },
-  });
-  let stopped = false, stops = 0;
+  };
+  records.set(paths.status, terminalStatus);
+  let stopped = false,
+    stops = 0,
+    cgroup = "ABSENT\n",
+    proofCode = 0,
+    keeperRunning = false,
+    failSettledWrite = false,
+    remoteObservation = observation(true);
   const runner: RemoteRunner = (command, args) => {
     if (command === "/usr/bin/env") {
       command = args[2];
@@ -392,20 +467,30 @@ Deno.test("real bridge close stops only proved retained invocation and is idempo
     }
     let stdout = "";
     if (command === "/usr/bin/id") stdout = "1000\n";
-    else if (command === "/usr/bin/cat") stdout = ID + "\n";
-    else if (command === "/bin/sh") {
+    else if (command === "/usr/bin/cat") {
+      assert(args[0] === "/proc/sys/kernel/random/boot_id");
+      stdout = ID + "\n";
+    } else if (command === "/bin/sh") {
       if (args[1].includes("systemctl --user stop")) {
         assert(args[1].includes(keeper.invocationId));
         assert(args[1].includes(paths.unitName));
+        assert(args[1].includes("cgroup.procs"));
+        assert(args[1].includes("SubState=exited"));
         stopped = true;
         stops++;
-      } else stdout = "ABSENT\n";
+      } else if (args[1].includes("cgroup.procs")) {
+        assert(args[1].includes("--homedir"));
+        assert(args[1].includes("/usr/bin/gpg-agent"));
+        return Promise.resolve({ code: proofCode, stdout: "", stderr: "" });
+      } else stdout = stopped ? "ABSENT\n" : cgroup;
     } else if (command === "/usr/bin/systemctl") {
       stdout = `LoadState=${stopped ? "not-found" : "loaded"}\nActiveState=${
         stopped ? "inactive" : "active"
       }\nSubState=${
-        stopped ? "dead" : "exited"
-      }\nResult=success\nMainPID=0\nControlPID=0\nInvocationID=${
+        stopped ? "dead" : keeperRunning ? "running" : "exited"
+      }\nResult=success\nMainPID=${
+        !stopped && keeperRunning ? keeper.mainPid : 0
+      }\nControlPID=0\nInvocationID=${
         stopped ? "" : keeper.invocationId
       }\nControlGroup=\n`;
     } else throw Error("Unexpected native boundary");
@@ -416,20 +501,93 @@ Deno.test("real bridge close stops only proved retained invocation and is idempo
     private: {
       read: (path: string) => Promise.resolve(records.get(path)),
       write: (path: string, value: unknown) => {
+        if (path === paths.settled && failSettledWrite) {
+          return Promise.reject(Error("Interrupted before settled receipt"));
+        }
         records.set(path, value);
         return Promise.resolve();
       },
     },
     remote: {
       root: (_program: string) =>
-        Promise.resolve({ code: 0, stdout: observation(true), stderr: "" }),
+        Promise.resolve({ code: 0, stdout: remoteObservation, stderr: "" }),
     },
   } as unknown as Pick<PiDeps, "private" | "remote" | "now">;
   const runtime = realBackupV2BridgeRuntime(deps, runner);
-  equal(await runtime.close(gate), "CLOSED");
-  assert(records.has(paths.settled));
-  equal(await runtime.close(gate), "CLOSED");
-  equal(stops, 1);
+  return {
+    runtime,
+    paths,
+    records,
+    stops: () => stops,
+    setRunning: (value: boolean) => {
+      keeperRunning = value;
+    },
+    setActive: () =>
+      records.set(paths.status, {
+        ...terminalStatus,
+        bridge: { ...terminalStatus.bridge, state: "ACTIVE", reason: null },
+      }),
+    setProof: (value: number) => {
+      cgroup = "populated 1\n";
+      proofCode = value;
+    },
+    setRemote: (value: string) => {
+      remoteObservation = value;
+    },
+    failSettledWrite: (value: boolean) => {
+      failSettledWrite = value;
+    },
+  };
+}
+
+Deno.test("real bridge close stops only proved retained invocation and is idempotent", async () => {
+  const f = await terminalBridgeFixture();
+  equal(await f.runtime.close(gate), "CLOSED");
+  assert(f.records.has(f.paths.settled));
+  equal(await f.runtime.close(gate), "CLOSED");
+  equal(f.stops(), 1);
+});
+
+Deno.test("bridge readiness observes a clean exit before status publication without reading a vanishing keeper PID", async () => {
+  const f = await terminalBridgeFixture();
+  f.setActive();
+  f.setRunning(true);
+  f.setRemote(observation(true, status(false)));
+  equal(await f.runtime.ensure(settings, gate), "PENDING");
+  f.setRemote(observation(true));
+  equal(await f.runtime.ensure(settings, gate), "PENDING");
+  equal(f.stops(), 0);
+  assert(!f.records.has(f.paths.close));
+});
+
+Deno.test("terminal bridge waits for verifier status and keeper exit before settling only an owned residual agent", async () => {
+  const f = await terminalBridgeFixture();
+  f.setRemote(observation(true, status(false)));
+  equal(await f.runtime.close(gate), "PENDING");
+  f.setRemote(observation(true));
+  f.setRunning(true);
+  equal(await f.runtime.close(gate), "PENDING");
+  f.setRunning(false);
+  f.setProof(1);
+  equal(await f.runtime.close(gate), {
+    state: "CANCELLATION_BLOCKED",
+    reason: "BRIDGE_TERMINAL_PROCESSES_UNPROVED",
+  });
+  assert(!f.records.has(f.paths.settlementIntent));
+  equal(f.stops(), 0);
+
+  f.setProof(0);
+  f.failSettledWrite(true);
+  equal(await f.runtime.close(gate), {
+    state: "CANCELLATION_BLOCKED",
+    reason: "BRIDGE_EXACT_STOP_UNPROVED",
+  });
+  assert(f.records.has(f.paths.settlementIntent));
+  assert(!f.records.has(f.paths.settled));
+  f.failSettledWrite(false);
+  equal(await f.runtime.close(gate), "CLOSED");
+  assert(f.records.has(f.paths.settled));
+  equal(f.stops(), 1);
 });
 
 Deno.test("real bridge close refuses absent or mismatched custody without stopping anything", async () => {
@@ -454,7 +612,7 @@ Deno.test("real bridge close refuses absent or mismatched custody without stoppi
   } as unknown as Pick<PiDeps, "private" | "remote" | "now">;
   equal(
     await realBackupV2BridgeRuntime(deps, runner).close(gate),
-    "CANCELLATION_BLOCKED",
+    { state: "CANCELLATION_BLOCKED", reason: "BRIDGE_SETTINGS_UNPROVED" },
   );
   equal(stops, 0);
 });

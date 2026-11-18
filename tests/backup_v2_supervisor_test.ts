@@ -779,6 +779,8 @@ Deno.test("supervisor cancellation blocks on wrong identity without stopping ano
     },
   });
   equal(result.state, "CANCELLATION_BLOCKED");
+  assert(result.state === "CANCELLATION_BLOCKED");
+  equal(result.reason, "SOURCE_INVOCATION_UNPROVED");
   assert(!stopped);
 });
 
@@ -828,6 +830,8 @@ Deno.test("cancellation never retries a changed identity after stop", async () =
     },
   });
   equal(result.state, "CANCELLATION_BLOCKED");
+  assert(result.state === "CANCELLATION_BLOCKED");
+  equal(result.reason, "SOURCE_INVOCATION_UNPROVED");
   equal(stops, 1);
   equal(reads, 2);
 });
@@ -902,6 +906,8 @@ Deno.test("supervisor bounded stop failure preserves blocked custody", async () 
       ),
   }, 5);
   equal(result.state, "CANCELLATION_BLOCKED");
+  assert(result.state === "CANCELLATION_BLOCKED");
+  equal(result.reason, "SOURCE_EXACT_STOP_FAILED");
 });
 
 /** Operator-only fixture, deliberately not a Deno.test: run inside an approved

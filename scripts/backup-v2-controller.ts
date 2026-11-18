@@ -7,6 +7,7 @@ import {
   backblazeScheduledClaim,
   BACKUP_BASE,
   BACKUP_RUNTIME_BASE,
+  CONTROLLER_LOCK_PATH,
   CONTROLLER_STATE_PATH,
   type ControllerState,
   GATE_PATH,
@@ -20,6 +21,7 @@ import {
   type PrivateSeam,
   type PrunePlanEntry,
   PUBLIC_HOME_BASE,
+  realPiDeps,
   realPrivateSeam,
   realRemoteRunner,
   realRemoteSeam,
@@ -115,6 +117,52 @@ export type BackupV2ControllerPhase =
   | "COMPLETE"
   | "FAILED"
   | "CANCELLATION_BLOCKED";
+const cancellationBlockedReasons = [
+  "LEGACY_CANCELLATION_UNCLASSIFIED",
+  "SOURCE_BOOT_CHANGED",
+  "SOURCE_UNIT_ABSENT",
+  "SOURCE_UNIT_FAILED",
+  "SOURCE_INVOCATION_UNPROVED",
+  "SOURCE_STATUS_FAILED",
+  "SOURCE_STATUS_CANCELLATION_BLOCKED",
+  "SOURCE_TERMINAL_STATUS_UNPROVED",
+  "SOURCE_TERMINAL_PROCESSES_UNSETTLED",
+  "SOURCE_TERMINAL_RESULT_MISSING",
+  "SOURCE_TERMINAL_RESULT_HASH_MISMATCH",
+  "SOURCE_TERMINAL_NATIVE_CUSTODY_MISMATCH",
+  "SOURCE_TERMINAL_RESULT_INVALID",
+  "SOURCE_OBSERVATION_UNPROVED",
+  "SOURCE_CLEAR_PROOF_MISSING",
+  "SOURCE_EXACT_STOP_FAILED",
+  "SOURCE_GATE_CLEAR_FAILED",
+  "SOURCE_CANCELLATION_SAMPLE_INVALID",
+  "SOURCE_CANCELLATION_UNSETTLED",
+  "BRIDGE_SETTINGS_UNPROVED",
+  "BRIDGE_MANAGER_UNPROVED",
+  "BRIDGE_STATUS_UNPROVED",
+  "BRIDGE_BINDING_MISMATCH",
+  "BRIDGE_SOURCE_UNPROVED",
+  "BRIDGE_SOCKET_UNPROVED",
+  "BRIDGE_READINESS_UNPROVED",
+  "BRIDGE_TERMINAL_CLOSE_UNPROVED",
+  "BRIDGE_CANCELLATION_CLOSE_PENDING",
+  "BRIDGE_TERMINAL_PROCESSES_UNPROVED",
+  "BRIDGE_EXACT_STOP_UNPROVED",
+  "BRIDGE_KEEPER_CANCELLED",
+  "BRIDGE_KEEPER_LEASE_EXPIRED",
+  "BRIDGE_KEEPER_IDENTITY_CHANGED",
+  "BRIDGE_KEEPER_PROGRESS_REGRESSED",
+  "BRIDGE_KEEPER_PROGRESS_WRONG_PHASE",
+  "BRIDGE_KEEPER_TUNNEL_LOST",
+  "BRIDGE_KEEPER_OVERLAPPING_OPERATION",
+  "BRIDGE_KEEPER_OBSERVATION_OR_NOTIFICATION_UNPROVED",
+] as const;
+export type BackupV2CancellationBlockedReason =
+  typeof cancellationBlockedReasons[number];
+export type BackupV2CancellationBlocked = {
+  state: "CANCELLATION_BLOCKED";
+  reason: BackupV2CancellationBlockedReason;
+};
 export interface BackupV2ControllerJob {
   settings: BackupV2WorkerSettings;
   phase: BackupV2ControllerPhase;
@@ -131,6 +179,7 @@ export interface BackupV2ControllerJob {
   workerResult: BackupV2Result | null;
   workerResultBytes: number[] | null;
   verified: BackupV2VerifiedResult | null;
+  cancellationBlockedReason?: BackupV2CancellationBlockedReason;
   updatedAtUtc: string;
 }
 export interface BackupV2ControllerState {
@@ -152,8 +201,10 @@ export interface BackupV2ControllerObservation {
   /** Independent collector, never inferred from a source status or missing unit. */
   tree: BackupV2TreeObservation | null;
 }
+type TerminalArtifacts = { resultSha256: string; nativeCustodySha256: string };
 export interface BackupV2ControllerCapabilities {
   now(): Date;
+  log(message: string): void;
   persist(state: BackupV2ControllerState): Promise<void>;
   /** Snapshot predecessor/controller state before any replacement request. */
   archive(value: ControllerState | BackupV2ControllerState): Promise<void>;
@@ -164,7 +215,7 @@ export interface BackupV2ControllerCapabilities {
       next: BackupV2Gate | null,
     ): Promise<void>;
     /** Durable exact-gate tombstone, recorded only after independent settlement. */
-    cleared(gate: BackupV2Gate): Promise<boolean>;
+    cleared(gate: BackupV2Gate, expected?: TerminalArtifacts): Promise<boolean>;
   };
   create(periodKey: string): Promise<BackupV2WorkerSettings>;
   /** Includes existing Oracle/scheduled claim, legacy invocation/lock settlement. */
@@ -181,15 +232,18 @@ export interface BackupV2ControllerCapabilities {
   /** Must freshly reconcile the exact retained invocation immediately before stop. */
   stop(
     gate: BackupV2Gate,
-    expected?: { resultSha256: string; nativeCustodySha256: string },
+    expected?: TerminalArtifacts,
   ): Promise<void>;
-  cancel(gate: BackupV2Gate): Promise<"SETTLED" | "CANCELLATION_BLOCKED">;
+  cancel(gate: BackupV2Gate): Promise<"SETTLED" | BackupV2CancellationBlocked>;
   bridge: {
     ensure(
       settings: BackupV2WorkerSettings,
       gate: BackupV2Gate,
-    ): Promise<"READY" | "PENDING" | "CANCELLATION_BLOCKED">;
-    close(gate: BackupV2Gate): Promise<"CLOSED" | "CANCELLATION_BLOCKED">;
+    ): Promise<"READY" | "PENDING" | BackupV2CancellationBlocked>;
+    close(
+      gate: BackupV2Gate,
+      mode: "terminal" | "cancel",
+    ): Promise<"CLOSED" | "PENDING" | BackupV2CancellationBlocked>;
   };
 }
 function fail(): never {
@@ -254,6 +308,8 @@ export function validateBackupV2ControllerState(
   if (new Set(ids).size !== ids.length) fail();
   let job: BackupV2ControllerJob | null = null;
   if (r.job !== null) {
+    const hasBlockReason = typeof r.job === "object" &&
+      Object.hasOwn(r.job, "cancellationBlockedReason");
     const j = record(r.job, [
       "settings",
       "phase",
@@ -267,7 +323,15 @@ export function validateBackupV2ControllerState(
       "workerResultBytes",
       "verified",
       "updatedAtUtc",
+      ...(hasBlockReason ? ["cancellationBlockedReason"] : []),
     ]);
+    const cancellationBlockedReason = j
+      .cancellationBlockedReason as BackupV2CancellationBlockedReason;
+    if (
+      hasBlockReason &&
+      (j.phase !== "CANCELLATION_BLOCKED" ||
+        !cancellationBlockedReasons.includes(cancellationBlockedReason))
+    ) fail();
     const settings = validateBackupV2WorkerSettings(j.settings),
       workerGate = validateBackupV2Gate(j.workerGate),
       verifierGate = validateBackupV2Gate(j.verifierGate);
@@ -361,6 +425,7 @@ export function validateBackupV2ControllerState(
       workerResult,
       workerResultBytes,
       verified,
+      ...(hasBlockReason ? { cancellationBlockedReason } : {}),
       updatedAtUtc: j.updatedAtUtc,
     };
     if (
@@ -453,10 +518,27 @@ export function backupV2ProcessesSettled(
       (observation.managerNamespaceReferences ?? null);
 }
 
+interface BackupV2VerifierRecoveryBinding {
+  jobId: string;
+  gateId: string;
+  requestSha256: string;
+}
+
+function logCancellationBlocked(
+  log: BackupV2ControllerCapabilities["log"],
+  gate: BackupV2Gate,
+  reason: BackupV2CancellationBlockedReason,
+): void {
+  log(
+    `Backup v2 CANCELLATION_BLOCKED job=${gate.envelope.request.jobId} gate=${gate.gateId} kind=${gate.kind} reason=${reason}`,
+  );
+}
+
 /** Exactly one bounded reconciliation; no polling loop and no whole-job timer. */
 export async function stepBackupV2Controller(
   input: ControllerState | BackupV2ControllerState,
   deps: BackupV2ControllerCapabilities,
+  recover?: BackupV2VerifierRecoveryBinding,
 ): Promise<BackupV2ControllerState> {
   let state: BackupV2ControllerState =
     (input as { schemaVersion: number }).schemaVersion === 1
@@ -472,11 +554,26 @@ export async function stepBackupV2Controller(
         })),
       }
       : validateBackupV2ControllerState(input);
+  if (recover) {
+    const job = state.job, gate = job?.verifierGate;
+    if (
+      !job || !gate || job.activeKind !== "verify" ||
+      !["CANCELLATION_BLOCKED", "VERIFY_SETTLED"].includes(job.phase) ||
+      gate.state !== "ACTIVE" || !gate.custody ||
+      recover.jobId !== gate.envelope.request.jobId ||
+      recover.gateId !== gate.gateId ||
+      recover.requestSha256 !== gate.envelope.requestSha256
+    ) {
+      throw new Error(
+        "Blocked verifier recovery no longer matches the job and gate",
+      );
+    }
+  }
   const now = deps.now();
   const save = async () => {
-    state = validateBackupV2ControllerState(state);
-    await deps.persist(state);
-    return state;
+    const checked = validateBackupV2ControllerState(state);
+    await deps.persist(checked);
+    return checked;
   };
   if (
     !state.job ||
@@ -528,6 +625,12 @@ export async function stepBackupV2Controller(
   if (job.phase === "COMPLETE" || job.phase === "FAILED") return state;
   const kind = job.activeKind;
   let gate = kind === "worker" ? job.workerGate : job.verifierGate;
+  const block = async (reason: BackupV2CancellationBlockedReason) => {
+    job.phase = "CANCELLATION_BLOCKED";
+    job.cancellationBlockedReason = reason;
+    logCancellationBlocked(deps.log, gate, reason);
+    return await save();
+  };
   const live = await deps.gate.read();
   if (job.phase === "REQUESTED" || job.phase === "VERIFY_REQUESTED") {
     if (live !== null) same(validateBackupV2Gate(live), gate);
@@ -540,46 +643,63 @@ export async function stepBackupV2Controller(
     await deps.install(job.settings);
     if (kind === "verify") await deps.verifierInput(job);
     job.phase = kind === "worker" ? "WORKER" : "VERIFY";
-    await save();
+    const saved = await save();
     // PENDING gate exists before the launch intent. Resume only observes it;
     // an ambiguous failed launch never starts another invocation automatically.
     await deps.launch(job.settings, kind);
-    return state;
+    return saved;
   }
-  if (job.phase === "WORKER_SETTLED" || job.phase === "VERIFY_SETTLED") {
+  if (
+    job.phase === "WORKER_SETTLED" || job.phase === "VERIFY_SETTLED" ||
+    kind === "verify" && job.phase === "CANCELLATION_BLOCKED" && job.verified
+  ) {
+    const terminal = kind === "worker" ? job.workerStatus : job.verifierStatus,
+      output = kind === "worker" ? job.workerResult : job.verified;
+    if (!terminal?.resultSha256 || !output?.nativeCustodySha256) {
+      return await block("SOURCE_TERMINAL_NATIVE_CUSTODY_MISMATCH");
+    }
+    const artifacts = {
+      resultSha256: terminal.resultSha256,
+      nativeCustodySha256: output.nativeCustodySha256,
+    };
+    let proofFailure: BackupV2CancellationBlockedReason =
+      "SOURCE_CLEAR_PROOF_MISSING";
     if (live !== null) {
       same(validateBackupV2Gate(live), gate);
-      if (
-        !backupV2ProcessesSettled(gate, await deps.observe(gate)) &&
-        !await deps.gate.cleared(gate)
-      ) {
-        job.phase = "CANCELLATION_BLOCKED";
-        return await save();
+      proofFailure = "SOURCE_TERMINAL_PROCESSES_UNSETTLED";
+    }
+    let proved: boolean;
+    try {
+      proved = (live !== null &&
+        backupV2ProcessesSettled(gate, await deps.observe(gate))) ||
+        await deps.gate.cleared(gate, artifacts);
+    } catch {
+      return await block("SOURCE_OBSERVATION_UNPROVED");
+    }
+    if (!proved) return await block(proofFailure);
+    if (kind === "verify") {
+      const close = await deps.bridge.close(gate, "terminal");
+      if (close === "PENDING") {
+        if (job.phase === "CANCELLATION_BLOCKED") {
+          return await block("BRIDGE_TERMINAL_CLOSE_UNPROVED");
+        }
+        return state;
       }
-      if (kind === "verify" && await deps.bridge.close(gate) !== "CLOSED") {
-        job.phase = "CANCELLATION_BLOCKED";
-        return await save();
+      if (close !== "CLOSED") return await block(close.reason);
+    }
+    if (live !== null) {
+      try {
+        await deps.stop(gate, artifacts);
+      } catch {
+        return await block("SOURCE_EXACT_STOP_FAILED");
       }
-      const terminal = kind === "worker"
-          ? job.workerStatus!
-          : job.verifierStatus!,
-        output = kind === "worker" ? job.workerResult! : job.verified!;
-      if (!output.nativeCustodySha256) fail();
-      await deps.stop(gate, {
-        resultSha256: terminal.resultSha256!,
-        nativeCustodySha256: output.nativeCustodySha256,
-      });
-      await deps.gate.replace(gate, null);
-    } else {
-      if (!await deps.gate.cleared(gate)) {
-        job.phase = "CANCELLATION_BLOCKED";
-        return await save();
-      }
-      if (kind === "verify" && await deps.bridge.close(gate) !== "CLOSED") {
-        job.phase = "CANCELLATION_BLOCKED";
-        return await save();
+      try {
+        await deps.gate.replace(gate, null);
+      } catch {
+        return await block("SOURCE_GATE_CLEAR_FAILED");
       }
     }
+    delete job.cancellationBlockedReason;
     if (kind === "worker") {
       job.phase = "VERIFY_REQUESTED";
       job.activeKind = "verify";
@@ -613,6 +733,7 @@ export async function stepBackupV2Controller(
   }
   if (live === null) fail();
   const savedLive = validateBackupV2Gate(live);
+  if (recover) same(savedLive, gate);
   if (gate.custody === null && savedLive.custody !== null) {
     same({
       ...savedLive,
@@ -625,28 +746,62 @@ export async function stepBackupV2Controller(
     else job.verifierGate = gate;
     await save();
   } else same(savedLive, gate);
-  if (job.phase === "CANCELLATION_BLOCKED") {
-    if (
-      !gate.custody || await deps.cancel(gate) !== "SETTLED" ||
-      kind === "verify" && await deps.bridge.close(gate) !== "CLOSED"
-    ) return await save();
-    await deps.stop(gate);
-    await deps.gate.replace(gate, null);
+  // Read fresh success proof before attempting to cancel a verifier. An
+  // unfinished controller observation can outlive clean source completion.
+  const retryVerifierTerminal = job.phase === "CANCELLATION_BLOCKED" &&
+    kind === "verify" &&
+    !["FAILED", "CANCELLATION_BLOCKED"].includes(
+      job.verifierStatus?.phase ?? "",
+    ) &&
+    job.cancellationBlockedReason !== "SOURCE_UNIT_FAILED";
+  if (
+    job.phase === "CANCELLATION_BLOCKED" && !recover && !retryVerifierTerminal
+  ) {
+    if (!gate.custody) return await block("SOURCE_INVOCATION_UNPROVED");
+    const cancelled = await deps.cancel(gate);
+    if (cancelled !== "SETTLED") return await block(cancelled.reason);
+    if (kind === "verify") {
+      const close = await deps.bridge.close(gate, "cancel");
+      if (close === "PENDING") {
+        return await block("BRIDGE_CANCELLATION_CLOSE_PENDING");
+      }
+      if (close !== "CLOSED") return await block(close.reason);
+    }
+    try {
+      await deps.stop(gate);
+    } catch {
+      return await block("SOURCE_EXACT_STOP_FAILED");
+    }
+    try {
+      await deps.gate.replace(gate, null);
+    } catch {
+      return await block("SOURCE_GATE_CLEAR_FAILED");
+    }
+    delete job.cancellationBlockedReason;
     job.phase = "FAILED";
     return await save();
   }
-  const observation = await deps.observe(gate);
-  if (
-    observation.sourceBootId !== gate.sourceBootId ||
-    observation.unit === "ABSENT"
-  ) {
-    job.phase = "CANCELLATION_BLOCKED";
-    return await save();
+  let observation: BackupV2ControllerObservation;
+  try {
+    observation = await deps.observe(gate);
+  } catch (error) {
+    if (!recover && !retryVerifierTerminal) throw error;
+    return await block("SOURCE_OBSERVATION_UNPROVED");
   }
+  if (observation.sourceBootId !== gate.sourceBootId) {
+    return await block(
+      observation.sourceBootId
+        ? "SOURCE_BOOT_CHANGED"
+        : "SOURCE_OBSERVATION_UNPROVED",
+    );
+  }
+  if (observation.unit === "ABSENT") return await block("SOURCE_UNIT_ABSENT");
   if (!observation.identity) {
-    if (!["RUNNING", "STARTING"].includes(observation.unit)) {
-      job.phase = "CANCELLATION_BLOCKED";
-      return await save();
+    if (
+      recover || retryVerifierTerminal ||
+      !["RUNNING", "STARTING"].includes(observation.unit)
+    ) {
+      return await block("SOURCE_INVOCATION_UNPROVED");
     }
     return state;
   }
@@ -664,61 +819,107 @@ export async function stepBackupV2Controller(
     if (kind === "worker") job.workerGate = gate;
     else job.verifierGate = gate;
     await save();
-  } else same(gate.custody, observation.identity);
-  if (observation.status === null) return state;
-  if (kind === "verify") {
-    const bridge = await deps.bridge.ensure(job.settings, gate);
-    if (bridge === "CANCELLATION_BLOCKED") {
-      job.phase = "CANCELLATION_BLOCKED";
-      return await save();
-    }
-    if (bridge !== "READY") return state;
+  } else if (!isDeepStrictEqual(gate.custody, observation.identity)) {
+    if (!recover && !retryVerifierTerminal) fail();
+    return await block("SOURCE_INVOCATION_UNPROVED");
   }
-  await deps.acknowledge(gate);
-  const status = validateBackupV2Status(observation.status, gate),
-    prior = kind === "worker" ? job.workerStatus : job.verifierStatus;
-  if (prior) assertBackupV2StatusTransition(prior, status);
+  if (observation.status === null) {
+    return recover || retryVerifierTerminal || observation.unit === "EXITED"
+      ? await block("SOURCE_TERMINAL_STATUS_UNPROVED")
+      : state;
+  }
+  let status: BackupV2Status;
+  try {
+    status = validateBackupV2Status(observation.status, gate);
+    const prior = kind === "worker" ? job.workerStatus : job.verifierStatus;
+    if (prior) assertBackupV2StatusTransition(prior, status);
+  } catch (error) {
+    if (!recover && !retryVerifierTerminal) throw error;
+    return await block("SOURCE_TERMINAL_STATUS_UNPROVED");
+  }
+  if (
+    recover && (status.phase !== "ACCEPTED" || observation.unit !== "EXITED")
+  ) {
+    return await block("SOURCE_TERMINAL_STATUS_UNPROVED");
+  }
+  const sourceFailure = status.phase === "CANCELLATION_BLOCKED"
+    ? "SOURCE_STATUS_CANCELLATION_BLOCKED"
+    : status.phase === "FAILED"
+    ? "SOURCE_STATUS_FAILED"
+    : observation.unit === "FAILED"
+    ? "SOURCE_UNIT_FAILED"
+    : null;
+  if (!sourceFailure && !status.finishedAtUtc) {
+    if (retryVerifierTerminal) {
+      return await block(
+        job.cancellationBlockedReason ?? "LEGACY_CANCELLATION_UNCLASSIFIED",
+      );
+    }
+    if (observation.unit === "EXITED") {
+      return now.getTime() - Date.parse(status.updatedAtUtc) <= 90_000
+        ? state
+        : await block("SOURCE_TERMINAL_STATUS_UNPROVED");
+    }
+    if (kind === "verify") {
+      const bridge = await deps.bridge.ensure(job.settings, gate);
+      if (typeof bridge === "object") return await block(bridge.reason);
+      if (bridge === "PENDING") return state;
+    }
+    await deps.acknowledge(gate);
+  }
   if (kind === "worker") job.workerStatus = status;
   else job.verifierStatus = status;
-  if (
-    status.phase === "CANCELLATION_BLOCKED" || status.phase === "FAILED" ||
-    observation.unit === "FAILED"
-  ) {
-    job.phase = "CANCELLATION_BLOCKED";
-    return await save();
-  }
+  if (sourceFailure) return await block(sourceFailure);
   if (status.finishedAtUtc === null) return await save();
-  if (["RUNNING", "STARTING"].includes(observation.unit)) return await save();
-  if (
-    !backupV2ProcessesSettled(gate, observation) || !observation.resultBytes ||
-    backupV2ArtifactSha256(observation.resultBytes) !== status.resultSha256
-  ) {
-    job.phase = "CANCELLATION_BLOCKED";
-    return await save();
+  if (["RUNNING", "STARTING"].includes(observation.unit)) {
+    return retryVerifierTerminal
+      ? await block("SOURCE_TERMINAL_PROCESSES_UNSETTLED")
+      : await save();
   }
-  const result = JSON.parse(
-    new TextDecoder("utf-8", { fatal: true }).decode(observation.resultBytes),
-  );
+  let settled: boolean;
+  try {
+    settled = backupV2ProcessesSettled(gate, observation);
+  } catch {
+    return await block("SOURCE_INVOCATION_UNPROVED");
+  }
+  if (!settled) return await block("SOURCE_TERMINAL_PROCESSES_UNSETTLED");
+  if (!observation.resultBytes) {
+    return await block("SOURCE_TERMINAL_RESULT_MISSING");
+  }
+  if (backupV2ArtifactSha256(observation.resultBytes) !== status.resultSha256) {
+    return await block("SOURCE_TERMINAL_RESULT_HASH_MISMATCH");
+  }
+  let result: Record<string, unknown> | null;
+  try {
+    result = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(observation.resultBytes),
+    );
+  } catch {
+    return await block("SOURCE_TERMINAL_RESULT_INVALID");
+  }
   if (
     typeof result?.nativeCustodySha256 !== "string" ||
     result.nativeCustodySha256 !== observation.nativeCustodySha256
-  ) {
-    job.phase = "CANCELLATION_BLOCKED";
-    return await save();
+  ) return await block("SOURCE_TERMINAL_NATIVE_CUSTODY_MISMATCH");
+  try {
+    if (kind === "worker") {
+      job.workerResult = validateBackupV2Result(result, gate);
+      job.workerResultBytes = [...observation.resultBytes];
+      job.phase = "WORKER_SETTLED";
+    } else {
+      job.verified = validateBackupV2VerifiedResult(
+        result,
+        gate,
+        job.workerResult!,
+        backupV2ArtifactSha256(new Uint8Array(job.workerResultBytes!)),
+      );
+      job.phase = "VERIFY_SETTLED";
+    }
+  } catch {
+    return await block("SOURCE_TERMINAL_RESULT_INVALID");
   }
-  if (kind === "worker") {
-    job.workerResult = validateBackupV2Result(result, gate);
-    job.workerResultBytes = [...observation.resultBytes];
-    job.phase = "WORKER_SETTLED";
-  } else {
-    job.verified = validateBackupV2VerifiedResult(
-      result,
-      gate,
-      job.workerResult!,
-      backupV2ArtifactSha256(new Uint8Array(job.workerResultBytes!)),
-    );
-    job.phase = "VERIFY_SETTLED";
-  }
+  if (recover || retryVerifierTerminal) await deps.archive(input);
+  delete job.cancellationBlockedReason;
   return await save();
 }
 
@@ -756,9 +957,41 @@ export function backupV2ControllerReport(
       : {}),
     detail: phase === "COMPLETE"
       ? "Cloud recovery point accepted; retention requires its separate reference-safe proof"
-      : "Bounded v2 reconciliation; source lease and custody remain independent",
+      : job?.cancellationBlockedReason ??
+        "Bounded v2 reconciliation; source lease and custody remain independent",
   };
 }
+
+/** On the Pi, finish only the named blocked verifier with the candidate
+ * controller code and the original immutable source runtime. */
+export async function recoverBlockedBackupV2Verifier(
+  expected: BackupV2VerifierRecoveryBinding,
+): Promise<BackblazeRunReport> {
+  if (await Deno.realPath(".") !== PI_CONTROLLER_CWD) fail();
+  if (!expected) fail();
+  const deps = realPiDeps();
+  const { realBackupV2BridgeRuntime } = await import(
+    "./backup-v2-bridge-runtime.ts"
+  );
+  return await deps.lock(CONTROLLER_LOCK_PATH, async () => {
+    const saved = await deps.private.read<BackupV2ControllerState>(
+      CONTROLLER_STATE_PATH,
+    );
+    if (!saved) fail();
+    const caps = realBackupV2ControllerCapabilities(
+      deps,
+      realBackupV2BridgeRuntime(deps),
+    );
+    let next = await stepBackupV2Controller(saved, caps, expected);
+    if (next.job?.phase === "VERIFY_SETTLED") {
+      next = await stepBackupV2Controller(next, caps, expected);
+    }
+    const report = backupV2ControllerReport(next, deps.now());
+    await deps.private.write(B2_REPORT_PATH, report);
+    return report;
+  });
+}
+
 /** Explicit recovery after exact cancellation/settlement. Unknown failures are
  * never automatically retried. The complete failed state remains archived. */
 export async function resumeBackupV2ControllerJob(
@@ -1178,7 +1411,7 @@ export function realBackupV2ControllerCapabilities(
     gate: BackupV2Gate;
     proof: BackupV2ControllerObservation;
     cancellation?: boolean;
-    artifacts?: { resultSha256: string; nativeCustodySha256: string };
+    artifacts?: TerminalArtifacts;
     exactStop?: {
       unitName: string;
       invocationId: string;
@@ -1218,12 +1451,17 @@ export function realBackupV2ControllerCapabilities(
   const retainedProof = async (
     gate: BackupV2Gate,
     timeoutMs = 30_000,
+    expected?: TerminalArtifacts,
   ): Promise<boolean> => {
     const saved = await deps.private.read<
       StopProof
     >(pathForClear(gate));
     if (!saved?.exactStop) return false;
     same(saved.gate, gate);
+    if (
+      expected &&
+      (saved.cancellation || !isDeepStrictEqual(saved.artifacts, expected))
+    ) return false;
     if (saved.cancellation) {
       if (saved.proof.sourceBootId !== gate.sourceBootId) fail();
       same(saved.proof.identity, gate.custody);
@@ -1249,6 +1487,7 @@ export function realBackupV2ControllerCapabilities(
   };
   return {
     now: deps.now,
+    log: deps.logger,
     persist: (state) => deps.private.write(CONTROLLER_STATE_PATH, state),
     archive: (state) =>
       deps.private.write(
@@ -1276,7 +1515,7 @@ export function realBackupV2ControllerCapabilities(
         same(await deps.private.read(GATE_PATH), expected);
         await removeGate(GATE_PATH);
       },
-      cleared: retainedProof,
+      cleared: (gate, expected) => retainedProof(gate, 30_000, expected),
     },
     async create(periodKey) {
       const deployment = await loadDeployment(deps),
@@ -1508,7 +1747,7 @@ export function realBackupV2ControllerCapabilities(
     async stop(gate, expected) {
       const actual = await observe(gate);
       if (actual.unit === "ABSENT") {
-        if (!await retainedProof(gate)) fail();
+        if (!await retainedProof(gate, 30_000, expected)) fail();
         return;
       }
       if (!backupV2ProcessesSettled(gate, actual)) fail();
@@ -1526,7 +1765,14 @@ export function realBackupV2ControllerCapabilities(
             nativeCustodySha256: actual.nativeCustodySha256,
           }
           : undefined);
-      if (!await deps.private.read(pathForClear(gate))) {
+      const prior = await deps.private.read<StopProof>(pathForClear(gate));
+      if (prior) {
+        same(prior.gate, gate);
+        if (
+          expected &&
+          (prior.cancellation || !isDeepStrictEqual(prior.artifacts, expected))
+        ) fail();
+      } else {
         await deps.private.write(pathForClear(gate), {
           gate,
           proof: { ...actual, resultBytes: null },
@@ -1559,15 +1805,34 @@ export function realBackupV2ControllerCapabilities(
       });
     },
     async cancel(gate) {
-      if (!gate.custody) return "CANCELLATION_BLOCKED";
+      if (!gate.custody) {
+        return {
+          state: "CANCELLATION_BLOCKED",
+          reason: "SOURCE_INVOCATION_UNPROVED",
+        };
+      }
+      let observationFailure: BackupV2CancellationBlockedReason | undefined;
       const deadline = performance.now() + 30_000;
       const settled = await settleBackupV2Cancellation(gate.custody, {
         now: () => performance.now(),
         observe: async () => {
+          observationFailure = undefined;
           const value = await observe(gate);
           if (value.sourceBootId === null) return null;
-          if (value.sourceBootId !== gate.sourceBootId) fail();
-          if (value.identity !== null) same(value.identity, gate.custody);
+          if (value.sourceBootId !== gate.sourceBootId) {
+            observationFailure = "SOURCE_BOOT_CHANGED";
+            fail();
+          }
+          if (
+            value.identity !== null &&
+            !isDeepStrictEqual(value.identity, gate.custody)
+          ) {
+            observationFailure = "SOURCE_INVOCATION_UNPROVED";
+            fail();
+          }
+          if (!value.tree && value.unit === "ABSENT") {
+            observationFailure = "SOURCE_UNIT_ABSENT";
+          }
           return value.tree;
         },
         stop: async () => {
@@ -1609,13 +1874,27 @@ test "$(systemctl show --value --property=InvocationID ${
           });
         },
       });
-      if (settled.state === "SETTLED") {
-        const remaining = deadline - performance.now();
-        if (remaining <= 0 || !await retainedProof(gate, remaining)) {
-          return "CANCELLATION_BLOCKED";
-        }
+      if (settled.state !== "SETTLED") {
+        return {
+          state: settled.state,
+          reason: observationFailure ?? settled.reason,
+        };
       }
-      return settled.state;
+      const remaining = deadline - performance.now();
+      try {
+        if (remaining > 0 && await retainedProof(gate, remaining)) {
+          return "SETTLED";
+        }
+      } catch {
+        return {
+          state: "CANCELLATION_BLOCKED",
+          reason: "SOURCE_OBSERVATION_UNPROVED",
+        };
+      }
+      return {
+        state: "CANCELLATION_BLOCKED",
+        reason: "SOURCE_CLEAR_PROOF_MISSING",
+      };
     },
     bridge,
   };
@@ -1635,6 +1914,7 @@ export interface BackupV2RetentionControl {
     | "CANCELLATION_BLOCKED";
   result: BackupV2PruneWorkerResult | null;
   legacyPlan?: PrunePlanEntry[];
+  cancellationBlockedReason?: BackupV2CancellationBlockedReason;
 }
 export async function prepareAcceptedBackupV2ScratchCleanup(
   job: BackupV2ControllerJob,
@@ -1777,8 +2057,16 @@ export async function runBackupV2RetentionCycle(
     generation: settings.envelope.request.captureId,
     detail: control!.phase === "COMPLETE"
       ? "Four complete recovery points retained"
-      : "Backup accepted; reference-safe retention is separately in progress",
+      : control!.cancellationBlockedReason ??
+        "Backup accepted; reference-safe retention is separately in progress",
   });
+  const block = async (reason: BackupV2CancellationBlockedReason) => {
+    control!.phase = "CANCELLATION_BLOCKED";
+    control!.cancellationBlockedReason = reason;
+    logCancellationBlocked(caps.log, control!.gate, reason);
+    await save();
+    return report();
+  };
   const gate = (sourceBootId: string) => {
     const id = crypto.randomUUID(), now = deps.now().toISOString();
     return validateBackupV2Gate({
@@ -1889,6 +2177,11 @@ export async function runBackupV2RetentionCycle(
     ].includes(control.phase)
   ) fail();
   if (
+    control.cancellationBlockedReason !== undefined &&
+    (control.phase !== "CANCELLATION_BLOCKED" ||
+      !cancellationBlockedReasons.includes(control.cancellationBlockedReason))
+  ) fail();
+  if (
     control.input.format !== "backup-v2-prune" ||
     control.input.schemaVersion !== 2 ||
     !["PLAN", "EXECUTE"].includes(control.input.stage)
@@ -1903,8 +2196,11 @@ export async function runBackupV2RetentionCycle(
     );
   }
   if (control.phase === "COMPLETE") return null;
-  if (["PARTIAL", "CANCELLATION_BLOCKED"].includes(control.phase)) {
-    return report();
+  if (control.phase === "PARTIAL") return report();
+  if (control.phase === "CANCELLATION_BLOCKED") {
+    return await block(
+      control.cancellationBlockedReason ?? "LEGACY_CANCELLATION_UNCLASSIFIED",
+    );
   }
   if (control.phase === "REQUESTED") {
     if (await caps.gate.read() !== null) fail();
@@ -1957,9 +2253,7 @@ export async function runBackupV2RetentionCycle(
     if (!observed.status) return report(true);
     const status = validateBackupV2Status(observed.status, control.gate);
     if (status.phase === "CANCELLATION_BLOCKED") {
-      control.phase = "CANCELLATION_BLOCKED";
-      await save();
-      return report();
+      return await block("SOURCE_STATUS_CANCELLATION_BLOCKED");
     }
     if (status.finishedAtUtc === null) {
       const fresh =
@@ -1987,14 +2281,11 @@ export async function runBackupV2RetentionCycle(
     );
     if (result.nativeCustodySha256 !== observed.nativeCustodySha256) fail();
     if (!backupV2ProcessesSettled(control.gate, observed)) {
-      if (
-        result.state !== "PARTIAL" ||
-        await caps.cancel(control.gate) !== "SETTLED"
-      ) {
-        control.phase = "CANCELLATION_BLOCKED";
-        await save();
-        return report();
+      if (result.state !== "PARTIAL") {
+        return await block("SOURCE_TERMINAL_PROCESSES_UNSETTLED");
       }
+      const cancelled = await caps.cancel(control.gate);
+      if (cancelled !== "SETTLED") return await block(cancelled.reason);
     }
     control.result = result;
     control.phase = "SETTLED";
@@ -2162,12 +2453,18 @@ export async function runBackupV2ControllerCycle(
     deadline = performance.now() + 240_000;
   let state: BackupV2ControllerState;
   do {
+    const previousPhase = value.schemaVersion === 2
+      ? value.job?.phase
+      : undefined;
     state = await stepBackupV2Controller(value, caps);
     value = state;
     const job = state.job;
     if (
       !job || ["COMPLETE", "FAILED", "CANCELLATION_BLOCKED"].includes(job.phase)
     ) break;
+    if (previousPhase === "VERIFY_SETTLED" && job.phase === previousPhase) {
+      break;
+    }
     const status = job.activeKind === "worker"
       ? job.workerStatus
       : job.verifierStatus;

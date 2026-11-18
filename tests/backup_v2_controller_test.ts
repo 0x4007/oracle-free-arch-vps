@@ -359,13 +359,19 @@ function legacy(): ControllerState {
 function fixture() {
   let live: BackupV2Gate | null = null,
     current = observation(settings().workerGate),
-    close: "CLOSED" | "CANCELLATION_BLOCKED" = "CLOSED",
-    bridge: "READY" | "PENDING" | "CANCELLATION_BLOCKED" = "READY";
+    close: Awaited<
+      ReturnType<BackupV2ControllerCapabilities["bridge"]["close"]>
+    > = "CLOSED",
+    bridge: Awaited<
+      ReturnType<BackupV2ControllerCapabilities["bridge"]["ensure"]>
+    > = "READY";
   const calls: string[] = [],
+    journal: string[] = [],
     cleared = new Set<string>(),
     saved: BackupV2ControllerState[] = [];
   const deps: BackupV2ControllerCapabilities = {
     now: () => new Date(END),
+    log: (line) => journal.push(line),
     persist: async (s) => {
       saved.push(structuredClone(s));
     },
@@ -405,12 +411,19 @@ function fixture() {
     stop: async () => {
       calls.push("stop");
     },
-    cancel: async () => "CANCELLATION_BLOCKED",
+    cancel: async () => {
+      calls.push("cancel");
+      return {
+        state: "CANCELLATION_BLOCKED",
+        reason: "SOURCE_CANCELLATION_UNSETTLED",
+      };
+    },
     bridge: { ensure: async () => bridge, close: async () => close },
   };
   return {
     deps,
     calls,
+    journal,
     saved,
     set live(value: BackupV2Gate | null) {
       live = value;
@@ -470,6 +483,41 @@ async function workerDone(
   return await stepBackupV2Controller(state, f.deps);
 }
 
+function verifiedResult(
+  state: BackupV2ControllerState,
+): BackupV2VerifiedResult {
+  const job = state.job!, gate = job.verifierGate, worker = job.workerResult!;
+  return {
+    schemaVersion: 2,
+    format: "backup-v2-verified",
+    envelope: gate.envelope,
+    gateId: gate.gateId,
+    sourceBootId: gate.sourceBootId,
+    custody: gate.custody!,
+    workerResultSha256: backupV2ArtifactSha256(
+      new Uint8Array(job.workerResultBytes!),
+    ),
+    selectedRoot: worker.selectedRoot,
+    receipt: receipt(worker),
+    receiptReference: reference("receipt"),
+    finishedAtUtc: END,
+    nativeCustodySha256: SHA,
+    protectedGraph: buildBackupV2Protection(worker.selectedRoot.reference, [
+      reference("receipt").object,
+      ...worker.selectedRoot.root.roles.map((role) => role.manifest.object),
+    ]).descriptor,
+  };
+}
+
+async function verifying() {
+  let { f, state } = await launched();
+  state = await workerDone(f, state);
+  state = await stepBackupV2Controller(state, f.deps);
+  f.observation = observation(state.job!.verifierGate);
+  state = await stepBackupV2Controller(state, f.deps);
+  return { f, state, gate: state.job!.verifierGate };
+}
+
 Deno.test("bounded controller preserves FAILED v1 and snapshots predecessor before one new due request", async () => {
   const f = fixture(), old = legacy(), bytes = backupV2ArtifactBytes(old);
   const state = await stepBackupV2Controller(old, f.deps);
@@ -526,6 +574,8 @@ Deno.test("missing unit and zero counters cannot clear gate or start a replaceme
   };
   const blocked = await stepBackupV2Controller(state, f.deps);
   equal(blocked.job!.phase, "CANCELLATION_BLOCKED");
+  equal(blocked.job!.cancellationBlockedReason, "SOURCE_UNIT_ABSENT");
+  assert(f.journal.at(-1)?.endsWith("reason=SOURCE_UNIT_ABSENT"));
   assert(f.live !== null);
   equal(f.calls.filter((c) => c.startsWith("launch:")), ["launch:worker"]);
 });
@@ -554,6 +604,10 @@ Deno.test("terminal status waits for actual process exit; result hash and tree m
   f.observation = o;
   next = await stepBackupV2Controller(next, f.deps);
   equal(next.job!.phase, "CANCELLATION_BLOCKED");
+  equal(
+    next.job!.cancellationBlockedReason,
+    "SOURCE_TERMINAL_RESULT_HASH_MISMATCH",
+  );
   assert(f.live !== null);
 });
 Deno.test("complete cloud receipt waits for bridge closure and accepted period never duplicates", async () => {
@@ -568,29 +622,11 @@ Deno.test("complete cloud receipt waits for bridge closure and accepted period n
   equal(f.calls.filter((c) => c === "ack").length, before);
   f.bridge = "READY";
   state = await stepBackupV2Controller(state, f.deps);
-  const g = state.job!.verifierGate,
-    w = state.job!.workerResult!,
-    verified: BackupV2VerifiedResult = {
-      schemaVersion: 2,
-      format: "backup-v2-verified",
-      envelope: g.envelope,
-      gateId: g.gateId,
-      sourceBootId: g.sourceBootId,
-      custody: g.custody!,
-      workerResultSha256: backupV2ArtifactSha256(
-        new Uint8Array(state.job!.workerResultBytes!),
-      ),
-      selectedRoot: w.selectedRoot,
-      receipt: receipt(w),
-      receiptReference: reference("receipt"),
-      finishedAtUtc: END,
-      nativeCustodySha256: SHA,
-      protectedGraph: buildBackupV2Protection(w.selectedRoot.reference, [
-        reference("receipt").object,
-        ...w.selectedRoot.root.roles.map((role) => role.manifest.object),
-      ]).descriptor,
-    };
-  f.observation = completeObservation(g, verified, "ACCEPTED");
+  f.observation = completeObservation(
+    state.job!.verifierGate,
+    verifiedResult(state),
+    "ACCEPTED",
+  );
   state = await stepBackupV2Controller(state, f.deps);
   equal(state.catalog.length, 0);
   state = await stepBackupV2Controller(state, f.deps);
@@ -604,39 +640,98 @@ Deno.test("complete cloud receipt waits for bridge closure and accepted period n
   equal(f.calls.filter((c) => c === "launch:worker").length, 1);
 });
 Deno.test("bridge closure failure keeps verifier gate and no accepted catalog", async () => {
-  let { f, state } = await launched();
-  state = await workerDone(f, state);
+  let { f, state, gate } = await verifying();
+  f.observation = completeObservation(gate, verifiedResult(state), "ACCEPTED");
   state = await stepBackupV2Controller(state, f.deps);
-  f.observation = observation(state.job!.verifierGate);
-  state = await stepBackupV2Controller(state, f.deps);
-  const g = state.job!.verifierGate, w = state.job!.workerResult!;
-  const verified = {
-    schemaVersion: 2,
-    format: "backup-v2-verified",
-    envelope: g.envelope,
-    gateId: g.gateId,
-    sourceBootId: g.sourceBootId,
-    custody: g.custody,
-    workerResultSha256: backupV2ArtifactSha256(
-      new Uint8Array(state.job!.workerResultBytes!),
-    ),
-    selectedRoot: w.selectedRoot,
-    receipt: receipt(w),
-    receiptReference: reference("receipt"),
-    finishedAtUtc: END,
-    nativeCustodySha256: SHA,
-    protectedGraph: buildBackupV2Protection(w.selectedRoot.reference, [
-      reference("receipt").object,
-      ...w.selectedRoot.root.roles.map((role) => role.manifest.object),
-    ]).descriptor,
+  f.close = {
+    state: "CANCELLATION_BLOCKED",
+    reason: "BRIDGE_TERMINAL_PROCESSES_UNPROVED",
   };
-  f.observation = completeObservation(g, verified, "ACCEPTED");
-  state = await stepBackupV2Controller(state, f.deps);
-  f.close = "CANCELLATION_BLOCKED";
   state = await stepBackupV2Controller(state, f.deps);
   equal(state.job!.phase, "CANCELLATION_BLOCKED");
+  equal(
+    state.job!.cancellationBlockedReason,
+    "BRIDGE_TERMINAL_PROCESSES_UNPROVED",
+  );
+  assert(
+    f.journal.at(-1)?.endsWith("reason=BRIDGE_TERMINAL_PROCESSES_UNPROVED"),
+  );
   equal(state.catalog.length, 0);
   assert(f.live !== null);
+});
+
+Deno.test("bridge snapshot crossing clean verifier exit is recoverable on a later reconciliation", async () => {
+  let { f, state, gate } = await verifying();
+  const accepted = completeObservation(gate, verifiedResult(state), "ACCEPTED");
+  f.observation = { ...f.observation, status: status(gate, "VERIFYING") };
+  f.deps.bridge.ensure = async () => {
+    // The controller saw a running verifier but the bridge's next snapshot
+    // finds it exiting. Even an inconclusive bridge observation cannot cancel
+    // the successful source job when its terminal proof becomes observable.
+    f.observation = accepted;
+    return { state: "CANCELLATION_BLOCKED", reason: "BRIDGE_MANAGER_UNPROVED" };
+  };
+  state = await stepBackupV2Controller(state, f.deps);
+  equal(state.job!.phase, "CANCELLATION_BLOCKED");
+  equal(state.job!.verifierStatus!.phase, "PREFLIGHT");
+  equal(state.job!.cancellationBlockedReason, "BRIDGE_MANAGER_UNPROVED");
+  equal(f.live, gate);
+  state = await stepBackupV2Controller(state, f.deps);
+  equal(state.job!.phase, "VERIFY_SETTLED");
+  f.close = "PENDING";
+  state = await stepBackupV2Controller(state, f.deps);
+  equal(state.job!.phase, "VERIFY_SETTLED");
+  equal(f.live, gate);
+  f.close = "CLOSED";
+  state = await stepBackupV2Controller(state, f.deps);
+  equal(state.job!.phase, "COMPLETE");
+  equal(state.catalog.length, 1);
+  assert(!f.calls.includes("cancel"));
+  equal(f.live, null);
+});
+
+Deno.test("exact blocked verifier accepts only after fresh native proof and retries after gate removal", async () => {
+  let { f, state, gate } = await verifying();
+  const accepted = completeObservation(gate, verifiedResult(state), "ACCEPTED");
+  state.job!.phase = "CANCELLATION_BLOCKED";
+  const binding = {
+    jobId: gate.envelope.request.jobId,
+    gateId: gate.gateId,
+    requestSha256: gate.envelope.requestSha256,
+  };
+  const before = [...f.calls];
+  await rejects(() =>
+    stepBackupV2Controller(state, f.deps, { ...binding, gateId: uuid(98) })
+  );
+  f.observation = {
+    ...accepted,
+    nativeCustodySha256: "f".repeat(64),
+  };
+  state = await stepBackupV2Controller(state, f.deps, binding);
+  equal(state.job!.phase, "CANCELLATION_BLOCKED");
+  equal(
+    state.job!.cancellationBlockedReason,
+    "SOURCE_TERMINAL_NATIVE_CUSTODY_MISMATCH",
+  );
+  equal(f.calls, before);
+  equal(f.live, gate);
+  equal(state.catalog, []);
+
+  f.observation = accepted;
+  state = await stepBackupV2Controller(state, f.deps, binding);
+  equal(state.job!.phase, "VERIFY_SETTLED");
+  const preserveProtection = f.deps.preserveProtection;
+  f.deps.preserveProtection = async () => {
+    throw new Error("Interrupted after gate removal");
+  };
+  await rejects(() => stepBackupV2Controller(state, f.deps, binding));
+  equal(f.live, null);
+  f.deps.preserveProtection = preserveProtection;
+  const complete = await stepBackupV2Controller(state, f.deps, binding);
+  equal(complete.job!.phase, "COMPLETE");
+  equal(complete.catalog.length, 1);
+  await rejects(() => stepBackupV2Controller(complete, f.deps, binding));
+  equal(f.calls.slice(before.length), ["archive", "stop", "clear", "protect"]);
 });
 Deno.test("actual generated source launch is finite notify custody with pinned scoped FFI", () => {
   const s = settings(), argv = backupV2LaunchArguments(s, "worker");
@@ -1228,6 +1323,21 @@ Deno.test("managed retention persists launch intent once and binds cold source c
   assert(
     argv.includes("--property=Type=notify") &&
       argv.includes("--property=CPUWeight=1"),
+  );
+  observed = {
+    ...observed,
+    status: status(control.gate, "CANCELLATION_BLOCKED"),
+  };
+  const blocked = await runBackupV2RetentionCycle(state, pi, caps);
+  equal(blocked?.status, "B2_RETENTION_PLAN_CANCELLATION_BLOCKED");
+  equal(
+    control.cancellationBlockedReason,
+    "SOURCE_STATUS_CANCELLATION_BLOCKED",
+  );
+  assert(
+    f.journal.at(-1)?.endsWith(
+      "kind=prune reason=SOURCE_STATUS_CANCELLATION_BLOCKED",
+    ),
   );
 });
 

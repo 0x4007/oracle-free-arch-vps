@@ -878,10 +878,18 @@ export async function pollBackupV2Settlement(
   }
   return false;
 }
-export type BackupV2CancellationResult = {
-  state: "SETTLED" | "CANCELLATION_BLOCKED";
-  identity: BackupV2SupervisorIdentity;
-};
+export type BackupV2CancellationFailure =
+  | "SOURCE_OBSERVATION_UNPROVED"
+  | "SOURCE_INVOCATION_UNPROVED"
+  | "SOURCE_CANCELLATION_SAMPLE_INVALID"
+  | "SOURCE_EXACT_STOP_FAILED"
+  | "SOURCE_CANCELLATION_UNSETTLED";
+export type BackupV2CancellationResult =
+  & { identity: BackupV2SupervisorIdentity }
+  & (
+    | { state: "SETTLED" }
+    | { state: "CANCELLATION_BLOCKED"; reason: BackupV2CancellationFailure }
+  );
 
 /** External controller only: the MainPID cannot stop itself and subsequently
  * prove its own death. No gate/lock/scratch/namespace is released here. */
@@ -894,19 +902,23 @@ export async function settleBackupV2Cancellation(
   finite(timeoutMs, 1, 30_000);
   const started = finite(capabilities.now()), deadline = started + timeoutMs;
   let observed = started;
+  let reason: BackupV2CancellationFailure = "SOURCE_OBSERVATION_UNPROVED";
   const remaining = () => {
     observed = finite(capabilities.now(), observed, deadline);
     return deadline - observed;
   };
   const read = async () => {
+    reason = "SOURCE_OBSERVATION_UNPROVED";
     const proof = await bounded(
       (signal) => capabilities.observe(signal),
       remaining(),
     );
     if (proof === null) return null;
+    reason = "SOURCE_INVOCATION_UNPROVED";
     if (!sameIdentity(expected, proof.identity)) {
       throw new Error("Cancellation identity changed");
     }
+    reason = "SOURCE_CANCELLATION_SAMPLE_INVALID";
     finite(
       proof.observedMonotonicMs,
       observed,
@@ -915,6 +927,7 @@ export async function settleBackupV2Cancellation(
     count(proof.mainPid);
     count(proof.controlPid);
     if (proof.mainPid !== 0 && proof.mainPid !== expected.mainPid) {
+      reason = "SOURCE_INVOCATION_UNPROVED";
       throw new Error("Cancellation MainPID changed");
     }
     return proof;
@@ -930,14 +943,17 @@ export async function settleBackupV2Cancellation(
     const before = await read();
     if (before === null) throw new Error("Cancellation custody is unknown");
     if (!settled(before)) {
+      reason = "SOURCE_EXACT_STOP_FAILED";
       await bounded(
         (signal) => capabilities.stop(expected, signal),
         remaining(),
       );
+      reason = "SOURCE_CANCELLATION_UNSETTLED";
       if (
         !await pollBackupV2Settlement(
           async () => {
             const proof = await read();
+            if (proof !== null) reason = "SOURCE_CANCELLATION_UNSETTLED";
             return proof !== null && settled(proof);
           },
           remaining(),
@@ -950,6 +966,6 @@ export async function settleBackupV2Cancellation(
     }
     return { state: "SETTLED", identity: expected };
   } catch {
-    return { state: "CANCELLATION_BLOCKED", identity: expected };
+    return { state: "CANCELLATION_BLOCKED", identity: expected, reason };
   }
 }

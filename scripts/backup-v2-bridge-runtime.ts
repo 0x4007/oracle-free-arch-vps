@@ -7,6 +7,10 @@ import type {
   TunnelSeam,
 } from "./backblaze-file-backup.ts";
 import type { BackupV2WorkerSettings } from "./backup-v2-worker.ts";
+import type {
+  BackupV2CancellationBlocked,
+  BackupV2CancellationBlockedReason,
+} from "./backup-v2-controller.ts";
 import {
   type BackupV2Gate,
   type BackupV2Status,
@@ -167,6 +171,7 @@ export function backupV2BridgeRuntimePaths(input: BackupV2Gate) {
     entry: `${directory}/entry.ts`,
     status: `${directory}/status.json`,
     close: `${directory}/close.json`,
+    settlementIntent: `${directory}/settlement-intent.json`,
     settled: `${directory}/settled.json`,
     unitName: `arch-vps-b2-bridge-${
       gate.envelope.request.jobId.slice(4)
@@ -241,6 +246,7 @@ async function localUnit(
   run: RemoteRunner,
   name: string,
   expected?: BackupV2SupervisorIdentity,
+  inspectProcess = true,
 ): Promise<Unit> {
   if (!/^arch-vps-b2-bridge-[a-f0-9-]+\.service$/.test(name)) fail();
   const props = properties(
@@ -264,7 +270,7 @@ async function localUnit(
   if (!/^[a-f0-9-]{36}$/.test(boot)) fail();
   const pid = Number(props.MainPID);
   let identity: BackupV2SupervisorIdentity | null = null;
-  if (pid > 0) {
+  if (inspectProcess && pid > 0) {
     if (
       !Number.isSafeInteger(pid) ||
       !/^[a-f0-9]{32}$/.test(props.InvocationID) ||
@@ -297,7 +303,9 @@ async function localUnit(
       "-c",
       `if test -d ${shellQuote(path)}; then cat ${
         shellQuote(path + "/cgroup.events")
-      }; else printf 'ABSENT\\n'; fi`,
+      } || { test ! -d ${
+        shellQuote(path)
+      } && printf 'ABSENT\\n'; }; else printf 'ABSENT\\n'; fi`,
     ]);
     empty = output.trim() === "ABSENT" || /^populated 0$/m.test(output);
   }
@@ -359,6 +367,7 @@ export function decodeBackupV2BridgeSource(
 ): {
   status: BackupV2Status;
   terminal: boolean;
+  terminalStatusPending: boolean;
   cancelled: boolean;
   socketPresent: boolean;
   defaultIdentity: string;
@@ -404,6 +413,9 @@ export function decodeBackupV2BridgeSource(
   return {
     status,
     terminal,
+    terminalStatusPending: settled && props.Result === "success" &&
+      ["PREFLIGHT", "VERIFYING"].includes(status.phase) &&
+      age <= TERMINAL_SETTLEMENT_MS,
     cancelled: status.phase === "FAILED" ||
       status.phase === "CANCELLATION_BLOCKED" ||
       settled && status.phase !== "ACCEPTED",
@@ -441,9 +453,92 @@ function statusBinding(
     value.bridge.binding.defaultSocket !== input.binding.defaultSocket ||
     value.bridge.keeper.unitName !==
       backupV2BridgeRuntimePaths(input.gate).unitName ||
+    !/^[a-f0-9]{32}$/.test(value.bridge.keeper.invocationId) ||
+    !Number.isSafeInteger(value.bridge.keeper.mainPid) ||
+    value.bridge.keeper.mainPid <= 0 ||
+    !/^[1-9][0-9]{0,19}$/.test(value.bridge.keeper.mainStartTicks) ||
     !Number.isSafeInteger(value.bridge.pendingOperations) ||
     value.bridge.pendingOperations < 0
   ) fail();
+}
+
+/** A terminal keeper closed its exact tunnel, but gpgconf can leave the
+ * dedicated keyring's agent in the keeper cgroup after MainPID exits. */
+function terminalBridgeCgroupProgram(
+  keeper: BackupV2SupervisorIdentity,
+  home: string,
+): string {
+  return [
+    `group=${shellQuote(keeper.cgroup)}`,
+    `home=${shellQuote(home)}`,
+    'root="/sys/fs/cgroup$group"',
+    'if test -d "$root"; then',
+    '  test "$(awk \'$1 == "nr_descendants" { print $2 }\' "$root/cgroup.stat")" = 0',
+    '  pid=$(cat "$root/cgroup.procs")',
+    '  if test -n "$pid"; then',
+    '    case "$pid" in *[!0-9]*) exit 1;; esac',
+    '    test "$pid" -gt 1',
+    '    test "$(cat "/proc/$pid/cgroup")" = "0::$group"',
+    '    test "$(readlink "/proc/$pid/exe")" = /usr/bin/gpg-agent',
+    '    start=$(awk \'{ sub(/^.*\\) /,""); print $20 }\' "/proc/$pid/stat")',
+    '    test -n "$start"',
+    "    match_agent() {",
+    '      printf "%s\\000" "$1" --homedir "$home" --use-standard-socket --daemon | cmp -s - "/proc/$pid/cmdline"',
+    "    }",
+    "    match_agent /usr/bin/gpg-agent || match_agent gpg-agent",
+    '    test "$(cat "/proc/$pid/cgroup")" = "0::$group"',
+    '    test "$(awk \'{ sub(/^.*\\) /,""); print $20 }\' "/proc/$pid/stat")" = "$start"',
+    '    test "$(cat "$root/cgroup.procs")" = "$pid"',
+    "  else",
+    '    test "$(awk \'$1 == "populated" { print $2 }\' "$root/cgroup.events")" = 0',
+    "  fi",
+    "fi",
+  ].join("\n");
+}
+
+const TERMINAL_SETTLEMENT_MS = 90_000;
+
+function terminalBridgeStatus(status: SavedStatus): boolean {
+  return status.bridge.state === "CLOSED" &&
+    status.bridge.reason === "TERMINAL" &&
+    status.bridge.pendingOperations === 0;
+}
+
+function keeperFailureReason(
+  status: SavedStatus,
+): BackupV2CancellationBlockedReason | null {
+  switch (status.bridge.reason) {
+    case "CANCELLED":
+    case "LEASE_EXPIRED":
+    case "IDENTITY_CHANGED":
+    case "PROGRESS_REGRESSED":
+    case "PROGRESS_WRONG_PHASE":
+    case "TUNNEL_LOST":
+    case "OVERLAPPING_OPERATION":
+    case "OBSERVATION_OR_NOTIFICATION_UNPROVED":
+      return `BRIDGE_KEEPER_${status.bridge.reason}`;
+    default:
+      return null;
+  }
+}
+
+function sameKeeperInvocation(unit: Unit, status: SavedStatus): boolean {
+  return unit.boot === status.keeperBootId &&
+    unit.props.LoadState === "loaded" &&
+    unit.props.InvocationID === status.bridge.keeper.invocationId &&
+    (!unit.props.ControlGroup ||
+      unit.props.ControlGroup === status.bridge.keeper.cgroup) &&
+    ["0", String(status.bridge.keeper.mainPid)].includes(unit.props.MainPID) &&
+    /^[0-9]+$/.test(unit.props.ControlPID);
+}
+
+function stoppedKeeper(unit: Unit, status: SavedStatus): boolean {
+  return unit.boot === status.keeperBootId && unit.empty &&
+    unit.props.MainPID === "0" && unit.props.ControlPID === "0" &&
+    (unit.props.LoadState === "not-found" && !unit.props.InvocationID ||
+      sameKeeperInvocation(unit, status) &&
+        unit.props.ActiveState === "inactive" &&
+        unit.props.SubState === "dead");
 }
 async function immutable(
   io: PiDeps["private"],
@@ -543,7 +638,9 @@ export function realBackupV2BridgeRuntime(
     async ensure(
       settings: BackupV2WorkerSettings,
       gateInput: BackupV2Gate,
-    ): Promise<"READY" | "PENDING" | "CANCELLATION_BLOCKED"> {
+    ): Promise<"READY" | "PENDING" | BackupV2CancellationBlocked> {
+      let reason: BackupV2CancellationBlockedReason =
+        "BRIDGE_SETTINGS_UNPROVED";
       try {
         const gate = active(gateInput),
           paths = backupV2BridgeRuntimePaths(gate),
@@ -554,10 +651,18 @@ export function realBackupV2BridgeRuntime(
           settings.envelope.requestSha256 !== gate.envelope.requestSha256 ||
           settings.verifierGate.gateId !== gate.gateId
         ) fail();
-        let input = await saved(gate),
-          unit = await localUnit(ctx.run, paths.unitName);
+        let input = await saved(gate);
+        if (
+          input &&
+          input.sourceDirectory !== ctx.worker.backupV2GateDirectory(gate)
+        ) {
+          fail();
+        }
         if (!input) {
+          reason = "BRIDGE_MANAGER_UNPROVED";
+          const unit = await localUnit(ctx.run, paths.unitName);
           if (unit.props.LoadState !== "not-found") fail();
+          reason = "BRIDGE_SOCKET_UNPROVED";
           const publicHome =
               `${ctx.legacy.PUBLIC_HOME_BASE}/${gate.envelope.request.captureId}`,
             sockets = await deps.remote.resolveAgentSocket(publicHome);
@@ -578,11 +683,13 @@ export function realBackupV2BridgeRuntime(
             sourceDirectory: ctx.worker.backupV2GateDirectory(gate),
             defaultSocketIdentity: "",
           };
+          reason = "BRIDGE_SOURCE_UNPROVED";
           const initial = await source(input);
           if (initial.terminal || initial.cancelled || initial.socketPresent) {
             fail();
           }
           input.defaultSocketIdentity = initial.defaultIdentity;
+          reason = "BRIDGE_SETTINGS_UNPROVED";
           await immutable(deps.private, paths.settings, bytes(input));
           const base =
             `file://${ctx.legacy.PI_CONTROLLER_CWD}/.private/file-backup/runtime/releases/${gate.envelope.request.sourceRevision}/scripts/`;
@@ -591,40 +698,61 @@ export function realBackupV2BridgeRuntime(
             paths.entry,
             encoder.encode(backupV2BridgeEntrypoint(base, paths.settings)),
           );
+          reason = "BRIDGE_MANAGER_UNPROVED";
           await checked(
             ctx.run,
             "/usr/local/bin/safepi",
             backupV2BridgeRuntimeCommand(input, ctx.legacy.PI_CONTROLLER_CWD),
           );
-          unit = await localUnit(ctx.run, paths.unitName);
         }
+        reason = "BRIDGE_STATUS_UNPROVED";
         const status = await deps.private.read<SavedStatus>(paths.status);
-        if (!status) return unit.identity ? "PENDING" : "CANCELLATION_BLOCKED";
+        if (!status) {
+          if ((await localUnit(ctx.run, paths.unitName)).identity) {
+            return "PENDING";
+          }
+          fail();
+        }
+        reason = "BRIDGE_BINDING_MISMATCH";
         statusBinding(input, status);
-        if (
-          status.inputSha256 !== await hash(bytes(input)) ||
-          status.keeperBootId !== unit.boot ||
-          status.bridge.keeper.unitName !== paths.unitName
-        ) fail();
-        const current = await source(input);
+        if (status.inputSha256 !== await hash(bytes(input))) fail();
+        reason = "BRIDGE_SOURCE_UNPROVED";
+        let current = await source(input);
+        let unit: Unit;
+        reason = "BRIDGE_MANAGER_UNPROVED";
+        try {
+          unit = await localUnit(
+            ctx.run,
+            paths.unitName,
+            undefined,
+            !current.terminal,
+          );
+        } catch (error) {
+          // The keeper can exit between the manager and /proc reads. A fresh,
+          // exact source terminal observation needs manager custody only.
+          if (current.terminal) throw error;
+          reason = "BRIDGE_SOURCE_UNPROVED";
+          current = await source(input);
+          if (!current.terminal) throw error;
+          reason = "BRIDGE_MANAGER_UNPROVED";
+          unit = await localUnit(ctx.run, paths.unitName, undefined, false);
+        }
+        reason = "BRIDGE_SOCKET_UNPROVED";
         if (current.defaultIdentity !== input.defaultSocketIdentity) fail();
-        if (
-          current.terminal && !current.cancelled &&
-          status.bridge.state === "CLOSED" &&
-          status.bridge.reason === "TERMINAL" &&
-          status.bridge.pendingOperations === 0 &&
-          unit.props.InvocationID === status.bridge.keeper.invocationId &&
-          unit.props.MainPID === "0" && unit.props.ControlPID === "0" &&
-          (await localUnit(ctx.run, paths.unitName, status.bridge.keeper))
-            .empty &&
-          !current.socketPresent
-        ) return "READY";
+        reason = "BRIDGE_BINDING_MISMATCH";
+        if (!sameKeeperInvocation(unit, status)) fail();
+        reason = keeperFailureReason(status) ?? "BRIDGE_READINESS_UNPROVED";
         const age = deps.now().getTime() - Date.parse(status.updatedAtUtc);
+        // The controller's earlier snapshot said the verifier still needed the
+        // tunnel. Its next reconciliation must collect the terminal source
+        // proof and close the bridge. The keeper PID may disappear at any time.
         if (
-          current.terminal && !current.cancelled && unit.identity &&
-          sameIdentity(status.bridge.keeper, unit.identity) &&
-          ["ACTIVE", "CLOSED"].includes(status.bridge.state) &&
-          Number.isFinite(age) && age >= -5000 && age <= 90_000
+          (current.terminal && !current.cancelled ||
+            current.terminalStatusPending) &&
+          (terminalBridgeStatus(status) && !current.socketPresent ||
+            status.bridge.state === "ACTIVE" &&
+              Number.isFinite(age) && age >= -5000 &&
+              age <= TERMINAL_SETTLEMENT_MS)
         ) return "PENDING";
         if (
           !unit.identity ||
@@ -635,48 +763,108 @@ export function realBackupV2BridgeRuntime(
         ) fail();
         return "READY";
       } catch {
-        return "CANCELLATION_BLOCKED";
+        return { state: "CANCELLATION_BLOCKED", reason };
       }
     },
     async close(
       gateInput: BackupV2Gate,
-    ): Promise<"CLOSED" | "CANCELLATION_BLOCKED"> {
+      mode: "terminal" | "cancel" = "terminal",
+    ): Promise<"CLOSED" | "PENDING" | BackupV2CancellationBlocked> {
+      let reason: BackupV2CancellationBlockedReason =
+        "BRIDGE_SETTINGS_UNPROVED";
       try {
         const gate = active(gateInput),
           paths = backupV2BridgeRuntimePaths(gate),
           input = await saved(gate),
           ctx = await context();
-        if (!input) fail();
+        if (
+          !input ||
+          input.sourceDirectory !== ctx.worker.backupV2GateDirectory(gate)
+        ) fail();
+        reason = "BRIDGE_STATUS_UNPROVED";
         const status = await deps.private.read<SavedStatus>(paths.status);
         if (!status || status.inputSha256 !== await hash(bytes(input))) fail();
+        reason = "BRIDGE_BINDING_MISMATCH";
         statusBinding(input, status);
-        const prior = await deps.private.read<
-          {
-            identity: BackupV2SupervisorIdentity;
-            boot: string;
-            inputSha256: string;
-          }
-        >(paths.settled);
+        const settlement = {
+          identity: status.bridge.keeper,
+          boot: status.keeperBootId,
+          inputSha256: status.inputSha256,
+        };
+        const intent = {
+          ...settlement,
+          statusSha256: await hash(bytes(status)),
+        };
+        const prior = await deps.private.read<typeof settlement>(paths.settled),
+          priorIntent = mode === "terminal"
+            ? await deps.private.read<typeof intent>(paths.settlementIntent)
+            : undefined;
+        const sameSettlement = (value: typeof settlement) =>
+          value.boot === settlement.boot &&
+          value.inputSha256 === settlement.inputSha256 &&
+          sameIdentity(value.identity, settlement.identity);
+        if (
+          prior && !sameSettlement(prior) ||
+          priorIntent && (!sameSettlement(priorIntent) ||
+              priorIntent.statusSha256 !== intent.statusSha256)
+        ) fail();
+        reason = "BRIDGE_MANAGER_UNPROVED";
         let unit = await localUnit(
           ctx.run,
           paths.unitName,
           status.bridge.keeper,
+          false,
         );
+        const stopped = stoppedKeeper(unit, status);
         if (
-          prior && prior.boot === unit.boot &&
-          prior.inputSha256 === status.inputSha256 &&
-          sameIdentity(prior.identity, status.bridge.keeper) &&
-          unit.props.LoadState === "not-found" && unit.empty
-        ) return "CLOSED";
-        if (
-          unit.boot !== status.keeperBootId ||
-          unit.props.InvocationID !== status.bridge.keeper.invocationId
-        ) fail();
-        if (status.bridge.state !== "CLOSED") {
-          const remote = await source(input);
-          if (remote.terminal && !remote.cancelled) {
-            return "CANCELLATION_BLOCKED";
+          prior && stopped &&
+          (mode === "cancel" || terminalBridgeStatus(status))
+        ) {
+          return "CLOSED";
+        }
+        reason = "BRIDGE_BINDING_MISMATCH";
+        if (!sameKeeperInvocation(unit, status) && !(priorIntent && stopped)) {
+          fail();
+        }
+        reason = "BRIDGE_SOURCE_UNPROVED";
+        const remote = await source(input);
+        reason = "BRIDGE_SOCKET_UNPROVED";
+        if (remote.defaultIdentity !== input.defaultSocketIdentity) fail();
+        reason = keeperFailureReason(status) ??
+          "BRIDGE_TERMINAL_CLOSE_UNPROVED";
+        const terminal = remote.terminal && !remote.cancelled;
+        if (mode === "terminal") {
+          if (!terminal) {
+            if (remote.terminalStatusPending) return "PENDING";
+            fail();
           }
+          const age = deps.now().getTime() -
+            Date.parse(remote.status.finishedAtUtc!);
+          const waiting = Number.isFinite(age) && age >= -5000 &&
+            age <= TERMINAL_SETTLEMENT_MS;
+          if (!terminalBridgeStatus(status)) {
+            if (waiting && status.bridge.state === "ACTIVE") return "PENDING";
+            fail();
+          }
+          if (priorIntent && stopped) {
+            reason = "BRIDGE_SOCKET_UNPROVED";
+            if (remote.socketPresent) fail();
+            reason = "BRIDGE_EXACT_STOP_UNPROVED";
+            await deps.private.write(paths.settled, settlement);
+            return "CLOSED";
+          }
+          if (unit.props.MainPID !== "0" || unit.props.ControlPID !== "0") {
+            if (waiting) return "PENDING";
+            fail();
+          }
+          if (
+            unit.props.ActiveState !== "active" ||
+            unit.props.SubState !== "exited" || unit.props.Result !== "success"
+          ) fail();
+        }
+        if (status.bridge.state !== "CLOSED") {
+          if (terminal) fail();
+          reason = "BRIDGE_CANCELLATION_CLOSE_PENDING";
           await immutable(
             deps.private,
             paths.close,
@@ -686,38 +874,88 @@ export function realBackupV2BridgeRuntime(
               custody: gate.custody,
             }),
           );
-          return "CANCELLATION_BLOCKED";
+          const keeperReason = keeperFailureReason(status);
+          return keeperReason
+            ? { state: "CANCELLATION_BLOCKED", reason: keeperReason }
+            : "PENDING";
         }
+        reason = "BRIDGE_TERMINAL_PROCESSES_UNPROVED";
         if (
           unit.props.MainPID !== "0" || unit.props.ControlPID !== "0" ||
-          !unit.empty || !["exited", "failed"].includes(unit.props.SubState)
+          !["exited", "failed"].includes(unit.props.SubState) ||
+          status.bridge.pendingOperations !== 0 ||
+          mode === "cancel" && !unit.empty
         ) fail();
-        const remote = await source(input);
+        reason = "BRIDGE_SOCKET_UNPROVED";
         if (
-          !remote.terminal || remote.socketPresent ||
-          remote.defaultIdentity !== input.defaultSocketIdentity
+          !remote.terminal || remote.socketPresent
         ) fail();
+        const cgroupProof = mode === "terminal"
+          ? terminalBridgeCgroupProgram(
+            status.bridge.keeper,
+            `${ctx.legacy.PI_CONTROLLER_CWD}/${ctx.legacy.PI_KEYRING_PATH}`,
+          )
+          : "";
+        reason = "BRIDGE_TERMINAL_PROCESSES_UNPROVED";
+        if (cgroupProof) {
+          await checked(ctx.run, "/bin/sh", ["-c", `set -eu\n${cgroupProof}`]);
+        }
+        reason = "BRIDGE_EXACT_STOP_UNPROVED";
+        if (mode === "terminal" && !priorIntent) {
+          await deps.private.write(paths.settlementIntent, intent);
+        }
+        const unitArg = shellQuote(paths.unitName);
+        const properties = mode === "terminal"
+          ? [
+            "LoadState=loaded",
+            "ActiveState=active",
+            "SubState=exited",
+            "Result=success",
+            "MainPID=0",
+            "ControlPID=0",
+            "KillMode=control-group",
+          ]
+          : [];
         await checked(ctx.run, "/bin/sh", [
           "-c",
-          `test "$(systemctl --user show ${
-            shellQuote(paths.unitName)
-          } --property=InvocationID --value)" = ${
-            shellQuote(status.bridge.keeper.invocationId)
-          } && systemctl --user stop ${shellQuote(paths.unitName)}`,
+          [
+            "set -eu",
+            `test "$(cat /proc/sys/kernel/random/boot_id)" = ${
+              shellQuote(unit.boot)
+            }`,
+            ...(properties.length
+              ? [
+                `props=$(systemctl --user show ${unitArg} --property=LoadState,ActiveState,SubState,Result,MainPID,ControlPID,KillMode,InvocationID)`,
+                ...[
+                  ...properties,
+                  `InvocationID=${status.bridge.keeper.invocationId}`,
+                ]
+                  .map((property) =>
+                    `printf '%s\\n' "$props" | grep -Fxq ${
+                      shellQuote(property)
+                    }`
+                  ),
+                cgroupProof,
+              ]
+              : [
+                `test "$(systemctl --user show ${unitArg} --property=InvocationID --value)" = ${
+                  shellQuote(status.bridge.keeper.invocationId)
+                }`,
+              ]),
+            `systemctl --user stop ${unitArg}`,
+          ].join("\n"),
         ]);
-        unit = await localUnit(ctx.run, paths.unitName, status.bridge.keeper);
-        if (
-          unit.props.MainPID !== "0" || unit.props.ControlPID !== "0" ||
-          !unit.empty
-        ) fail();
-        await deps.private.write(paths.settled, {
-          identity: status.bridge.keeper,
-          boot: unit.boot,
-          inputSha256: status.inputSha256,
-        });
+        unit = await localUnit(
+          ctx.run,
+          paths.unitName,
+          status.bridge.keeper,
+          false,
+        );
+        if (!stoppedKeeper(unit, status)) fail();
+        await deps.private.write(paths.settled, settlement);
         return "CLOSED";
       } catch {
-        return "CANCELLATION_BLOCKED";
+        return { state: "CANCELLATION_BLOCKED", reason };
       }
     },
   };
@@ -842,7 +1080,8 @@ export async function runBackupV2BridgeRuntime(
       if (!sameGate(input.gate, gate)) fail();
       const remote = await source();
       if (remote.defaultIdentity !== input.defaultSocketIdentity) fail();
-      let cancelled = gate.state !== "ACTIVE" || remote.cancelled;
+      let cancelled = gate.state !== "ACTIVE" ||
+        remote.cancelled && !remote.terminalStatusPending;
       try {
         const request = JSON.parse(
           new TextDecoder().decode(await strictRead(paths.close)),
@@ -867,7 +1106,7 @@ export async function runBackupV2BridgeRuntime(
         keeper: identity,
         binding: input.binding,
         observedMonotonicMs: performance.now(),
-        gate: remote.terminal && !cancelled
+        gate: remote.terminal && !cancelled && !remote.terminalStatusPending
           ? "TERMINAL"
           : cancelled
           ? "CANCELLED"
