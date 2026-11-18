@@ -7,6 +7,11 @@ import {
   validateRetentionSummary,
 } from "./backup-v2-retention-report.ts";
 import type { BackupV2RetentionSummary } from "./backup-v2-retention.ts";
+import {
+  backblazeReportExplanation,
+  type BackblazeReportReason,
+  backblazeReportReason,
+} from "./backup-v2-report-reasons.ts";
 
 export const DEFAULT_ALERT_DESTINATION = "https://ntfy.pavlovcik.com/alerts";
 export const ALERT_REMINDER_MS = 6 * 60 * 60_000;
@@ -23,6 +28,8 @@ const streams = [
   "oracle-watchdog",
   "backblaze-watchdog",
   "backblaze-retention",
+  "backblaze-catalog-verification",
+  "backblaze-catalog-integrity",
 ] as const;
 
 const reasons = [
@@ -75,6 +82,8 @@ export interface BackupAlertObservation {
   stream: AlertStream;
   outcome: BackupAlertOutcome;
   retention?: RetentionAlertEvidence;
+  reportReason?: BackblazeReportReason;
+  outstandingDamage?: { captureIds: string[]; total: number };
 }
 
 interface AlertRecord {
@@ -87,6 +96,8 @@ interface AlertRecord {
   lastAttemptAtUtc?: string;
   deliveredAtUtc?: string;
   retention?: RetentionAlertEvidence;
+  reportReason?: BackblazeReportReason;
+  outstandingDamage?: BackupAlertObservation["outstandingDamage"];
 }
 
 interface AlertLedger {
@@ -112,14 +123,30 @@ export function backupAlertReason(
   return reasons.find((reason) => reason === code) ?? fallback;
 }
 
-export function backupRetentionAlert(report: {
-  status?: unknown;
-  retentionStatus?: unknown;
-  retentionTransactionId?: unknown;
-  retention?: unknown;
-}): BackupAlertObservation | undefined {
+export function backupRetentionAlert(
+  report: {
+    status?: unknown;
+    retentionStatus?: unknown;
+    retentionTransactionId?: unknown;
+    retention?: unknown;
+    healthy?: unknown;
+    reason?: unknown;
+  },
+  stream: "backblaze-retention" | "backblaze-catalog-verification" =
+    "backblaze-retention",
+): BackupAlertObservation | undefined {
   const status = report.retentionStatus ?? report.status;
   const txn = report.retentionTransactionId;
+  const failed = typeof status === "string" &&
+    status.startsWith("B2_RETENTION_") &&
+    report.healthy === false &&
+    report.reason !== "B2_RETENTION_RECONCILIATION_PENDING";
+  const reportReason = failed
+    ? backblazeReportReason(
+      report.reason,
+      "B2_RETENTION_STATUS_UNPROVED",
+    )
+    : undefined;
   if (
     typeof txn !== "string" ||
     !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(txn) ||
@@ -133,10 +160,27 @@ export function backupRetentionAlert(report: {
       B2_RETENTION_ORPHAN_ALERT,
       B2_CATALOG_DAMAGED_ALERT,
     ].includes(status)
-  ) return undefined;
-  const summary = validateRetentionSummary(report.retention);
+  ) {
+    return failed
+      ? {
+        stream,
+        outcome: "B2_RETENTION_BLOCKED",
+        reportReason,
+      }
+      : undefined;
+  }
+  let summary: BackupV2RetentionSummary;
+  try {
+    summary = validateRetentionSummary(report.retention);
+  } catch {
+    return {
+      stream,
+      outcome: "B2_RETENTION_BLOCKED",
+      reportReason: reportReason ?? "B2_REPORT_INVALID",
+    };
+  }
   return {
-    stream: "backblaze-retention",
+    stream,
     outcome: summary.damagedCaptureIds.length
       ? B2_CATALOG_DAMAGED_ALERT
       : status === B2_RETENTION_ORPHAN_ALERT
@@ -145,6 +189,25 @@ export function backupRetentionAlert(report: {
       ? "B2_RETENTION_BLOCKED"
       : "B2_RETENTION_REPORT_AVAILABLE",
     retention: { transactionId: txn, summary },
+    ...(reportReason ? { reportReason } : {}),
+  };
+}
+
+export function outstandingBackblazeDamageAlert(
+  captureIds: readonly string[],
+): BackupAlertObservation | undefined {
+  const ids = captureIds.filter((id) =>
+    /^generation-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(id)
+  ).sort();
+  if (!ids.length) return undefined;
+  return {
+    stream: "backblaze-catalog-integrity",
+    outcome: B2_CATALOG_DAMAGED_ALERT,
+    reportReason: "DAMAGED_ACCEPTED_GENERATION",
+    outstandingDamage: {
+      captureIds: ids.slice(0, MAX_DAMAGED_GENERATIONS_PER_ALERT),
+      total: ids.length,
+    },
   };
 }
 
@@ -222,11 +285,17 @@ function updateLedger(
   now: Date,
 ): boolean {
   let updated = false;
-  for (const { stream, outcome, retention } of observations) {
+  for (
+    const { stream, outcome, retention, reportReason, outstandingDamage }
+      of observations
+  ) {
     if (outcome === "DEFERRED") continue;
-    if (stream === "backblaze-retention") {
+    if (
+      retention &&
+      (stream === "backblaze-retention" ||
+        stream === "backblaze-catalog-verification")
+    ) {
       const proposed = retention;
-      if (!proposed) continue;
       const summary = validateRetentionSummary(proposed.summary),
         damagedTotal = summary.damagedCaptureIds.length;
       for (
@@ -248,7 +317,8 @@ function updateLedger(
           JSON.stringify(record.retention.summary) === JSON.stringify(batch)
         );
         const reminderDue = (outcome === B2_RETENTION_ORPHAN_ALERT ||
-          outcome === B2_CATALOG_DAMAGED_ALERT) &&
+          outcome === B2_CATALOG_DAMAGED_ALERT ||
+          outcome === "B2_RETENTION_BLOCKED") &&
           previous?.deliveredAtUtc !== undefined &&
           now.getTime() - Date.parse(previous.deliveredAtUtc) >=
             ALERT_REMINDER_MS;
@@ -265,6 +335,7 @@ function updateLedger(
             summary: batch,
             damagedTotal,
           },
+          ...(reportReason ? { reportReason } : {}),
         });
         updated = true;
       }
@@ -283,7 +354,13 @@ function updateLedger(
       previous?.status !== CLAIM_CUSTODY_OVERDUE;
     const due = !healthy && previous?.deliveredAtUtc !== undefined &&
       now.getTime() - Date.parse(previous.deliveredAtUtc) >= ALERT_REMINDER_MS;
-    const transition = previous ? previous.healthy !== healthy : !healthy;
+    const transition = previous
+      ? previous.healthy !== healthy ||
+        reportReason !== undefined && reportReason !== previous.reportReason ||
+        outstandingDamage !== undefined &&
+          JSON.stringify(outstandingDamage) !==
+            JSON.stringify(previous.outstandingDamage)
+      : !healthy;
     if (!transition && !escalation && !due) continue;
     ledger.records.push({
       id: crypto.randomUUID(),
@@ -292,6 +369,8 @@ function updateLedger(
       healthy,
       observedAtUtc: now.toISOString(),
       attempts: 0,
+      ...(reportReason ? { reportReason } : {}),
+      ...(outstandingDamage ? { outstandingDamage } : {}),
     });
     updated = true;
   }
@@ -311,10 +390,24 @@ async function publishAlert(
   const summary = record.retention
     ? validateRetentionSummary(record.retention.summary)
     : undefined;
-  const damaged = summary?.damagedCaptureIds ?? [];
-  const total = record.retention?.damagedTotal;
+  const priorDamage = record.outstandingDamage;
+  const damage = Array.isArray(priorDamage?.captureIds)
+    ? outstandingBackblazeDamageAlert(priorDamage.captureIds)?.outstandingDamage
+    : undefined;
+  const damaged = summary?.damagedCaptureIds ?? damage?.captureIds ?? [];
+  const total = record.retention?.damagedTotal ?? priorDamage?.total;
   const message = [
     `${service} ${reason} ${timestamp}`,
+    ...(record.reportReason
+      ? [
+        backblazeReportExplanation(
+          backblazeReportReason(
+            record.reportReason,
+            "B2_RETENTION_STATUS_UNPROVED",
+          ),
+        ).message,
+      ]
+      : []),
     ...(summary ? [retentionAlertSummary(summary)] : []),
     ...(damaged.length
       ? [

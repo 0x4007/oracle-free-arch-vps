@@ -1408,7 +1408,8 @@ Deno.test("managed retention persists launch intent once and binds cold source c
         path === B2_RETENTION_CONTROL_PATH
           ? structuredClone(control)
           : undefined,
-      write: async (_path: string, value: unknown) => {
+      write: async (path: string, value: unknown) => {
+        if (path !== B2_RETENTION_CONTROL_PATH) return;
         control = structuredClone(value) as BackupV2RetentionControl;
         calls.push(`save:${control.phase}`);
       },
@@ -1432,6 +1433,7 @@ Deno.test("managed retention persists launch intent once and binds cold source c
       cleared: async () => false,
     },
     observe: async () => observed,
+    cancel: async () => "SETTLED",
     acknowledge: async () => {
       calls.push("ack");
     },
@@ -1477,6 +1479,8 @@ Deno.test("managed retention persists launch intent once and binds cold source c
   };
   const blocked = await reconcile();
   equal(blocked?.status, "B2_RETENTION_PLAN_CANCELLATION_BLOCKED");
+  equal(blocked?.reason, "SOURCE_STATUS_CANCELLATION_BLOCKED");
+  assert(blocked?.message);
   equal(
     control.cancellationBlockedReason,
     "SOURCE_STATUS_CANCELLATION_BLOCKED",
@@ -1486,6 +1490,10 @@ Deno.test("managed retention persists launch intent once and binds cold source c
       "kind=prune reason=SOURCE_STATUS_CANCELLATION_BLOCKED",
     ),
   );
+  const refused = await reconcile();
+  equal(refused?.status, "B2_RETENTION_PLAN_BLOCKED");
+  equal(refused?.reason, "SOURCE_STATUS_CANCELLATION_BLOCKED");
+  assert(refused?.message && refused.retention === undefined);
 });
 
 Deno.test("retention execution needs a current explicit boolean policy", async () => {

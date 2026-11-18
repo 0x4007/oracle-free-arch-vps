@@ -12,8 +12,8 @@ import {
   backupAlertReason,
   backupRetentionAlert,
   notifyBackupAlerts,
+  outstandingBackblazeDamageAlert,
 } from "./backup-mac-alert.ts";
-import { readGate } from "./backblaze-controller-gate.ts";
 import type { OnlineBackupRetry } from "./online-backup-contract.ts";
 import type { GroupRestorePlan } from "./oci-group-restore-drill.ts";
 import {
@@ -30,12 +30,12 @@ import {
   STALE_AFTER_MS,
   validateControllerState,
   type WatchdogAssessment,
-  weekWindow,
 } from "./backblaze-file-backup.ts";
 import {
-  backupRuntimeCatalog,
+  acceptedBackupRuntimeCapture,
   type BackupV2ControllerObservation,
   type BackupV2ControllerState,
+  normalizeBackupV2ControllerState,
   observeBackupV2Source,
   readBackupRuntimeGate,
   readBackupV2RetentionControl,
@@ -51,99 +51,19 @@ import {
 
 import {
   B2_CATALOG_DAMAGED_ALERT,
-  B2_CATALOG_REPORT_PATH,
-  B2_RETENTION_REPORT_PATH,
-  type BackupV2PiRetentionReport,
-  retentionTransactionPath,
-  validateRetentionPlanReference,
-  validateRetentionSummary,
+  type BackblazeMaintenanceResult,
+  readBackblazeMaintenance,
 } from "./backup-v2-retention-report.ts";
+import {
+  addBackblazeFailureReason,
+  backblazeReportExplanation,
+} from "./backup-v2-report-reasons.ts";
 
-async function readRetentionReport(path: string, now: Date) {
-  try {
-    const value = await readPrivateJson<BackupV2PiRetentionReport>(path);
-    if (
-      value.schemaVersion !== 1 ||
-      value.format !== "backblaze-retention-report" ||
-      new Date(value.observedAtUtc).toISOString() !== value.observedAtUtc ||
-      Date.parse(value.observedAtUtc) > now.getTime() ||
-      value.plan.path !== retentionTransactionPath(value.transactionId, "plan")
-    ) return undefined;
-    validateRetentionPlanReference(value.plan);
-    const report = {
-      observedAtUtc: value.observedAtUtc,
-      retentionStatus: value.status,
-      retentionTransactionId: value.transactionId,
-      retention: validateRetentionSummary(value.summary),
-    };
-    return backupRetentionAlert(report) ? report : undefined;
-  } catch {
-    return undefined;
-  }
-}
+export { acceptedBackupRuntimeCapture };
 
 export const B2_REPORT_PATH = ".private/reports/backblaze-file-backup.json";
 export const ORACLE_REPORT_PATH = ".private/reports/backup-watchdog.json";
 export const B2_STATE_PATH = ".private/file-backup/controller.json";
-
-/** Actual capture intervals and independently accepted receipts determine
- * freshness. A request, heartbeat or new verification date cannot refresh it. */
-export function acceptedBackupRuntimeCapture(
-  value: unknown,
-  now: Date,
-  damaged: readonly string[] = [],
-) {
-  const window = weekWindow(now),
-    start = Date.parse(window.startAtUtc),
-    end = Date.parse(window.endAtUtc);
-  let unknown = false;
-  const entries = backupRuntimeCatalog(value).flatMap((entry) => {
-    const capture = entry.schemaVersion === 2
-      ? entry.envelope.request.captureId
-      : entry.entry.index.generation;
-    if (damaged.includes(capture)) return [];
-    const verifiedAtUtc = entry.schemaVersion === 1
-      ? entry.entry.receipt.verifiedAtUtc
-      : entry.receipt.verifiedAtUtc;
-    const acceptedAtUtc = entry.schemaVersion === 1
-      ? entry.entry.acceptedAtUtc
-      : entry.acceptedAtUtc;
-    const starts = entry.schemaVersion === 1
-      ? [entry.entry.index.captureStartedAtUtc]
-      : entry.selectedRoot.root.roles.map((role) => role.captureStartedAtUtc);
-    const finishes = entry.schemaVersion === 1
-      ? [entry.entry.index.captureFinishedAtUtc]
-      : entry.selectedRoot.root.roles.map((role) => role.captureFinishedAtUtc);
-    const captured = Math.max(...finishes.map(Date.parse)),
-      verified = Date.parse(verifiedAtUtc),
-      accepted = Date.parse(acceptedAtUtc);
-    if (
-      ![captured, verified, accepted, ...starts.map(Date.parse)].every(
-        Number.isFinite,
-      ) || captured > verified || verified > now.getTime() ||
-      accepted > now.getTime()
-    ) {
-      unknown = true;
-      return [];
-    }
-    return [{
-      entry,
-      captureStartedAtUtc: new Date(Math.min(...starts.map(Date.parse)))
-        .toISOString(),
-      captureFinishedAtUtc: new Date(captured).toISOString(),
-      verifiedAtUtc,
-      current: captured >= start && captured < end,
-    }];
-  }).sort((a, b) =>
-    Date.parse(b.captureFinishedAtUtc) - Date.parse(a.captureFinishedAtUtc)
-  );
-  return {
-    latest: entries[0] ?? null,
-    current: entries.find((entry) => entry.current) ?? null,
-    periodKey: window.periodKey,
-    unknown,
-  };
-}
 
 export function assessBackupV2Watchdog(
   stateInput: unknown,
@@ -151,52 +71,38 @@ export function assessBackupV2Watchdog(
   now: Date,
   source?: BackupV2ControllerObservation,
   progress?: unknown,
-  retention?: unknown,
   damaged: readonly string[] = [],
 ): WatchdogAssessment {
+  const report = assessBackupV2BackupHealth(
+    stateInput,
+    gateInput,
+    now,
+    source,
+    progress,
+    damaged,
+  );
+  return report.reason
+    ? report
+    : addBackblazeFailureReason(report, "B2_WATCHDOG_CHECK_FAILED");
+}
+
+function assessBackupV2BackupHealth(
+  stateInput: unknown,
+  gateInput: unknown | null,
+  now: Date,
+  source: BackupV2ControllerObservation | undefined,
+  progress: unknown,
+  damaged: readonly string[],
+): WatchdogAssessment {
   const state = validateBackupV2ControllerState(stateInput), job = state.job;
-  let gate: BackupV2Gate | null = null;
+  let gate: BackupV2Gate | null;
   try {
     gate = gateInput === null ? null : validateBackupV2Gate(gateInput);
+    if (gate?.kind === "prune") gate = null;
   } catch {
     return { status: "B2_BACKUP_GATE_UNKNOWN", healthy: false };
   }
   const jobId = job?.settings.envelope.request.jobId;
-  if (
-    gate?.kind === "prune" &&
-    (retention as { schemaVersion?: unknown } | null | undefined)
-        ?.schemaVersion === 3
-  ) {
-    const report = assessBackupV2Retention(
-      gate.envelope,
-      gate,
-      now,
-      retention,
-      source,
-    );
-    const accepted = acceptedBackupRuntimeCapture(state, now, damaged);
-    return {
-      ...report,
-      healthy: report.healthy && !accepted.unknown && accepted.current !== null,
-    };
-  }
-  if (
-    job?.phase === "COMPLETE" &&
-    (gate?.kind === "prune" || retention !== undefined)
-  ) {
-    const report = assessBackupV2Retention(
-      job.settings.envelope,
-      gate,
-      now,
-      retention,
-      source,
-    );
-    const accepted = acceptedBackupRuntimeCapture(state, now, damaged);
-    return {
-      ...report,
-      healthy: report.healthy && !accepted.unknown && accepted.current !== null,
-    };
-  }
   if (
     gate?.state === "CANCELLATION_BLOCKED" ||
     job?.phase === "CANCELLATION_BLOCKED"
@@ -206,6 +112,9 @@ export function assessBackupV2Watchdog(
         jobId ?? gate?.envelope.request.jobId
       }`,
       healthy: false,
+      ...backblazeReportExplanation(
+        job?.cancellationBlockedReason ?? "B2_CANCELLATION_BLOCKED",
+      ),
     };
   }
   const accepted = acceptedBackupRuntimeCapture(state, now, damaged);
@@ -227,9 +136,17 @@ export function assessBackupV2Watchdog(
     const acceptedJob = entry?.schemaVersion === 2
       ? entry.envelope.request.jobId
       : entry?.entry.index.generation.replace(/^generation-/, "job-");
-    return accepted.current
-      ? { status: `B2_BACKUP_CURRENT:${acceptedJob}`, healthy: true }
-      : { status: `B2_PERIOD_MISSED:${accepted.periodKey}`, healthy: false };
+    if (accepted.current) {
+      return { status: `B2_BACKUP_CURRENT:${acceptedJob}`, healthy: true };
+    }
+    if (damaged.length && acceptedBackupRuntimeCapture(state, now).current) {
+      return {
+        status: B2_CATALOG_DAMAGED_ALERT,
+        healthy: false,
+        ...backblazeReportExplanation("DAMAGED_ACCEPTED_GENERATION"),
+      };
+    }
+    return { status: `B2_PERIOD_MISSED:${accepted.periodKey}`, healthy: false };
   }
   if (job.phase === "FAILED") {
     return { status: `B2_BACKUP_FAILED:${jobId}`, healthy: false };
@@ -270,7 +187,15 @@ export function assessBackupV2Watchdog(
     return { status: `B2_BACKUP_SOURCE_MISMATCH:${jobId}`, healthy: false };
   }
   if (status.phase === "CANCELLATION_BLOCKED" || status.phase === "FAILED") {
-    return { status: `B2_BACKUP_${status.phase}:${jobId}`, healthy: false };
+    return {
+      status: `B2_BACKUP_${status.phase}:${jobId}`,
+      healthy: false,
+      ...backblazeReportExplanation(
+        status.phase === "FAILED"
+          ? "SOURCE_STATUS_FAILED"
+          : "SOURCE_STATUS_CANCELLATION_BLOCKED",
+      ),
+    };
   }
   if (["CLOUD_COMPLETE", "ACCEPTED", "CLEANED"].includes(status.phase)) {
     return {
@@ -393,7 +318,7 @@ export function assessBackupV2Retention(
     return {
       status: "B2_RETENTION_UNKNOWN",
       healthy: false,
-      detail: "Retention control or prune custody is unavailable",
+      ...backblazeReportExplanation("B2_RETENTION_CONTROL_INVALID"),
     };
   }
   let healthy = false;
@@ -435,9 +360,13 @@ export function assessBackupV2Retention(
   return {
     status: `B2_RETENTION_${stage}_${phase}`,
     healthy,
-    detail: phase === "COMPLETE" && healthy
-      ? "Controller retention and cleanup completed; backup freshness is checked separately"
-      : "Backup accepted; source retention and cleanup remain separate",
+    ...(phase === "COMPLETE" && healthy ? {} : backblazeReportExplanation(
+      phase === "CANCELLATION_BLOCKED"
+        ? "B2_RETENTION_CUSTODY_UNPROVED"
+        : healthy || phase === "REQUESTED" || phase === "SETTLED"
+        ? "B2_RETENTION_RECONCILIATION_PENDING"
+        : "B2_RETENTION_STATUS_UNPROVED",
+    )),
   };
 }
 
@@ -624,6 +553,7 @@ export function watchdogAlertOutcome(
     ) return "DEFERRED";
     return "HEALTHY";
   }
+  if (status === B2_CATALOG_DAMAGED_ALERT) return "B2_BACKUP_FAILED";
   if (status.startsWith("B2_RETENTION_")) return "B2_RETENTION_BLOCKED";
   if (status === "B2_BACKUP_CANCELLATION_BLOCKED") {
     return "B2_CANCELLATION_BLOCKED";
@@ -680,6 +610,10 @@ export async function main(): Promise<void> {
       notificationSent: false,
     };
   }
+  const { reports: maintenance, damaged } = await readBackblazeMaintenance(
+    realPrivateSeam(),
+    new Date(),
+  );
   let b2Report: Record<string, unknown>;
   let v2Dispatch = false;
   try {
@@ -689,17 +623,28 @@ export async function main(): Promise<void> {
     } catch (error) {
       if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
-    v2Dispatch =
-      (rawState as { schemaVersion?: unknown } | undefined)?.schemaVersion ===
-        2;
+    const runtimeGate = await readBackupRuntimeGate();
+    const version = (rawState as { schemaVersion?: unknown } | undefined)
+      ?.schemaVersion;
+    const original = rawState as
+      | ControllerState
+      | BackupV2ControllerState
+      | undefined;
+    const legacyActive = original?.schemaVersion === 1 && original.job &&
+      !["COMPLETE", "FAILED"].includes(original.job.phase);
+    v2Dispatch = version === 2 ||
+      !legacyActive &&
+        (runtimeGate?.schemaVersion === 2 && runtimeGate.kind === "prune" ||
+          damaged.length > 0);
     if (v2Dispatch) {
-      const state: BackupV2ControllerState = validateBackupV2ControllerState(
-          rawState,
-        ),
-        gate = await readBackupRuntimeGate();
+      const state = normalizeBackupV2ControllerState(
+        original ?? { schemaVersion: 1, catalog: [] },
+      );
+      const gate = runtimeGate;
       let source: BackupV2ControllerObservation | undefined,
         progress: unknown,
-        retention: unknown;
+        retention: unknown,
+        catalogMaintenance = false;
       if (gate?.schemaVersion === 2 && gate.kind === "prune") {
         try {
           const privateIO = realPrivateSeam();
@@ -710,6 +655,7 @@ export async function main(): Promise<void> {
             );
             if (control?.gate.gateId === gate.gateId) {
               retention = control;
+              catalogMaintenance = verifyCatalogOnly;
               break;
             }
           }
@@ -738,16 +684,28 @@ export async function main(): Promise<void> {
         }
       }
       const observedNow = new Date();
-      const [planReport, catalogReport] = await Promise.all([
-        readRetentionReport(B2_RETENTION_REPORT_PATH, observedNow),
-        readRetentionReport(B2_CATALOG_REPORT_PATH, observedNow),
-      ]);
-      const latest = [planReport, catalogReport].filter((item) =>
-        item !== undefined
-      )
-        .sort((a, b) => b.observedAtUtc.localeCompare(a.observedAtUtc))[0];
-      const damage = latest?.retention.damagedCaptureIds ?? [];
-      const accepted = acceptedBackupRuntimeCapture(state, observedNow, damage);
+      if (gate?.schemaVersion === 2 && gate.kind === "prune") {
+        const key = catalogMaintenance ? "catalog" : "retention";
+        const assessed = assessBackupV2Retention(
+          gate.envelope,
+          gate,
+          observedNow,
+          retention,
+          source,
+        );
+        const live: BackblazeMaintenanceResult = {
+          ...assessed,
+          observedAtUtc: observedNow.toISOString(),
+        };
+        if (
+          assessed.healthy || !maintenance[key] || maintenance[key]?.healthy
+        ) maintenance[key] = live;
+      }
+      const accepted = acceptedBackupRuntimeCapture(
+        state,
+        observedNow,
+        damaged,
+      );
       b2Report = {
         lastSuccessfulCaptureAtUtc: accepted.latest?.captureFinishedAtUtc ??
           null,
@@ -763,19 +721,8 @@ export async function main(): Promise<void> {
           observedNow,
           source,
           progress,
-          retention,
-          damage,
+          damaged,
         ),
-        ...(latest
-          ? {
-            retentionStatus: latest.retentionStatus,
-            retentionTransactionId: latest.retentionTransactionId,
-            retention: latest.retention,
-          }
-          : {}),
-        ...(damage.length
-          ? { status: B2_CATALOG_DAMAGED_ALERT, healthy: false }
-          : {}),
         observedAtUtc: observedNow.toISOString(),
         notificationSent: false,
       };
@@ -784,7 +731,10 @@ export async function main(): Promise<void> {
       if (rawState !== undefined) {
         controllerState = validateControllerState(rawState);
       }
-      const gate = await readGate();
+      if (runtimeGate?.schemaVersion === 2) {
+        throw Error("Backup gate and controller versions differ");
+      }
+      const gate = runtimeGate;
       let source: ObservedSource | undefined;
       if (gate !== null && controllerState?.job !== undefined) {
         try {
@@ -805,6 +755,12 @@ export async function main(): Promise<void> {
       const latestAccepted = controllerState?.catalog.slice().sort((a, b) =>
         Date.parse(b.acceptedAtUtc) - Date.parse(a.acceptedAtUtc)
       )[0];
+      const { status, healthy } = assessBackblazeWatchdog(
+        controllerState,
+        gate,
+        now,
+        source,
+      );
       b2Report = {
         lastSuccessfulCaptureAtUtc:
           latestAccepted?.index.captureFinishedAtUtc ??
@@ -815,20 +771,25 @@ export async function main(): Promise<void> {
           ".private/reports/backblaze-machine-boot.json",
           now,
         ),
-        ...assessBackblazeWatchdog(controllerState, gate, now, source),
+        ...addBackblazeFailureReason(
+          { status, healthy },
+          "B2_WATCHDOG_CHECK_FAILED",
+        ),
         observedAtUtc: now.toISOString(),
         notificationSent: false,
       };
     }
-  } catch (error) {
+  } catch {
     b2Report = {
       status: "B2_WATCHDOG_CHECK_FAILED",
       healthy: false,
       observedAtUtc: now.toISOString(),
       notificationSent: false,
-      detail: error instanceof Error ? error.message : String(error),
+      ...backblazeReportExplanation("B2_WATCHDOG_CHECK_FAILED"),
     };
   }
+  if (Object.keys(maintenance).length) b2Report.maintenance = maintenance;
+  if (damaged.length) b2Report.damagedCaptureIds = damaged;
   // Read only the small hourly report; this never restarts or recaptures a job.
   if (b2Report.healthy === true && !v2Dispatch) {
     try {
@@ -848,7 +809,15 @@ export async function main(): Promise<void> {
             invocationId,
             now,
           );
-          if (alarm) Object.assign(b2Report, alarm);
+          if (alarm) {
+            Object.assign(
+              b2Report,
+              addBackblazeFailureReason(
+                alarm as { status: string; healthy: boolean },
+                "B2_WATCHDOG_CHECK_FAILED",
+              ),
+            );
+          }
         }
       }
     } catch {
@@ -857,7 +826,6 @@ export async function main(): Promise<void> {
   }
   let delivery: BackupAlertDelivery | undefined;
   try {
-    const retention = backupRetentionAlert(b2Report);
     const observations: BackupAlertObservation[] = [
       {
         stream: "oracle-watchdog",
@@ -865,12 +833,34 @@ export async function main(): Promise<void> {
       },
       {
         stream: "backblaze-watchdog",
-        outcome: retention && b2Report.status === B2_CATALOG_DAMAGED_ALERT
-          ? "DEFERRED"
-          : watchdogAlertOutcome(b2Report, "B2_WATCHDOG_CHECK_FAILED"),
+        outcome: watchdogAlertOutcome(b2Report, "B2_WATCHDOG_CHECK_FAILED"),
       },
     ];
-    if (retention) observations.push(retention);
+    for (const kind of ["retention", "catalog"] as const) {
+      const report = maintenance[kind];
+      if (!report) continue;
+      const alert = backupRetentionAlert(
+        report,
+        kind === "catalog"
+          ? "backblaze-catalog-verification"
+          : "backblaze-retention",
+      );
+      if (alert) observations.push(alert);
+    }
+    const unreportedDamage = outstandingBackblazeDamageAlert(
+      damaged.filter((capture) =>
+        !observations.some((observation) =>
+          observation.retention?.summary.damagedCaptureIds.includes(capture)
+        )
+      ),
+    );
+    if (unreportedDamage) observations.push(unreportedDamage);
+    else if (!damaged.length) {
+      observations.push({
+        stream: "backblaze-catalog-integrity",
+        outcome: "HEALTHY",
+      });
+    }
     delivery = await notifyBackupAlerts(observations);
   } catch {
     for (const report of [b2Report, oracleReport]) {

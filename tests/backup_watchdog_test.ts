@@ -582,6 +582,33 @@ Deno.test("v2 due-period proof uses capture interval, not new acceptance or veri
       V2_NOW,
     ).healthy
   ) throw Error("Cross-host acceptance ordering was invented");
+  const entry = acceptedV2Entry();
+  const root = entry.selectedRoot.root;
+  const invalidInterval = {
+    ...entry,
+    selectedRoot: {
+      ...entry.selectedRoot,
+      root: {
+        ...root,
+        roles: root.roles.map((role) => ({
+          ...role,
+          captureStartedAtUtc: role.captureFinishedAtUtc,
+        })),
+      },
+    },
+  };
+  let intervalRefused = false;
+  try {
+    acceptedBackupRuntimeCapture(
+      { ...state, catalog: [invalidInterval] },
+      V2_NOW,
+    );
+  } catch {
+    intervalRefused = true;
+  }
+  if (!intervalRefused) {
+    throw Error("Invalid same-source capture interval became current");
+  }
   if (
     assessBackupV2Watchdog(
       {
@@ -654,6 +681,25 @@ Deno.test("accepted backup retains prune stage reporting until controller cleanu
     progress: { ...f.progress.sample.v2Status.progress, phase: "PRUNING" },
   }, gate);
   const source = { ...f.source, identity: gate.custody, status };
+  const accepted = acceptedV2Entry();
+  const state = { ...f.state, job: null, catalog: [accepted] };
+  const current = assessBackupV2Watchdog(state, gate, V2_NOW);
+  if (!current.healthy || !current.status.startsWith("B2_BACKUP_CURRENT:")) {
+    throw Error("Maintenance gate changed accepted backup health");
+  }
+  const damage = assessBackupV2Watchdog(
+    state,
+    gate,
+    V2_NOW,
+    undefined,
+    undefined,
+    [accepted.envelope.request.captureId],
+  );
+  if (damage.healthy || damage.reason !== "DAMAGED_ACCEPTED_GENERATION") {
+    throw Error(
+      "Proven cloud damage did not invalidate the only current accepted point",
+    );
+  }
   const control = {
     schemaVersion: 2,
     format: "backup-v2-retention-controller",
