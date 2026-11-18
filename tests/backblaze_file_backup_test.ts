@@ -16,19 +16,40 @@
 import {
   authorizeCatalogRetirement,
   type BackupV2ControllerCapabilities,
+  type BackupV2ControllerObservation,
+  type BackupV2ControllerState,
   type BackupV2RetentionControl,
   runBackupV2ControllerCycle,
+  runBackupV2RetentionCycle,
 } from "../scripts/backup-v2-controller.ts";
 import {
   B2_CATALOG_CONTROL_PATH,
+  B2_CATALOG_DAMAGED_ALERT,
+  B2_CATALOG_REPORT_PATH,
   B2_RETENTION_CATEGORIES,
   B2_RETENTION_CONTROL_PATH,
   B2_RETENTION_KEY_PATH,
   B2_RETENTION_POLICY_PATH,
+  B2_RETENTION_REPORT_PATH,
+  type BackupV2PiRetentionReport,
   retentionTransactionPath,
 } from "../scripts/backup-v2-retention-report.ts";
-import type { BackupV2Gate } from "../scripts/backup-v2-runtime-contract.ts";
 import {
+  type BackupV2Gate,
+  type BackupV2Request,
+  backupV2RequestSha256,
+  validateBackupV2Gate,
+} from "../scripts/backup-v2-runtime-contract.ts";
+import type { BackupV2ListedVersion } from "../scripts/backup-v2-contract.ts";
+import { backupV2SourceConfigSha256 } from "../scripts/backup-v2-metadata.ts";
+import { BACKUP_V2_PROFILE_ID } from "../scripts/backup-v2-profile.ts";
+import { runBackupV2SourcePruner } from "../scripts/backup-v2-source-pruner.ts";
+import {
+  backupV2ArtifactBytes,
+  backupV2ArtifactSha256,
+} from "../scripts/backup-v2-worker.ts";
+import {
+  type BackupV2RetentionJournalEntry,
   type BackupV2RetentionSummary,
   DEFAULT_BACKUP_V2_RETENTION_POLICY,
 } from "../scripts/backup-v2-retention.ts";
@@ -49,9 +70,15 @@ import {
   GATE_BACKUP_CGROUP_ROOT,
   GATE_DEADLINE_HOURS,
   GATE_DEADLINE_MS,
+  GATE_OWNER,
+  GATE_REMOTE_HOST,
+  GATE_SOURCE_LOCK_PATH,
   type OrphanReason,
 } from "../scripts/backblaze-controller-contract.ts";
-import type { CaptureResult } from "../scripts/backblaze-capture.ts";
+import type {
+  CaptureResult,
+  CaptureSettings,
+} from "../scripts/backblaze-capture.ts";
 import type { UploadResult } from "../scripts/backblaze-upload.ts";
 import {
   generationChunkName,
@@ -119,6 +146,7 @@ import {
   type TunnelHandle,
   type TunnelSeam,
   validateAcceptedReceipt,
+  validateCatalogEntry,
   validateControllerState,
   validateReleaseManifest,
   validateSavedWorkerResult,
@@ -6287,4 +6315,406 @@ Deno.test({
     assert(result.stdout.length === 262149);
     assert(result.stdout.endsWith("done\n"));
   },
+});
+Deno.test("managed retention publishes exact source PLAN before EXECUTE and trims only after intact completion", async () => {
+  for (const damage of [false, true]) {
+    const generations = [1, 2, 3].map((seed) =>
+      generationFixture(seed, WINDOW_START + seed * 3_600_000)
+    );
+    const entries = generations.map((generation, index) =>
+      catalogEntry(
+        generation,
+        WINDOW_START + index * 1000,
+      )
+    );
+    const old = {
+      schemaVersion: 1 as const,
+      catalog: entries,
+    };
+    const state: BackupV2ControllerState = {
+      schemaVersion: 2,
+      format: "backup-v2-controller",
+      legacy: old,
+      job: null,
+      catalog: entries.map((entry) => ({
+        schemaVersion: 1,
+        format: "backup-v1",
+        entry,
+      })),
+    };
+    const now = new Date(WINDOW_START + 10 * 86_400_000);
+    const h = harness({ now });
+    await h.deps.private.write(CONTROLLER_STATE_PATH, old);
+    const policy = { ...DEFAULT_BACKUP_V2_RETENTION_POLICY, execute: true };
+    await h.deps.private.write(B2_RETENTION_POLICY_PATH, policy);
+    await h.deps.private.write(B2_RETENTION_KEY_PATH, {
+      accessKeyId: "isolated-fixture-key",
+      secretAccessKey: "synthetic",
+      bucketId: "bucket",
+      bucketName: "pavlovcik-arch-vps-backups",
+    });
+    const uid = "00000000-0000-4000-8000-000000000099";
+    const boot = "00000000-0000-4000-8000-000000000098";
+    const date = now.toISOString();
+    const captureSettings: CaptureSettings = {
+      generation: "generation-" + uid,
+      sources: sourceConfig(),
+      recipientFile: "/fixture/recipient.asc",
+      recipientSha256: RECIPIENT_SHA256,
+      recipientFingerprint: RECIPIENT_FINGERPRINT,
+      exclusionsText: EXCLUSIONS_TEXT,
+    };
+    const cloud = new Map<string, BackupV2ListedVersion>(
+      inventoryFor(generations).map(
+        (object) => [object.fileId, { ...object, action: "upload" }],
+      ),
+    );
+    cloud.set("foreign-ballast", {
+      fileId: "foreign-ballast",
+      fileName: "foreign/blob",
+      contentLength: 256 * 1024 * 1024,
+      contentSha1: "a".repeat(40),
+      action: "upload",
+      uploadTimestamp: 1,
+    });
+    const journal: BackupV2RetentionJournalEntry[] = [];
+    const mutations: string[] = [];
+    let sourcePlan: Uint8Array | undefined, piPlan: Uint8Array | undefined;
+    let live: BackupV2Gate | null = null;
+    let observed: BackupV2ControllerObservation | null = null;
+    const cleared = new Set<string>();
+    const nativeDigest = "a".repeat(64);
+    const current = async () =>
+      (await h.deps.private.read<BackupV2RetentionControl>(
+        B2_RETENTION_CONTROL_PATH,
+      ))!;
+    const absent = (): BackupV2ControllerObservation => ({
+      sourceBootId: boot,
+      unit: "ABSENT",
+      identity: null,
+      status: null,
+      resultBytes: null,
+      tree: null,
+    });
+    h.deps.remote.root = (script) => {
+      if (script.includes("discoverBackupV2UnresolvedPuts")) {
+        return Promise.resolve({
+          code: 0,
+          stdout: JSON.stringify({
+            sourceBootId: boot,
+            gates: [],
+            unresolvedPuts: [],
+          }),
+          stderr: "",
+        });
+      }
+      if (script.includes("echo SOURCE_IDLE")) {
+        return Promise.resolve({
+          code: 0,
+          stdout: "SOURCE_IDLE\n",
+          stderr: "",
+        });
+      }
+      if (
+        script.includes("systemd-run") &&
+        script.includes("BACKUP_V2_PRUNE_GATE_ID")
+      ) {
+        assert(live !== null && script.includes(live.gateId));
+        assert(script.includes(REVISION + "/scripts/backup-v2-worker.ts"));
+        observed = {
+          ...absent(),
+          unit: "RUNNING",
+          identity: {
+            unitName: live.unitName,
+            invocationId: "a".repeat(32),
+            mainPid: 123,
+            mainStartTicks: "456",
+            cgroup: GATE_BACKUP_CGROUP_ROOT + "/" + live.unitName,
+          },
+        };
+      }
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    };
+    const caps = {
+      create(periodKey: string) {
+        const request: BackupV2Request = {
+          schemaVersion: 2,
+          format: "backup-v2",
+          profile: BACKUP_V2_PROFILE_ID,
+          jobId: "job-" + uid,
+          captureId: captureSettings.generation,
+          requestedAtUtc: date,
+          periodKey,
+          sourceRevision: REVISION,
+          sourceConfigSha256: backupV2SourceConfigSha256(captureSettings),
+          recipientSha256: RECIPIENT_SHA256,
+          recipientFingerprint: RECIPIENT_FINGERPRINT,
+        };
+        const envelope = {
+          request,
+          requestSha256: backupV2RequestSha256(request),
+        };
+        const gate = (kind: "worker" | "verify", gateId: string) =>
+          validateBackupV2Gate({
+            schemaVersion: 2,
+            format: "backup-v2",
+            owner: GATE_OWNER,
+            envelope,
+            gateId,
+            sourceBootId: boot,
+            kind,
+            unitName: ["arch-vps-b2-v2", kind, uid, gateId].join("-") +
+              ".service",
+            state: "PENDING",
+            custody: null,
+            remoteHost: GATE_REMOTE_HOST,
+            sourceLockPath: GATE_SOURCE_LOCK_PATH,
+            createdAtUtc: date,
+            updatedAtUtc: date,
+          });
+        return Promise.resolve({
+          schemaVersion: 2,
+          format: "backup-v2",
+          envelope,
+          captureSettings,
+          B2Settings: {
+            accessKeyId: "fixture-current-writer",
+            secretAccessKey: "synthetic",
+            bucketId: "bucket",
+            bucketName: "pavlovcik-arch-vps-backups",
+          },
+          workerGate: gate("worker", crypto.randomUUID()),
+          verifierGate: gate("verify", crypto.randomUUID()),
+          publicationAttemptId: crypto.randomUUID(),
+        });
+      },
+      gate: {
+        read: () => Promise.resolve(live),
+        replace(
+          expected: BackupV2Gate | null,
+          next: BackupV2Gate | null,
+        ) {
+          assert(JSON.stringify(expected) === JSON.stringify(live));
+          live = next;
+          if (!next && expected) {
+            cleared.add(expected.gateId);
+            observed = null;
+          }
+          return Promise.resolve();
+        },
+        cleared: (gate: BackupV2Gate) =>
+          Promise.resolve(cleared.has(gate.gateId)),
+      },
+      observe() {
+        return Promise.resolve(observed ?? absent());
+      },
+      async acknowledge() {},
+      async stop() {},
+      async persist(next: BackupV2ControllerState) {
+        await h.deps.private.write(CONTROLLER_STATE_PATH, next);
+      },
+    } as unknown as BackupV2ControllerCapabilities;
+    const cycle = () =>
+      runBackupV2RetentionCycle(state, h.deps, caps, "scheduled", {
+        async proveIdle() {},
+        async installRuntime() {},
+        readPlan(control, _deps, fetch) {
+          const ref = (control.plannedResult ?? control.result)!.plan;
+          if (fetch) {
+            assert(sourcePlan && !piPlan);
+            piPlan = sourcePlan.slice();
+          }
+          assert(piPlan && backupV2ArtifactSha256(piPlan) === ref.sha256);
+          return Promise.resolve();
+        },
+      });
+    const finishSource = async () => {
+      const control = await current(), gate = control.gate;
+      assert(gate.custody && observed);
+      const input = { ...control.input, gate };
+      const result = {
+        ...await runBackupV2SourcePruner(input, {
+          exactStore: {
+            bucketVersionsPage: (_cursor, prefix) =>
+              Promise.resolve({
+                items: [...cloud.values()].filter((object) =>
+                  !prefix || object.fileName.startsWith(prefix)
+                ),
+                next: null,
+              }),
+            unfinishedFilesPage: () =>
+              Promise.resolve({ items: [], next: null }),
+            unfinishedPartsPage: () =>
+              Promise.resolve({ items: [], next: null }),
+            async removeRetentionVersion(object) {
+              assert(piPlan);
+              assert(
+                await h.deps.private.read(
+                  retentionTransactionPath(input.transactionId, "report"),
+                ),
+              );
+              assert(
+                await h.deps.private.read(
+                  retentionTransactionPath(input.transactionId, "retirement"),
+                ),
+              );
+              assert(
+                (await h.deps.private.read<ControllerState>(
+                  CONTROLLER_STATE_PATH,
+                ))!.catalog.length === 3,
+              );
+              assert(cloud.delete(object.fileId));
+              mutations.push(object.fileId);
+            },
+          },
+          readGraphManifest: () => Promise.reject(Error("unexpected graph")),
+          readGraphPage: () => Promise.reject(Error("unexpected page")),
+          readPlan: () => Promise.resolve(sourcePlan!),
+          writePlanDurable(_id, bytes) {
+            sourcePlan = bytes.slice();
+            return Promise.resolve();
+          },
+          loadJournal: () => Promise.resolve(structuredClone(journal)),
+          appendDurable(_id, entry) {
+            journal.push(entry);
+            return Promise.resolve();
+          },
+          observeFresh: () => Promise.resolve(input),
+          validateLegacy: validateCatalogEntry,
+          now: () => now,
+          progress: () => Promise.resolve(),
+        }),
+        nativeCustodySha256: nativeDigest,
+      };
+      const resultBytes = backupV2ArtifactBytes(result);
+      observed = {
+        ...observed,
+        unit: "EXITED",
+        nativeCustodySha256: nativeDigest,
+        managerNamespaceReferences: 0,
+        resultBytes,
+        status: {
+          schemaVersion: 2,
+          format: "backup-v2",
+          envelope: gate.envelope,
+          gateId: gate.gateId,
+          sourceBootId: boot,
+          custody: gate.custody,
+          kind: "prune",
+          phase: "CLEANED",
+          activeRoleAttempt: null,
+          startedAtUtc: date,
+          updatedAtUtc: date,
+          finishedAtUtc: date,
+          resultSha256: backupV2ArtifactSha256(resultBytes),
+          progress: {
+            phase: "CLEANED",
+            observedMonotonicMs: 10,
+            sourceBytes: 0,
+            compressionInputBytes: 0,
+            verifiedChunks: 0,
+            decryptedBytes: 0,
+            inventoryMembers: 1,
+          },
+          lease: {
+            observedMonotonicMs: 10,
+            usefulProgressAtMs: 10,
+            usefulProgressExpiresAtMs: 120010,
+            retryEpisode: null,
+          },
+        },
+        tree: {
+          identity: gate.custody,
+          observedMonotonicMs: 10,
+          mainPid: 0,
+          controlPid: 0,
+          cgroupPopulated: false,
+          descendants: 0,
+          escapedProcesses: 0,
+          namespaceReferences: 0,
+          openPipelineHandles: 0,
+          pendingOperations: 0,
+          sourceLockFree: true,
+        },
+      };
+      return result;
+    };
+    await cycle(); // Plan launch from a settled old-format catalog.
+    await cycle(); // Bind and acknowledge.
+    const source = await finishSource();
+    assert(
+      source.state === "PLAN_PROVED" && source.summary.blockReason === null,
+      source.summary.blockReason ?? source.state,
+    );
+    await cycle(); // Accept bound plan result.
+    await cycle(); // Publish exact bytes and private report.
+    assert(piPlan && mutations.length === 0);
+    assert(
+      (await current()).input.stage === "EXECUTE",
+      (await current()).phase,
+    );
+    await cycle(); // Publish retirement intent, then launch.
+    await cycle(); // Bind and acknowledge.
+    if (damage) cloud.delete(generations[2].publishedIndex.object.fileId);
+    assert((await finishSource()).state === (damage ? "PARTIAL" : "COMPLETE"));
+    await cycle(); // Accept the bound CLEANED status even if result is PARTIAL.
+    const result = await cycle(); // Trim only after source final integrity proof.
+    const final = await h.deps.private.read<ControllerState>(
+      CONTROLLER_STATE_PATH,
+    );
+    assert(final?.catalog.length === (damage ? 3 : 2));
+    assert(
+      result?.status ===
+        (damage
+          ? "B2_RETENTION_CATALOG_DAMAGED"
+          : "B2_RETENTION_EXECUTE_COMPLETE"),
+    );
+    if (damage) {
+      assert(
+        result.retention!.damagedCaptureIds[0] === generations[2].generation,
+      );
+      assert(mutations.length === 0);
+    } else {
+      assert(Number(mutations.length) === UPLOAD_ROLE_ORDER.length + 1);
+      const control = await current();
+      const finished = (await h.deps.private.read<BackupV2PiRetentionReport>(
+        B2_RETENTION_REPORT_PATH,
+      ))!;
+      const newer = new Date(now.getTime() + 60_000).toISOString();
+      const damageId = "00000000-0000-4000-8000-000000000097";
+      await h.deps.private.write(B2_CATALOG_REPORT_PATH, {
+        ...finished,
+        transactionId: damageId,
+        status: B2_CATALOG_DAMAGED_ALERT,
+        observedAtUtc: newer,
+        healthy: false,
+        plan: {
+          ...finished.plan,
+          path: retentionTransactionPath(damageId, "plan"),
+        },
+        summary: {
+          ...finished.summary,
+          blockReason: "DAMAGED_ACCEPTED_GENERATION",
+          damagedCaptureIds: [generations[2].generation],
+        },
+      });
+      // Controller reached COMPLETE before its report publication settled.
+      h.privateMap.delete(
+        retentionTransactionPath(control.input.transactionId, "report"),
+      );
+      h.privateMap.delete(B2_RETENTION_REPORT_PATH);
+      h.clock.current = new Date(now.getTime() + 120_000);
+      const replay = await cycle();
+      assert(replay?.observedAtUtc === control.result!.finishedAtUtc);
+      const rebuilt = await h.deps.private.read<BackupV2PiRetentionReport>(
+        B2_RETENTION_REPORT_PATH,
+      );
+      const detected = await h.deps.private.read<BackupV2PiRetentionReport>(
+        B2_CATALOG_REPORT_PATH,
+      );
+      assert(
+        rebuilt && detected && rebuilt.observedAtUtc < detected.observedAtUtc,
+      );
+    }
+  }
 });

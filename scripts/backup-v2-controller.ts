@@ -2518,7 +2518,9 @@ async function retentionReport(
       schemaVersion: 1,
       format: "backblaze-retention-report",
       transactionId: control.input.transactionId,
-      observedAtUtc: deps.now().toISOString(),
+      // Reconstructing a missing report must retain the time of its proof.
+      // Otherwise cached success can outrank a newer catalog damage check.
+      observedAtUtc: result.finishedAtUtc,
       status,
       healthy,
       policy: control.input.snapshot.policy,
@@ -2543,15 +2545,7 @@ async function retentionReport(
         "report",
       );
       const saved = await deps.private.read<BackupV2PiRetentionReport>(path);
-      if (
-        saved &&
-        isDeepStrictEqual(
-          { ...report, observedAtUtc: saved.observedAtUtc },
-          saved,
-        )
-      ) {
-        report.observedAtUtc = saved.observedAtUtc;
-      } else {
+      if (!isDeepStrictEqual(report, saved)) {
         await deps.private.write(path, report);
       }
       const latestPath = control.input.snapshot.verifyCatalogOnly
