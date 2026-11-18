@@ -3,6 +3,7 @@ import {
   ALERT_RETRY_MS,
   backupAlertDestination,
   type BackupAlertObservation,
+  backupRetentionAlert,
   DEFAULT_ALERT_DESTINATION,
   notifyBackupAlerts,
   runWithBackupAlert,
@@ -15,6 +16,12 @@ import {
   canUseBackupTestFixtures,
   withBackupTestFixture,
 } from "./backup-test-fixtures.ts";
+
+import {
+  B2_CATALOG_DAMAGED_ALERT,
+  B2_RETENTION_CATEGORIES,
+} from "../scripts/backup-v2-retention-report.ts";
+import type { BackupV2RetentionSummary } from "../scripts/backup-v2-retention.ts";
 
 function assert(value: unknown, message = "Assertion failed"): asserts value {
   if (!value) throw new Error(message);
@@ -363,4 +370,68 @@ Deno.test("an alert recording failure leaves the original backup failure intact"
   }
   assert(caught === original);
   assert(logged.length === 1 && logged[0] === "BACKUP_ALERT_RECORD_FAILED");
+});
+
+Deno.test({
+  name:
+    "damage alerts name the verified generation at urgent priority and deduplicate by transaction",
+  ignore: !canUseBackupTestFixtures,
+  async fn() {
+    await withLedgerFixture(async (notify) => {
+      const generation = "generation-61d5c174-45ff-4d7d-baec-57d06da81e89";
+      const damaged = [
+        generation,
+        ...Array.from(
+          { length: 17 },
+          (_, index) =>
+            `generation-00000000-0000-4000-8000-${
+              String(index).padStart(12, "0")
+            }`,
+        ),
+      ];
+      const categories = Object.fromEntries(
+        B2_RETENTION_CATEGORIES.map((
+          name,
+        ) => [name, {
+          objects: 1,
+          bytes: 10,
+          plannedObjects: 0,
+          plannedBytes: 0,
+        }]),
+      ) as BackupV2RetentionSummary["categories"];
+      const report = backupRetentionAlert({
+        status: B2_CATALOG_DAMAGED_ALERT,
+        retentionTransactionId: "61d5c174-45ff-4d7d-baec-57d06da81e89",
+        retention: {
+          keptGenerations: 1,
+          damagedCaptureIds: damaged,
+          bucketBytes: 100,
+          maxDeleteBytes: 50,
+          categories,
+          blockReason: "DAMAGED_ACCEPTED_GENERATION",
+          deletedObjects: 0,
+          deletedBytes: 0,
+          reconciledAbsentObjects: 0,
+          reconciledAbsentBytes: 0,
+        },
+      });
+      assert(report);
+      const messages: string[] = [];
+      const request: typeof fetch = (input, init) => {
+        assert(new Headers(init?.headers).get("Priority") === "5");
+        const body = String(init?.body);
+        messages.push(body);
+        assert(body.includes("Kept 1 generations"));
+        return Promise.resolve(receipt(input, init));
+      };
+      await notify([report], { now: at(), request });
+      await notify([report], { now: at(1000), request });
+      assert(messages.length === 2);
+      assert(
+        damaged.every((id) =>
+          messages.filter((message) => message.includes(id)).length === 1
+        ),
+      );
+    });
+  },
 });
