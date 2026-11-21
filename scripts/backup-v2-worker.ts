@@ -907,6 +907,72 @@ async function rootDirectory(path: string): Promise<void> {
   }
   await assertBackupV2Directory(path);
 }
+
+function protectionFileNames(
+  descriptor: BackupV2ProtectionDescriptor,
+): string[] {
+  return [
+    "manifest.json",
+    ...Array.from(
+      { length: descriptor.pageCount },
+      (_, i) => backupV2ProtectionPageName(i),
+    ),
+    "descriptor.json",
+  ];
+}
+
+/** The source graph is a cache under /var/tmp. Only absent files may be restored. */
+export async function missingBackupV2ProtectionFiles(
+  raw: BackupV2ProtectionDescriptor,
+): Promise<string[]> {
+  const descriptor = validateBackupV2ProtectionDescriptor(raw);
+  const directory = backupV2ProtectionSourceDirectory(
+    descriptor.manifestSha256,
+  );
+  const names = protectionFileNames(descriptor);
+  try {
+    await assertBackupV2Directory(BACKUP_V2_PROTECTION_SOURCE_BASE);
+    await assertBackupV2Directory(directory);
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) return names;
+    throw error;
+  }
+  const missing = [];
+  for (const name of names) {
+    try {
+      const info = await Deno.lstat(`${directory}/${name}`);
+      if (
+        !info.isFile || info.uid !== 0 || info.nlink !== 1 ||
+        info.mode === null ||
+        (info.mode & 0o777) !== 0o600 ||
+        info.size > BACKUP_V2_LIMITS.controlResponseBytes
+      ) fail();
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+      missing.push(name);
+    }
+  }
+  return missing;
+}
+
+export async function restoreBackupV2ProtectionFile(
+  raw: BackupV2ProtectionDescriptor,
+  name: string,
+  value: unknown,
+  sha256: string,
+): Promise<void> {
+  const descriptor = validateBackupV2ProtectionDescriptor(raw);
+  if (
+    !protectionFileNames(descriptor).includes(name) ||
+    backupV2ArtifactSha256(backupV2ArtifactBytes(value)) !== sha256
+  ) fail();
+  await rootDirectory(BACKUP_V2_PROTECTION_SOURCE_BASE);
+  const directory = backupV2ProtectionSourceDirectory(
+    descriptor.manifestSha256,
+  );
+  await rootDirectory(directory);
+  await atomicArtifact(directory, name, value, true);
+}
 /** One per-invocation append file. Registration resolves only after the exact
  * facts are durable; an uncertain write poisons later registration. */
 export async function openBackupV2NativeCustody(
