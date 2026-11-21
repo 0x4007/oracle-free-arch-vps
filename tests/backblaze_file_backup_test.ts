@@ -43,7 +43,10 @@ import {
   backupV2RequestSha256,
   validateBackupV2Gate,
 } from "../scripts/backup-v2-runtime-contract.ts";
-import type { BackupV2ListedVersion } from "../scripts/backup-v2-contract.ts";
+import {
+  type BackupV2ListedVersion,
+  backupV2ObjectName,
+} from "../scripts/backup-v2-contract.ts";
 import { backupV2SourceConfigSha256 } from "../scripts/backup-v2-metadata.ts";
 import { BACKUP_V2_PROFILE_ID } from "../scripts/backup-v2-profile.ts";
 import { runBackupV2SourcePruner } from "../scripts/backup-v2-source-pruner.ts";
@@ -2534,6 +2537,21 @@ Deno.test("installed controller starts read-only maintenance against a settled h
     assert(
       h.privateMap.has(`.private/file-backup/retention/${old.jobId}.json`),
     );
+    if (mode === "scheduled") {
+      h.privateMap.delete(GATE_PATH);
+      await h.deps.private.write(directory, {
+        ...control,
+        phase: "PLAN_BLOCKED",
+        anchor: "f".repeat(64),
+      });
+      h.deps.remote.root = () =>
+        Promise.resolve({ code: 1, stdout: "", stderr: "" });
+      const next = await runBackupV2ControllerCycle(h.deps, trap);
+      assert(next.healthy);
+      const refused = next.maintenance?.retention;
+      assert(refused?.reason === "B2_RETENTION_CUSTODY_UNPROVED");
+      assert(refused.retentionTransactionId === undefined);
+    }
   }
 });
 
@@ -6505,8 +6523,10 @@ Deno.test({
   },
 });
 Deno.test("managed retention publishes exact source PLAN before EXECUTE and trims only after intact completion", async () => {
-  for (const damage of [false, true]) {
-    const generations = [1, 2, 3].map((seed) =>
+  for (const scenario of ["execute", "damage", "legacy-plan-only"]) {
+    const damage = scenario === "damage",
+      planOnly = scenario === "legacy-plan-only";
+    const generations = (planOnly ? [1, 2, 3, 4] : [1, 2, 3]).map((seed) =>
       generationFixture(seed, WINDOW_START + seed * 3_600_000)
     );
     const entries = generations.map((generation, index) =>
@@ -6538,9 +6558,9 @@ Deno.test("managed retention publishes exact source PLAN before EXECUTE and trim
       orphanGraceHours: 72,
       maxDeleteFraction: 0.5,
       cleanLegacyOrphans: false,
-      execute: true,
+      execute: !planOnly,
     };
-    await h.deps.private.write(B2_RETENTION_POLICY_PATH, policy);
+    if (!planOnly) await h.deps.private.write(B2_RETENTION_POLICY_PATH, policy);
     await h.deps.private.write(B2_RETENTION_KEY_PATH, {
       accessKeyId: "isolated-fixture-key",
       secretAccessKey: "synthetic",
@@ -6571,12 +6591,29 @@ Deno.test("managed retention publishes exact source PLAN before EXECUTE and trim
       action: "upload",
       uploadTimestamp: 1,
     });
+    const externallyRemoved: string[] = [];
+    if (planOnly) {
+      for (let i = 0; i < 11; i++) {
+        const capture = "generation-" + (i === 0 ? uid : crypto.randomUUID());
+        const fileId = "unaccepted-" + i;
+        externallyRemoved.push(fileId);
+        cloud.set(fileId, {
+          ...cloud.get("old-index-version")!,
+          fileId,
+          fileName: i < 7
+            ? backupV2ObjectName(capture, uid, "data", 0, uid)
+            : generationChunkName(capture, "root", 0),
+          contentLength: 1,
+        });
+      }
+    }
     const journal: BackupV2RetentionJournalEntry[] = [];
     const mutations: string[] = [];
     let sourcePlan: Uint8Array | undefined, piPlan: Uint8Array | undefined;
     let live: BackupV2Gate | null = null;
     let observed: BackupV2ControllerObservation | null = null;
     const cleared = new Set<string>();
+    const historicalGates: BackupV2Gate[] = [];
     const nativeDigest = "a".repeat(64);
     const current = async () =>
       (await h.deps.private.read<BackupV2RetentionControl>(
@@ -6596,7 +6633,7 @@ Deno.test("managed retention publishes exact source PLAN before EXECUTE and trim
           code: 0,
           stdout: JSON.stringify({
             sourceBootId: boot,
-            gates: [],
+            gates: historicalGates,
             unresolvedPuts: [],
           }),
           stderr: "",
@@ -6854,7 +6891,7 @@ Deno.test("managed retention publishes exact source PLAN before EXECUTE and trim
           summary.maxDeleteBytes,
       );
       const legacyResult = { ...source, summary };
-      const head = entries[2];
+      const head = entries.at(-1)!;
       const anchor = backupV2ArtifactSha256(backupV2ArtifactBytes({
         accepted: [head.index.generation, head.acceptedAtUtc],
         job: null,
@@ -6898,19 +6935,52 @@ Deno.test("managed retention publishes exact source PLAN before EXECUTE and trim
         reports.retention.retention &&
           !("maxDeleteBytes" in reports.retention.retention),
       );
+      if (planOnly) {
+        assert(source.summary.categories.PROTECTED.objects === 11);
+        for (const fileId of externallyRemoved) assert(cloud.delete(fileId));
+        // One gone v2 job still has local gate history but no Pi clear proof.
+        const worker = settled.settings.workerGate;
+        historicalGates.push({
+          ...worker,
+          state: "ACTIVE",
+          custody: {
+            ...settled.gate.custody!,
+            unitName: worker.unitName,
+            cgroup: GATE_BACKUP_CGROUP_ROOT + "/" + worker.unitName,
+          },
+        });
+      }
       await cycle();
       const fresh = await current();
       assert(fresh.input.transactionId !== legacyResult.transactionId);
       assert(
-        fresh.input.stage === "PLAN" && fresh.input.snapshot.policy.execute,
+        fresh.input.stage === "PLAN" &&
+          fresh.input.snapshot.policy.execute === !planOnly,
       );
       assert(!("maxDeleteFraction" in fresh.input.snapshot.policy));
+      if (planOnly) {
+        assert(
+          fresh.input.snapshot.jobs.some((job) =>
+            job.captureId === "generation-" + uid && job.custody === "PROTECTED"
+          ),
+        );
+      }
       await cycle(); // Bind the new plan's gate.
-      await finishSource();
+      const replanned = await finishSource();
+      assert(replanned.summary.blockReason === null);
+      assert(replanned.summary.categories.PROTECTED.objects === 0);
       await cycle(); // Accept the new plan result.
     }
     await cycle(); // Publish exact bytes and private report.
     assert(piPlan && mutations.length === 0);
+    if (planOnly) {
+      assert((await current()).phase === "PLAN_ONLY");
+      assert(
+        (await h.deps.private.read<ControllerState>(CONTROLLER_STATE_PATH))
+          ?.catalog.length === 4,
+      );
+      continue;
+    }
     assert(
       (await current()).input.stage === "EXECUTE",
       (await current()).phase,

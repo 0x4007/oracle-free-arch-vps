@@ -2299,7 +2299,10 @@ async function prepareAcceptedBackupV2ScratchCleanup(
   );
 }
 
-async function proveRetentionIdle(deps: PiDeps): Promise<void> {
+async function proveRetentionIdle(
+  deps: PiDeps,
+  initializeMissingLock = false,
+): Promise<void> {
   await withBackblazeReportReason(
     "B2_RETENTION_ORACLE_CUSTODY_UNPROVED",
     async () => {
@@ -2310,7 +2313,7 @@ async function proveRetentionIdle(deps: PiDeps): Promise<void> {
   );
   await withBackblazeReportReason(
     "B2_RETENTION_CUSTODY_UNPROVED",
-    () => proveBackblazeSourceIdle(deps.remote),
+    () => proveBackblazeSourceIdle(deps.remote, { initializeMissingLock }),
   );
 }
 
@@ -2429,7 +2432,8 @@ async function startRetentionControl(
   options: ReturnType<typeof backupV2RetentionPolicy>,
   verifyCatalogOnly: boolean,
 ): Promise<BackupV2RetentionControl> {
-  await proveRetentionIdle(deps);
+  // Only fresh admission, with the Pi gate absent, can initialize the lock.
+  await proveRetentionIdle(deps, true);
   const settings = withoutKey(
     await withBackblazeReportReason(
       "B2_RETENTION_SOURCE_PREFLIGHT_FAILED",
@@ -3356,11 +3360,19 @@ export async function runBackupV2ControllerCycle(
       } while (performance.now() < deadline);
     } catch (error) {
       const reason = reasonForBackblazeError(error, "B2_RETENTION_STEP_FAILED");
+      // Fresh admission can fail before it writes its own transaction.
+      let transactionId = control?.input.transactionId;
+      if (!control || !backupV2RetentionNeedsReconcile(control)) {
+        const latest = await readControl(requested).catch(() => undefined);
+        transactionId = latest?.input.transactionId === transactionId
+          ? undefined
+          : latest?.input.transactionId;
+      }
       return await refused(
         requested,
         reason,
         undefined,
-        control?.input.transactionId,
+        transactionId,
       );
     }
     return report ? record(requested, report) : null;
