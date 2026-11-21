@@ -2745,7 +2745,6 @@ Deno.test("Pi journals the exact catalog retirement but retains fallback until c
         blockReason: null,
         damagedCaptureIds: [],
         categories,
-        maxDeleteBytes: 40,
       },
     },
   } as unknown as BackupV2RetentionControl;
@@ -6534,7 +6533,13 @@ Deno.test("managed retention publishes exact source PLAN before EXECUTE and trim
     const now = new Date(WINDOW_START + 10 * 86_400_000);
     const h = harness({ now });
     await h.deps.private.write(CONTROLLER_STATE_PATH, old);
-    const policy = { ...DEFAULT_BACKUP_V2_RETENTION_POLICY, execute: true };
+    const policy = {
+      keepAccepted: 2,
+      orphanGraceHours: 72,
+      maxDeleteFraction: 0.5,
+      cleanLegacyOrphans: false,
+      execute: true,
+    };
     await h.deps.private.write(B2_RETENTION_POLICY_PATH, policy);
     await h.deps.private.write(B2_RETENTION_KEY_PATH, {
       accessKeyId: "isolated-fixture-key",
@@ -6558,9 +6563,9 @@ Deno.test("managed retention publishes exact source PLAN before EXECUTE and trim
         (object) => [object.fileId, { ...object, action: "upload" }],
       ),
     );
-    cloud.set("foreign-ballast", {
-      fileId: "foreign-ballast",
-      fileName: "foreign/blob",
+    cloud.set("old-index-version", {
+      fileId: "old-index-version",
+      fileName: generations[2].publishedIndex.object.fileName,
       contentLength: 256 * 1024 * 1024,
       contentSha1: "a".repeat(40),
       action: "upload",
@@ -6836,6 +6841,74 @@ Deno.test("managed retention publishes exact source PLAN before EXECUTE and trim
       source.summary.blockReason ?? source.state,
     );
     await cycle(); // Accept bound plan result.
+    if (!damage) {
+      // On upgrade f179be4 has already cleared the gate and saved PLAN_BLOCKED.
+      const settled = await current();
+      const summary = {
+        ...source.summary,
+        maxDeleteBytes: Math.floor(source.summary.bucketBytes / 2),
+        blockReason: "CAP_EXCEEDED",
+      };
+      assert(
+        summary.categories.NONCURRENT_VERSION.plannedBytes >
+          summary.maxDeleteBytes,
+      );
+      const legacyResult = { ...source, summary };
+      const head = entries[2];
+      const anchor = backupV2ArtifactSha256(backupV2ArtifactBytes({
+        accepted: [head.index.generation, head.acceptedAtUtc],
+        job: null,
+        policy,
+      }));
+      await caps.gate.replace(settled.gate, null);
+      await h.deps.private.write(B2_RETENTION_CONTROL_PATH, {
+        ...settled,
+        phase: "PLAN_BLOCKED",
+        anchor,
+        input: {
+          ...settled.input,
+          snapshot: { ...settled.input.snapshot, policy },
+        },
+        result: legacyResult,
+        resultSha256: backupV2ArtifactSha256(
+          backupV2ArtifactBytes(legacyResult),
+        ),
+        plannedResult: legacyResult,
+      });
+      await h.deps.private.write(B2_RETENTION_REPORT_PATH, {
+        schemaVersion: 1,
+        format: "backblaze-retention-report",
+        status: "B2_RETENTION_PLAN_BLOCKED",
+        healthy: false,
+        reason: "CAP_EXCEEDED",
+        observedAtUtc: legacyResult.finishedAtUtc,
+        transactionId: legacyResult.transactionId,
+        plan: {
+          ...legacyResult.plan,
+          path: retentionTransactionPath(legacyResult.transactionId, "plan"),
+        },
+        retainedCaptureIds: legacyResult.retainedCaptureIds,
+        summary,
+        policy,
+      });
+      const { reports } = await readBackblazeMaintenance(h.deps.private, now);
+      assert(reports.retention?.status === "B2_RETENTION_PLAN_BLOCKED");
+      assert(reports.retention.reason === "PLAN_CHANGED");
+      assert(
+        reports.retention.retention &&
+          !("maxDeleteBytes" in reports.retention.retention),
+      );
+      await cycle();
+      const fresh = await current();
+      assert(fresh.input.transactionId !== legacyResult.transactionId);
+      assert(
+        fresh.input.stage === "PLAN" && fresh.input.snapshot.policy.execute,
+      );
+      assert(!("maxDeleteFraction" in fresh.input.snapshot.policy));
+      await cycle(); // Bind the new plan's gate.
+      await finishSource();
+      await cycle(); // Accept the new plan result.
+    }
     await cycle(); // Publish exact bytes and private report.
     assert(piPlan && mutations.length === 0);
     assert(
@@ -6879,7 +6952,8 @@ Deno.test("managed retention publishes exact source PLAN before EXECUTE and trim
         latest.reports.retention?.reason === "B2_CREDENTIAL_SCOPE_REJECTED",
       );
     } else {
-      assert(Number(mutations.length) === UPLOAD_ROLE_ORDER.length + 1);
+      assert(Number(mutations.length) === UPLOAD_ROLE_ORDER.length + 2);
+      assert(mutations.includes("old-index-version"));
       const control = await current();
       const finished = (await h.deps.private.read<BackupV2PiRetentionReport>(
         B2_RETENTION_REPORT_PATH,

@@ -234,7 +234,7 @@ function maintenanceRecord(
   const reason = !healthy || raw.reason !== undefined
     ? backblazeReportReason(
       raw.reason ?? terminal?.summary.blockReason,
-      "B2_RETENTION_STATUS_UNPROVED",
+      terminal?.summary.blockReason ?? "B2_RETENTION_STATUS_UNPROVED",
     )
     : undefined;
   const result: BackblazeMaintenanceResult = {
@@ -366,7 +366,10 @@ export function validateRetentionSummary(
     if (plannedObjects > objects || plannedBytes > bytes) invalid();
     return [category, { objects, bytes, plannedObjects, plannedBytes }];
   })) as BackupV2RetentionSummary["categories"];
-  const blockReason = r.blockReason;
+  // A plan blocked under the old policy still requires a fresh plan.
+  const blockReason = r.blockReason === "CAP_EXCEEDED"
+    ? "PLAN_CHANGED"
+    : r.blockReason;
   const ids = r.damagedCaptureIds;
   if (
     !Array.isArray(ids) || ids.length > BACKUP_V2_LIMITS.pruneCandidates ||
@@ -377,7 +380,7 @@ export function validateRetentionSummary(
     new Set(ids).size !== ids.length
   ) invalid();
   if (
-    blockReason !== null && blockReason !== "CAP_EXCEEDED" &&
+    blockReason !== null &&
     blockReason !== "PLAN_CHANGED" && blockReason !== "IDENTITY_CHANGED" &&
     blockReason !== "TRANSPORT_UNCERTAIN" &&
     blockReason !== "NO_ACCEPTED_GENERATION" &&
@@ -386,7 +389,6 @@ export function validateRetentionSummary(
   return {
     keptGenerations: count(r.keptGenerations),
     bucketBytes: count(r.bucketBytes),
-    maxDeleteBytes: count(r.maxDeleteBytes),
     categories: checked,
     blockReason,
     damagedCaptureIds: [...ids],

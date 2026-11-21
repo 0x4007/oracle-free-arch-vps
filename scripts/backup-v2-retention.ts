@@ -119,7 +119,6 @@ export async function collectBackupV2ProtectedReferences(
 export interface BackupV2RetentionPolicy {
   keepAccepted: number;
   orphanGraceHours: number;
-  maxDeleteFraction: number;
   cleanLegacyOrphans: boolean;
   execute: boolean;
 }
@@ -129,7 +128,6 @@ export const DEFAULT_BACKUP_V2_RETENTION_POLICY: Readonly<
 > = Object.freeze({
   keepAccepted: 2,
   orphanGraceHours: 72,
-  maxDeleteFraction: 0.5,
   cleanLegacyOrphans: false,
   execute: false,
 });
@@ -188,7 +186,6 @@ export const BACKUP_V2_RETENTION_EVIDENCE = {
 export type BackupV2RetentionCategory =
   keyof typeof BACKUP_V2_RETENTION_EVIDENCE;
 export type BackupV2RetentionBlockReason =
-  | "CAP_EXCEEDED"
   | "NO_ACCEPTED_GENERATION"
   | "DAMAGED_ACCEPTED_GENERATION"
   | "PLAN_CHANGED"
@@ -199,7 +196,6 @@ export interface BackupV2RetentionSummary {
   keptGenerations: number;
   damagedCaptureIds: string[];
   bucketBytes: number;
-  maxDeleteBytes: number;
   categories: Record<BackupV2RetentionCategory, {
     objects: number;
     bytes: number;
@@ -269,7 +265,6 @@ export interface BackupV2RetentionExecution {
 }
 
 const encoder = new TextEncoder();
-const fractionScale = 1_000_000;
 const hourMs = 3_600_000;
 const capturePattern =
   /^generation-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
@@ -295,21 +290,19 @@ export function validateBackupV2RetentionPolicy(
   value: unknown,
 ): BackupV2RetentionPolicy {
   if (!value || typeof value !== "object" || Array.isArray(value)) invalid();
-  const p = value as BackupV2RetentionPolicy;
+  const { maxDeleteFraction: _legacy, ...p } = value as
+    & BackupV2RetentionPolicy
+    & { maxDeleteFraction?: unknown };
   if (
     Object.keys(p).sort().join(",") !==
-      "cleanLegacyOrphans,execute,keepAccepted,maxDeleteFraction,orphanGraceHours" ||
+      "cleanLegacyOrphans,execute,keepAccepted,orphanGraceHours" ||
     !Number.isSafeInteger(p.keepAccepted) || p.keepAccepted < 1 ||
     p.keepAccepted > BACKUP_V2_LIMITS.pruneCandidates ||
     !Number.isSafeInteger(p.orphanGraceHours) || p.orphanGraceHours < 1 ||
     p.orphanGraceHours > 24 * 365 ||
-    !Number.isFinite(p.maxDeleteFraction) || p.maxDeleteFraction <= 0 ||
-    p.maxDeleteFraction > 1 ||
-    Math.round(p.maxDeleteFraction * fractionScale) / fractionScale !==
-      p.maxDeleteFraction ||
     typeof p.cleanLegacyOrphans !== "boolean" || typeof p.execute !== "boolean"
   ) invalid();
-  return structuredClone(p);
+  return p;
 }
 export function validateBackupV2RetiredRestic(
   value: unknown,
@@ -590,7 +583,7 @@ function planFromInventory(
   const candidates: RetentionCandidate[] = [];
   const hides: BackupV2RetentionVersion[] = [];
   const remainingUploads = new Map<string, number>();
-  let bucketBytes = 0, plannedBytes = 0;
+  let bucketBytes = 0;
   function stage(
     object: BackupV2RetentionVersion,
     reason: BackupV2RetentionCategory,
@@ -602,7 +595,6 @@ function planFromInventory(
     if (candidate && !state.verifyCatalogOnly && age(object) <= cutoff) {
       tally.plannedObjects++;
       tally.plannedBytes += object.contentLength;
-      plannedBytes += object.contentLength;
       candidates.push({
         object,
         reason: candidate,
@@ -707,15 +699,10 @@ function planFromInventory(
       Number(right.object.action === "hide") ||
     retentionVersionOrder(left.object, right.object)
   );
-  const maxDeleteBytes = Number(
-    BigInt(Math.round(state.policy.maxDeleteFraction * fractionScale)) *
-      BigInt(bucketBytes) / BigInt(fractionScale),
-  );
   let blockReason: BackupV2RetentionBlockReason | null = null;
   if (damaged.length) blockReason = "DAMAGED_ACCEPTED_GENERATION";
   else if (protectedMissing) blockReason = "IDENTITY_CHANGED";
   else if (!retained.length) blockReason = "NO_ACCEPTED_GENERATION";
-  else if (plannedBytes > maxDeleteBytes) blockReason = "CAP_EXCEEDED";
   const body: Omit<BackupV2RetentionPlan, "digest"> = {
     schemaVersion: 2,
     format: "backup-v2-retention",
@@ -739,7 +726,6 @@ function planFromInventory(
       keptGenerations: retained.length,
       damagedCaptureIds: damaged,
       bucketBytes: state.verifyCatalogOnly ? 0 : bucketBytes,
-      maxDeleteBytes: state.verifyCatalogOnly ? 0 : maxDeleteBytes,
       categories,
       blockReason,
       deletedObjects: 0,
@@ -806,7 +792,7 @@ type RetentionExecutionOutcome = {
 };
 class RetentionPreconditionError extends Error {}
 
-/** Repeat uses the original byte cap and catalog even after partial deletion.
+/** Repeat uses the original plan and catalog even after partial deletion.
  * Reconstruct its complete baseline using only missing members with durable
  * intent. A new object, changed part, or unrelated absence blocks execution. */
 export async function executeBackupV2Retention(

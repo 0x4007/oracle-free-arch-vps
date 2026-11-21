@@ -2122,7 +2122,6 @@ export function backupV2RetentionPolicy(
     string,
     unknown
   >;
-  if (Object.keys(raw).some((key) => !Object.hasOwn(defaults, key))) fail();
   const policy = validateBackupV2RetentionPolicy({ ...defaults, ...raw });
   if (planOnly) policy.execute = false;
   let legacy: RetiredLegacyCapture[] | undefined;
@@ -2803,12 +2802,7 @@ export async function authorizeCatalogRetirement(
   const snapshot = control.input.snapshot;
   if (
     !plan || !snapshot.policy.execute || plan.summary.blockReason !== null ||
-    plan.summary.damagedCaptureIds.length || !plan.retainedCaptureIds.length ||
-    Object.values(plan.summary.categories).reduce(
-        (sum, category) => sum + category.plannedBytes,
-        0,
-      ) >
-      plan.summary.maxDeleteBytes
+    plan.summary.damagedCaptureIds.length || !plan.retainedCaptureIds.length
   ) fail();
   const originals = snapshot.catalog;
   const retired = new Set(plan.retiredCaptureIds),
@@ -2903,6 +2897,8 @@ export async function runBackupV2RetentionCycle(
     [...state.catalog].sort((a, b) =>
       acceptedAt(b).localeCompare(acceptedAt(a))
     )[0];
+  // Pre-upgrade anchors include the retired policy field. A settled plan
+  // from that release must go through a fresh PLAN under the current policy.
   const anchor = digest({
     accepted: head ? [acceptedId(head), acceptedAt(head)] : null,
     job: state.job
