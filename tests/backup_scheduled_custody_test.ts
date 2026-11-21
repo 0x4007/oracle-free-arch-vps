@@ -570,16 +570,18 @@ Deno.test({
     const ps = `${dir}/ps`;
     const shellFile = (path: string, command: string) =>
       Deno.writeTextFile(path, "#!/bin/sh\n" + command + "\n", { mode: 0o700 });
-    const run = () =>
+    const run = (initializeMissingLock = false) =>
       proveBackblazeSourceIdle({
         root: (script) =>
           defaultRunner("/bin/bash", [
             "-c",
             `export PATH='${dir}:/usr/bin:/bin';\n` + script
               .replaceAll(SOURCE_LOCK_PATH, lock)
+              .replace("0:700:directory", '"$(id -u):700:directory"')
+              .replace("/proc/[0-9]*/fd", `/proc/${Deno.pid}/fd`)
               .replaceAll("/sys/fs/cgroup", cgroup),
           ]),
-      });
+      }, { initializeMissingLock });
     try {
       await shellFile(systemctl, "exit 0");
       await shellFile(ps, `printf '%s' '${processList}'`);
@@ -611,6 +613,34 @@ Deno.test({
       await Deno.remove(lock);
       await rejects(run);
       await rejects(() => Deno.stat(lock));
+      assert(
+        (await defaultRunner("/bin/bash", [
+          "-c",
+          'ln -s -- "$1" "$2"',
+          "test",
+          dir + "/missing",
+          lock,
+        ])).code === 0,
+      );
+      await rejects(() => run(true));
+      await Deno.remove(lock);
+      {
+        using old = await Deno.open(lock, { createNew: true, write: true });
+        await old.lock();
+        await Deno.remove(lock);
+        await rejects(() => run(true));
+        await rejects(() => Deno.stat(lock));
+      }
+      await run(true);
+      const created = await Deno.lstat(lock);
+      assert(created.isFile && (created.mode! & 0o777) === 0o600);
+      {
+        using held = await Deno.open(lock);
+        await held.lock();
+        await rejects(() => run(true));
+      }
+      await run();
+      assert((await Deno.lstat(lock)).ino === created.ino);
     } finally {
       await Deno.remove(dir, { recursive: true });
     }

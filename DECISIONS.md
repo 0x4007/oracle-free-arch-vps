@@ -20,6 +20,8 @@ Grace defaults to 72 hours. On 2026-11-21 the owner removed the per-transaction 
 
 Historical retention records cannot enable execution. Maintenance uses the current verified release, leaving pinned capture settings and existing backup schedules intact. The policy, safe rollout and key requirements are in the [retention runbook](BACKUP-REPAIR-RUNBOOK.md#backblaze-retention-rollout). The upload-size proposal changes no exclusions.
 
+On 2026-11-21 a missing VPS source lock prevented the controller from starting a fresh retention plan after upgrade. When the Pi gate is absent, fresh retention admission may create a mode-0600 lock in the verified root-owned source directory after checking for open descriptors to the deleted lock. It must acquire the lock, prove source quiescence, and verify the locked inode still matches the pathname. Reconciliation of an existing invocation requires its existing lock.
+
 ## Backblaze verifier terminal reconciliation — 2026-11-18
 
 The Pi reconciles a successful verifier from the exact invocation's terminal status, result digest, native custody and receipt before settling the decrypt bridge. A clean exit can overlap a controller observation. A bounded pending observation keeps the gate, and the next reconciliation checks for terminal success before cancelling an ambiguously blocked verifier.

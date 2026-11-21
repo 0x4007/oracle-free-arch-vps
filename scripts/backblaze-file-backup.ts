@@ -3907,9 +3907,23 @@ export async function backblazeScheduledClaim(
 
 export async function proveBackblazeSourceIdle(
   remote: Pick<RemoteSeam, "root">,
+  { initializeMissingLock = false } = {},
 ): Promise<void> {
   const result = await remote.root([
     "set -euo pipefail",
+    ...(initializeMissingLock
+      ? [
+        `lock=${shellQuote(SOURCE_LOCK_PATH)}`,
+        'if [[ ! -e "$lock" && ! -L "$lock" ]]; then',
+        "  base=${lock%/*}",
+        '  [[ $(realpath -e -- "$base") == "$base" && $(LC_ALL=C stat -c %u:%a:%F -- "$base") == 0:700:directory ]]',
+        // Never create a second lock inode while a process can use the old one.
+        '  deleted=$(timeout 10s find /proc/[0-9]*/fd -ignore_readdir_race -maxdepth 1 -lname "$lock (deleted)" -printf x -quit)',
+        '  test -z "$deleted"',
+        '  (umask 077; set -C; : > "$lock")',
+        "fi",
+      ]
+      : []),
     `test -f ${shellQuote(SOURCE_LOCK_PATH)}`,
     `test ! -L ${shellQuote(SOURCE_LOCK_PATH)}`,
     `exec 9<${shellQuote(SOURCE_LOCK_PATH)}`,
@@ -3933,6 +3947,7 @@ export async function proveBackblazeSourceIdle(
     "    ($0 ~ /\\/var\\/tmp\\/arch-vps-file-(backup|recovery|verification)[-\\/ ]/ ||",
     "     $0 ~ / (entry-(worker|verify)\\.ts|backup-v2-(worker|bridge-runtime)\\.ts)( |$)/) { escaped = 1 }",
     "  END { exit !init || escaped }'",
+    `test /proc/self/fd/9 -ef ${shellQuote(SOURCE_LOCK_PATH)}`,
     "echo SOURCE_IDLE",
   ].join("\n"));
   if (result.code !== 0 || result.stdout.trim() !== "SOURCE_IDLE") {
