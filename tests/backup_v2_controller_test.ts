@@ -1506,7 +1506,10 @@ Deno.test("retention execution needs a current explicit boolean policy", async (
   await rejects(() => backupV2RetentionPolicy({ execute: "true" }));
   await rejects(() => backupV2RetentionPolicy({ enabled: true }));
   await rejects(() => backupV2RetentionPolicy({ keepAccepted: 0 }));
-  await rejects(() => backupV2RetentionPolicy({ maxDeleteFraction: 1.5 }));
+  equal(
+    backupV2RetentionPolicy({ maxDeleteFraction: 0.5, execute: true }).policy,
+    { ...DEFAULT_BACKUP_V2_RETENTION_POLICY, execute: true },
+  );
 });
 
 Deno.test({

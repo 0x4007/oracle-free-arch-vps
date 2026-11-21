@@ -670,25 +670,16 @@ Deno.test("retention reports new accepted damage between irreversible older capt
   assert(f.cloud.has("legacy-2-root") && f.cloud.has("legacy-3-root"));
 });
 
-Deno.test("retention refuses cap overruns, new or changed identities, and altered plan digests", async () => {
-  const capped = fixture();
-  capped.snapshot.policy.maxDeleteFraction = 0.1;
-  const blocked = await capped.plan();
-  assert(blocked.summary.blockReason === "CAP_EXCEEDED");
-  assert(
-    (await executeBackupV2Retention(blocked, blocked.digest, capped.caps))
-      .status === "PARTIAL",
-  );
-  assert(capped.removed.length === 0);
+Deno.test("retention refuses policy or inventory changes and altered plan digests", async () => {
   const f = fixture(), plan = await f.plan(), changed = structuredClone(plan);
   changed.candidates[0].object.contentLength++;
   await rejects(() => executeBackupV2Retention(changed, plan.digest, f.caps));
-  f.snapshot.policy.maxDeleteFraction = 1;
+  f.snapshot.policy.orphanGraceHours++;
   assert(
     (await executeBackupV2Retention(plan, plan.digest, f.caps)).summary
       .blockReason === "PLAN_CHANGED",
   );
-  f.snapshot.policy.maxDeleteFraction = 0.5;
+  f.snapshot.policy.orphanGraceHours--;
   f.cloud.delete("8-data-0");
   assert(
     (await executeBackupV2Retention(plan, plan.digest, f.caps)).summary

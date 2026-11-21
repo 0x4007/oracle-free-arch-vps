@@ -116,8 +116,6 @@ const messages = {
   B2_TUNNEL_CLOSE_FAILED: "Task tunnel closure could not be proved",
   B2_WATCHDOG_CHECK_FAILED:
     "The watchdog could not read or validate backup state and source custody. Inspect the private controller and gate records.",
-  CAP_EXCEEDED:
-    "The proposed deletion exceeds maxDeleteFraction. Review the private plan and bucket totals before changing the policy.",
   DAMAGED_ACCEPTED_GENERATION:
     "An accepted generation has missing or mismatched cloud objects. Keep intact fallbacks and verify the named generations.",
   IDENTITY_CHANGED:

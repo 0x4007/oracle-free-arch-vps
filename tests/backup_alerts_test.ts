@@ -432,7 +432,6 @@ Deno.test({
           keptGenerations: 1,
           damagedCaptureIds: damaged,
           bucketBytes: 100,
-          maxDeleteBytes: 50,
           categories,
           blockReason: "DAMAGED_ACCEPTED_GENERATION",
           deletedObjects: 0,
