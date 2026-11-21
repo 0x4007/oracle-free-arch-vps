@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { validateCatalogEntry } from "../scripts/backblaze-file-backup.ts";
+import { restoreBackupV2RetentionGraphs } from "../scripts/backup-v2-controller.ts";
 import { generationChunkName } from "../scripts/backblaze-upload.ts";
 import {
   BACKUP_V2_BOOT_SAMPLES,
@@ -13,6 +14,8 @@ import { createBackupV2InventorySummary } from "../scripts/backup-v2-inventory.t
 import { BACKUP_V2_PROFILE_ID } from "../scripts/backup-v2-profile.ts";
 import {
   type BackupV2ProtectionBundle,
+  backupV2ProtectionControlDirectory,
+  backupV2ProtectionPageName,
   type BackupV2PruneInput,
   buildBackupV2Protection,
 } from "../scripts/backup-v2-protection.ts";
@@ -422,6 +425,75 @@ function fixture() {
     stats: () => ({ lists, reads, writes }),
   };
 }
+
+Deno.test("PLAN repairs an evicted accepted graph from verified Pi pages before listing the bucket", async () => {
+  const f = fixture(), entry = f.entries[0], old = f.input.graphs[0];
+  const graph = buildBackupV2Protection(entry.selectedRoot.reference, [
+    ...f.bundles.get(old.manifestSha256)!.pages.flatMap((page) =>
+      page.value.objects
+    ),
+    entry.receiptReference.object,
+  ]);
+  f.input.graphs[0] = graph.descriptor;
+  f.input.snapshot.policy.execute = false;
+  const directory = backupV2ProtectionControlDirectory(
+    graph.descriptor.manifestSha256,
+  );
+  const pi = new Map([
+    ["manifest.json", graph.manifestBytes],
+    ["descriptor.json", encode(graph.descriptor)],
+    ...graph.pages.map((page) =>
+      [backupV2ProtectionPageName(page.value.pageIndex), page.bytes] as const
+    ),
+  ]);
+  const source = new Map<string, Uint8Array>();
+  const manifest = f.caps.readGraphManifest, page = f.caps.readGraphPage;
+  const readSource = (name: string) => {
+    const bytes = source.get(name);
+    if (!bytes) throw new Deno.errors.NotFound();
+    return Promise.resolve(bytes);
+  };
+  f.caps.readGraphManifest = (d) =>
+    d.manifestSha256 === graph.descriptor.manifestSha256
+      ? readSource("manifest.json")
+      : manifest(d);
+  f.caps.readGraphPage = (d, p) =>
+    d.manifestSha256 === graph.descriptor.manifestSha256
+      ? readSource(backupV2ProtectionPageName(p.pageIndex))
+      : page(d, p);
+  await rejects(() => runBackupV2SourcePruner(f.input, f.caps));
+  assert(f.stats().lists === 0 && f.progress.length === 0);
+  const restore = () =>
+    restoreBackupV2RetentionGraphs(f.input, {
+      missing: (d) =>
+        Promise.resolve(
+          d.manifestSha256 === graph.descriptor.manifestSha256
+            ? [...pi.keys()].filter((name) => !source.has(name))
+            : [],
+        ),
+      read: (path) => {
+        assert(path.startsWith(directory + "/"));
+        return Promise.resolve(pi.get(path.slice(directory.length + 1)));
+      },
+      install: (_d, name, bytes) => {
+        assert(!source.has(name));
+        source.set(name, bytes.slice());
+        return Promise.resolve();
+      },
+    });
+  const first = backupV2ProtectionPageName(0);
+  pi.set(first, new Uint8Array([0]));
+  await rejects(restore);
+  assert(!source.has("descriptor.json") && !source.has(first));
+  pi.set(first, graph.pages[0].bytes);
+  await restore();
+  source.delete(first);
+  await restore(); // Repair a partially expired graph.
+  await restore(); // Reuse the intact source copy.
+  const plan = await runBackupV2SourcePruner(f.input, f.caps);
+  assert(plan.state === "PLAN_PROVED" && plan.summary.blockReason === null);
+  assert(f.stats().lists > 0 && f.removed.length === 0);
+});
 
 Deno.test("source pruner PLAN verifies complete metadata and persists exact dry-run bytes without deletion", async () => {
   const f = fixture(),

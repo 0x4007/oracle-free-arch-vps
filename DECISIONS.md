@@ -22,6 +22,8 @@ Historical retention records cannot enable execution. Maintenance uses the curre
 
 On 2026-11-21 a missing VPS source lock prevented the controller from starting a fresh retention plan after upgrade. When the Pi gate is absent, fresh retention admission may create a mode-0600 lock in the verified root-owned source directory after checking for open descriptors to the deleted lock. It must acquire the lock, prove source quiescence, and verify the locked inode still matches the pathname. Reconciliation of an existing invocation requires its existing lock.
 
+Before launching retention, the Pi restores missing VPS protection graph files from its verified private copy. The controller checks the catalog root, manifest digest, page hashes and direct references. The managed worker independently verifies the graph before listing provider objects. A settled blocked plan gets a fresh transaction on the next scheduled run after the live gate clears and source custody is proved again. Successful terminal plans retain their existing anchor-based reuse.
+
 ## Backblaze verifier terminal reconciliation — 2026-11-18
 
 The Pi reconciles a successful verifier from the exact invocation's terminal status, result digest, native custody and receipt before settling the decrypt bridge. A clean exit can overlap a controller observation. A bounded pending observation keeps the gate, and the next reconciliation checks for terminal success before cancelling an ambiguously blocked verifier.

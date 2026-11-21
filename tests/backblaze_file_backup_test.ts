@@ -2542,8 +2542,9 @@ Deno.test("installed controller starts read-only maintenance against a settled h
       await h.deps.private.write(directory, {
         ...control,
         phase: "PLAN_BLOCKED",
-        anchor: "f".repeat(64),
+        cancellationBlockedReason: "SOURCE_STATUS_CANCELLATION_BLOCKED",
       });
+      const root = h.deps.remote.root;
       h.deps.remote.root = () =>
         Promise.resolve({ code: 1, stdout: "", stderr: "" });
       const next = await runBackupV2ControllerCycle(h.deps, trap);
@@ -2551,6 +2552,22 @@ Deno.test("installed controller starts read-only maintenance against a settled h
       const refused = next.maintenance?.retention;
       assert(refused?.reason === "B2_RETENTION_CUSTODY_UNPROVED");
       assert(refused.retentionTransactionId === undefined);
+      launched = false;
+      gate = null;
+      h.deps.remote.root = root;
+      const retry = await runBackupV2ControllerCycle(h.deps, trap);
+      const fresh = await h.deps.private.read<BackupV2RetentionControl>(
+        directory,
+      );
+      assert(
+        retry.maintenance?.retention?.status === "B2_RETENTION_PLAN_RUNNING",
+      );
+      assert(fresh?.input.stage === "PLAN" && fresh.anchor === control.anchor);
+      assert(fresh.input.transactionId !== control.input.transactionId);
+      assert(
+        fresh.gate.unitName !== control.gate.unitName &&
+          !fresh.input.snapshot.policy.execute,
+      );
     }
   }
 });

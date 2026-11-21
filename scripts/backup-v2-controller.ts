@@ -1335,7 +1335,10 @@ export async function installBackupV2PiRelease(
 
 /** Existing immutable wrapper names, with an explicit version-specific import. */
 export async function copyBackupV2Protection(
-  verified: BackupV2VerifiedResult,
+  verified: Pick<
+    BackupV2VerifiedResult,
+    "protectedGraph" | "selectedRoot" | "receiptReference"
+  >,
   io: {
     read(name: string): Promise<Uint8Array>;
     write(name: string, bytes: Uint8Array): Promise<void>;
@@ -2791,8 +2794,102 @@ const retentionIO: BackupV2RetentionCycleSeam = {
       ...control.settings,
       B2Settings: key,
     });
+    await withBackblazeReportReason(
+      "B2_RETENTION_CATALOG_BINDING_INVALID",
+      () => restoreRetentionGraphs(control, deps),
+    );
   },
 };
+
+export async function restoreBackupV2RetentionGraphs(
+  input: BackupV2PruneInput,
+  io: {
+    missing(graph: BackupV2ProtectionDescriptor): Promise<unknown>;
+    read(path: string, maxBytes: number): Promise<Uint8Array | undefined>;
+    install(
+      graph: BackupV2ProtectionDescriptor,
+      name: string,
+      bytes: Uint8Array,
+    ): Promise<void>;
+  },
+) {
+  for (const graph of input.graphs) {
+    const descriptor = validateBackupV2ProtectionDescriptor(graph);
+    const entry = input.snapshot.catalog.find((entry) =>
+      entry.format === "backup-v2" &&
+      isDeepStrictEqual(entry.selectedRoot.reference, descriptor.root)
+    );
+    if (entry?.format !== "backup-v2") fail();
+    const names = await io.missing(descriptor);
+    if (!Array.isArray(names) || names.length > descriptor.pageCount + 2) {
+      fail();
+    }
+    const missing = new Set(names);
+    if (!missing.size) continue;
+    const directory = backupV2ProtectionControlDirectory(
+      descriptor.manifestSha256,
+    );
+    await copyBackupV2Protection({ ...entry, protectedGraph: descriptor }, {
+      async read(name) {
+        const bytes = await io.read(
+          `${directory}/${name}`,
+          BACKUP_V2_LIMITS.controlResponseBytes,
+        );
+        if (!bytes) fail();
+        return bytes;
+      },
+      async write(name, bytes) {
+        if (missing.delete(name)) await io.install(descriptor, name, bytes);
+      },
+    });
+    if (missing.size) fail();
+  }
+}
+
+async function restoreRetentionGraphs(
+  control: BackupV2RetentionControl,
+  deps: PiDeps,
+) {
+  if (!control.input.graphs.length) return;
+  const request = control.settings.envelope.request;
+  // The controller can resume an immutable job pinned before this helper existed.
+  const deployment = await loadDeployment(deps);
+  const module = JSON.stringify(
+    `${RELEASES_ROOT}/${deployment.sourceRevision}/scripts/backup-v2-worker.ts`,
+  );
+  await restoreBackupV2RetentionGraphs(control.input, {
+    read: (path, maxBytes) => deps.private.readBytes(path, maxBytes),
+    async missing(graph) {
+      const program =
+        `import { missingBackupV2ProtectionFiles } from ${module}; console.log(JSON.stringify(await missingBackupV2ProtectionFiles(${
+          JSON.stringify(graph)
+        })));`;
+      const response = await deps.remote.root(
+        backupV2RemoteProgram(request.jobId, program),
+      );
+      if (
+        response.code !== 0 ||
+        response.stdout.length > BACKUP_V2_LIMITS.controlResponseBytes
+      ) fail();
+      return JSON.parse(response.stdout);
+    },
+    async install(graph, name, bytes) {
+      const value = JSON.parse(
+        new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+      );
+      const program =
+        `import { restoreBackupV2ProtectionFile } from ${module}; await restoreBackupV2ProtectionFile(${
+          JSON.stringify(graph)
+        },${JSON.stringify(name)},${JSON.stringify(value)},${
+          JSON.stringify(backupV2ArtifactSha256(bytes))
+        });`;
+      const command = `printf '%s' ${shellQuote(program)} | DENO_DIR=${
+        shellQuote(backupV2ControlCacheDirectory(request.jobId))
+      } /usr/local/bin/deno run --no-prompt --no-config --no-lock --no-code-cache --cached-only --allow-read=${RELEASES_ROOT},${BACKUP_V2_PROTECTION_SOURCE_BASE} --allow-write=${BACKUP_V2_PROTECTION_SOURCE_BASE} -`;
+      if ((await deps.remote.root(command)).code !== 0) fail();
+    },
+  });
+}
 
 /** Record the retirement decision before mutation. Apply the visible catalog
  * change only after the source has proved completion and retained integrity. */
@@ -2913,10 +3010,12 @@ export async function runBackupV2RetentionCycle(
   let preflightCredential: B2Settings | undefined;
   if (!control || !backupV2RetentionNeedsReconcile(control)) {
     if (live !== null) return null;
-    if (!planOnly && control?.anchor === anchor) {
-      return retentionReport(control, deps, control.phase !== "PLAN_BLOCKED");
+    if (!planOnly && control?.phase !== "PLAN_BLOCKED") {
+      if (control?.anchor === anchor) {
+        return retentionReport(control, deps, true);
+      }
+      if (!state.catalog.length) return null;
     }
-    if (!planOnly && !state.catalog.length) return null;
     preflightCredential = await configuredRetentionKey(deps);
     await deps.verifyRetentionCredential?.(preflightCredential);
     control = await startRetentionControl(
